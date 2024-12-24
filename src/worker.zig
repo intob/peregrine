@@ -102,8 +102,8 @@ pub const Worker = struct {
         }
     }
 
-    fn handleRequest(self: *Worker, socket: posix.socket_t, _: request.Request) !void {
-        //std.debug.print("kfd-{d} [{d}] got request: {any} {s}\n", .{ self.kfd, socket, req.method, req.path });
+    fn handleRequest(self: *Worker, socket: posix.socket_t, req: request.Request) !void {
+        std.debug.print("kfd-{d} [{d}] got request: {any} {s}\n", .{ self.kfd, socket, req.method, req.path });
 
         // Respond with Hello world
         //try resp.headers.append(Header{ .key = "Connection", .value = "close" });

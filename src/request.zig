@@ -7,16 +7,14 @@ pub const Method = enum(u2) {
     OPTIONS,
 
     fn parse(bytes: []const u8) !Method {
-        if (bytes.len == 3 and bytes[0] == 'G') {
-            return Method.GET;
+        if (bytes.len > 7) return error.MethodUnsupported;
+        const first = bytes[0];
+        switch (first) {
+            'G' => return if (bytes.len == 3) Method.GET else error.MethodUnsupported,
+            'P' => return if (std.mem.eql(u8, bytes, "POST")) Method.POST else error.MethodUnsupported,
+            'O' => return if (std.mem.eql(u8, bytes, "OPTIONS")) Method.OPTIONS else error.MethodUnsupported,
+            else => return error.MethodUnsupported,
         }
-        if (std.mem.eql(u8, bytes, "POST")) {
-            return Method.POST;
-        }
-        if (std.mem.eql(u8, bytes, "OPTIONS")) {
-            return Method.OPTIONS;
-        }
-        return error.MethodUnsupported;
     }
 };
 
@@ -50,13 +48,13 @@ pub const RequestReader = struct {
 
     pub fn readRequest(self: *Self, socket: posix.socket_t) !?Request {
         const n = try self.readLine(socket);
-        if (n == 0) {
-            return error.EOF;
+        if (n < "GET / HTTP/1.1".len) { // Fast path
+            return error.InvalidRequest;
         }
         const mp = try parseMethodAndPath(self.buffer[0..n]);
-        return Request{
-            .method = try Method.parse(mp[0]),
-            .path = mp[1],
+        return .{
+            .method = mp.method,
+            .path = mp.path,
         };
         // TODO: parse body of POST request
     }
@@ -93,25 +91,20 @@ pub const RequestReader = struct {
     }
 };
 
-fn parseMethodAndPath(line: []const u8) ![2][]const u8 {
-    var result: [2][]const u8 = undefined;
-    var start: usize = 0;
-    var part: usize = 0;
+fn parseMethodAndPath(buffer: []const u8) !struct { method: Method, path: []const u8 } {
+    // Find first space
+    const method_end = std.mem.indexOfScalar(u8, buffer, ' ') orelse return error.InvalidRequest;
+    if (method_end > 7) return error.InvalidRequest;
 
-    var i: usize = 0;
-    while (i < line.len and part < 2) : (i += 1) {
-        if (line[i] == ' ') {
-            result[part] = line[start..i];
-            start = i + 1;
-            part += 1;
-        }
-    }
+    // Find second space
+    const path_start = method_end + 1;
+    const path_end = if (path_start < buffer.len)
+        std.mem.indexOfScalarPos(u8, buffer, path_start, ' ') orelse return error.InvalidRequest
+    else
+        return error.InvalidRequest;
 
-    // Handle the last part if we haven't found enough spaces
-    if (part < 2 and start < line.len) {
-        result[part] = line[start..line.len];
-        part += 1;
-    }
-
-    return if (part < 2) error.InvalidRequest else result;
+    return .{
+        .method = try Method.parse(buffer[0..method_end]),
+        .path = buffer[path_start..path_end],
+    };
 }
