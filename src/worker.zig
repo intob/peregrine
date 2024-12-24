@@ -51,7 +51,7 @@ pub const Worker = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         posix.close(self.kfd);
-        self.allocator.destroy(self.resp);
+        self.resp.deinit();
         self.allocator.free(self.resp_buf);
         self.file_buffer.flush() catch |err| {
             std.debug.print("error flushing buffer: {any}\n", .{err});
