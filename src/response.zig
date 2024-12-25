@@ -8,22 +8,24 @@ pub const Response = struct {
     allocator: std.mem.Allocator,
     status: Status,
     headers: std.ArrayList(Header),
-    body: ?[]const u8 = null,
+    body: []align(16) u8,
 
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator) !*Self {
+    pub fn init(allocator: std.mem.Allocator, body_size: usize) !*Self {
         const resp = try allocator.create(Self);
         resp.* = .{
             .allocator = allocator,
             .status = Status.ok,
             .headers = std.ArrayList(Header).init(allocator),
+            .body = try allocator.alignedAlloc(u8, 16, std.mem.alignForward(usize, body_size, 16)),
         };
         return resp;
     }
 
     pub fn deinit(self: *Self) void {
         self.headers.deinit();
+        self.allocator.free(self.body);
         self.allocator.destroy(self);
     }
 
@@ -55,9 +57,9 @@ test "serialise without body" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    const r = try Response.init(allocator);
-    try r.*.headers.append(Header{ .key = "Content-Type", .value = "total/rubbish" });
-    try r.*.headers.append(Header{ .key = "Content-Length", .value = "0" });
+    var r = try Response.init(allocator, 1024);
+    try r.headers.append(Header{ .key = "Content-Type", .value = "total/rubbish" });
+    try r.headers.append(Header{ .key = "Content-Length", .value = "0" });
 
     var buf = try allocator.alloc(u8, 128);
     const n = try r.serialiseHeaders(&buf);
@@ -71,18 +73,19 @@ test "serialise with body" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    const r = try Response.init(allocator);
-    r.*.body = "test response";
-    try r.*.headers.append(Header{ .key = "Content-Type", .value = "total/rubbish" });
-    try r.*.headers.append(Header{ .key = "Content-Length", .value = "13" });
+    var r = try Response.init(allocator, 1024);
+    try r.headers.append(Header{ .key = "Content-Type", .value = "total/rubbish" });
+    try r.headers.append(Header{ .key = "Content-Length", .value = "13" });
 
     var buf = try allocator.alloc(u8, 128);
     const len_headers = try r.serialiseHeaders(&buf);
-    @memcpy(buf[len_headers .. len_headers + r.body.?.len], r.body.?);
+
+    const body = "test response";
+    @memcpy(buf[len_headers .. len_headers + body.len], body);
 
     const expected = "HTTP/1.0 200 OK\nContent-Type: total/rubbish\nContent-Length: 13\n\ntest response";
 
-    try std.testing.expectEqualStrings(expected, buf[0 .. len_headers + r.body.?.len]);
+    try std.testing.expectEqualStrings(expected, buf[0 .. len_headers + body.len]);
 }
 
 test "benchmark serialise" {
@@ -92,12 +95,11 @@ test "benchmark serialise" {
 }
 
 fn benchmark(allocator: std.mem.Allocator) !void {
-    var resp = try Response.init(allocator);
+    var resp = try Response.init(allocator, 1024);
     defer resp.deinit();
-    resp.*.body = "Hello world";
-    try resp.*.headers.append(Header{ .key = "Content-Type", .value = "total/rubbish" });
-    try resp.*.headers.append(Header{ .key = "Content-Length", .value = "11" });
-    try resp.*.headers.append(Header{ .key = "Etag", .value = "32456756753456" });
+    try resp.headers.append(Header{ .key = "Content-Type", .value = "total/rubbish" });
+    try resp.headers.append(Header{ .key = "Content-Length", .value = "11" });
+    try resp.headers.append(Header{ .key = "Etag", .value = "32456756753456" });
 
     var buffer = try allocator.alloc(u8, 1024);
     defer allocator.free(buffer);

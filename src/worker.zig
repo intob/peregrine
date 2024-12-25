@@ -26,9 +26,8 @@ pub const Worker = struct {
         self.mutex = std.Thread.Mutex{};
         self.kfd = try posix.kqueue();
         self.allocator = allocator;
-        self.resp = try Response.init(self.allocator);
-        const aligned_size = std.mem.alignForward(usize, 128, 16);
-        self.resp_buf = try allocator.alignedAlloc(u8, 16, aligned_size);
+        self.resp = try Response.init(self.allocator, 4096);
+        self.resp_buf = try allocator.alignedAlloc(u8, 16, std.mem.alignForward(usize, 4096, 16));
         self.req = try allocator.create(request.Request);
 
         const filename = try std.fmt.allocPrint(allocator, "./logdata_{d}", .{self.id});
