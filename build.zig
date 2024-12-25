@@ -9,20 +9,18 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-
-    const lib_tests = b.addTest(.{
-        .name = "peregrine-tests",
+    const lib_test = b.addTest(.{
+        .name = "tests",
         .root_source_file = b.path("./src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-
-    const test_step = b.step("test", "Run library tests");
-    test_step.dependOn(&b.addRunArtifact(lib_tests).step);
+    const lib_test_step = b.step("test", "Run library tests");
+    lib_test_step.dependOn(&b.addRunArtifact(lib_test).step);
 
     // Example app
     const example = b.addExecutable(.{
-        .name = "example-server",
+        .name = "example",
         .root_source_file = b.path("./example/example.zig"),
         .target = target,
         .optimize = optimize,

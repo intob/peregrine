@@ -7,7 +7,16 @@ The main goal of this project is to provide a HTTP server, with the following pr
 - Simplicity
 
 ## Getting started
+
+### Run example
+Run the example server:
+```bash
+zig build run-example
+```
+
+### Example source
 ```zig
+// ./example/example.zig
 const std = @import("std");
 const peregrine = @import("peregrine");
 
@@ -46,12 +55,13 @@ I started this project as a way to learn Zig. As such, some of it will be garbag
 ## This is no framework
 This is not a framework for building web applications. This is purely a HTTP server designed from the ground up to be stable and performant. There are no built-in features such as routing or authentication.
 
-If you want a more substantial HTTP library, I suggest that you look at [Zap][https://github.com/zigzap/zap], built on [Facil.io][http://facil.io]. Facil.io is an excellent battle-tested library written in C.
+If you want a more substantial HTTP library, I suggest that you look at [Zap](https://github.com/zigzap/zap), built on [Facil.io](http://facil.io). Facil.io is an excellent battle-tested library written in C.
 
 ## Benchmarks
 I will add some graphs later. Currently, this (unfinished) server is around 3-5% faster than Zap/Facil.io for static GET requests.
 
 ## To do
+- API reference
 - Query params
 - Redirects
 - HTTP/1.1 (keep-alive)
