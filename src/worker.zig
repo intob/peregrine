@@ -114,18 +114,13 @@ pub const Worker = struct {
         self.resp.status = Status.ok;
         self.resp.headers.clearRetainingCapacity();
         try self.resp.headers.append(Header{ .key = "Content-Length", .value = "17" });
-        self.resp.body = "Hello world!!!!!!";
-        const n = try self.resp.serialise(&self.resp_buf);
-        _ = try writeAll(socket, self.resp_buf[0..n]);
+        const body = "Hello world!!!!!!";
+        const n = try self.resp.serialiseHeaders(&self.resp_buf);
+        const total_len = n + body.len;
+        @memcpy(self.resp_buf[n..total_len], body);
+        _ = try writeAll(socket, self.resp_buf[0..total_len]);
     }
 };
-
-fn writeAllToBuffer(buf: *std.io.BufferedWriter(4096, std.fs.File.Writer), bytes: []const u8) !void {
-    var n: usize = 0;
-    while (n < bytes.len) {
-        n += try buf.write(bytes[n..]);
-    }
-}
 
 fn writeAll(socket: posix.socket_t, msg: []u8) !void {
     var n: usize = 0;
@@ -135,5 +130,12 @@ fn writeAll(socket: posix.socket_t, msg: []u8) !void {
             return err;
         };
         n += written;
+    }
+}
+
+fn writeAllToBuffer(buf: *std.io.BufferedWriter(4096, std.fs.File.Writer), bytes: []const u8) !void {
+    var n: usize = 0;
+    while (n < bytes.len) {
+        n += try buf.write(bytes[n..]);
     }
 }

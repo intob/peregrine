@@ -27,7 +27,7 @@ pub const Response = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn serialise(self: *Self, bufRef: *[]u8) !usize {
+    pub fn serialiseHeaders(self: *Self, bufRef: *[]u8) !usize {
         var buf = bufRef.*;
         var n: usize = 0;
         // Explicitly unroll loop, as compiler doesn't.
@@ -47,13 +47,7 @@ pub const Response = struct {
         }
         // New line
         buf[n] = '\n';
-        n += 1;
-        // Body
-        if (self.body) |body| {
-            @memcpy(buf[n .. n + body.len], body);
-            n += body.len;
-        }
-        return n;
+        return n + 1;
     }
 };
 
@@ -66,7 +60,7 @@ test "serialise without body" {
     try r.*.headers.append(Header{ .key = "Content-Length", .value = "0" });
 
     var buf = try allocator.alloc(u8, 128);
-    const n = try r.serialise(&buf);
+    const n = try r.serialiseHeaders(&buf);
 
     const expected = "HTTP/1.0 200 OK\nContent-Type: total/rubbish\nContent-Length: 0\n\n";
 
@@ -83,11 +77,12 @@ test "serialise with body" {
     try r.*.headers.append(Header{ .key = "Content-Length", .value = "13" });
 
     var buf = try allocator.alloc(u8, 128);
-    const n = try r.serialise(&buf);
+    const len_headers = try r.serialiseHeaders(&buf);
+    @memcpy(buf[len_headers .. len_headers + r.body.?.len], r.body.?);
 
     const expected = "HTTP/1.0 200 OK\nContent-Type: total/rubbish\nContent-Length: 13\n\ntest response";
 
-    try std.testing.expectEqualStrings(expected, buf[0..n]);
+    try std.testing.expectEqualStrings(expected, buf[0 .. len_headers + r.body.?.len]);
 }
 
 test "benchmark serialise" {
@@ -114,7 +109,7 @@ fn benchmark(allocator: std.mem.Allocator) !void {
     var total_size: usize = 0;
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
-        const size = try resp.serialise(&buffer);
+        const size = try resp.serialiseHeaders(&buffer);
         std.mem.doNotOptimizeAway(size);
         total_size += size;
     }
