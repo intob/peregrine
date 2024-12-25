@@ -12,6 +12,7 @@ pub const Worker = struct {
     allocator: std.mem.Allocator,
     resp: *Response,
     resp_buf: []u8,
+    req: *request.Request,
     file: std.fs.File,
     file_buffer: *std.io.BufferedWriter(4096, std.fs.File.Writer),
     shutdown: std.atomic.Value(bool),
@@ -27,6 +28,7 @@ pub const Worker = struct {
         self.allocator = allocator;
         self.resp = try Response.init(self.allocator);
         self.resp_buf = try allocator.alloc(u8, 128);
+        self.req = try allocator.create(request.Request);
 
         const filename = try std.fmt.allocPrint(allocator, "./logdata_{d}", .{self.id});
         defer allocator.free(filename);
@@ -52,6 +54,7 @@ pub const Worker = struct {
         defer self.mutex.unlock();
         posix.close(self.kfd);
         self.resp.deinit();
+        self.allocator.destroy(self.req);
         self.allocator.free(self.resp_buf);
         self.file_buffer.flush() catch |err| {
             std.debug.print("error flushing buffer: {any}\n", .{err});
@@ -97,13 +100,17 @@ pub const Worker = struct {
 
     fn handleKevent(self: *Worker, socket: posix.socket_t, reader: *request.RequestReader) !void {
         defer posix.close(socket);
-        if (try reader.readRequest(socket)) |req| {
-            try self.handleRequest(socket, req);
-        }
+        try reader.readRequest(socket, self.req);
+        try self.handleRequest(socket);
     }
 
-    fn handleRequest(self: *Worker, socket: posix.socket_t, req: request.Request) !void {
-        std.debug.print("kfd-{d} [{d}] got request: {any} {s}\n", .{ self.kfd, socket, req.method, req.path });
+    fn handleRequest(self: *Worker, socket: posix.socket_t) !void {
+        std.debug.print("kfd-{d} [{d}] got request: {any} {s}\n", .{
+            self.kfd,
+            socket,
+            self.req.method,
+            self.req.path_buf[0..self.req.path_len],
+        });
 
         // Respond with Hello world
         //try resp.headers.append(Header{ .key = "Connection", .value = "close" });

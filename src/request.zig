@@ -20,7 +20,8 @@ pub const Method = enum(u2) {
 
 pub const Request = struct {
     method: Method,
-    path: []const u8,
+    path_buf: [256]u8,
+    path_len: usize,
     body: ?[]const u8 = null,
 };
 
@@ -29,6 +30,7 @@ pub const RequestReader = struct {
     buffer: []u8,
     pos: usize = 0, // Current position in buffer
     len: usize = 0, // Amount of valid data in buffer
+    start: usize = 0, // Start of unprocessed data
 
     const Self = @This();
 
@@ -46,47 +48,74 @@ pub const RequestReader = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn readRequest(self: *Self, socket: posix.socket_t) !?Request {
+    pub fn readRequest(self: *Self, socket: posix.socket_t, req: *Request) !void {
+        defer self.start = 0;
+        defer self.pos = 0;
+        defer self.len = 0;
+
         const n = try self.readLine(socket);
         if (n < "GET / HTTP/1.1".len) { // Fast path
             return error.InvalidRequest;
         }
-        const mp = try parseMethodAndPath(self.buffer[0..n]);
-        return .{
-            .method = mp.method,
-            .path = mp.path,
-        };
-        // TODO: parse body of POST request
+
+        // Use the actual data from start position
+        const request_line = self.buffer[self.start - n .. self.start];
+        const parsed = try parseMethodAndPath(request_line);
+        req.method = parsed.method;
+        req.path_len = parsed.path.len;
+        @memcpy(req.path_buf[0..parsed.path.len], parsed.path);
+
+        // Consume the rest of the headers until we hit an empty line
+        while (true) {
+            const header_len = try self.readLine(socket);
+            if (header_len <= 2) { // Just \r\n
+                break;
+            }
+        }
     }
 
     pub fn readLine(self: *Self, socket: posix.socket_t) !usize {
         var line_len: usize = 0;
         while (true) {
-            if (self.pos >= self.len) { // Check if we need to refill the buffer
-                self.pos = 0;
-                self.len = try posix.read(socket, self.buffer);
-                if (self.len == 0) return line_len;
+            // Compact if buffer is more than half full
+            if (self.pos > (self.buffer.len / 2)) {
+                self.compact();
             }
-            while (self.pos < self.len) { // Process buffered data
+
+            // Read more data if needed
+            if (self.pos >= self.len) {
+                const available = self.buffer.len - self.len;
+                if (available == 0) return error.LineTooLong;
+
+                const read_amount = try posix.read(socket, self.buffer[self.len..]);
+                if (read_amount == 0) return line_len;
+                self.len += read_amount;
+            }
+
+            // Process current buffer
+            while (self.pos < self.len) {
                 const byte = self.buffer[self.pos];
                 self.pos += 1;
                 line_len += 1;
+
                 if (byte == '\n') {
-                    self.buffer[line_len] = 0;
+                    // Store current position as start for next read
+                    self.start = self.pos;
                     return line_len;
                 }
-            }
-            if (line_len >= self.buffer.len - 1) { // Check buffer overflow
-                return error.LineTooLong;
             }
         }
     }
 
     fn compact(self: *Self) void {
         if (self.start == 0) return;
-        const unprocessed = self.buffer[self.start..self.pos];
-        std.mem.copyForwards(u8, self.buffer[0..unprocessed.len], unprocessed);
-        self.pos = unprocessed.len;
+
+        const unprocessed = self.buffer[self.start..self.len];
+        if (unprocessed.len > 0) {
+            @memcpy(self.buffer[0..unprocessed.len], unprocessed);
+        }
+        self.len = unprocessed.len;
+        self.pos -= self.start;
         self.start = 0;
     }
 };
@@ -94,7 +123,7 @@ pub const RequestReader = struct {
 fn parseMethodAndPath(buffer: []const u8) !struct { method: Method, path: []const u8 } {
     // Find first space
     const method_end = std.mem.indexOfScalar(u8, buffer, ' ') orelse return error.InvalidRequest;
-    if (method_end > 7) return error.InvalidRequest;
+    if (method_end > "OPTIONS".len) return error.InvalidRequest;
 
     // Find second space
     const path_start = method_end + 1;
