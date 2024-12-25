@@ -5,36 +5,33 @@ const Response = @import("./response.zig").Response;
 const Header = @import("./header.zig").Header;
 const Status = @import("./status.zig").Status;
 
+pub const RequestHandler = *const fn (req: *request.Request, resp: *Response) void;
+
 pub const Worker = struct {
     id: usize,
+    on_request: RequestHandler,
     mutex: std.Thread.Mutex,
     kfd: posix.fd_t,
     allocator: std.mem.Allocator,
     resp: *Response,
     resp_buf: []align(16) u8,
     req: *request.Request,
-    file: std.fs.File,
-    file_buffer: *std.io.BufferedWriter(4096, std.fs.File.Writer),
     shutdown: std.atomic.Value(bool),
     shutdown_cond: std.Thread.Condition,
     shutdown_mutex: std.Thread.Mutex,
     shutdown_done: bool,
     thread: std.Thread,
 
-    pub fn init(self: *Worker, allocator: std.mem.Allocator, id: usize) !void {
+    pub fn init(self: *Worker, allocator: std.mem.Allocator, id: usize, on_request: RequestHandler) !void {
+        errdefer self.deinit();
         self.id = id;
+        self.on_request = on_request;
         self.mutex = std.Thread.Mutex{};
         self.kfd = try posix.kqueue();
         self.allocator = allocator;
-        self.resp = try Response.init(self.allocator, 4096);
+        self.resp = try Response.init(allocator, 4096);
         self.resp_buf = try allocator.alignedAlloc(u8, 16, std.mem.alignForward(usize, 4096, 16));
         self.req = try allocator.create(request.Request);
-
-        const filename = try std.fmt.allocPrint(allocator, "./logdata_{d}", .{self.id});
-        defer allocator.free(filename);
-        self.file = try std.fs.cwd().createFile(filename, .{ .truncate = false });
-        self.file_buffer = try allocator.create(std.io.BufferedWriter(4096, std.fs.File.Writer));
-        self.file_buffer.* = std.io.bufferedWriter(self.file.writer());
         self.shutdown = std.atomic.Value(bool).init(false);
         self.shutdown_cond = std.Thread.Condition{};
         self.shutdown_mutex = std.Thread.Mutex{};
@@ -56,11 +53,6 @@ pub const Worker = struct {
         self.resp.deinit();
         self.allocator.destroy(self.req);
         self.allocator.free(self.resp_buf);
-        self.file_buffer.flush() catch |err| {
-            std.debug.print("error flushing buffer: {any}\n", .{err});
-        };
-        self.allocator.destroy(self.file_buffer);
-        self.file.close();
         self.thread.join();
         std.debug.print("w-{d} shutdown complete\n", .{self.id});
     }
@@ -102,13 +94,17 @@ pub const Worker = struct {
         defer posix.close(socket);
         reader.reset();
         try reader.readRequest(socket, self.req);
-        try self.handleRequest(socket);
-    }
-
-    fn handleRequest(self: *Worker, socket: posix.socket_t) !void {
-        //std.debug.print("got request: {any} {s}\n", .{ self.req.method, self.req.getPath() });
+        self.resp.body_len = 0;
         self.resp.status = Status.ok;
         self.resp.headers.clearRetainingCapacity();
+        self.on_request(self.req, self.resp);
+        try self.respond(socket);
+    }
+
+    fn respond(self: *Worker, socket: posix.socket_t) !void {
+        // TODO: add Content-Length header if body_len is not zero
+        // TODO: choose between Vectored and plain writing based on body
+
         try self.resp.headers.append(Header{ .key = "Content-Length", .value = "17" });
         const headers_len = try self.resp.serialiseHeaders(&self.resp_buf);
         const body = "Hello world!!!!!!";

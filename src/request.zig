@@ -29,7 +29,6 @@ pub const Request = struct {
     method: Method,
     path_buf: [256]u8,
     path_len: usize,
-    body: ?[]const u8 = null,
 
     pub inline fn getPath(self: *const Request) []const u8 {
         return self.path_buf[0..self.path_len];
