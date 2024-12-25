@@ -1,23 +1,23 @@
 const std = @import("std");
-const net = std.net;
-const posix = std.posix;
 const peregrine = @import("peregrine");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
-    const srv = try peregrine.Server.init(
-        allocator,
-        "0.0.0.0",
-        3000,
-        on_request,
-        try std.Thread.getCpuCount(),
-    );
-    std.debug.print("Listening on 0.0.0.0:3000\n", .{});
-    try srv.start();
+    const srv = try peregrine.Server.init(.{
+        .allocator = allocator,
+        .listen_port = 3000,
+        .on_request = on_request,
+        // .listen_ip defaults to 0.0.0.0
+        // .worker_count defaults to CPU core count
+    });
+    std.debug.print("listening on 0.0.0.0:3000\n", .{});
+    try srv.start(); // This blocks if there is no error
 }
 
-fn on_request(req: *peregrine.Request, _: *peregrine.Response) void {
+fn on_request(req: *peregrine.Request, resp: *peregrine.Response) void {
     std.debug.print("got request: {any} {s}\n", .{ req.method, req.getPath() });
+    resp.setBody("Kawww\n") catch {};
+    resp.headers.append(.{ .key = "Content-Length", .value = "6" }) catch {};
 }

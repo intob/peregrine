@@ -25,6 +25,11 @@ pub const Method = enum(u2) {
     }
 };
 
+/// This request is reused.
+/// It is reset by the worker before each request is read.
+/// Library users do not need to call the reset method.
+/// IMPORTANT:
+/// If a field is added, it MUST be reset by the reset() method.
 pub const Request = struct {
     method: Method,
     path_buf: [256]u8,
@@ -33,6 +38,10 @@ pub const Request = struct {
     pub inline fn getPath(self: *const Request) []const u8 {
         return self.path_buf[0..self.path_len];
     }
+
+    // Currently no-op because all fields are overwritten
+    // by the request reader.
+    fn reset() void {}
 };
 
 pub const RequestReader = struct {
@@ -60,16 +69,11 @@ pub const RequestReader = struct {
     }
 
     pub fn readRequest(self: *Self, socket: posix.socket_t, req: *Request) !void {
-        defer self.start = 0;
-        defer self.pos = 0;
-        defer self.len = 0;
-
+        defer self.reset();
         const n = try self.readLine(socket);
         if (n < "GET / HTTP/1.1".len) { // Fast path
             return error.InvalidRequest;
         }
-
-        // Use the actual data from start position
         const request_line = self.buffer[self.start - n .. self.start];
         const parsed = try parseMethodAndPath(request_line);
         req.method = parsed.method;
@@ -79,12 +83,10 @@ pub const RequestReader = struct {
 
     pub fn skipHeaders(self: *Self, socket: posix.socket_t) !void {
         var header_lines: usize = 0;
-
         while (true) {
             while (self.pos < self.len) {
                 const c = self.buffer[self.pos];
                 self.pos += 1;
-
                 switch (c) {
                     '\n' => {
                         header_lines += 1;
@@ -94,13 +96,10 @@ pub const RequestReader = struct {
                     else => header_lines = 0, // Reset on any other character
                 }
             }
-
-            // Need more data
             const available = self.buffer.len - self.len;
             if (available == 0) {
                 self.compact();
             }
-
             const read_amount = try posix.read(socket, self.buffer[self.len..]);
             if (read_amount == 0) return;
             self.len += read_amount;
@@ -117,12 +116,10 @@ pub const RequestReader = struct {
         var line_len: usize = 0;
         const Vector = @Vector(16, u8);
         const newline: Vector = @splat(@as(u8, '\n'));
-
         while (true) {
             if (self.pos > (self.buffer.len / 2)) {
                 self.compact();
             }
-
             if (self.pos >= self.len) {
                 const available = self.buffer.len - self.len;
                 if (available == 0) return error.LineTooLong;
@@ -131,7 +128,6 @@ pub const RequestReader = struct {
                 if (read_amount == 0) return line_len;
                 self.len += read_amount;
             }
-
             // Process 16 bytes at a time
             while (self.pos + 16 <= self.len) {
                 var chunk: [16]u8 align(16) = undefined;
@@ -139,7 +135,6 @@ pub const RequestReader = struct {
                 const vec: Vector = chunk;
                 const matches = vec == newline;
                 const mask = @as(u16, @bitCast(matches));
-
                 if (mask != 0) {
                     const offset = @ctz(mask);
                     line_len += offset + 1;
@@ -147,11 +142,9 @@ pub const RequestReader = struct {
                     self.start = self.pos;
                     return line_len;
                 }
-
                 self.pos += 16;
                 line_len += 16;
             }
-
             // Handle remaining bytes
             while (self.pos < self.len) {
                 if (self.buffer[self.pos] == '\n') {
@@ -177,17 +170,13 @@ pub const RequestReader = struct {
 };
 
 fn parseMethodAndPath(buffer: []const u8) !struct { method: Method, path: []const u8 } {
-    // Find first space
     const method_end = std.mem.indexOfScalar(u8, buffer, ' ') orelse return error.InvalidRequest;
     if (method_end > "OPTIONS".len) return error.InvalidRequest;
-
-    // Find second space
     const path_start = method_end + 1;
     const path_end = if (path_start < buffer.len)
         std.mem.indexOfScalarPos(u8, buffer, path_start, ' ') orelse return error.InvalidRequest
     else
         return error.InvalidRequest;
-
     return .{
         .method = try Method.parseFast(buffer[0..method_end]),
         .path = buffer[path_start..path_end],

@@ -92,31 +92,26 @@ pub const Worker = struct {
 
     fn handleKevent(self: *Worker, socket: posix.socket_t, reader: *request.RequestReader) !void {
         defer posix.close(socket);
-        reader.reset();
         try reader.readRequest(socket, self.req);
-        self.resp.body_len = 0;
-        self.resp.status = Status.ok;
-        self.resp.headers.clearRetainingCapacity();
+        self.resp.reset();
         self.on_request(self.req, self.resp);
         try self.respond(socket);
     }
 
     fn respond(self: *Worker, socket: posix.socket_t) !void {
-        // TODO: add Content-Length header if body_len is not zero
-        // TODO: choose between Vectored and plain writing based on body
-
-        try self.resp.headers.append(Header{ .key = "Content-Length", .value = "17" });
         const headers_len = try self.resp.serialiseHeaders(&self.resp_buf);
-        const body = "Hello world!!!!!!";
-
-        var iovecs = [_]posix.iovec_const{
-            .{ .base = @ptrCast(self.resp_buf[0..headers_len]), .len = headers_len },
-            .{ .base = @ptrCast(@constCast(body)), .len = body.len },
-        };
-        const written = try posix.writev(socket, &iovecs);
-        if (written != headers_len + body.len) {
-            return error.WriteError;
+        if (self.resp.body_len > 0) {
+            var iovecs = [_]posix.iovec_const{
+                .{ .base = @ptrCast(self.resp_buf[0..headers_len]), .len = headers_len },
+                .{ .base = @ptrCast(self.resp.body[0..self.resp.body_len]), .len = self.resp.body_len },
+            };
+            const written = try posix.writev(socket, &iovecs);
+            if (written != headers_len + self.resp.body_len) {
+                return error.WriteError;
+            }
+            return;
         }
+        try writeAll(socket, self.resp_buf[0..headers_len]);
     }
 };
 

@@ -4,6 +4,10 @@ const Status = @import("./status.zig").Status;
 
 const VERSION = "HTTP/1.0 ";
 
+/// This response is reused.
+/// The reset method is called by the worker, so library users do not need to think about it.
+/// IMPORTANT:
+/// If a field is added, it MUST be reset by the reset() method.
 pub const Response = struct {
     allocator: std.mem.Allocator,
     status: Status,
@@ -52,6 +56,23 @@ pub const Response = struct {
         // New line
         buf[n] = '\n';
         return n + 1;
+    }
+
+    pub fn setBody(self: *Self, buf: []const u8) !void {
+        if (buf.len > self.body.len) {
+            return error.ResponseBodyBufferTooSmall;
+        }
+        @memcpy(self.body[0..buf.len], buf);
+        self.body_len = buf.len;
+    }
+
+    /// This is called automatically before on_request.
+    /// The response is reused so that no allocations are required per request.
+    /// All fields must be reset to prevent leaks across responses.
+    pub fn reset(self: *Self) void {
+        self.status = Status.ok;
+        self.headers.clearRetainingCapacity();
+        self.body_len = 0;
     }
 };
 

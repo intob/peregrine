@@ -6,6 +6,40 @@ The main goal of this project is to provide a HTTP server, with the following pr
 - Performance
 - Simplicity
 
+## Getting started
+```zig
+const std = @import("std");
+const peregrine = @import("peregrine");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+    const srv = try peregrine.Server.init(.{
+        .allocator = allocator,
+        .listen_port = 3000,
+        .on_request = on_request,
+        // .listen_ip defaults to 0.0.0.0
+        // .worker_count defaults to CPU core count
+    });
+    std.debug.print("listening on 0.0.0.0:3000\n", .{});
+    try srv.start(); // This blocks if there is no error
+}
+
+fn on_request(req: *peregrine.Request, resp: *peregrine.Response) void {
+    std.debug.print("got request: {any} {s}\n", .{ req.method, req.getPath() });
+    resp.setBody("Kawww\n") catch {};
+    resp.headers.append(.{ .key = "Content-Length", .value = "6" }) catch {};
+}
+```
+
+As it stands, the configuration is minimal, with sensible defaults. Simply provide a request handler function.
+
+The server will shutdown gracefully if an interrupt signal is received. Alternatively, you can call `srv.shutdown()` yourself.
+
+## No magic behind the scenes
+For example, you need to set the Content-Length header yourself. Regardless of whether it's an ArrayList or a HashMap, checking if it was set already by the user would incur a cost (albeit small). Again, this library is designed to be reliable, performant, and simple.
+
 ## I need your feedback
 I started this project as a way to learn Zig. As such, some of it will be garbage. I would value any feedback.
 
@@ -19,7 +53,8 @@ I will add some graphs later. Currently, this (unfinished) server is around 3-5%
 
 ## To do
 - Query params
-- HTTP/1.1 (keep-alive)
-- HTTP/2
-- WebSockets
 - Redirects
+- HTTP/1.1 (keep-alive)
+- Better task scheduling
+- WebSockets
+- HTTP/2

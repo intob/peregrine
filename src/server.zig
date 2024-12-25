@@ -11,6 +11,14 @@ fn handleSignal(sig: c_int) callconv(.C) void {
     should_shutdown.store(true, .release);
 }
 
+pub const ServerConfig = struct {
+    allocator: std.mem.Allocator,
+    listen_ip: []const u8 = "0.0.0.0",
+    listen_port: u16,
+    on_request: worker.RequestHandler,
+    worker_count: usize = 0, // Defaults to CPU core count
+};
+
 pub const Server = struct {
     allocator: std.mem.Allocator,
     address: std.net.Address,
@@ -21,17 +29,12 @@ pub const Server = struct {
 
     const Self = @This();
 
-    pub fn init(
-        allocator: std.mem.Allocator,
-        listen_ip: []const u8,
-        listen_port: u16,
-        on_request: worker.RequestHandler,
-        worker_count: usize,
-    ) !*Self {
+    pub fn init(cfg: ServerConfig) !*Self {
+        const allocator = cfg.allocator;
         const s = try allocator.create(Self);
         errdefer allocator.destroy(s);
         const sock_type: u32 = posix.SOCK.STREAM | posix.SOCK.NONBLOCK;
-        const address = try std.net.Address.parseIp(listen_ip, listen_port);
+        const address = try std.net.Address.parseIp(cfg.listen_ip, cfg.listen_port);
         const listener = try posix.socket(address.any.family, sock_type, posix.IPPROTO.TCP);
         try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
         try posix.bind(listener, &address.any, address.getOsSockLen());
@@ -43,6 +46,7 @@ pub const Server = struct {
         };
         posix.sigaction(posix.SIG.INT, &act, null);
         posix.sigaction(posix.SIG.TERM, &act, null);
+        const worker_count = if (cfg.worker_count > 0) cfg.worker_count else try std.Thread.getCpuCount();
         s.* = .{
             .allocator = allocator,
             .address = address,
@@ -52,7 +56,7 @@ pub const Server = struct {
             .main_thread = undefined,
         };
         for (s.workers, 0..) |*w, i| {
-            try w.init(allocator, i, on_request);
+            try w.init(allocator, i, cfg.on_request);
         }
         // OS-specific async IO
         try s.initPoll();
