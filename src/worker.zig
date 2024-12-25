@@ -107,17 +107,20 @@ pub const Worker = struct {
 
     fn handleRequest(self: *Worker, socket: posix.socket_t) !void {
         //std.debug.print("got request: {any} {s}\n", .{ self.req.method, self.req.getPath() });
-
-        // Respond with Hello world
-        //try resp.headers.append(Header{ .key = "Connection", .value = "close" });
         self.resp.status = Status.ok;
         self.resp.headers.clearRetainingCapacity();
         try self.resp.headers.append(Header{ .key = "Content-Length", .value = "17" });
+        const headers_len = try self.resp.serialiseHeaders(&self.resp_buf);
         const body = "Hello world!!!!!!";
-        const n = try self.resp.serialiseHeaders(&self.resp_buf);
-        const total_len = n + body.len;
-        @memcpy(self.resp_buf[n..total_len], body);
-        _ = try writeAll(socket, self.resp_buf[0..total_len]);
+
+        var iovecs = [_]posix.iovec_const{
+            .{ .base = @ptrCast(self.resp_buf[0..headers_len]), .len = headers_len },
+            .{ .base = @ptrCast(@constCast(body)), .len = body.len },
+        };
+        const written = try posix.writev(socket, &iovecs);
+        if (written != headers_len + body.len) {
+            return error.WriteError;
+        }
     }
 };
 

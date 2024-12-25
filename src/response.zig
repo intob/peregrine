@@ -9,6 +9,7 @@ pub const Response = struct {
     status: Status,
     headers: std.ArrayList(Header),
     body: []align(16) u8,
+    body_len: usize,
 
     const Self = @This();
 
@@ -19,6 +20,7 @@ pub const Response = struct {
             .status = Status.ok,
             .headers = std.ArrayList(Header).init(allocator),
             .body = try allocator.alignedAlloc(u8, 16, std.mem.alignForward(usize, body_size, 16)),
+            .body_len = 0,
         };
         return resp;
     }
