@@ -38,7 +38,7 @@ pub const Request = struct {
 
 pub const RequestReader = struct {
     allocator: std.mem.Allocator,
-    buffer: []u8,
+    buffer: []align(16) u8,
     pos: usize = 0, // Current position in buffer
     len: usize = 0, // Amount of valid data in buffer
     start: usize = 0, // Start of unprocessed data
