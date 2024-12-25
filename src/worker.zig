@@ -11,7 +11,7 @@ pub const Worker = struct {
     kfd: posix.fd_t,
     allocator: std.mem.Allocator,
     resp: *Response,
-    resp_buf: []u8,
+    resp_buf: []align(16) u8,
     req: *request.Request,
     file: std.fs.File,
     file_buffer: *std.io.BufferedWriter(4096, std.fs.File.Writer),
@@ -27,7 +27,8 @@ pub const Worker = struct {
         self.kfd = try posix.kqueue();
         self.allocator = allocator;
         self.resp = try Response.init(self.allocator);
-        self.resp_buf = try allocator.alloc(u8, 128);
+        const aligned_size = std.mem.alignForward(usize, 128, 16);
+        self.resp_buf = try allocator.alignedAlloc(u8, 16, aligned_size);
         self.req = try allocator.create(request.Request);
 
         const filename = try std.fmt.allocPrint(allocator, "./logdata_{d}", .{self.id});
