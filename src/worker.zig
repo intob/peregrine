@@ -100,17 +100,13 @@ pub const Worker = struct {
 
     fn handleKevent(self: *Worker, socket: posix.socket_t, reader: *request.RequestReader) !void {
         defer posix.close(socket);
+        reader.reset();
         try reader.readRequest(socket, self.req);
         try self.handleRequest(socket);
     }
 
     fn handleRequest(self: *Worker, socket: posix.socket_t) !void {
-        std.debug.print("kfd-{d} [{d}] got request: {any} {s}\n", .{
-            self.kfd,
-            socket,
-            self.req.method,
-            self.req.path_buf[0..self.req.path_len],
-        });
+        std.debug.print("got request: {any} {s}\n", .{ self.req.method, self.req.getPath() });
 
         // Respond with Hello world
         //try resp.headers.append(Header{ .key = "Connection", .value = "close" });
