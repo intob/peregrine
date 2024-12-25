@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-const NUM_REQUEST = 1_000
+const NUM_REQUEST = 5_000
 
 func main() {
 	args := os.Args
@@ -17,31 +17,35 @@ func main() {
 	}
 	switch args[1] {
 	case "get":
-		get()
+		if len(args) < 3 {
+			fmt.Println("missing target, for example: get http://127.0.0.1:3000")
+			return
+		}
+		get(args[2])
 	case "serve":
 		serve()
 	}
 }
 
-func get() {
+func get(target string) {
 	t := time.Now()
 	for range NUM_REQUEST {
-		_, err := http.Get("http://127.0.0.1:5882/")
+		_, err := http.Get(target)
 		if err != nil {
 			fmt.Println(err)
 			return
 		}
 	}
 	dur := time.Since(t)
-	nsPerReq := float32(dur.Nanoseconds()) / float32((NUM_REQUEST))
-	fmt.Printf("made %dK requests in %s\n%.2fns/req\n%.2freq/sec\n", NUM_REQUEST/1000, dur, nsPerReq, float64(NUM_REQUEST)/dur.Seconds())
+	usPerReq := float32(dur.Microseconds()) / float32((NUM_REQUEST))
+	fmt.Printf("made %dK requests in %s\n%.2fµs/req\n%.2freq/sec\n", NUM_REQUEST/1000, dur, usPerReq, float64(NUM_REQUEST)/dur.Seconds())
 }
 
 func serve() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("Hello world"))
 	})
-	err := http.ListenAndServe(":5882", nil)
+	err := http.ListenAndServe(":3000", nil)
 	if err != nil {
 		fmt.Println(err)
 		return

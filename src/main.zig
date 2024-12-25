@@ -26,7 +26,7 @@ pub fn main() !void {
     for (workers, 0..) |*w, i| {
         try w.init(allocator, i);
     }
-    const address = try std.net.Address.parseIp("127.0.0.1", 5882);
+    const address = try std.net.Address.parseIp("0.0.0.0", 5882);
     const tpe: u32 = posix.SOCK.STREAM | posix.SOCK.NONBLOCK;
     const listener = try posix.socket(address.any.family, tpe, posix.IPPROTO.TCP);
     defer posix.close(listener);

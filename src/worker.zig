@@ -107,14 +107,14 @@ pub const Worker = struct {
     }
 
     fn handleRequest(self: *Worker, socket: posix.socket_t) !void {
-        std.debug.print("got request: {any} {s}\n", .{ self.req.method, self.req.getPath() });
+        //std.debug.print("got request: {any} {s}\n", .{ self.req.method, self.req.getPath() });
 
         // Respond with Hello world
         //try resp.headers.append(Header{ .key = "Connection", .value = "close" });
         self.resp.status = Status.ok;
         self.resp.headers.clearRetainingCapacity();
-        try self.resp.headers.append(Header{ .key = "Content-Length", .value = "11" });
-        self.resp.body = "Hello world";
+        try self.resp.headers.append(Header{ .key = "Content-Length", .value = "17" });
+        self.resp.body = "Hello world!!!!!!";
         const n = try self.resp.serialise(&self.resp_buf);
         _ = try writeAll(socket, self.resp_buf[0..n]);
     }
