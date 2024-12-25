@@ -7,9 +7,9 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const srv = try peregrine.Server.init(.{
         .allocator = allocator,
-        .listen_port = 3000,
+        .port = 3000,
         .on_request = on_request,
-        // .listen_ip defaults to 0.0.0.0
+        // .ip defaults to 0.0.0.0
         // .worker_count defaults to CPU core count
     });
     std.debug.print("listening on 0.0.0.0:3000\n", .{});

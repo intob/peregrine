@@ -13,8 +13,8 @@ fn handleSignal(sig: c_int) callconv(.C) void {
 
 pub const ServerConfig = struct {
     allocator: std.mem.Allocator,
-    listen_ip: []const u8 = "0.0.0.0",
-    listen_port: u16,
+    ip: []const u8 = "0.0.0.0",
+    port: u16,
     on_request: worker.RequestHandler,
     worker_count: usize = 0, // Defaults to CPU core count
 };
@@ -34,7 +34,7 @@ pub const Server = struct {
         const s = try allocator.create(Self);
         errdefer allocator.destroy(s);
         const sock_type: u32 = posix.SOCK.STREAM | posix.SOCK.NONBLOCK;
-        const address = try std.net.Address.parseIp(cfg.listen_ip, cfg.listen_port);
+        const address = try std.net.Address.parseIp(cfg.ip, cfg.port);
         const listener = try posix.socket(address.any.family, sock_type, posix.IPPROTO.TCP);
         try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
         try posix.bind(listener, &address.any, address.getOsSockLen());
