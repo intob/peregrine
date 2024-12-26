@@ -113,6 +113,28 @@ The configuration is minimal, with reasonable defaults. Simply provide an alloca
 
 The server will shutdown gracefully if an interrupt signal is received. Alternatively, you can call `srv.shutdown()` yourself.
 
+### Query params
+`req.parseQuery()` returns `!?std.StringHashMap([]const u8)` - an error union containing an optional hash map. The semantics are:
+- Returns error.OutOfMemory if hash map insertion fails
+- Returns null in two cases:
+    - No query string exists (no '?' in path)
+    - Malformed query string (missing '=' between key-value pairs)
+- Returns the populated hash map on successful parsing
+
+The hash map (`req.query`) is cleared at the start of each `parseQuery()` call using `clearRetainingCapacity()`. Accessing `req.query` without first calling `parseQuery()` will expose stale data from previous requests.
+
+Emptying the hash map has a cost, and we should only pay that price if we want to use the query, not unconditionally for each request.
+
+Example usage:
+```zig
+if (try req.parseQuery()) |query| {
+    // use query hash map
+}
+if (req.query.get("some-key")) |value| {
+    // it's safe to access the map directly after calling parseQuery
+}
+```
+
 ## No magic behind the scenes
 For example, you need to set the Content-Length header yourself. Regardless of whether it's an ArrayList or a HashMap, checking if it was set already by the user would incur a cost (albeit small). Again, this library is designed to be reliable, performant, and simple.
 
