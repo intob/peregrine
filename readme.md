@@ -57,8 +57,16 @@ zig build run-example
 ```
 
 ### Run the example in a Linux Docker container
-```zig
+
+#### x86_64
+```bash
 zig build -Dtarget=x86_64-linux-musl && \
+docker build -t example . -f ./example/Dockerfile && \
+docker run -p 3000:3000 example
+```
+#### aarch64 (ARM)
+```bash
+zig build -Dtarget=aarch64-linux-musl && \
 docker build -t example . -f ./example/Dockerfile && \
 docker run -p 3000:3000 example
 ```
@@ -126,3 +134,4 @@ I would be very happy if this could consistently outperform Facil.io even by jus
 - Better task scheduling
 - WebSockets
 - HTTP/2
+- Support Windows
