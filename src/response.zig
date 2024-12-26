@@ -41,23 +41,23 @@ pub const Response = struct {
         @setRuntimeSafety(false);
         var buf = bufRef.*;
         var n: usize = 0;
-        @memcpy(buf[n..], VERSION);
+        @memcpy(buf[n .. n + VERSION.len], VERSION);
         n += VERSION.len;
         const status = self.status.toString();
-        @memcpy(buf[n..], status);
+        @memcpy(buf[n .. n + status.len], status);
         n += status.len;
         buf[n] = '\r';
         buf[n + 1] = '\n';
         n += 2;
         for (self.headers.items) |h| {
             const key = h.key();
-            @memcpy(buf[n..], key);
+            @memcpy(buf[n .. n + key.len], key);
             n += key.len;
             buf[n] = ':';
             buf[n + 1] = ' ';
             n += 2;
             const value = h.value();
-            @memcpy(buf[n..], value);
+            @memcpy(buf[n .. n + value.len], value);
             n += value.len;
             buf[n] = '\r';
             buf[n + 1] = '\n';
