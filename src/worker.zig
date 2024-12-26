@@ -8,6 +8,14 @@ const Header = @import("./header.zig").Header;
 const Status = @import("./status.zig").Status;
 
 pub const RequestHandler = *const fn (req: *request.Request, resp: *Response) void;
+const KEEP_ALIVE_HEADERS = "Connection: keep-alive\r\nKeep-Alive: timeout=10, max=100\r\n";
+const CLOSE_HEADER = "Connection: close\r\n";
+
+pub const WorkerConfig = struct {
+    allocator: std.mem.Allocator,
+    id: usize,
+    on_request: RequestHandler,
+};
 
 pub const Worker = struct {
     allocator: std.mem.Allocator,
@@ -15,9 +23,10 @@ pub const Worker = struct {
     id: usize,
     on_request: RequestHandler,
     mutex: std.Thread.Mutex,
+    req: *request.Request,
     resp: *Response,
     resp_buf: []align(16) u8,
-    req: *request.Request,
+    iovecs: std.ArrayList(posix.iovec_const),
     shutdown: std.atomic.Value(bool),
     shutdown_cond: std.Thread.Condition,
     shutdown_mutex: std.Thread.Mutex,
@@ -32,16 +41,18 @@ pub const Worker = struct {
 
     const Self = @This();
 
-    pub fn init(self: *Self, allocator: std.mem.Allocator, id: usize, on_request: RequestHandler) !void {
+    pub fn init(self: *Self, cfg: WorkerConfig) !void {
+        const allocator = cfg.allocator;
         errdefer self.deinit();
         self.allocator = allocator;
         self.io_handler = try IOHandler.init();
-        self.id = id;
-        self.on_request = on_request;
+        self.id = cfg.id;
+        self.on_request = cfg.on_request;
         self.mutex = std.Thread.Mutex{};
         self.req = try request.Request.init(allocator);
         self.resp = try Response.init(allocator, 4096);
         self.resp_buf = try allocator.alignedAlloc(u8, 16, std.mem.alignForward(usize, 4096, 16));
+        self.iovecs = std.ArrayList(posix.iovec_const).init(self.allocator);
         self.shutdown = std.atomic.Value(bool).init(false);
         self.shutdown_cond = std.Thread.Condition{};
         self.shutdown_mutex = std.Thread.Mutex{};
@@ -62,6 +73,7 @@ pub const Worker = struct {
         self.req.deinit();
         self.resp.deinit();
         self.allocator.free(self.resp_buf);
+        self.iovecs.deinit();
         self.thread.join();
         std.debug.print("worker-{d} shutdown\n", .{self.id});
     }
@@ -91,6 +103,9 @@ pub const Worker = struct {
         };
         defer reader.deinit();
 
+        var connection_requests = std.AutoHashMap(posix.socket_t, u32).init(self.allocator);
+        defer connection_requests.deinit();
+
         while (!self.shutdown.load(.acquire)) {
             const timeout = switch (os) {
                 .freebsd, .netbsd, .openbsd, .dragonfly, .macos => posix.timespec{ .sec = 0, .nsec = 50_000_000 },
@@ -113,56 +128,76 @@ pub const Worker = struct {
                     .linux => event.data.fd,
                     else => unreachable,
                 };
-                self.handleEvent(socket, reader) catch |err| {
-                    std.debug.print("error handling event: {any}\n", .{err});
+                const requests_handled = connection_requests.get(socket) orelse 0;
+                if (requests_handled >= 100) {
+                    posix.close(socket);
+                    _ = connection_requests.remove(socket);
+                    continue;
+                }
+                self.handleEvent(socket, reader) catch {};
+                //std.debug.print("error handling event: {any}\n", .{err});
+                connection_requests.put(socket, requests_handled + 1) catch |err| {
+                    std.debug.print("error updating socket request count: {any}\n", .{err});
                 };
             }
         }
     }
 
     fn handleEvent(self: *Self, socket: posix.socket_t, reader: *request.RequestReader) !void {
-        defer posix.close(socket);
+        const keep_alive = self.shouldKeepAlive();
+        defer {
+            if (!keep_alive) {
+                posix.close(socket);
+            }
+        }
         self.req.reset();
         try reader.readRequest(socket, self.req);
         self.resp.reset();
         self.on_request(self.req, self.resp);
-        if (!self.resp.hijacked) try self.respond(socket);
+        if (!self.resp.hijacked) {
+            try self.respond(socket, keep_alive);
+        }
     }
 
-    fn respond(self: *Self, socket: posix.socket_t) !void {
-        const headers_len = try self.resp.serialiseHeaders(&self.resp_buf);
-        if (self.resp.body_len > 0) {
-            var iovecs = [_]posix.iovec_const{
-                .{ .base = @ptrCast(self.resp_buf[0..headers_len]), .len = headers_len },
-                .{ .base = @ptrCast(self.resp.body[0..self.resp.body_len]), .len = self.resp.body_len },
-            };
-            const written = try posix.writev(socket, &iovecs);
-            if (written != headers_len + self.resp.body_len) {
-                return error.WriteError;
+    fn shouldKeepAlive(self: *Self) bool {
+        if (self.req.version == .@"HTTP/1.1") {
+            if (self.req.getHeader("Connection")) |connection| {
+                return !std.mem.eql(u8, connection, "close");
             }
-            return;
+            return true; // HTTP/1.1 defaults to keep-alive
         }
-        try writeAll(socket, self.resp_buf[0..headers_len]);
+        return false; // HTTP/1.0
+    }
+
+    fn respond(self: *Self, socket: posix.socket_t, keep_alive: bool) !void {
+        const headers_len = try self.resp.serialiseHeaders(&self.resp_buf);
+        self.iovecs.clearRetainingCapacity();
+        try self.iovecs.appendSlice(&.{
+            .{
+                .base = @ptrCast(self.resp_buf[0..headers_len]),
+                .len = headers_len,
+            },
+            .{
+                .base = if (keep_alive) KEEP_ALIVE_HEADERS else CLOSE_HEADER,
+                .len = if (keep_alive) KEEP_ALIVE_HEADERS.len else CLOSE_HEADER.len,
+            },
+        });
+        if (self.resp.body_len > 0) {
+            try self.iovecs.append(.{
+                .base = @ptrCast(self.resp.body[0..self.resp.body_len]),
+                .len = self.resp.body_len,
+            });
+        }
+        const total_len = headers_len +
+            (if (keep_alive) KEEP_ALIVE_HEADERS.len else CLOSE_HEADER.len) +
+            self.resp.body_len;
+
+        const written = try posix.writev(socket, self.iovecs.items);
+        if (written != total_len) {
+            return error.WriteError;
+        }
     }
 };
-
-pub fn writeAll(socket: posix.socket_t, payload: []u8) !void {
-    var n: usize = 0;
-    while (n < payload.len) {
-        const written = posix.write(socket, payload[n..]) catch |err| {
-            posix.close(socket);
-            return err;
-        };
-        n += written;
-    }
-}
-
-fn writeAllToBuffer(buf: *std.io.BufferedWriter(4096, std.fs.File.Writer), bytes: []const u8) !void {
-    var n: usize = 0;
-    while (n < bytes.len) {
-        n += try buf.write(bytes[n..]);
-    }
-}
 
 const KqueueHandler = struct {
     kfd: i32,

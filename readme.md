@@ -6,9 +6,9 @@ The main goal of this project is to provide a HTTP server with the following pri
 - Performance
 - Simplicity
 
-Currently, all heap allocations are made during startup. Internally, no heap allocations are made per-request.
+Currently, all heap allocations are made during startup. Internally, no heap allocations are made per-request unless pre-allocated buffers overflow.
 
-Note: This project has just started, and is not yet a complete HTTP server implementation. See [To do section](#to-do).
+Note: This project has just started, and is not yet a complete HTTP server implementation. See [To do section](#to-do). The exposed API is still likely to change.
 
 ## Features
 
@@ -25,6 +25,8 @@ Note: This project has just started, and is not yet a complete HTTP server imple
     - Non-blocking socket operations
     - Efficient event-driven architecture
     - Aligned buffer allocation for optimal IO performance
+
+- Support for HTTP/1.0 and HTTP/1.1
 
 ## Architecture
 
@@ -85,7 +87,7 @@ pub fn main() !void {
     const srv = try pereg.Server.init(.{
         .allocator = allocator,
         .port = 3000,
-        .on_request = handleRequest,
+        .on_request = mainHandler,
         // .ip defaults to 0.0.0.0
         // .worker_count defaults to CPU core count
     });
@@ -93,12 +95,12 @@ pub fn main() !void {
     try srv.start(); // This blocks if there is no error
 }
 
-fn handleRequest(req: *pereg.Request, resp: *pereg.Response) void {
+fn mainHandler(req: *pereg.Request, resp: *pereg.Response) void {
     std.debug.print("got request {any} {s}\n", .{req.method, req.getPath()})
-    default(resp) catch {}; // Error handling omitted for brevity
+    handle(resp) catch {}; // Error handling omitted for brevity
 }
 
-fn default(resp: *pereg.Response) !void {
+fn handle(resp: *pereg.Response) !void {
     try resp.setBody("Kawww\n");
     try resp.headers.append(try pereg.Header.init(.{
         .key = "Content-Length",
@@ -113,6 +115,8 @@ The server will shutdown gracefully if an interrupt signal is received. Alternat
 
 ## No magic behind the scenes
 For example, you need to set the Content-Length header yourself. Regardless of whether it's an ArrayList or a HashMap, checking if it was set already by the user would incur a cost (albeit small). Again, this library is designed to be reliable, performant, and simple.
+
+Connection and Keep-Alive headers ARE set by the Worker. This is because there is internal logic to handle connection persistence, and it would hurt developer experience to not set these headers appropriately.
 
 ## I need your feedback
 I started this project as a way to learn Zig. As such, some of it will be garbage. I would value any feedback.
@@ -132,7 +136,6 @@ I would be very happy if this could consistently outperform Facil.io even by jus
 ## To do
 - Query params
 - Redirects
-- HTTP/1.1 (keep-alive)
 - TLS support
 - API reference
 - WebSockets support

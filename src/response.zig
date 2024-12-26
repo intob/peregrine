@@ -2,7 +2,7 @@ const std = @import("std");
 const Header = @import("./header.zig").Header;
 const Status = @import("./status.zig").Status;
 
-const VERSION = "HTTP/1.0 ";
+const VERSION = "HTTP/1.1 ";
 
 /// This response is reused.
 /// The reset method is called by the worker, so library users do not need to think about it.

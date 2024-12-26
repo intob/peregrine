@@ -71,7 +71,7 @@ pub const Server = struct {
             .io_handler = io_handler,
         };
         for (s.workers, 0..) |*w, i| {
-            try w.init(allocator, i, cfg.on_request);
+            try w.init(.{ .allocator = allocator, .id = i, .on_request = cfg.on_request });
         }
         return s;
     }
@@ -158,7 +158,7 @@ const KqueueHandler = struct {
             .{
                 .ident = @intCast(listener),
                 .filter = posix.system.EVFILT.READ,
-                .flags = posix.system.EV.ADD,
+                .flags = posix.system.EV.ADD | posix.system.EV.CLEAR,
                 .fflags = 0,
                 .data = 0,
                 .udata = @intCast(listener),
@@ -195,7 +195,7 @@ const EpollHandler = struct {
 
     fn initializeEvents(epfd: i32, listener: posix.socket_t) !void {
         var evt = linux.epoll_event{
-            .events = linux.EPOLL.IN,
+            .events = linux.EPOLL.IN | linux.EPOLL.ET,
             .data = .{ .fd = listener },
         };
         try posix.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, listener, &evt);
@@ -203,7 +203,8 @@ const EpollHandler = struct {
 };
 
 fn setClientSockOpt(sock: posix.socket_t) !void {
-    const timeout = posix.timeval{ .sec = 2, .usec = 500_000 };
-    try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(timeout));
-    try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &std.mem.toBytes(timeout));
+    const send_timeout = posix.timeval{ .sec = 2, .usec = 500_000 };
+    const recv_timeout = posix.timeval{ .sec = 10_000, .usec = 0 };
+    try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &std.mem.toBytes(send_timeout));
+    try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(recv_timeout));
 }

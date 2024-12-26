@@ -3,6 +3,22 @@ const posix = std.posix;
 const Method = @import("./method.zig").Method;
 const Header = @import("./header.zig").Header;
 
+const Version = enum {
+    @"HTTP/1.0",
+    @"HTTP/1.1",
+
+    pub fn parse(version: []const u8) !Version {
+        // Verify minimum length for "HTTP/1.x"
+        if (version.len < 8) return error.InvalidVersion;
+        // Skip checking "HTTP/" prefix, check only the version number
+        return switch (version[7]) {
+            '0' => if (version[5] == '1' and version[6] == '.') .@"HTTP/1.0" else error.UnsupportedVersion,
+            '1' => if (version[5] == '1' and version[6] == '.') .@"HTTP/1.1" else error.UnsupportedVersion,
+            else => error.UnsupportedVersion,
+        };
+    }
+};
+
 /// This request is reused.
 /// It is reset by the worker before each request is read.
 /// Library users do not need to call the reset method.
@@ -16,6 +32,7 @@ pub const Request = struct {
     path_len: usize,
     headers: [32]Header,
     headers_len: usize,
+    version: Version,
 
     const Self = @This();
 
@@ -29,6 +46,7 @@ pub const Request = struct {
             .path_len = 0,
             .headers = undefined,
             .headers_len = 0,
+            .version = Version.@"HTTP/1.1",
         };
         return r;
     }
@@ -39,6 +57,15 @@ pub const Request = struct {
 
     pub fn getHeaders(self: *Self) []Header {
         return self.headers[0..self.headers_len];
+    }
+
+    pub fn getHeader(self: *Self, key: []const u8) ?[]const u8 {
+        for (self.headers[0..self.headers_len]) |h| {
+            if (std.mem.eql(u8, key, h.key())) {
+                return h.value();
+            }
+        }
+        return null;
     }
 
     pub inline fn getPath(self: *Self) []const u8 {
@@ -85,10 +112,7 @@ pub const RequestReader = struct {
         if (n < "GET / HTTP/1.1".len) { // Fast path
             return error.InvalidRequest;
         }
-        const parsed = try parseMethodAndPath(self.buffer[self.start - n .. self.start]);
-        req.method = parsed.method;
-        req.path_len = parsed.path.len;
-        @memcpy(req.path_buf[0..parsed.path.len], parsed.path);
+        try parseRequestLine(req, self.buffer[self.start - n .. self.start]);
         try self.readHeaders(socket, req);
     }
 
@@ -199,7 +223,7 @@ pub const RequestReader = struct {
     }
 };
 
-fn parseMethodAndPath(buffer: []const u8) !struct { method: Method, path: []const u8 } {
+fn parseRequestLine(req: *Request, buffer: []const u8) !void {
     const method_end = std.mem.indexOfScalar(u8, buffer, ' ') orelse return error.InvalidRequest;
     if (method_end > "OPTIONS".len) return error.InvalidRequest;
     const path_start = method_end + 1;
@@ -207,8 +231,14 @@ fn parseMethodAndPath(buffer: []const u8) !struct { method: Method, path: []cons
         std.mem.indexOfScalarPos(u8, buffer, path_start, ' ') orelse return error.InvalidRequest
     else
         return error.InvalidRequest;
-    return .{
-        .method = try Method.parse(buffer[0..method_end]),
-        .path = buffer[path_start..path_end],
-    };
+    const version_start = path_end + 1;
+    if (version_start + 8 > buffer.len) return error.InvalidRequest;
+    const version_end = if (version_start < buffer.len)
+        std.mem.indexOfScalarPos(u8, buffer, version_start, '\r') orelse return error.InvalidRequest
+    else
+        return error.InvalidRequest;
+    req.method = try Method.parse(buffer[0..method_end]);
+    req.path_len = path_end - path_start;
+    @memcpy(req.path_buf[0..req.path_len], buffer[path_start..path_end]);
+    req.version = try Version.parse(buffer[version_start..version_end]);
 }
