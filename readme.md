@@ -63,10 +63,10 @@ Currently, this (unfinished) server is around 2-3% faster than Zap/Facil.io for 
 I would be very happy if this could consistently outperform Facil.io even by just a hair, while being robust.
 
 ## To do
-- API reference
 - Query params
 - Redirects
 - HTTP/1.1 (keep-alive)
+- API reference
 - Better task scheduling
 - WebSockets
 - HTTP/2
