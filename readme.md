@@ -76,13 +76,13 @@ docker run -p 3000:3000 example
 ### Implement a server
 ```zig
 const std = @import("std");
-const peregrine = @import("peregrine");
+const pereg = @import("peregrine");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
-    const srv = try peregrine.Server.init(.{
+    const srv = try pereg.Server.init(.{
         .allocator = allocator,
         .port = 3000,
         .on_request = handleRequest,
