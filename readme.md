@@ -94,6 +94,7 @@ pub fn main() !void {
 }
 
 fn handleRequest(req: *pereg.Request, resp: *pereg.Response) void {
+    std.debug.print("got request {any} {s}\n", .{req.method, req.getPath()})
     default(resp) catch {}; // Error handling omitted for brevity
 }
 
