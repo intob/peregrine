@@ -29,9 +29,9 @@ pub const Worker = struct {
         self.mutex = std.Thread.Mutex{};
         self.kfd = try posix.kqueue();
         self.allocator = allocator;
+        self.req = try request.Request.init(allocator);
         self.resp = try Response.init(allocator, 4096);
         self.resp_buf = try allocator.alignedAlloc(u8, 16, std.mem.alignForward(usize, 4096, 16));
-        self.req = try allocator.create(request.Request);
         self.shutdown = std.atomic.Value(bool).init(false);
         self.shutdown_cond = std.Thread.Condition{};
         self.shutdown_mutex = std.Thread.Mutex{};
@@ -50,11 +50,11 @@ pub const Worker = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         posix.close(self.kfd);
+        self.req.deinit();
         self.resp.deinit();
-        self.allocator.destroy(self.req);
         self.allocator.free(self.resp_buf);
         self.thread.join();
-        std.debug.print("w-{d} shutdown complete\n", .{self.id});
+        std.debug.print("worker-{d} shutdown\n", .{self.id});
     }
 
     fn workerLoop(self: *Worker) void {
@@ -71,7 +71,7 @@ pub const Worker = struct {
         };
         defer self.allocator.destroy(timeout);
         timeout.* = .{ .sec = 0, .nsec = 50_000_000 };
-        const reader = request.RequestReader.init(self.allocator, 64) catch |err| {
+        const reader = request.RequestReader.init(self.allocator, 4096) catch |err| {
             std.debug.print("error allocating reader: {any}\n", .{err});
             return;
         };
@@ -92,10 +92,11 @@ pub const Worker = struct {
 
     fn handleKevent(self: *Worker, socket: posix.socket_t, reader: *request.RequestReader) !void {
         defer posix.close(socket);
+        self.req.reset();
         try reader.readRequest(socket, self.req);
         self.resp.reset();
         self.on_request(self.req, self.resp);
-        try self.respond(socket);
+        if (!self.resp.hijacked) try self.respond(socket);
     }
 
     fn respond(self: *Worker, socket: posix.socket_t) !void {
@@ -115,10 +116,10 @@ pub const Worker = struct {
     }
 };
 
-fn writeAll(socket: posix.socket_t, msg: []u8) !void {
+pub fn writeAll(socket: posix.socket_t, payload: []u8) !void {
     var n: usize = 0;
-    while (n < msg.len) {
-        const written = posix.write(socket, msg[n..]) catch |err| {
+    while (n < payload.len) {
+        const written = posix.write(socket, payload[n..]) catch |err| {
             posix.close(socket);
             return err;
         };

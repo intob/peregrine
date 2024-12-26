@@ -1,29 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
-
-pub const Method = enum(u2) {
-    GET,
-    POST,
-    OPTIONS,
-
-    fn parse(bytes: []const u8) !Method {
-        if (bytes.len > 7) return error.MethodUnsupported;
-        const first = bytes[0];
-        switch (first) {
-            'P' => return if (std.mem.eql(u8, bytes, "POST")) Method.POST else error.MethodUnsupported,
-            'O' => return if (std.mem.eql(u8, bytes, "OPTIONS")) Method.OPTIONS else error.MethodUnsupported,
-            'G' => return if (bytes.len == 3) Method.GET else error.MethodUnsupported,
-            else => return error.MethodUnsupported,
-        }
-    }
-
-    fn parseFast(bytes: []const u8) !Method {
-        if (bytes.len == 3 and bytes[0] == 'G') {
-            return Method.GET;
-        }
-        return Method.parse(bytes); // fallback to normal parsing
-    }
-};
+const Method = @import("./method.zig").Method;
+const Header = @import("./header.zig").Header;
 
 /// This request is reused.
 /// It is reset by the worker before each request is read.
@@ -31,17 +9,49 @@ pub const Method = enum(u2) {
 /// IMPORTANT:
 /// If a field is added, it MUST be reset by the reset() method.
 pub const Request = struct {
+    allocator: std.mem.Allocator,
+    socket: std.posix.socket_t,
     method: Method,
     path_buf: [256]u8,
     path_len: usize,
+    headers: [32]Header,
+    headers_len: usize,
 
-    pub inline fn getPath(self: *const Request) []const u8 {
+    const Self = @This();
+
+    pub fn init(allocator: std.mem.Allocator) !*Self {
+        const r = try allocator.create(Self);
+        r.* = .{
+            .allocator = allocator,
+            .socket = 0,
+            .method = Method.GET,
+            .path_buf = [_]u8{0} ** 256,
+            .path_len = 0,
+            .headers = undefined,
+            .headers_len = 0,
+        };
+        return r;
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.allocator.destroy(self);
+    }
+
+    pub fn getHeaders(self: *Self) []Header {
+        return self.headers[0..self.headers_len];
+    }
+
+    pub inline fn getPath(self: *Self) []const u8 {
         return self.path_buf[0..self.path_len];
     }
 
-    // Currently no-op because all fields are overwritten
-    // by the request reader.
-    fn reset() void {}
+    // Socket, method, path_buf and path_len will always be overwritten by the
+    // request reader.
+    // See below. No need to reset them here also.
+    // This method should be called BEFORE the call to RequestReader.readRequest.
+    pub fn reset(self: *Self) void {
+        self.headers_len = 0;
+    }
 };
 
 pub const RequestReader = struct {
@@ -69,18 +79,39 @@ pub const RequestReader = struct {
     }
 
     pub fn readRequest(self: *Self, socket: posix.socket_t, req: *Request) !void {
-        defer self.reset();
+        self.reset();
+        req.socket = socket;
         const n = try self.readLine(socket);
         if (n < "GET / HTTP/1.1".len) { // Fast path
             return error.InvalidRequest;
         }
-        const request_line = self.buffer[self.start - n .. self.start];
-        const parsed = try parseMethodAndPath(request_line);
+        const parsed = try parseMethodAndPath(self.buffer[self.start - n .. self.start]);
         req.method = parsed.method;
         req.path_len = parsed.path.len;
         @memcpy(req.path_buf[0..parsed.path.len], parsed.path);
+        try self.readHeaders(socket, req);
     }
 
+    pub fn readHeaders(self: *Self, socket: posix.socket_t, req: *Request) !void {
+        while (true) {
+            const n = try self.readLine(socket);
+            if (n == 0) return error.UnexpectedEOF;
+            // Check for empty line (header section terminator)
+            if (n == 2 and self.buffer[self.start - 2] == '\r' and self.buffer[self.start - 1] == '\n') {
+                break; // End of headers
+            }
+            if (n == 1 and self.buffer[self.start - 1] == '\n') {
+                break; // Handle bare LF (lenient parsing)
+            }
+            if (req.headers_len >= req.headers.len) {
+                return error.TooManyHeaders;
+            }
+            req.headers[req.headers_len] = try Header.parse(self.buffer[self.start - n .. self.start]);
+            req.headers_len += 1;
+        }
+    }
+
+    // Not yet used, but could be useful. Will leave it here for now.
     pub fn skipHeaders(self: *Self, socket: posix.socket_t) !void {
         var header_lines: usize = 0;
         while (true) {
@@ -106,7 +137,7 @@ pub const RequestReader = struct {
         }
     }
 
-    pub fn reset(self: *Self) void {
+    pub inline fn reset(self: *Self) void {
         self.pos = 0;
         self.len = 0;
         self.start = 0;
@@ -123,7 +154,6 @@ pub const RequestReader = struct {
             if (self.pos >= self.len) {
                 const available = self.buffer.len - self.len;
                 if (available == 0) return error.LineTooLong;
-
                 const read_amount = try posix.read(socket, self.buffer[self.len..]);
                 if (read_amount == 0) return line_len;
                 self.len += read_amount;
@@ -178,7 +208,7 @@ fn parseMethodAndPath(buffer: []const u8) !struct { method: Method, path: []cons
     else
         return error.InvalidRequest;
     return .{
-        .method = try Method.parseFast(buffer[0..method_end]),
+        .method = try Method.parse(buffer[0..method_end]),
         .path = buffer[path_start..path_end],
     };
 }

@@ -14,6 +14,7 @@ pub const Response = struct {
     headers: std.ArrayList(Header),
     body: []align(16) u8,
     body_len: usize,
+    hijacked: bool,
 
     const Self = @This();
 
@@ -25,6 +26,7 @@ pub const Response = struct {
             .headers = std.ArrayList(Header).init(allocator),
             .body = try allocator.alignedAlloc(u8, 16, std.mem.alignForward(usize, body_size, 16)),
             .body_len = 0,
+            .hijacked = false,
         };
         return resp;
     }
@@ -48,7 +50,7 @@ pub const Response = struct {
         for (self.headers.items) |h| {
             // Explicitly unroll loop, as compiler doesn't.
             // Benchmarks show that it's significantly faster.
-            inline for ([_][]const u8{ h.key, ": ", h.value, "\n" }) |part| {
+            inline for ([_][]const u8{ h.key(), ": ", h.value(), "\n" }) |part| {
                 @memcpy(buf[n .. n + part.len], part);
                 n += part.len;
             }
@@ -66,6 +68,17 @@ pub const Response = struct {
         self.body_len = buf.len;
     }
 
+    /// Prevent the response from being sent by the worker.
+    /// This allows a library user to take complete control of the
+    /// response. This could be useful for some specific performance-critical
+    /// scenarios.
+    /// Note: The worker uses Vectored IO to write the headers and body
+    /// simultaneously. If you don't reimplement that, you could actually lose
+    /// performance.
+    pub fn hijack(self: *Self) void {
+        self.hijacked = true;
+    }
+
     /// This is called automatically before on_request.
     /// The response is reused so that no allocations are required per request.
     /// All fields must be reset to prevent leaks across responses.
@@ -73,6 +86,7 @@ pub const Response = struct {
         self.status = Status.ok;
         self.headers.clearRetainingCapacity();
         self.body_len = 0;
+        self.hijacked = false;
     }
 };
 
@@ -81,8 +95,8 @@ test "serialise without body" {
     const allocator = gpa.allocator();
 
     var r = try Response.init(allocator, 1024);
-    try r.headers.append(Header{ .key = "Content-Type", .value = "total/rubbish" });
-    try r.headers.append(Header{ .key = "Content-Length", .value = "0" });
+    try r.headers.append(try Header.init(.{ .key = "Content-Type", .value = "total/rubbish" }));
+    try r.headers.append(try Header.init(.{ .key = "Content-Length", .value = "0" }));
 
     var buf = try allocator.alloc(u8, 128);
     const n = try r.serialiseHeaders(&buf);
@@ -97,8 +111,8 @@ test "serialise with body" {
     const allocator = gpa.allocator();
 
     var r = try Response.init(allocator, 1024);
-    try r.headers.append(Header{ .key = "Content-Type", .value = "total/rubbish" });
-    try r.headers.append(Header{ .key = "Content-Length", .value = "13" });
+    try r.headers.append(try Header.init(.{ .key = "Content-Type", .value = "total/rubbish" }));
+    try r.headers.append(try Header.init(.{ .key = "Content-Length", .value = "13" }));
 
     var buf = try allocator.alloc(u8, 128);
     const len_headers = try r.serialiseHeaders(&buf);

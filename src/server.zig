@@ -140,7 +140,7 @@ pub const Server = struct {
         std.debug.print("shutdown complete\n", .{});
     }
 
-    pub fn stop(self: *Self) void {
+    pub fn shutdown(self: *Self) void {
         should_shutdown.store(true, .release);
         self.main_thread.join();
     }
