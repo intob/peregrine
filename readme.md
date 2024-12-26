@@ -8,6 +8,8 @@ The main goal of this project is to provide a HTTP server with the following pri
 
 Currently, all heap allocations are made during startup. Internally, no heap allocations are made per-request.
 
+Note: This project has just started, and is not yet a complete HTTP server implementation. See [To do section](#to-do).
+
 ## Features
 
 - Cross-platform IO Multiplexing
