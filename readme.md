@@ -133,8 +133,8 @@ I would be very happy if this could consistently outperform Facil.io even by jus
 - Query params
 - Redirects
 - HTTP/1.1 (keep-alive)
+- TLS support
 - API reference
-- Better task scheduling
-- WebSockets
-- HTTP/2
-- Support Windows
+- WebSockets support
+- HTTP/2 support
+- Windows support
