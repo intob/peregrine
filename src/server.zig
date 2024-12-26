@@ -80,11 +80,12 @@ pub const Server = struct {
     pub fn start(self: *Self) !void {
         should_shutdown = std.atomic.Value(bool).init(false);
         try posix.listen(self.listener, 128);
+        const timeout = posix.timespec{ .sec = 1, .nsec = 0 };
         const Runner = struct {
             fn run(srv: *Self) !void {
                 while (!should_shutdown.load(.acquire)) {
                     try switch (os) {
-                        .freebsd, .netbsd, .openbsd, .dragonfly, .macos => srv.pollKqueue(),
+                        .freebsd, .netbsd, .openbsd, .dragonfly, .macos => srv.pollKqueue(&timeout),
                         .linux => srv.pollEpoll(),
                         else => unreachable,
                     };
@@ -96,14 +97,17 @@ pub const Server = struct {
         self.thread.join();
     }
 
-    fn pollKqueue(self: *Self) !void {
+    fn pollKqueue(self: *Self, timeout: *const posix.timespec) !void {
         var events: [1]posix.Kevent = undefined;
-        _ = try posix.kevent(self.io_handler.kfd, &.{}, &events, null);
+        _ = try posix.kevent(self.io_handler.kfd, &.{}, &events, timeout);
         if (events[0].filter == posix.system.EVFILT.SIGNAL) {
             should_shutdown.store(true, .release);
             return;
         }
-        try self.acceptConnection();
+        self.acceptConnection() catch |err| switch (err) {
+            error.WouldBlock => {},
+            else => std.debug.print("error accepting connection: {any}\n", .{err}),
+        };
     }
 
     fn pollEpoll(self: *Self) !void {
@@ -116,7 +120,10 @@ pub const Server = struct {
             return;
         }
         if (event.data.fd == self.listener) {
-            try self.acceptConnection();
+            self.acceptConnection() catch |err| switch (err) {
+                error.WouldBlock => {},
+                else => std.debug.print("error accepting connection: {any}\n", .{err}),
+            };
         }
     }
 
@@ -134,7 +141,6 @@ pub const Server = struct {
     }
 
     fn cleanup(self: *Self) !void {
-        std.debug.print("CLEANUP\n", .{});
         posix.close(self.listener);
         for (self.workers) |*w| {
             w.deinit();
