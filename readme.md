@@ -6,6 +6,8 @@ The main goal of this project is to provide a HTTP server, with the following pr
 - Performance
 - Simplicity
 
+Currently, all heap allocations are made during startup. Internally, no heap allocations are made per-request.
+
 ## Getting started
 
 ### Run the example server
