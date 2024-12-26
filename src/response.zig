@@ -38,25 +38,32 @@ pub const Response = struct {
     }
 
     pub fn serialiseHeaders(self: *Self, bufRef: *[]u8) !usize {
+        @setRuntimeSafety(false);
         var buf = bufRef.*;
         var n: usize = 0;
-        // Explicitly unroll loop, as compiler doesn't.
-        // Benchmarks show that it's significantly faster.
-        inline for ([_][]const u8{ VERSION, self.status.toString(), "\n" }) |part| {
-            @memcpy(buf[n .. n + part.len], part);
-            n += part.len;
-        }
-        // Headers
-        for (self.headers.items) |h| {
-            // Explicitly unroll loop, as compiler doesn't.
-            // Benchmarks show that it's significantly faster.
-            inline for ([_][]const u8{ h.key(), ": ", h.value(), "\n" }) |part| {
-                @memcpy(buf[n .. n + part.len], part);
-                n += part.len;
-            }
-        }
-        // New line
+        @memcpy(buf[n..], VERSION);
+        n += VERSION.len;
+        const status = self.status.toString();
+        @memcpy(buf[n..], status);
+        n += status.len;
         buf[n] = '\n';
+        n += 1;
+        for (self.headers.items) |h| {
+            const key = h.key();
+            @memcpy(buf[n..], key);
+            n += key.len;
+            buf[n] = ':';
+            buf[n + 1] = ' ';
+            n += 2;
+            const value = h.value();
+            @memcpy(buf[n..], value);
+            n += value.len;
+            buf[n] = '\n';
+            n += 1;
+        }
+
+        buf[n] = '\n';
+
         return n + 1;
     }
 
@@ -101,7 +108,7 @@ test "serialise without body" {
     var buf = try allocator.alloc(u8, 128);
     const n = try r.serialiseHeaders(&buf);
 
-    const expected = "HTTP/1.0 200 OK\nContent-Type: total/rubbish\nContent-Length: 0\n\n";
+    const expected = "HTTP/1.1 200 OK\nContent-Type: total/rubbish\nContent-Length: 0\n\n";
 
     try std.testing.expectEqualStrings(expected, buf[0..n]);
 }
@@ -120,7 +127,7 @@ test "serialise with body" {
     const body = "test response";
     @memcpy(buf[len_headers .. len_headers + body.len], body);
 
-    const expected = "HTTP/1.0 200 OK\nContent-Type: total/rubbish\nContent-Length: 13\n\ntest response";
+    const expected = "HTTP/1.1 200 OK\nContent-Type: total/rubbish\nContent-Length: 13\n\ntest response";
 
     try std.testing.expectEqualStrings(expected, buf[0 .. len_headers + body.len]);
 }
@@ -134,28 +141,19 @@ test "benchmark serialise" {
 fn benchmark(allocator: std.mem.Allocator) !void {
     var resp = try Response.init(allocator, 1024);
     defer resp.deinit();
-    try resp.headers.append(Header{ .key = "Content-Type", .value = "total/rubbish" });
-    try resp.headers.append(Header{ .key = "Content-Length", .value = "11" });
-    try resp.headers.append(Header{ .key = "Etag", .value = "32456756753456" });
-
+    try resp.headers.append(try Header.init(.{ .key = "Content-Type", .value = "total/rubbish" }));
+    try resp.headers.append(try Header.init(.{ .key = "Content-Length", .value = "11" }));
+    try resp.headers.append(try Header.init(.{ .key = "Etag", .value = "32456756753456" }));
     var buffer = try allocator.alloc(u8, 1024);
     defer allocator.free(buffer);
-
-    // Ensure the result isn't optimized away
-    var timer = try std.time.Timer.start();
     const iterations: usize = 100_000_000;
-
-    var total_size: usize = 0;
+    var timer = try std.time.Timer.start();
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
         const size = try resp.serialiseHeaders(&buffer);
         std.mem.doNotOptimizeAway(size);
-        total_size += size;
     }
-
     const elapsed = timer.lap();
     const avg_ns = @divFloor(elapsed, iterations);
-
     std.debug.print("Average serialization time: {d}ns\n", .{avg_ns});
-    std.debug.print("Average message size: {d} bytes\n", .{@divFloor(total_size, iterations)});
 }

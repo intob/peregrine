@@ -25,7 +25,7 @@ pub const Worker = struct {
     mutex: std.Thread.Mutex,
     req: *request.Request,
     resp: *Response,
-    resp_buf: []align(16) u8,
+    resp_header_buf: []align(16) u8,
     iovecs: std.ArrayList(posix.iovec_const),
     shutdown: std.atomic.Value(bool),
     shutdown_cond: std.Thread.Condition,
@@ -50,8 +50,12 @@ pub const Worker = struct {
         self.on_request = cfg.on_request;
         self.mutex = std.Thread.Mutex{};
         self.req = try request.Request.init(allocator);
-        self.resp = try Response.init(allocator, 4096);
-        self.resp_buf = try allocator.alignedAlloc(u8, 16, std.mem.alignForward(usize, 4096, 16));
+        // TODO: make body buffer size configurable
+        self.resp = try Response.init(allocator, 4096); // Aligned internally
+        // Up to 32 headers, each  with [64]u8 key and [256]u8 value, plus ": " and "\n"
+        const max_header_size = ((64 + 256 + 3) * 32) + "HTTP/1.1 500 Internal Server Error\n".len;
+        const aligned_header_size = std.mem.alignForward(usize, max_header_size, 16);
+        self.resp_header_buf = try allocator.alignedAlloc(u8, 16, aligned_header_size);
         self.iovecs = std.ArrayList(posix.iovec_const).init(self.allocator);
         self.shutdown = std.atomic.Value(bool).init(false);
         self.shutdown_cond = std.Thread.Condition{};
@@ -72,7 +76,7 @@ pub const Worker = struct {
         defer self.mutex.unlock();
         self.req.deinit();
         self.resp.deinit();
-        self.allocator.free(self.resp_buf);
+        self.allocator.free(self.resp_header_buf);
         self.iovecs.deinit();
         self.thread.join();
         std.debug.print("worker-{d} shutdown\n", .{self.id});
@@ -97,6 +101,8 @@ pub const Worker = struct {
         };
 
         var events: [128]EventType = undefined;
+        // TODO: make request reader buffer size configurable
+        // Buffer is aligned internally
         const reader = request.RequestReader.init(self.allocator, 4096) catch |err| {
             std.debug.print("error allocating reader: {any}\n", .{err});
             return;
@@ -170,11 +176,11 @@ pub const Worker = struct {
     }
 
     fn respond(self: *Self, socket: posix.socket_t, keep_alive: bool) !void {
-        const headers_len = try self.resp.serialiseHeaders(&self.resp_buf);
+        const headers_len = try self.resp.serialiseHeaders(&self.resp_header_buf);
         self.iovecs.clearRetainingCapacity();
         try self.iovecs.appendSlice(&.{
             .{
-                .base = @ptrCast(self.resp_buf[0..headers_len]),
+                .base = @ptrCast(self.resp_header_buf[0..headers_len]),
                 .len = headers_len,
             },
             .{
