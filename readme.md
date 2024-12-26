@@ -127,11 +127,7 @@ This is not a framework for building web applications. This is purely a HTTP ser
 If you want a more substantial HTTP library, I suggest that you look at [Zap](https://github.com/zigzap/zap), built on [Facil.io](http://facil.io). Facil.io is an excellent battle-tested library written in C.
 
 ## Benchmarks
-I will add some graphs later.
-
-Currently, this (unfinished) server is around 2-3% faster than Zap/Facil.io for static GET requests. Although, this is not a fair comparison because Facil.io is a production-ready and complete HTTP server.
-
-I would be very happy if this could consistently outperform Facil.io even by just a hair, while being robust.
+Currently, this (unfinished) server is around 6% to 7% faster than Zap/Facil.io for static GET requests on BSD (kqueue). Although, this is not an entirely fair comparison because Facil.io is a production-ready and complete HTTP server. I would be very happy if this could consistently outperform Facil.io even by just a hair, while being robust. I will first implement the missing core HTTP features before benchmarking properly. It's encouraging to see that it is indeed very fast, though.
 
 ## To do
 - Query params
