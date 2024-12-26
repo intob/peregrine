@@ -1,4 +1,4 @@
-# Peregrine - a bleeding fast HTTP server
+# Peregrine - a bleeding fast HTTP server 🦅
 This is a HTTP server written in pure Zig with no dependencies other than Zig's standard library.
 
 The main goal of this project is to provide a HTTP server, with the following priorities (in order of prevalence):
