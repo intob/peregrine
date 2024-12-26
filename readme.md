@@ -25,7 +25,7 @@ pub fn main() !void {
     const srv = try peregrine.Server.init(.{
         .allocator = allocator,
         .port = 3000,
-        .on_request = on_request,
+        .on_request = handleRequest,
         // .ip defaults to 0.0.0.0
         // .worker_count defaults to CPU core count
     });
@@ -33,10 +33,16 @@ pub fn main() !void {
     try srv.start(); // This blocks if there is no error
 }
 
-fn on_request(req: *peregrine.Request, resp: *peregrine.Response) void {
-    std.debug.print("got request: {any} {s}\n", .{ req.method, req.getPath() });
-    resp.setBody("Kawww\n") catch {};
-    resp.headers.append(.{ .key = "Content-Length", .value = "6" }) catch {};
+fn handleRequest(req: *pereg.Request, resp: *pereg.Response) void {
+    default(resp) catch {}; // Error handling omitted for brevity
+}
+
+fn default(resp: *pereg.Response) !void {
+    try resp.setBody("Kawww\n");
+    try resp.headers.append(try pereg.Header.init(.{
+        .key = "Content-Length",
+        .value = "6",
+    }));
 }
 ```
 
