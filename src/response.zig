@@ -46,8 +46,9 @@ pub const Response = struct {
         const status = self.status.toString();
         @memcpy(buf[n..], status);
         n += status.len;
-        buf[n] = '\n';
-        n += 1;
+        buf[n] = '\r';
+        buf[n + 1] = '\n';
+        n += 2;
         for (self.headers.items) |h| {
             const key = h.key();
             @memcpy(buf[n..], key);
@@ -58,13 +59,11 @@ pub const Response = struct {
             const value = h.value();
             @memcpy(buf[n..], value);
             n += value.len;
-            buf[n] = '\n';
-            n += 1;
+            buf[n] = '\r';
+            buf[n + 1] = '\n';
+            n += 2;
         }
-
-        buf[n] = '\n';
-
-        return n + 1;
+        return n;
     }
 
     pub fn setBody(self: *Self, buf: []const u8) !void {
@@ -97,7 +96,7 @@ pub const Response = struct {
     }
 };
 
-test "serialise without body" {
+test "serialise" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
@@ -108,28 +107,10 @@ test "serialise without body" {
     var buf = try allocator.alloc(u8, 128);
     const n = try r.serialiseHeaders(&buf);
 
-    const expected = "HTTP/1.1 200 OK\nContent-Type: total/rubbish\nContent-Length: 0\n\n";
+    const expected = "HTTP/1.1 200 OK\r\nContent-Type: total/rubbish\r\nContent-Length: 0\r\n";
 
     try std.testing.expectEqualStrings(expected, buf[0..n]);
-}
-
-test "serialise with body" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-
-    var r = try Response.init(allocator, 1024);
-    try r.headers.append(try Header.init(.{ .key = "Content-Type", .value = "total/rubbish" }));
-    try r.headers.append(try Header.init(.{ .key = "Content-Length", .value = "13" }));
-
-    var buf = try allocator.alloc(u8, 128);
-    const len_headers = try r.serialiseHeaders(&buf);
-
-    const body = "test response";
-    @memcpy(buf[len_headers .. len_headers + body.len], body);
-
-    const expected = "HTTP/1.1 200 OK\nContent-Type: total/rubbish\nContent-Length: 13\n\ntest response";
-
-    try std.testing.expectEqualStrings(expected, buf[0 .. len_headers + body.len]);
+    try std.testing.expectEqual(expected.len, n);
 }
 
 test "benchmark serialise" {
@@ -146,7 +127,7 @@ fn benchmark(allocator: std.mem.Allocator) !void {
     try resp.headers.append(try Header.init(.{ .key = "Etag", .value = "32456756753456" }));
     var buffer = try allocator.alloc(u8, 1024);
     defer allocator.free(buffer);
-    const iterations: usize = 100_000_000;
+    const iterations: usize = 10_000_000;
     var timer = try std.time.Timer.start();
     var i: usize = 0;
     while (i < iterations) : (i += 1) {

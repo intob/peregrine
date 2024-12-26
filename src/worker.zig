@@ -8,8 +8,10 @@ const Header = @import("./header.zig").Header;
 const Status = @import("./status.zig").Status;
 
 pub const RequestHandler = *const fn (req: *request.Request, resp: *Response) void;
-const KEEP_ALIVE_HEADERS = "Connection: keep-alive\r\nKeep-Alive: timeout=10, max=100\r\n";
-const CLOSE_HEADER = "Connection: close\r\n";
+
+// Extra CRLF to terminate headers
+const KEEP_ALIVE_HEADERS = "Connection: keep-alive\r\nKeep-Alive: timeout=10, max=100\r\n\r\n";
+const CLOSE_HEADER = "Connection: close\r\n\r\n";
 
 pub const WorkerConfig = struct {
     allocator: std.mem.Allocator,
