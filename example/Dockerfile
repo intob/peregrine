@@ -1,3 +1,3 @@
-FROM alpine:3.14
+FROM alpine:3.21
 COPY ../zig-out/bin/example /bin/
 ENTRYPOINT ["example"]
