@@ -8,6 +8,8 @@ The main goal of this project is to provide a HTTP server, with the following pr
 
 Currently, all heap allocations are made during startup. Internally, no heap allocations are made per-request.
 
+Note: This project has just started. Kqueue is done, but Epoll is not. Therefore, this will not yet work on Linux. This will work on FreeBSD and MacOS.
+
 ## Getting started
 
 ### Run the example server
@@ -71,6 +73,7 @@ Currently, this (unfinished) server is around 2-3% faster than Zap/Facil.io for 
 I would be very happy if this could consistently outperform Facil.io even by just a hair, while being robust.
 
 ## To do
+- Epoll (support Linux)
 - Query params
 - Redirects
 - HTTP/1.1 (keep-alive)
