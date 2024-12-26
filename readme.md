@@ -130,7 +130,6 @@ If you want a more substantial HTTP library, I suggest that you look at [Zap](ht
 Currently, this (unfinished) server is around 1% faster than Zap/Facil.io for static GET requests on BSD (kqueue). Although, this is not an entirely fair comparison because Facil.io is a production-ready and complete HTTP server. I would be very happy if this could match the performance of Facil.io. I will first implement the missing core HTTP features before benchmarking properly. It's encouraging to see that it is indeed very fast, though.
 
 ## To do
-- Query params
 - Redirects
 - TLS support
 - API reference

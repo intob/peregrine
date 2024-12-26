@@ -2,12 +2,13 @@ const os = @import("builtin").os.tag;
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
-const request = @import("./request.zig");
+const RequestReader = @import("./reader.zig").RequestReader;
+const Request = @import("./request.zig").Request;
 const Response = @import("./response.zig").Response;
 const Header = @import("./header.zig").Header;
 const Status = @import("./status.zig").Status;
 
-pub const RequestHandler = *const fn (req: *request.Request, resp: *Response) void;
+pub const RequestHandler = *const fn (req: *Request, resp: *Response) void;
 
 // Extra CRLF to terminate headers
 const KEEP_ALIVE_HEADERS = "Connection: keep-alive\r\nKeep-Alive: timeout=10, max=100\r\n\r\n";
@@ -25,7 +26,7 @@ pub const Worker = struct {
     id: usize,
     on_request: RequestHandler,
     mutex: std.Thread.Mutex,
-    req: *request.Request,
+    req: *Request,
     resp: *Response,
     resp_header_buf: []align(16) u8,
     iovecs: std.ArrayList(posix.iovec_const),
@@ -51,7 +52,7 @@ pub const Worker = struct {
         self.id = cfg.id;
         self.on_request = cfg.on_request;
         self.mutex = std.Thread.Mutex{};
-        self.req = try request.Request.init(allocator);
+        self.req = try Request.init(allocator);
         // TODO: make body buffer size configurable
         self.resp = try Response.init(allocator, 4096); // Aligned internally
         // Up to 32 headers, each  with [64]u8 key and [256]u8 value, plus ": " and "\n"
@@ -105,7 +106,7 @@ pub const Worker = struct {
         var events: [128]EventType = undefined;
         // TODO: make request reader buffer size configurable
         // Buffer is aligned internally
-        const reader = request.RequestReader.init(self.allocator, 4096) catch |err| {
+        const reader = RequestReader.init(self.allocator, 4096) catch |err| {
             std.debug.print("error allocating reader: {any}\n", .{err});
             return;
         };
@@ -151,7 +152,7 @@ pub const Worker = struct {
         }
     }
 
-    fn handleEvent(self: *Self, socket: posix.socket_t, reader: *request.RequestReader) !void {
+    fn handleEvent(self: *Self, socket: posix.socket_t, reader: *RequestReader) !void {
         const keep_alive = self.shouldKeepAlive();
         defer {
             if (!keep_alive) {

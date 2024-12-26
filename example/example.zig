@@ -21,7 +21,16 @@ fn mainHandler(req: *pereg.Request, resp: *pereg.Response) void {
     handle(req, resp) catch {}; // Error handling omitted for brevity
 }
 
-fn handle(_: *pereg.Request, resp: *pereg.Response) !void {
+fn handle(req: *pereg.Request, resp: *pereg.Response) !void {
+    if (try req.parseQuery()) |query| {
+        var iter = query.iterator();
+        while (iter.next()) |entry| {
+            std.debug.print("query param {s}: {s}\n", .{
+                entry.key_ptr.*,
+                entry.value_ptr.*,
+            });
+        }
+    }
     try resp.setBody("Kawww\n");
     try resp.headers.append(try pereg.Header.init(.{
         .key = "Content-Length",
