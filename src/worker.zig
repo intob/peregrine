@@ -1,5 +1,7 @@
+const os = @import("builtin").os.tag;
 const std = @import("std");
 const posix = std.posix;
+const linux = std.os.linux;
 const request = @import("./request.zig");
 const Response = @import("./response.zig").Response;
 const Header = @import("./header.zig").Header;
@@ -8,11 +10,11 @@ const Status = @import("./status.zig").Status;
 pub const RequestHandler = *const fn (req: *request.Request, resp: *Response) void;
 
 pub const Worker = struct {
+    allocator: std.mem.Allocator,
+    io_handler: IOHandler,
     id: usize,
     on_request: RequestHandler,
     mutex: std.Thread.Mutex,
-    kfd: posix.fd_t,
-    allocator: std.mem.Allocator,
     resp: *Response,
     resp_buf: []align(16) u8,
     req: *request.Request,
@@ -22,13 +24,21 @@ pub const Worker = struct {
     shutdown_done: bool,
     thread: std.Thread,
 
-    pub fn init(self: *Worker, allocator: std.mem.Allocator, id: usize, on_request: RequestHandler) !void {
+    const IOHandler = switch (os) {
+        .freebsd, .netbsd, .openbsd, .dragonfly, .macos => KqueueHandler,
+        .linux => EpollHandler,
+        else => @compileError("Unsupported OS"),
+    };
+
+    const Self = @This();
+
+    pub fn init(self: *Self, allocator: std.mem.Allocator, id: usize, on_request: RequestHandler) !void {
         errdefer self.deinit();
+        self.allocator = allocator;
+        self.io_handler = try IOHandler.init();
         self.id = id;
         self.on_request = on_request;
         self.mutex = std.Thread.Mutex{};
-        self.kfd = try posix.kqueue();
-        self.allocator = allocator;
         self.req = try request.Request.init(allocator);
         self.resp = try Response.init(allocator, 4096);
         self.resp_buf = try allocator.alignedAlloc(u8, 16, std.mem.alignForward(usize, 4096, 16));
@@ -38,7 +48,7 @@ pub const Worker = struct {
         self.thread = try std.Thread.spawn(.{}, workerLoop, .{self});
     }
 
-    pub fn deinit(self: *Worker) void {
+    pub fn deinit(self: *Self) void {
         self.shutdown.store(true, .release);
         {
             self.shutdown_mutex.lock();
@@ -49,7 +59,6 @@ pub const Worker = struct {
         }
         self.mutex.lock();
         defer self.mutex.unlock();
-        posix.close(self.kfd);
         self.req.deinit();
         self.resp.deinit();
         self.allocator.free(self.resp_buf);
@@ -57,40 +66,61 @@ pub const Worker = struct {
         std.debug.print("worker-{d} shutdown\n", .{self.id});
     }
 
-    fn workerLoop(self: *Worker) void {
+    pub fn addClient(self: *Self, socket: posix.socket_t) !void {
+        try self.io_handler.addSocket(socket);
+    }
+
+    fn workerLoop(self: *Self) void {
         defer {
             self.shutdown_mutex.lock();
             defer self.shutdown_mutex.unlock();
             self.shutdown_done = true;
             self.shutdown_cond.signal();
         }
-        var ready_list: [128]posix.Kevent = undefined;
-        const timeout = self.allocator.create(posix.timespec) catch |err| {
-            std.debug.print("error allocating timeout: {any}\n", .{err});
-            return;
+
+        const EventType = switch (os) {
+            .freebsd, .netbsd, .openbsd, .dragonfly, .macos => posix.Kevent,
+            .linux => linux.epoll_event,
+            else => unreachable,
         };
-        defer self.allocator.destroy(timeout);
-        timeout.* = .{ .sec = 0, .nsec = 50_000_000 };
+
+        var events: [128]EventType = undefined;
         const reader = request.RequestReader.init(self.allocator, 4096) catch |err| {
             std.debug.print("error allocating reader: {any}\n", .{err});
             return;
         };
         defer reader.deinit();
-        while (true) {
-            if (self.shutdown.load(.acquire)) break;
-            const ready_count = posix.kevent(self.kfd, &.{}, &ready_list, timeout) catch |err| {
-                std.debug.print("kevent error: {}\n", .{err});
+
+        while (!self.shutdown.load(.acquire)) {
+            const timeout = switch (os) {
+                .freebsd, .netbsd, .openbsd, .dragonfly, .macos => posix.timespec{ .sec = 0, .nsec = 50_000_000 },
+                .linux => 50, // 50ms timeout
+                else => unreachable,
+            };
+
+            const ready_count = switch (os) {
+                .freebsd, .netbsd, .openbsd, .dragonfly, .macos => self.io_handler.wait(&events, &timeout),
+                .linux => self.io_handler.wait(&events, timeout),
+                else => unreachable,
+            } catch |err| {
+                std.debug.print("event wait error: {}\n", .{err});
                 continue;
             };
-            for (ready_list[0..ready_count]) |ready| {
-                self.handleKevent(@intCast(ready.udata), reader) catch |err| {
+
+            for (events[0..ready_count]) |event| {
+                const socket: i32 = switch (os) {
+                    .freebsd, .netbsd, .openbsd, .dragonfly, .macos => @intCast(event.udata),
+                    .linux => event.data.fd,
+                    else => unreachable,
+                };
+                self.handleEvent(socket, reader) catch |err| {
                     std.debug.print("error handling event: {any}\n", .{err});
                 };
             }
         }
     }
 
-    fn handleKevent(self: *Worker, socket: posix.socket_t, reader: *request.RequestReader) !void {
+    fn handleEvent(self: *Self, socket: posix.socket_t, reader: *request.RequestReader) !void {
         defer posix.close(socket);
         self.req.reset();
         try reader.readRequest(socket, self.req);
@@ -99,7 +129,7 @@ pub const Worker = struct {
         if (!self.resp.hijacked) try self.respond(socket);
     }
 
-    fn respond(self: *Worker, socket: posix.socket_t) !void {
+    fn respond(self: *Self, socket: posix.socket_t) !void {
         const headers_len = try self.resp.serialiseHeaders(&self.resp_buf);
         if (self.resp.body_len > 0) {
             var iovecs = [_]posix.iovec_const{
@@ -133,3 +163,57 @@ fn writeAllToBuffer(buf: *std.io.BufferedWriter(4096, std.fs.File.Writer), bytes
         n += try buf.write(bytes[n..]);
     }
 }
+
+const KqueueHandler = struct {
+    kfd: i32,
+
+    pub fn init() !@This() {
+        const kfd = try posix.kqueue();
+        return .{ .kfd = kfd };
+    }
+
+    pub fn addSocket(self: *@This(), socket: posix.socket_t) !void {
+        const event = posix.Kevent{
+            .ident = @intCast(socket),
+            .filter = posix.system.EVFILT.READ,
+            .flags = posix.system.EV.ADD,
+            .fflags = 0,
+            .data = 0,
+            .udata = @intCast(socket),
+        };
+        _ = try posix.kevent(self.kfd, &[_]posix.Kevent{event}, &.{}, null);
+    }
+
+    pub fn wait(self: *@This(), events: []posix.Kevent, timeout: ?*const posix.timespec) !usize {
+        return try posix.kevent(self.kfd, &.{}, events, timeout);
+    }
+
+    pub fn deinit(self: *@This()) void {
+        posix.close(self.kfd);
+    }
+};
+
+const EpollHandler = struct {
+    epfd: i32,
+
+    pub fn init() !@This() {
+        const epfd = try posix.epoll_create1(0);
+        return .{ .epfd = epfd };
+    }
+
+    pub fn addSocket(self: *@This(), socket: posix.socket_t) !void {
+        var event = linux.epoll_event{
+            .events = linux.EPOLL.IN,
+            .data = .{ .fd = socket },
+        };
+        try posix.epoll_ctl(self.epfd, linux.EPOLL.CTL_ADD, socket, &event);
+    }
+
+    pub fn wait(self: *@This(), events: []linux.epoll_event, timeout_ms: i32) !usize {
+        return posix.epoll_wait(self.epfd, events, timeout_ms);
+    }
+
+    pub fn deinit(self: *@This()) void {
+        posix.close(self.epfd);
+    }
+};

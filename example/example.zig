@@ -11,7 +11,7 @@ pub fn main() !void {
         .on_request = handleRequest,
         // .ip defaults to 0.0.0.0
         // .worker_count defaults to CPU core count
-        .worker_count = 8,
+        .worker_count = 1,
     });
     std.debug.print("listening on 0.0.0.0:3000\n", .{});
     std.debug.print("with {d} worker-threads\n", .{srv.workers.len});

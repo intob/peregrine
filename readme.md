@@ -1,23 +1,69 @@
 # Peregrine - a bleeding fast HTTP server 🦅
-This is a HTTP server written in pure Zig with no dependencies other than Zig's standard library.
+This is a high-performance, event-driven HTTP server. Written in pure Zig, with no dependencies other than Zig's standard library. Supports Linux (epoll) and BSD/MacOS (kqueue) systems.
 
-The main goal of this project is to provide a HTTP server, with the following priorities (in order of prevalence):
+The main goal of this project is to provide a HTTP server with the following priorities (in order of prevalence):
 - Reliability
 - Performance
 - Simplicity
 
 Currently, all heap allocations are made during startup. Internally, no heap allocations are made per-request.
 
-Note: This project has just started. Kqueue is done, but Epoll is not. Therefore, this will not yet work on Linux. This will work on FreeBSD and MacOS.
+## Features
 
-## Getting started
+- Cross-platform IO Multiplexing
+    - Kqueue support for BSD and MacOS systems
+    - Epoll support for Linux systems
 
-### Run the example server
+- Multi-Worker Architecture
+    - Automatic worker scaling based on CPU core count
+    - Configurable worker count
+    - Thread-safe request handling
+
+- Performance Optimisations
+    - Non-blocking socket operations
+    - Efficient event-driven architecture
+    - Aligned buffer allocation for optimal IO performance
+
+## Architecture
+
+### Server
+- Server configuration and initialization
+- Worker pool management
+- Signal handling for graceful shutdown
+- Platform-specific I/O handlers
+
+### Workers
+- Simple worker-per-thread design
+- Request parsing and handling
+- Response generation
+- Connection management
+- Event loop processing
+
+### Signal Handling
+The server handles the following signals for graceful shutdown:
+- SIGINT (Ctrl+C)
+- SIGTERM
+
+### Timeouts
+Connection timeouts are configured with:
+- Receive timeout: 2.5 seconds
+- Send timeout: 2.5 seconds
+
+## Usage
+
+### Run the example server natively
 ```bash
 zig build run-example
 ```
 
-### Example usage
+### Run the example in a Linux Docker container
+```zig
+zig build -Dtarget=x86_64-linux-musl && \
+docker build -t example . -f ./example/Dockerfile && \
+docker run -p 3000:3000 example
+```
+
+### Implement a server
 ```zig
 const std = @import("std");
 const peregrine = @import("peregrine");
@@ -50,7 +96,7 @@ fn default(resp: *pereg.Response) !void {
 }
 ```
 
-As it stands, the configuration is minimal, with sensible defaults. Simply provide a request handler function.
+The configuration is minimal, with reasonable defaults. Simply provide an allocator, port number, and a request handler function.
 
 The server will shutdown gracefully if an interrupt signal is received. Alternatively, you can call `srv.shutdown()` yourself.
 
@@ -73,7 +119,6 @@ Currently, this (unfinished) server is around 2-3% faster than Zap/Facil.io for 
 I would be very happy if this could consistently outperform Facil.io even by just a hair, while being robust.
 
 ## To do
-- Epoll (support Linux)
 - Query params
 - Redirects
 - HTTP/1.1 (keep-alive)
