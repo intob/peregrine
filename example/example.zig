@@ -8,7 +8,7 @@ pub fn main() !void {
     const srv = try pereg.Server.init(.{
         .allocator = allocator,
         .port = 3000,
-        .on_request = mainHandler,
+        .on_request = handler,
         // .ip defaults to 0.0.0.0
         // .worker_count defaults to CPU core count
     });
@@ -16,7 +16,7 @@ pub fn main() !void {
     try srv.start(); // This blocks if there is no error
 }
 
-fn mainHandler(req: *pereg.Request, resp: *pereg.Response) void {
+fn handler(req: *pereg.Request, resp: *pereg.Response) void {
     handle(req, resp) catch {}; // Error handling omitted for brevity
 }
 
