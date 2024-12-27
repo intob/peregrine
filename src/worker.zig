@@ -1,4 +1,4 @@
-const os = @import("builtin").os.tag;
+const native_os = @import("builtin").os.tag;
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
@@ -11,6 +11,7 @@ const Status = @import("./status.zig").Status;
 pub const RequestHandler = *const fn (req: *Request, resp: *Response) void;
 
 // Extra CRLF to terminate headers
+const CONNECTION_MAX_REQUESTS: u32 = 100;
 const KEEP_ALIVE_HEADERS = "Connection: keep-alive\r\nKeep-Alive: timeout=10, max=100\r\n\r\n";
 const CLOSE_HEADER = "Connection: close\r\n\r\n";
 
@@ -37,7 +38,7 @@ pub const Worker = struct {
     shutdown_done: bool,
     thread: std.Thread,
 
-    const IOHandler = switch (os) {
+    const IOHandler = switch (native_os) {
         .freebsd, .netbsd, .openbsd, .dragonfly, .macos => KqueueHandler,
         .linux => EpollHandler,
         else => @compileError("Unsupported OS"),
@@ -99,12 +100,12 @@ pub const Worker = struct {
             self.shutdown_done = true;
             self.shutdown_cond.signal();
         }
-        const EventType = switch (os) {
+        const EventType = switch (native_os) {
             .freebsd, .netbsd, .openbsd, .dragonfly, .macos => posix.Kevent,
             .linux => linux.epoll_event,
             else => unreachable,
         };
-        var events: [128]EventType = undefined;
+        var events: [256]EventType = undefined;
         // TODO: make request reader buffer size configurable
         // Buffer is aligned internally
         const reader = RequestReader.init(self.allocator, 4096) catch |err| {
@@ -113,21 +114,12 @@ pub const Worker = struct {
         };
         defer reader.deinit();
         while (!self.shutdown.load(.acquire)) {
-            const timeout = switch (os) {
-                .freebsd, .netbsd, .openbsd, .dragonfly, .macos => posix.timespec{ .sec = 0, .nsec = 50_000_000 },
-                .linux => 50, // 50ms
-                else => unreachable,
-            };
-            const ready_count = switch (os) {
-                .freebsd, .netbsd, .openbsd, .dragonfly, .macos => self.io_handler.wait(&events, &timeout),
-                .linux => self.io_handler.wait(&events, timeout),
-                else => unreachable,
-            } catch |err| {
-                std.debug.print("event wait error: {}\n", .{err});
+            const ready_count = self.io_handler.wait(&events) catch |err| {
+                std.debug.print("error waiting for events: {any}\n", .{err});
                 continue;
             };
             for (events[0..ready_count]) |event| {
-                const socket: i32 = switch (os) {
+                const socket: i32 = switch (native_os) {
                     .freebsd, .netbsd, .openbsd, .dragonfly, .macos => @intCast(event.udata),
                     .linux => event.data.fd,
                     else => unreachable,
@@ -142,7 +134,7 @@ pub const Worker = struct {
                     continue;
                 };
                 const requests_handled = self.connection_requests.get(socket) orelse 0;
-                if (requests_handled >= 100) {
+                if (requests_handled >= CONNECTION_MAX_REQUESTS) {
                     posix.close(socket);
                     _ = self.connection_requests.remove(socket);
                 } else {
@@ -195,7 +187,6 @@ pub const Worker = struct {
         const total_len = headers_len +
             (if (keep_alive) KEEP_ALIVE_HEADERS.len else CLOSE_HEADER.len) +
             self.resp.body_len;
-
         const written = try posix.writev(socket, self.iovecs.items);
         if (written != total_len) {
             return error.WriteError;
@@ -215,12 +206,15 @@ fn shouldKeepAlive(req: *Request) bool {
 
 const KqueueHandler = struct {
     kfd: i32,
+    timeout: posix.timespec,
 
     const Self = @This();
 
     pub fn init() !Self {
-        const kfd = try posix.kqueue();
-        return .{ .kfd = kfd };
+        return .{
+            .kfd = try posix.kqueue(),
+            .timeout = posix.timespec{ .sec = 0, .nsec = 50_000_000 },
+        };
     }
 
     pub fn addSocket(self: *Self, socket: posix.socket_t) !void {
@@ -235,8 +229,8 @@ const KqueueHandler = struct {
         _ = try posix.kevent(self.kfd, &[_]posix.Kevent{event}, &.{}, null);
     }
 
-    pub fn wait(self: *Self, events: []posix.Kevent, timeout: ?*const posix.timespec) !usize {
-        return try posix.kevent(self.kfd, &.{}, events, timeout);
+    pub fn wait(self: *Self, events: []posix.Kevent) !usize {
+        return try posix.kevent(self.kfd, &.{}, events, &self.timeout);
     }
 
     pub fn deinit(self: *Self) void {
@@ -262,8 +256,8 @@ const EpollHandler = struct {
         try posix.epoll_ctl(self.epfd, linux.EPOLL.CTL_ADD, socket, &event);
     }
 
-    pub fn wait(self: *Self, events: []linux.epoll_event, timeout_ms: i32) !usize {
-        return posix.epoll_wait(self.epfd, events, timeout_ms);
+    pub fn wait(self: *Self, events: []linux.epoll_event) !usize {
+        return posix.epoll_wait(self.epfd, events, 50); // 50ms timeout
     }
 
     pub fn deinit(self: *Self) void {

@@ -1,4 +1,4 @@
-const os = @import("builtin").os.tag;
+const native_os = @import("builtin").os.tag;
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
@@ -32,7 +32,7 @@ pub const Server = struct {
 
     const Self = @This();
 
-    const IOHandler = switch (os) {
+    const IOHandler = switch (native_os) {
         .freebsd, .netbsd, .openbsd, .dragonfly, .macos => KqueueHandler,
         .linux => EpollHandler,
         else => @compileError("Unsupported OS"),
@@ -64,7 +64,7 @@ pub const Server = struct {
         posix.sigaction(posix.SIG.INT, &sig_action, null);
         posix.sigaction(posix.SIG.TERM, &sig_action, null);
         const worker_count = if (cfg.worker_count > 0) cfg.worker_count else try std.Thread.getCpuCount();
-        const io_handler = switch (os) {
+        const io_handler = switch (native_os) {
             .freebsd, .netbsd, .openbsd, .dragonfly, .macos => try KqueueHandler.init(listener),
             .linux => try EpollHandler.init(listener),
             else => unreachable,
@@ -220,6 +220,7 @@ const EpollHandler = struct {
 
 fn setClientSockOpt(sock: posix.socket_t) !void {
     try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(@as(c_int, 1)));
+    //try posix.setsockopt(sock, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
     const send_timeout = posix.timeval{ .sec = 2, .usec = 500_000 };
     const recv_timeout = posix.timeval{ .sec = 10_000, .usec = 0 };
     try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &std.mem.toBytes(send_timeout));
