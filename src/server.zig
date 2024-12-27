@@ -46,6 +46,15 @@ pub const Server = struct {
         const address = try std.net.Address.parseIp(cfg.ip, cfg.port);
         const listener = try posix.socket(address.any.family, sock_type, posix.IPPROTO.TCP);
         try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+        // Reuse port
+        // https://www.openmymind.net/TCP-Server-In-Zig-Part-8-Epoll-and-Kqueue/
+        if (@hasDecl(posix.SO, "REUSEPORT_LB")) {
+            std.debug.print("set REUSEPORT_LB\n", .{});
+            try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEPORT_LB, &std.mem.toBytes(@as(c_int, 1)));
+        } else if (@hasDecl(posix.SO, "REUSEPORT")) {
+            std.debug.print("set REUSEPORT\n", .{});
+            try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
+        }
         try posix.bind(listener, &address.any, address.getOsSockLen());
         // Init interrupt signal handler
         var act = posix.Sigaction{
@@ -80,51 +89,16 @@ pub const Server = struct {
     pub fn start(self: *Self) !void {
         should_shutdown = std.atomic.Value(bool).init(false);
         try posix.listen(self.listener, 128);
-        const timeout = posix.timespec{ .sec = 1, .nsec = 0 };
         const Runner = struct {
             fn run(srv: *Self) !void {
                 while (!should_shutdown.load(.acquire)) {
-                    try switch (os) {
-                        .freebsd, .netbsd, .openbsd, .dragonfly, .macos => srv.pollKqueue(&timeout),
-                        .linux => srv.pollEpoll(),
-                        else => unreachable,
-                    };
+                    try srv.io_handler.poll(srv);
                 }
                 try srv.cleanup();
             }
         };
         self.thread = try std.Thread.spawn(.{}, Runner.run, .{self});
         self.thread.join();
-    }
-
-    fn pollKqueue(self: *Self, _: *const posix.timespec) !void {
-        var events: [1]posix.Kevent = undefined;
-        _ = try posix.kevent(self.io_handler.kfd, &.{}, &events, null);
-        if (events[0].filter == posix.system.EVFILT.SIGNAL) {
-            should_shutdown.store(true, .release);
-            return;
-        }
-        self.acceptConnection() catch |err| switch (err) {
-            error.WouldBlock => {},
-            else => std.debug.print("error accepting connection: {any}\n", .{err}),
-        };
-    }
-
-    fn pollEpoll(self: *Self) !void {
-        var events: [1]linux.epoll_event = undefined;
-        const n = posix.epoll_wait(self.io_handler.epfd, &events, 50);
-        if (n == 0) return;
-        const event = events[0];
-        if (event.events & (linux.EPOLL.ERR | linux.EPOLL.HUP) != 0) {
-            should_shutdown.store(true, .release);
-            return;
-        }
-        if (event.data.fd == self.listener) {
-            self.acceptConnection() catch |err| switch (err) {
-                error.WouldBlock => {},
-                else => std.debug.print("error accepting connection: {any}\n", .{err}),
-            };
-        }
     }
 
     fn acceptConnection(self: *Self) !void {
@@ -153,7 +127,9 @@ pub const Server = struct {
 const KqueueHandler = struct {
     kfd: i32,
 
-    fn init(listener: posix.socket_t) !@This() {
+    const Self = @This();
+
+    fn init(listener: posix.socket_t) !Self {
         const kfd = try posix.kqueue();
         try initializeEvents(kfd, listener);
         return .{ .kfd = kfd };
@@ -191,12 +167,27 @@ const KqueueHandler = struct {
             return error.EventRegistrationFailed;
         }
     }
+
+    fn poll(self: *Self, srv: *Server) !void {
+        var events: [1]posix.Kevent = undefined;
+        _ = try posix.kevent(self.kfd, &.{}, &events, null);
+        if (events[0].filter == posix.system.EVFILT.SIGNAL) {
+            should_shutdown.store(true, .release);
+            return;
+        }
+        srv.acceptConnection() catch |err| switch (err) {
+            error.WouldBlock => {},
+            else => std.debug.print("error accepting connection: {any}\n", .{err}),
+        };
+    }
 };
 
 const EpollHandler = struct {
     epfd: i32,
 
-    fn init(listener: posix.socket_t) !@This() {
+    const Self = @This();
+
+    fn init(listener: posix.socket_t) !Self {
         const epfd = try posix.epoll_create1(0);
         try initializeEvents(epfd, listener);
         return .{ .epfd = epfd };
@@ -208,6 +199,23 @@ const EpollHandler = struct {
             .data = .{ .fd = listener },
         };
         try posix.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, listener, &evt);
+    }
+
+    fn poll(self: *Self, srv: *Server) !void {
+        var events: [1]linux.epoll_event = undefined;
+        const n = posix.epoll_wait(self.epfd, &events, 50);
+        if (n == 0) return;
+        const event = events[0];
+        if (event.events & (linux.EPOLL.ERR | linux.EPOLL.HUP) != 0) {
+            should_shutdown.store(true, .release);
+            return;
+        }
+        if (event.data.fd == srv.listener) {
+            srv.acceptConnection() catch |err| switch (err) {
+                error.WouldBlock => {},
+                else => std.debug.print("error accepting connection: {any}\n", .{err}),
+            };
+        }
     }
 };
 

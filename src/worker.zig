@@ -30,6 +30,7 @@ pub const Worker = struct {
     resp: *Response,
     resp_header_buf: []align(16) u8,
     iovecs: std.ArrayList(posix.iovec_const),
+    connection_requests: std.AutoHashMap(posix.socket_t, u32),
     shutdown: std.atomic.Value(bool),
     shutdown_cond: std.Thread.Condition,
     shutdown_mutex: std.Thread.Mutex,
@@ -59,7 +60,8 @@ pub const Worker = struct {
         const max_header_size = ((64 + 256 + 3) * 32) + "HTTP/1.1 500 Internal Server Error\n".len;
         const aligned_header_size = std.mem.alignForward(usize, max_header_size, 16);
         self.resp_header_buf = try allocator.alignedAlloc(u8, 16, aligned_header_size);
-        self.iovecs = std.ArrayList(posix.iovec_const).init(self.allocator);
+        self.iovecs = std.ArrayList(posix.iovec_const).init(allocator);
+        self.connection_requests = std.AutoHashMap(posix.socket_t, u32).init(allocator);
         self.shutdown = std.atomic.Value(bool).init(false);
         self.shutdown_cond = std.Thread.Condition{};
         self.shutdown_mutex = std.Thread.Mutex{};
@@ -81,6 +83,7 @@ pub const Worker = struct {
         self.resp.deinit();
         self.allocator.free(self.resp_header_buf);
         self.iovecs.deinit();
+        self.connection_requests.deinit();
         self.thread.join();
         std.debug.print("worker-{d} shutdown\n", .{self.id});
     }
@@ -109,8 +112,6 @@ pub const Worker = struct {
             return;
         };
         defer reader.deinit();
-        var connection_requests = std.AutoHashMap(posix.socket_t, u32).init(self.allocator);
-        defer connection_requests.deinit();
         while (!self.shutdown.load(.acquire)) {
             const timeout = switch (os) {
                 .freebsd, .netbsd, .openbsd, .dragonfly, .macos => posix.timespec{ .sec = 0, .nsec = 50_000_000 },
@@ -131,26 +132,36 @@ pub const Worker = struct {
                     .linux => event.data.fd,
                     else => unreachable,
                 };
-                self.handleEvent(socket, reader) catch |err| switch (err) {
-                    error.EOF => {},
-                    else => std.debug.print("error handling event: {any}\n", .{err}),
+                self.handleEvent(socket, reader) catch |err| {
+                    posix.close(socket);
+                    _ = self.connection_requests.remove(socket);
+                    switch (err) {
+                        error.EOF => {}, // Expected case
+                        else => std.debug.print("error handling event: {any}\n", .{err}),
+                    }
+                    continue;
                 };
-                const requests_handled = connection_requests.get(socket) orelse 0;
+                const requests_handled = self.connection_requests.get(socket) orelse 0;
                 if (requests_handled >= 100) {
                     posix.close(socket);
-                    _ = connection_requests.remove(socket);
-                    continue;
+                    _ = self.connection_requests.remove(socket);
+                } else {
+                    self.connection_requests.put(socket, requests_handled + 1) catch |err| {
+                        std.debug.print("error updating socket request count: {any}\n", .{err});
+                    };
                 }
-                connection_requests.put(socket, requests_handled + 1) catch |err| {
-                    std.debug.print("error updating socket request count: {any}\n", .{err});
-                };
             }
         }
     }
 
     fn handleEvent(self: *Self, socket: posix.socket_t, reader: *RequestReader) !void {
         var keep_alive = false;
-        defer if (!keep_alive) posix.close(socket);
+        defer {
+            if (!keep_alive) {
+                posix.close(socket);
+                _ = self.connection_requests.remove(socket);
+            }
+        }
         // Is this correect? What if we have read part of the next request?
         // The advantage is that this is faster than compacting the buffer.
         reader.reset();
