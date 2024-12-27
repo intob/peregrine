@@ -122,24 +122,33 @@ pub const RequestReader = struct {
     }
 };
 
+// This has been optimised to take advantage of the fixed length of HTTP/1.x
+// version. This saves us one search for the final ' ' marking the path ending.
+// This implementation also handles both CRLF and bare LF line endings.
+// As HTTP/2 is a binary protocol, it will be handled in a different path.
 fn parseRequestLine(req: *Request, buffer: []const u8) !void {
+    // Find first space for method end
     const method_end = std.mem.indexOfScalar(u8, buffer, ' ') orelse return error.InvalidRequest;
     if (method_end > "OPTIONS".len) return error.InvalidRequest;
-    const path_start = method_end + 1;
-    const path_end = if (path_start < buffer.len)
-        std.mem.indexOfScalarPos(u8, buffer, path_start, ' ') orelse return error.InvalidRequest
+    // Find version start from the end (looking for last space)
+    const line_end = if (buffer[buffer.len - 2] == '\r' and buffer[buffer.len - 1] == '\n')
+        buffer.len - 2 // CRLF ending
+    else if (buffer[buffer.len - 1] == '\n')
+        buffer.len - 1 // LF ending
     else
         return error.InvalidRequest;
-    const version_start = path_end + 1;
-    if (version_start + 8 > buffer.len) return error.InvalidRequest;
-    const version_end = if (version_start < buffer.len)
-        std.mem.indexOfScalarPos(u8, buffer, version_start, '\r') orelse return error.InvalidRequest
-    else
-        return error.InvalidRequest;
+    if (line_end < method_end + 10) return error.InvalidRequest;
+    // HTTP version is fixed length, so we can calculate version_start
+    const version_start = line_end - 8; // Length of "HTTP/1.x"
+    if (buffer[version_start - 1] != ' ') return error.InvalidRequest;
+    // Parse method and version first
     req.method = try Method.parse(buffer[0..method_end]);
+    req.version = try Version.parse(buffer[version_start..line_end]);
+    // Path is everything between method and version
+    const path_start = method_end + 1;
+    const path_end = version_start - 1;
     req.path_len = path_end - path_start;
     @memcpy(req.path_buf[0..req.path_len], buffer[path_start..path_end]);
-    req.version = try Version.parse(buffer[version_start..version_end]);
 }
 
 test "benchmark read and parse headers" {
@@ -148,7 +157,7 @@ test "benchmark read and parse headers" {
     var req = try Request.init(allocator);
     defer req.deinit();
     var reader = try RequestReader.init(allocator, 1024);
-    const raw = "Header-1: header-1-value\nHeader-2: header-2-value\nHeader-3: header-3-value\r\n\r\n";
+    const raw = "Header-1: header-1-value\r\nHeader-2: header-2-value\r\nHeader-3: header-3-value\r\n\r\n";
     const iterations: usize = 10_000_000;
     var i: usize = 0;
     var timer = try std.time.Timer.start();
@@ -162,6 +171,30 @@ test "benchmark read and parse headers" {
     const elapsed = timer.lap();
     const avg_ns = @divFloor(elapsed, iterations);
     std.debug.print("Average time: {d}ns\n", .{avg_ns});
+}
+
+test "test parse request line" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+    var req = try Request.init(allocator);
+    defer req.deinit();
+    const line = "GET /some-random-path?some=test HTTP/1.1\r\n";
+    try parseRequestLine(req, line[0..]);
+    try std.testing.expectEqual(Version.@"HTTP/1.1", req.version);
+    try std.testing.expectEqual(Method.GET, req.method);
+    try std.testing.expectEqualStrings("/some-random-path?some=test", req.getPath());
+}
+
+test "test parse request line bare LF" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+    var req = try Request.init(allocator);
+    defer req.deinit();
+    const line = "POST /some-random-path HTTP/1.0\n";
+    try parseRequestLine(req, line[0..]);
+    try std.testing.expectEqual(Version.@"HTTP/1.0", req.version);
+    try std.testing.expectEqual(Method.POST, req.method);
+    try std.testing.expectEqualStrings("/some-random-path", req.getPath());
 }
 
 test "benchmark parse request line" {
