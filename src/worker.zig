@@ -137,14 +137,15 @@ pub const Worker = struct {
                     .linux => event.data.fd,
                     else => unreachable,
                 };
+                self.handleEvent(socket, reader) catch |err| {
+                    std.debug.print("error handling event: {any}\n", .{err});
+                };
                 const requests_handled = connection_requests.get(socket) orelse 0;
                 if (requests_handled >= 100) {
                     posix.close(socket);
                     _ = connection_requests.remove(socket);
                     continue;
                 }
-                self.handleEvent(socket, reader) catch {};
-                //std.debug.print("error handling event: {any}\n", .{err});
                 connection_requests.put(socket, requests_handled + 1) catch |err| {
                     std.debug.print("error updating socket request count: {any}\n", .{err});
                 };
@@ -153,25 +154,28 @@ pub const Worker = struct {
     }
 
     fn handleEvent(self: *Self, socket: posix.socket_t, reader: *RequestReader) !void {
-        const keep_alive = self.shouldKeepAlive();
-        defer {
-            if (!keep_alive) {
-                posix.close(socket);
+        var keep_alive = false;
+        defer if (!keep_alive) posix.close(socket);
+        while (true) {
+            self.req.reset();
+            reader.readRequest(socket, self.req) catch |err| switch (err) {
+                error.WouldBlock => break,
+                else => return err,
+            };
+            keep_alive = self.shouldKeepAlive();
+            self.resp.reset();
+            self.on_request(self.req, self.resp);
+            if (!self.resp.hijacked) {
+                try self.respond(socket, keep_alive);
+                if (!keep_alive) break;
             }
-        }
-        self.req.reset();
-        try reader.readRequest(socket, self.req);
-        self.resp.reset();
-        self.on_request(self.req, self.resp);
-        if (!self.resp.hijacked) {
-            try self.respond(socket, keep_alive);
         }
     }
 
     fn shouldKeepAlive(self: *Self) bool {
         if (self.req.version == .@"HTTP/1.1") {
             if (self.req.getHeader("Connection")) |connection| {
-                return !std.mem.eql(u8, connection, "close");
+                return !std.mem.eql(u8, connection, "Close");
             }
             return true; // HTTP/1.1 defaults to keep-alive
         }
@@ -220,7 +224,7 @@ const KqueueHandler = struct {
         const event = posix.Kevent{
             .ident = @intCast(socket),
             .filter = posix.system.EVFILT.READ,
-            .flags = posix.system.EV.ADD,
+            .flags = posix.system.EV.ADD | posix.system.EV.CLEAR,
             .fflags = 0,
             .data = 0,
             .udata = @intCast(socket),
@@ -247,7 +251,7 @@ const EpollHandler = struct {
 
     pub fn addSocket(self: *@This(), socket: posix.socket_t) !void {
         var event = linux.epoll_event{
-            .events = linux.EPOLL.IN,
+            .events = linux.EPOLL.IN | linux.EPOLL.ET,
             .data = .{ .fd = socket },
         };
         try posix.epoll_ctl(self.epfd, linux.EPOLL.CTL_ADD, socket, &event);
