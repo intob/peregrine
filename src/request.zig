@@ -88,8 +88,7 @@ pub const Request = struct {
     }
 
     // Socket, method, path_buf and path_len will always be overwritten by the
-    // request reader.
-    // See below. No need to reset them here also.
+    // request reader. No need to reset them here also.
     // This method should be called BEFORE the call to RequestReader.readRequest.
     // The query map is reset in the parseQuery method, because we don't need to clear
     // the map unless we want to use it.
