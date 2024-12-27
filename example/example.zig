@@ -7,13 +7,15 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const srv = try pereg.Server.init(.{
         .allocator = allocator,
-        .port = 3000,
         .on_request = handler,
+        .port = 3000,
         // .ip defaults to 0.0.0.0
-        // .worker_count defaults to CPU core count
+        // .worker_thread_count defaults to CPU core count
+        // .accept_thread_count defaults to worker_thread_count/3
+        //    with a minimum of 1
     });
     std.debug.print("listening on 0.0.0.0:3000\n", .{});
-    try srv.start(); // This blocks if there is no error
+    try srv.start(); // Blocks if there is no error
 }
 
 fn handler(req: *pereg.Request, resp: *pereg.Response) void {
@@ -21,19 +23,22 @@ fn handler(req: *pereg.Request, resp: *pereg.Response) void {
 }
 
 fn handle(req: *pereg.Request, resp: *pereg.Response) !void {
+    // The query is only parsed if you explicitly call parseQuery
     if (try req.parseQuery()) |query| {
         var iter = query.iterator();
-        while (iter.next()) |entry| {
-            std.debug.print("query param {s}: {s}\n", .{
-                entry.key_ptr.*,
-                entry.value_ptr.*,
+        while (iter.next()) |param| {
+            std.debug.print("query parameter {s}: {s}\n", .{
+                param.key_ptr.*,
+                param.value_ptr.*,
             });
         }
     }
+    // After calling parseQuery, it is safe to access the query hash map directly
+    // std.debug.print("got {d} query params\n", .{req.query.count()});
     try resp.setBody("Kawww\n");
     try resp.headers.append(try pereg.Header.init(.{
-        .key = "Content-Length",
-        .value = "6",
+        .key = "Content-Length", // Max length of 64 (see Header.init)
+        .value = "6", // Max length of 256 (see Header.init)
     }));
 }
 

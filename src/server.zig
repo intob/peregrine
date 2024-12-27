@@ -15,10 +15,11 @@ fn handleSignal(sig: c_int) callconv(.C) void {
 
 pub const ServerConfig = struct {
     allocator: std.mem.Allocator,
-    ip: []const u8 = "0.0.0.0",
-    port: u16,
     on_request: worker.RequestHandler,
-    worker_count: usize = 0, // Defaults to CPU core count
+    port: u16,
+    ip: []const u8 = "0.0.0.0",
+    worker_thread_count: usize = 0, // Defaults to CPU core count
+    accept_thread_count: usize = 0,
 };
 
 pub const Server = struct {
@@ -61,7 +62,14 @@ pub const Server = struct {
         };
         posix.sigaction(posix.SIG.INT, &sig_action, null);
         posix.sigaction(posix.SIG.TERM, &sig_action, null);
-        const worker_count = if (cfg.worker_count > 0) cfg.worker_count else try std.Thread.getCpuCount();
+        const worker_thread_count = if (cfg.worker_thread_count > 0)
+            cfg.worker_thread_count
+        else
+            try std.Thread.getCpuCount();
+        const accept_thread_count = if (cfg.accept_thread_count > 0)
+            cfg.accept_thread_count
+        else
+            @max(1, worker_thread_count / 3);
         const io_handler = switch (native_os) {
             .freebsd, .netbsd, .openbsd, .dragonfly, .macos => try KqueueHandler.init(listener),
             .linux => try EpollHandler.init(listener),
@@ -72,10 +80,10 @@ pub const Server = struct {
         srv.* = .{
             .allocator = allocator,
             .address = address,
-            .workers = try allocator.alloc(worker.Worker, worker_count),
+            .workers = try allocator.alloc(worker.Worker, worker_thread_count),
             .next_worker = 0,
             .listener = listener,
-            .accept_threads = try allocator.alloc(std.Thread, @max(1, (worker_count / 3))), // maybe tweak this
+            .accept_threads = try allocator.alloc(std.Thread, accept_thread_count),
             .io_handler = io_handler,
         };
         for (srv.workers, 0..) |*w, i| {
@@ -88,7 +96,7 @@ pub const Server = struct {
     }
 
     /// Blocks until the server is shutdown.
-    pub fn start(self: *Self) !void {
+    pub fn start(self: *Self) posix.ListenError!void {
         should_shutdown = std.atomic.Value(bool).init(false);
         try posix.listen(self.listener, 1024);
         self.waitForShutdown();
