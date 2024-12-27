@@ -86,7 +86,7 @@ pub const Worker = struct {
         self.iovecs.deinit();
         self.connection_requests.deinit();
         self.thread.join();
-        std.debug.print("worker-{d} shutdown\n", .{self.id});
+        std.debug.print("worker-thread-{d} joined\n", .{self.id});
     }
 
     pub fn addClient(self: *Self, socket: posix.socket_t) !void {
@@ -219,7 +219,7 @@ const KqueueHandler = struct {
         const event = posix.Kevent{
             .ident = @intCast(socket),
             .filter = posix.system.EVFILT.READ,
-            .flags = posix.system.EV.ADD, // | posix.system.EV.CLEAR,
+            .flags = posix.system.EV.ADD | posix.system.EV.CLEAR,
             .fflags = 0,
             .data = 0,
             .udata = @intCast(socket),
@@ -248,7 +248,7 @@ const EpollHandler = struct {
 
     pub fn addSocket(self: *Self, socket: posix.socket_t) !void {
         var event = linux.epoll_event{
-            .events = linux.EPOLL.IN, // | linux.EPOLL.ET,
+            .events = linux.EPOLL.IN | linux.EPOLL.ET,
             .data = .{ .fd = socket },
         };
         try posix.epoll_ctl(self.epfd, linux.EPOLL.CTL_ADD, socket, &event);

@@ -27,7 +27,7 @@ pub const Server = struct {
     workers: []worker.Worker,
     next_worker: usize,
     listener: posix.socket_t,
-    thread: std.Thread,
+    accept_threads: []std.Thread,
     io_handler: IOHandler,
 
     const Self = @This();
@@ -40,8 +40,6 @@ pub const Server = struct {
 
     pub fn init(cfg: ServerConfig) !*Self {
         const allocator = cfg.allocator;
-        const s = try allocator.create(Self);
-        errdefer allocator.destroy(s);
         const sock_type: u32 = posix.SOCK.STREAM | posix.SOCK.NONBLOCK;
         const address = try std.net.Address.parseIp(cfg.ip, cfg.port);
         const listener = try posix.socket(address.any.family, sock_type, posix.IPPROTO.TCP);
@@ -69,98 +67,100 @@ pub const Server = struct {
             .linux => try EpollHandler.init(listener),
             else => unreachable,
         };
-        s.* = .{
+        const srv = try allocator.create(Self);
+        errdefer allocator.destroy(srv);
+        srv.* = .{
             .allocator = allocator,
             .address = address,
             .workers = try allocator.alloc(worker.Worker, worker_count),
             .next_worker = 0,
             .listener = listener,
-            .thread = undefined,
+            .accept_threads = try allocator.alloc(std.Thread, @max(1, (worker_count / 3))), // maybe tweak this
             .io_handler = io_handler,
         };
-        for (s.workers, 0..) |*w, i| {
+        for (srv.workers, 0..) |*w, i| {
             try w.init(.{ .allocator = allocator, .id = i, .on_request = cfg.on_request });
         }
-        return s;
+        for (srv.accept_threads) |*thread| {
+            thread.* = try std.Thread.spawn(.{}, loop, .{srv});
+        }
+        return srv;
     }
 
     /// Blocks until the server is shutdown.
     pub fn start(self: *Self) !void {
         should_shutdown = std.atomic.Value(bool).init(false);
         try posix.listen(self.listener, 1024);
-        const Runner = struct {
-            fn run(srv: *Self) !void {
-                while (!should_shutdown.load(.acquire)) {
-                    try srv.io_handler.poll(srv);
-                }
-                try srv.cleanup();
-            }
-        };
-        self.thread = try std.Thread.spawn(.{}, Runner.run, .{self});
-        self.thread.join();
+        self.waitForShutdown();
+    }
+
+    fn loop(self: *Self) !void {
+        while (!should_shutdown.load(.acquire)) {
+            try self.io_handler.poll(self);
+        }
     }
 
     fn acceptConnection(self: *Self) !void {
         const clsock = try posix.accept(self.listener, null, null, posix.SOCK.NONBLOCK);
         errdefer posix.close(clsock);
         try setClientSockOpt(clsock);
-        try self.workers[self.next_worker].addClient(clsock);
-        self.next_worker = (self.next_worker + 1) % self.workers.len;
+        const worker_id = @atomicRmw(usize, &self.next_worker, .Add, 1, .monotonic) % self.workers.len;
+        //std.debug.print("accepted sock {d}, sent to worker {d}\n", .{ clsock, worker_id });
+        try self.workers[worker_id].addClient(clsock);
     }
 
     pub fn shutdown(self: *Self) void {
         should_shutdown.store(true, .release);
-        self.thread.join();
+        self.waitForShutdown();
     }
 
-    fn cleanup(self: *Self) !void {
-        posix.close(self.listener);
+    fn waitForShutdown(self: *Self) void {
+        for (self.accept_threads, 0..) |t, i| {
+            t.join();
+            std.debug.print("accept-thread-{d} joined\n", .{i});
+        }
         for (self.workers) |*w| {
             w.deinit();
         }
+        self.cleanup();
+        std.debug.print("shutdown complete\n", .{});
+    }
+
+    fn cleanup(self: *Self) void {
+        posix.close(self.listener);
         self.allocator.free(self.workers);
+        self.allocator.free(self.accept_threads);
         self.allocator.destroy(self);
     }
 };
 
 const KqueueHandler = struct {
     kfd: i32,
+    timeout: posix.timespec,
+    listener_ident: usize,
 
     const Self = @This();
 
     fn init(listener: posix.socket_t) !Self {
         const kfd = try posix.kqueue();
         try initializeEvents(kfd, listener);
-        return .{ .kfd = kfd };
+        return .{
+            .kfd = kfd,
+            .timeout = posix.timespec{ .sec = 1, .nsec = 0 },
+            .listener_ident = @intCast(listener),
+        };
     }
 
     fn initializeEvents(kfd: i32, listener: posix.socket_t) !void {
-        const events = [_]posix.Kevent{
-            .{
-                .ident = @intCast(listener),
-                .filter = posix.system.EVFILT.READ,
-                .flags = posix.system.EV.ADD, // | posix.system.EV.CLEAR,
-                .fflags = 0,
-                .data = 0,
-                .udata = @intCast(listener),
-            },
-            .{
-                .ident = posix.SIG.INT,
-                .filter = posix.system.EVFILT.SIGNAL,
-                .flags = posix.system.EV.ADD,
-                .fflags = 0,
-                .data = 0,
-                .udata = 0,
-            },
-            .{
-                .ident = posix.SIG.TERM,
-                .filter = posix.system.EVFILT.SIGNAL,
-                .flags = posix.system.EV.ADD,
-                .fflags = 0,
-                .data = 0,
-                .udata = 0,
-            },
-        };
+        const events = [_]posix.Kevent{.{
+            .ident = @intCast(listener),
+            .filter = posix.system.EVFILT.READ,
+            // Edge-triggered causes multiple threads to accept the connection.
+            .flags = posix.system.EV.ADD, // | posix.system.EV.CLEAR,
+            .fflags = 0,
+            .data = 0,
+            .udata = @intCast(listener),
+        }};
         const result = try posix.kevent(kfd, &events, &.{}, null);
         if (result < 0) {
             return error.EventRegistrationFailed;
@@ -169,15 +169,13 @@ const KqueueHandler = struct {
 
     fn poll(self: *Self, srv: *Server) !void {
         var events: [1]posix.Kevent = undefined;
-        _ = try posix.kevent(self.kfd, &.{}, &events, null);
-        if (events[0].filter == posix.system.EVFILT.SIGNAL) {
-            should_shutdown.store(true, .release);
-            return;
+        _ = try posix.kevent(self.kfd, &.{}, &events, &self.timeout);
+        if (events[0].ident == self.listener_ident) {
+            srv.acceptConnection() catch |err| switch (err) {
+                error.WouldBlock => {},
+                else => std.debug.print("error accepting connection: {any}\n", .{err}),
+            };
         }
-        srv.acceptConnection() catch |err| switch (err) {
-            error.WouldBlock => {},
-            else => std.debug.print("error accepting connection: {any}\n", .{err}),
-        };
     }
 };
 
@@ -194,6 +192,7 @@ const EpollHandler = struct {
 
     fn initializeEvents(epfd: i32, listener: posix.socket_t) !void {
         var evt = linux.epoll_event{
+            // Edge-triggered causes multiple threads to accept the connection.
             .events = linux.EPOLL.IN, // | linux.EPOLL.ET,
             .data = .{ .fd = listener },
         };
@@ -205,10 +204,6 @@ const EpollHandler = struct {
         const n = posix.epoll_wait(self.epfd, &events, 50);
         if (n == 0) return;
         const event = events[0];
-        if (event.events & (linux.EPOLL.ERR | linux.EPOLL.HUP) != 0) {
-            should_shutdown.store(true, .release);
-            return;
-        }
         if (event.data.fd == srv.listener) {
             srv.acceptConnection() catch |err| switch (err) {
                 error.WouldBlock => {},

@@ -13,7 +13,6 @@ pub fn main() !void {
         // .worker_count defaults to CPU core count
     });
     std.debug.print("listening on 0.0.0.0:3000\n", .{});
-    std.debug.print("with {d} worker-threads\n", .{srv.workers.len});
     try srv.start(); // This blocks if there is no error
 }
 
