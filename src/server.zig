@@ -97,9 +97,9 @@ pub const Server = struct {
         self.thread.join();
     }
 
-    fn pollKqueue(self: *Self, timeout: *const posix.timespec) !void {
+    fn pollKqueue(self: *Self, _: *const posix.timespec) !void {
         var events: [1]posix.Kevent = undefined;
-        _ = try posix.kevent(self.io_handler.kfd, &.{}, &events, timeout);
+        _ = try posix.kevent(self.io_handler.kfd, &.{}, &events, null);
         if (events[0].filter == posix.system.EVFILT.SIGNAL) {
             should_shutdown.store(true, .release);
             return;
@@ -186,7 +186,10 @@ const KqueueHandler = struct {
                 .udata = 0,
             },
         };
-        _ = try posix.kevent(kfd, &events, &.{}, null);
+        const result = try posix.kevent(kfd, &events, &.{}, null);
+        if (result < 0) {
+            return error.EventRegistrationFailed;
+        }
     }
 };
 
