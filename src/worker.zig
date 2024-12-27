@@ -132,12 +132,12 @@ pub const Worker = struct {
                     .linux => event.data.fd,
                     else => unreachable,
                 };
-                self.handleEvent(socket, reader) catch |err| {
+                self.readSocket(socket, reader) catch |err| {
                     posix.close(socket);
                     _ = self.connection_requests.remove(socket);
                     switch (err) {
                         error.EOF => {}, // Expected case
-                        else => std.debug.print("error handling event: {any}\n", .{err}),
+                        else => std.debug.print("error reading socket: {any}\n", .{err}),
                     }
                     continue;
                 };
@@ -154,7 +154,7 @@ pub const Worker = struct {
         }
     }
 
-    fn handleEvent(self: *Self, socket: posix.socket_t, reader: *RequestReader) !void {
+    fn readSocket(self: *Self, socket: posix.socket_t, reader: *RequestReader) !void {
         var keep_alive = false;
         defer {
             if (!keep_alive) {
@@ -162,7 +162,7 @@ pub const Worker = struct {
                 _ = self.connection_requests.remove(socket);
             }
         }
-        // Is this correect? What if we have read part of the next request?
+        // Is this correct? What if we have read part of the next request?
         // The advantage is that this is faster than compacting the buffer.
         reader.reset();
         self.req.reset();
@@ -216,16 +216,18 @@ fn shouldKeepAlive(req: *Request) bool {
 const KqueueHandler = struct {
     kfd: i32,
 
-    pub fn init() !@This() {
+    const Self = @This();
+
+    pub fn init() !Self {
         const kfd = try posix.kqueue();
         return .{ .kfd = kfd };
     }
 
-    pub fn addSocket(self: *@This(), socket: posix.socket_t) !void {
+    pub fn addSocket(self: *Self, socket: posix.socket_t) !void {
         const event = posix.Kevent{
             .ident = @intCast(socket),
             .filter = posix.system.EVFILT.READ,
-            .flags = posix.system.EV.ADD | posix.system.EV.CLEAR,
+            .flags = posix.system.EV.ADD, // | posix.system.EV.CLEAR,
             .fflags = 0,
             .data = 0,
             .udata = @intCast(socket),
@@ -233,11 +235,11 @@ const KqueueHandler = struct {
         _ = try posix.kevent(self.kfd, &[_]posix.Kevent{event}, &.{}, null);
     }
 
-    pub fn wait(self: *@This(), events: []posix.Kevent, timeout: ?*const posix.timespec) !usize {
+    pub fn wait(self: *Self, events: []posix.Kevent, timeout: ?*const posix.timespec) !usize {
         return try posix.kevent(self.kfd, &.{}, events, timeout);
     }
 
-    pub fn deinit(self: *@This()) void {
+    pub fn deinit(self: *Self) void {
         posix.close(self.kfd);
     }
 };
@@ -245,24 +247,26 @@ const KqueueHandler = struct {
 const EpollHandler = struct {
     epfd: i32,
 
-    pub fn init() !@This() {
+    const Self = @This();
+
+    pub fn init() !Self {
         const epfd = try posix.epoll_create1(0);
         return .{ .epfd = epfd };
     }
 
-    pub fn addSocket(self: *@This(), socket: posix.socket_t) !void {
+    pub fn addSocket(self: *Self, socket: posix.socket_t) !void {
         var event = linux.epoll_event{
-            .events = linux.EPOLL.IN | linux.EPOLL.ET,
+            .events = linux.EPOLL.IN, // | linux.EPOLL.ET,
             .data = .{ .fd = socket },
         };
         try posix.epoll_ctl(self.epfd, linux.EPOLL.CTL_ADD, socket, &event);
     }
 
-    pub fn wait(self: *@This(), events: []linux.epoll_event, timeout_ms: i32) !usize {
+    pub fn wait(self: *Self, events: []linux.epoll_event, timeout_ms: i32) !usize {
         return posix.epoll_wait(self.epfd, events, timeout_ms);
     }
 
-    pub fn deinit(self: *@This()) void {
+    pub fn deinit(self: *Self) void {
         posix.close(self.epfd);
     }
 };

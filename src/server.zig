@@ -87,7 +87,7 @@ pub const Server = struct {
     /// Blocks until the server is shutdown.
     pub fn start(self: *Self) !void {
         should_shutdown = std.atomic.Value(bool).init(false);
-        try posix.listen(self.listener, 128);
+        try posix.listen(self.listener, 1024);
         const Runner = struct {
             fn run(srv: *Self) !void {
                 while (!should_shutdown.load(.acquire)) {
@@ -139,7 +139,7 @@ const KqueueHandler = struct {
             .{
                 .ident = @intCast(listener),
                 .filter = posix.system.EVFILT.READ,
-                .flags = posix.system.EV.ADD | posix.system.EV.CLEAR,
+                .flags = posix.system.EV.ADD, // | posix.system.EV.CLEAR,
                 .fflags = 0,
                 .data = 0,
                 .udata = @intCast(listener),
@@ -194,7 +194,7 @@ const EpollHandler = struct {
 
     fn initializeEvents(epfd: i32, listener: posix.socket_t) !void {
         var evt = linux.epoll_event{
-            .events = linux.EPOLL.IN | linux.EPOLL.ET,
+            .events = linux.EPOLL.IN, // | linux.EPOLL.ET,
             .data = .{ .fd = listener },
         };
         try posix.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, listener, &evt);
@@ -219,6 +219,7 @@ const EpollHandler = struct {
 };
 
 fn setClientSockOpt(sock: posix.socket_t) !void {
+    try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(@as(c_int, 1)));
     const send_timeout = posix.timeval{ .sec = 2, .usec = 500_000 };
     const recv_timeout = posix.timeval{ .sec = 10_000, .usec = 0 };
     try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &std.mem.toBytes(send_timeout));

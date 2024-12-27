@@ -38,7 +38,7 @@ func get(target string) {
 	}
 	dur := time.Since(t)
 	usPerReq := float32(dur.Microseconds()) / float32((NUM_REQUEST))
-	fmt.Printf("made %dK requests in %s\n%.2fµs/req\n%.2freq/sec\n", NUM_REQUEST/1000, dur, usPerReq, float64(NUM_REQUEST)/dur.Seconds())
+	fmt.Printf("%dK requests in %s\n%.2fµs/req\n%.2freq/sec\n", NUM_REQUEST/1000, dur, usPerReq, float64(NUM_REQUEST)/dur.Seconds())
 }
 
 func serve() {
