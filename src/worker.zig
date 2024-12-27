@@ -96,13 +96,11 @@ pub const Worker = struct {
             self.shutdown_done = true;
             self.shutdown_cond.signal();
         }
-
         const EventType = switch (os) {
             .freebsd, .netbsd, .openbsd, .dragonfly, .macos => posix.Kevent,
             .linux => linux.epoll_event,
             else => unreachable,
         };
-
         var events: [128]EventType = undefined;
         // TODO: make request reader buffer size configurable
         // Buffer is aligned internally
@@ -111,17 +109,14 @@ pub const Worker = struct {
             return;
         };
         defer reader.deinit();
-
         var connection_requests = std.AutoHashMap(posix.socket_t, u32).init(self.allocator);
         defer connection_requests.deinit();
-
         while (!self.shutdown.load(.acquire)) {
             const timeout = switch (os) {
                 .freebsd, .netbsd, .openbsd, .dragonfly, .macos => posix.timespec{ .sec = 0, .nsec = 50_000_000 },
-                .linux => 50, // 50ms timeout
+                .linux => 50, // 50ms
                 else => unreachable,
             };
-
             const ready_count = switch (os) {
                 .freebsd, .netbsd, .openbsd, .dragonfly, .macos => self.io_handler.wait(&events, &timeout),
                 .linux => self.io_handler.wait(&events, timeout),
@@ -130,15 +125,15 @@ pub const Worker = struct {
                 std.debug.print("event wait error: {}\n", .{err});
                 continue;
             };
-
             for (events[0..ready_count]) |event| {
                 const socket: i32 = switch (os) {
                     .freebsd, .netbsd, .openbsd, .dragonfly, .macos => @intCast(event.udata),
                     .linux => event.data.fd,
                     else => unreachable,
                 };
-                self.handleEvent(socket, reader) catch |err| {
-                    std.debug.print("error handling event: {any}\n", .{err});
+                self.handleEvent(socket, reader) catch |err| switch (err) {
+                    error.EOF => {},
+                    else => std.debug.print("error handling event: {any}\n", .{err}),
                 };
                 const requests_handled = connection_requests.get(socket) orelse 0;
                 if (requests_handled >= 100) {
@@ -156,30 +151,15 @@ pub const Worker = struct {
     fn handleEvent(self: *Self, socket: posix.socket_t, reader: *RequestReader) !void {
         var keep_alive = false;
         defer if (!keep_alive) posix.close(socket);
-        while (true) {
-            self.req.reset();
-            reader.readRequest(socket, self.req) catch |err| switch (err) {
-                error.WouldBlock => break,
-                else => return err,
-            };
-            keep_alive = self.shouldKeepAlive();
-            self.resp.reset();
-            self.on_request(self.req, self.resp);
-            if (!self.resp.hijacked) {
-                try self.respond(socket, keep_alive);
-                if (!keep_alive) break;
-            }
-        }
-    }
-
-    fn shouldKeepAlive(self: *Self) bool {
-        if (self.req.version == .@"HTTP/1.1") {
-            if (self.req.getHeader("Connection")) |connection| {
-                return !std.mem.eql(u8, connection, "Close");
-            }
-            return true; // HTTP/1.1 defaults to keep-alive
-        }
-        return false; // HTTP/1.0
+        // Is this correect? What if we have read part of the next request?
+        // The advantage is that this is faster than compacting the buffer.
+        reader.reset();
+        self.req.reset();
+        try reader.readRequest(socket, self.req);
+        keep_alive = shouldKeepAlive(self.req);
+        self.resp.reset();
+        self.on_request(self.req, self.resp);
+        if (!self.resp.hijacked) try self.respond(socket, keep_alive);
     }
 
     fn respond(self: *Self, socket: posix.socket_t, keep_alive: bool) !void {
@@ -211,6 +191,16 @@ pub const Worker = struct {
         }
     }
 };
+
+fn shouldKeepAlive(req: *Request) bool {
+    if (req.version == .@"HTTP/1.1") {
+        if (req.getHeader("Connection")) |connection| {
+            return !std.mem.eql(u8, connection, "Close");
+        }
+        return true; // HTTP/1.1 defaults to keep-alive
+    }
+    return false; // HTTP/1.0
+}
 
 const KqueueHandler = struct {
     kfd: i32,

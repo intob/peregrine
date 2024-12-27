@@ -30,12 +30,10 @@ pub const RequestReader = struct {
     }
 
     pub fn readRequest(self: *Self, socket: posix.socket_t, req: *Request) !void {
-        self.reset();
         req.socket = socket;
         const n = try self.readLine(socket);
-        if (n < "GET / HTTP/1.1".len) { // Fast path
-            return error.InvalidRequest;
-        }
+        if (n == 0) return error.EOF;
+        if (n < "GET / HTTP/1.1".len) return error.InvalidRequest;
         try parseRequestLine(req, self.buffer[self.start - n .. self.start]);
         try self.readHeaders(socket, req);
     }
