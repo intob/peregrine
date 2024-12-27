@@ -148,12 +148,6 @@ pub const Worker = struct {
 
     fn readSocket(self: *Self, socket: posix.socket_t, reader: *RequestReader) !void {
         var keep_alive = false;
-        defer {
-            if (!keep_alive) {
-                posix.close(socket);
-                _ = self.connection_requests.remove(socket);
-            }
-        }
         // Is this correct? What if we have read part of the next request?
         // The advantage is that this is faster than compacting the buffer.
         reader.reset();
@@ -162,7 +156,11 @@ pub const Worker = struct {
         keep_alive = shouldKeepAlive(self.req);
         self.resp.reset();
         self.on_request(self.req, self.resp);
-        if (!self.resp.hijacked) try self.respond(socket, keep_alive);
+        if (!self.resp.hijacked) {
+            try self.respond(socket, keep_alive);
+            // Returning EOF causes the connection to be closed by the caller.
+            if (!keep_alive) return error.EOF;
+        }
     }
 
     fn respond(self: *Self, socket: posix.socket_t, keep_alive: bool) !void {
@@ -197,7 +195,7 @@ pub const Worker = struct {
 fn shouldKeepAlive(req: *Request) bool {
     if (req.version == .@"HTTP/1.1") {
         if (req.getHeader("Connection")) |connection| {
-            return !std.mem.eql(u8, connection, "Close");
+            return !std.mem.eql(u8, connection, "close");
         }
         return true; // HTTP/1.1 defaults to keep-alive
     }
