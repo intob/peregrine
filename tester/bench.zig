@@ -4,42 +4,44 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer std.debug.assert(gpa.deinit() == .ok);
     const allocator = gpa.allocator();
-
-    // Create HTTP client
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
-
-    // Benchmark configuration
-    const num_requests = 10_000;
-    const uri = try std.Uri.parse("http://127.0.0.1:5882/");
-
-    // Timing variables
-    var timer = try std.time.Timer.start();
-    var total_time: u64 = 0;
+    const num_requests = 100_000;
+    const uri = try std.Uri.parse("http://127.0.0.1:3000/");
     var successful_requests: usize = 0;
-
-    // Run benchmark
     var i: usize = 0;
+    //var resp = std.ArrayList(u8).init(allocator);
+    var timer = try std.time.Timer.start();
+    const start_time = timer.read();
     while (i < num_requests) : (i += 1) {
-        timer.reset();
-        _ = client.fetch(.{
+        const req = client.fetch(.{
             .location = .{ .uri = uri },
             .method = .GET,
-            .keep_alive = false, // Disable keep-alive to avoid connection resets
+            .keep_alive = true,
+            .response_storage = .ignore,
         }) catch |err| switch (err) {
-            error.ConnectionResetByPeer => {},
+            error.ConnectionResetByPeer => continue,
             else => return err,
         };
-        total_time += timer.read();
-        successful_requests += 1;
+        if (req.status == std.http.Status.ok) {
+            successful_requests += 1;
+        }
     }
-
-    // Calculate and print results
+    const total_time = timer.read() - start_time;
     const avg_time = @divFloor(total_time, successful_requests);
     const requests_per_sec = @divFloor(std.time.ns_per_s * successful_requests, total_time);
-
-    try std.io.getStdOut().writer().print("Benchmark Results:\n" ++
-        "Successful Requests: {d}/{d}\n" ++
-        "Average Time: {d}ns\n" ++
-        "Requests/second: {d}\n", .{ successful_requests, num_requests, avg_time, requests_per_sec });
+    try std.io.getStdOut().writer().print(
+        \\Benchmark Results:
+        \\Successful Requests: {d}/{d}
+        \\Total Time: {d}ms
+        \\Average Time: {d}µs
+        \\Requests/second: {d}
+        \\
+    , .{
+        successful_requests,
+        num_requests,
+        total_time / std.time.ns_per_ms,
+        avg_time / std.time.ns_per_us,
+        requests_per_sec,
+    });
 }
