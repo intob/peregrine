@@ -56,14 +56,13 @@ pub const Server = struct {
             try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
         }
         try posix.bind(listener, &address.any, address.getOsSockLen());
-        // Init interrupt signal handler
-        var act = posix.Sigaction{
+        var sig_action = posix.Sigaction{
             .handler = .{ .handler = handleSignal },
             .mask = posix.empty_sigset,
             .flags = 0,
         };
-        posix.sigaction(posix.SIG.INT, &act, null);
-        posix.sigaction(posix.SIG.TERM, &act, null);
+        posix.sigaction(posix.SIG.INT, &sig_action, null);
+        posix.sigaction(posix.SIG.TERM, &sig_action, null);
         const worker_count = if (cfg.worker_count > 0) cfg.worker_count else try std.Thread.getCpuCount();
         const io_handler = switch (os) {
             .freebsd, .netbsd, .openbsd, .dragonfly, .macos => try KqueueHandler.init(listener),
