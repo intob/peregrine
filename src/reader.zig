@@ -180,3 +180,34 @@ test "benchmark parse request line" {
     const avg_ns = @divFloor(elapsed, iterations);
     std.debug.print("Average time: {d}ns\n", .{avg_ns});
 }
+
+test "benchmark HTTP GET request parsing" {
+    const allocator = std.testing.allocator;
+    var req = try Request.init(allocator);
+    defer req.deinit();
+    var reader = try RequestReader.init(allocator, 4096);
+    defer reader.deinit();
+    const request_data =
+        "GET /path/to/resource HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "User-Agent: test-client\r\n" ++
+        "Accept: */*\r\n" ++
+        "Connection: keep-alive\r\n\r\n";
+    const pipe_fds = try posix.pipe();
+    const read_fd = pipe_fds[0];
+    const write_fd = pipe_fds[1];
+    defer posix.close(read_fd);
+    defer posix.close(write_fd);
+    const iterations: usize = 1_000_000;
+    var timer = try std.time.Timer.start();
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        _ = try posix.write(write_fd, request_data);
+        reader.reset();
+        req.reset();
+        try reader.readRequest(read_fd, req);
+    }
+    const elapsed = timer.lap();
+    const avg_ns = @divFloor(elapsed, iterations);
+    std.debug.print("Average request parse time: {d}ns\n", .{avg_ns});
+}
