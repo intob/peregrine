@@ -32,13 +32,16 @@ pub const Header = struct {
     pub fn parse(raw: []const u8) !Header {
         var h = Header{};
         const colon_pos = std.mem.indexOfScalar(u8, raw, ':') orelse return error.InvalidHeader;
-        if (colon_pos >= h.key_buf.len) return error.KeyTooLong;
+        if (colon_pos >= h.key_buf.len or raw.len - (colon_pos + 2) >= h.value_buf.len) {
+            return if (colon_pos >= h.key_buf.len)
+                error.KeyTooLong
+            else
+                error.ValueTooLong;
+        }
         @memcpy(h.key_buf[0..colon_pos], raw[0..colon_pos]);
-        h.key_len = colon_pos;
-        // Skip colon and space
-        const val = raw[colon_pos + 2 .. raw.len];
-        if (val.len >= h.value_buf.len) return error.ValueTooLong;
+        const val = raw[colon_pos + 2 ..];
         @memcpy(h.value_buf[0..val.len], val);
+        h.key_len = colon_pos;
         h.value_len = val.len;
         return h;
     }

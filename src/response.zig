@@ -75,19 +75,16 @@ pub const Response = struct {
     }
 
     /// Prevent the response from being sent by the worker.
-    /// This allows a library user to take complete control of the
-    /// response. This could be useful for some specific performance-critical
-    /// scenarios.
-    /// Note: The worker uses Vectored IO to write the headers and body
-    /// simultaneously. If you don't reimplement that, you could actually lose
-    /// performance.
+    /// This allows a library user to take complete control of the response.
+    /// This could be useful for some specific performance-critical scenarios.
+    /// If this is called, the caller becomes responsible for closing the socket.
     pub fn hijack(self: *Self) void {
         self.hijacked = true;
     }
 
     /// This is called automatically before on_request.
     /// The response is reused so that no allocations are required per request.
-    /// All fields must be reset to prevent leaks across responses.
+    /// All fields must be reset to prevent exposing stale data.
     pub fn reset(self: *Self) void {
         self.status = Status.ok;
         self.headers.clearRetainingCapacity();

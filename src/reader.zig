@@ -52,34 +52,11 @@ pub const RequestReader = struct {
             if (req.headers_len >= req.headers.len) {
                 return error.TooManyHeaders;
             }
-            req.headers[req.headers_len] = try Header.parse(self.buffer[self.start - n .. self.start - 2]);
+            const line_end_len: usize = if (n >= 2 and
+                self.buffer[self.start - 2] == '\r' and
+                self.buffer[self.start - 1] == '\n') 2 else 1;
+            req.headers[req.headers_len] = try Header.parse(self.buffer[self.start - n .. self.start - line_end_len]);
             req.headers_len += 1;
-        }
-    }
-
-    // Not yet used, but could be useful. Will leave it here for now.
-    pub fn skipHeaders(self: *Self, socket: posix.socket_t) !void {
-        var header_lines: usize = 0;
-        while (true) {
-            while (self.pos < self.len) {
-                const c = self.buffer[self.pos];
-                self.pos += 1;
-                switch (c) {
-                    '\n' => {
-                        header_lines += 1;
-                        if (header_lines == 2) return; // Empty line found
-                    },
-                    '\r' => {}, // Skip carriage returns
-                    else => header_lines = 0, // Reset on any other character
-                }
-            }
-            const available = self.buffer.len - self.len;
-            if (available == 0) {
-                self.compact();
-            }
-            const read_amount = try posix.read(socket, self.buffer[self.len..]);
-            if (read_amount == 0) return;
-            self.len += read_amount;
         }
     }
 
@@ -163,6 +140,28 @@ fn parseRequestLine(req: *Request, buffer: []const u8) !void {
     req.path_len = path_end - path_start;
     @memcpy(req.path_buf[0..req.path_len], buffer[path_start..path_end]);
     req.version = try Version.parse(buffer[version_start..version_end]);
+}
+
+test "benchmark read and parse headers" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+    var req = try Request.init(allocator);
+    defer req.deinit();
+    var reader = try RequestReader.init(allocator, 1024);
+    const raw = "Header-1: header-1-value\nHeader-2: header-2-value\nHeader-3: header-3-value\r\n\r\n";
+    const iterations: usize = 10_000_000;
+    var i: usize = 0;
+    var timer = try std.time.Timer.start();
+    while (i < iterations) : (i += 1) {
+        reader.reset();
+        @memcpy(reader.buffer[0..raw.len], raw);
+        reader.len = raw.len;
+        req.reset();
+        try reader.readHeaders(0, req);
+    }
+    const elapsed = timer.lap();
+    const avg_ns = @divFloor(elapsed, iterations);
+    std.debug.print("Average time: {d}ns\n", .{avg_ns});
 }
 
 test "benchmark parse request line" {
