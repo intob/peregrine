@@ -41,6 +41,6 @@ fn hijack(_: *pereg.Request, resp: *pereg.Response) !void {
     resp.hijack();
     // If you need, you can take total control by writing the response to
     // the socket yourself. If you do this, note that the worker uses
-    // vectored IO to write the headers and body simultaneously. You will
-    // need to implement that yourself, or lose some performance.
+    // vectored IO to write the headers and body with a single syscall.
+    // You will need to implement that yourself, or lose some performance.
 }
