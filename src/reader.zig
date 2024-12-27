@@ -54,7 +54,7 @@ pub const RequestReader = struct {
             if (req.headers_len >= req.headers.len) {
                 return error.TooManyHeaders;
             }
-            req.headers[req.headers_len] = try Header.parse(self.buffer[self.start - n .. self.start]);
+            req.headers[req.headers_len] = try Header.parse(self.buffer[self.start - n .. self.start - 2]);
             req.headers_len += 1;
         }
     }
