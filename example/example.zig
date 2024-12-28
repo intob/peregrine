@@ -13,6 +13,7 @@ pub fn main() !void {
         // .worker_thread_count defaults to CPU core count
         // .accept_thread_count defaults to worker_thread_count/3
         //    with a minimum of 1
+        // .tcp_nodelay defaults to true (Nagle's algorithm disabled)
     });
     std.debug.print("listening on 0.0.0.0:3000\n", .{});
     try srv.start(); // Blocks if there is no error
@@ -35,10 +36,12 @@ fn handle(req: *pereg.Request, resp: *pereg.Response) !void {
     }
     // After calling parseQuery, it is safe to access the query hash map directly
     // std.debug.print("got {d} query params\n", .{req.query.count()});
-    try resp.setBody("Kawww\n");
+
+    // Remember to set Content-Length header
+    try resp.setBody("Kaaawwwwwwwwwww\r\n");
     try resp.headers.append(try pereg.Header.init(.{
         .key = "Content-Length", // Max length of 64 (see Header.init)
-        .value = "6", // Max length of 256 (see Header.init)
+        .value = "17", // Max length of 256 (see Header.init)
     }));
 }
 
