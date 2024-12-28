@@ -1,4 +1,3 @@
-pub const HandlerVTable = @import("./handler.zig").HandlerVTable;
 pub const Header = @import("./header.zig").Header;
 pub const Method = @import("./method.zig").Method;
 pub const Request = @import("./request.zig").Request;

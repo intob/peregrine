@@ -90,18 +90,19 @@ const std = @import("std");
 const pereg = @import("peregrine");
 
 const MyHandler = struct {
-    const vtable: pereg.HandlerVTable = .{
-        .handle = handle,
-    };
+    pub fn init(allocator: std.mem.Allocator) !*@This() {
+        return try allocator.create(@This());
+    }
 
-    pub fn handle(ptr: *anyopaque, _: *pereg.Request, resp: *pereg.Response) void {
-        const self = @as(*MyHandler, @alignCast(@ptrCast(ptr)));
-        self.handleWithError(resp) catch |err| {
+    pub fn deinit(_: *@This()) void {}
+
+    pub fn handle(self: *@This(), req: *pereg.Request, resp: *pereg.Response) void {
+        self.handleWithError(req, resp) catch |err| {
             std.debug.print("error handling request: {any}\n", .{err});
         };
     }
 
-    inline fn handleWithError(_: *MyHandler, resp: *pereg.Response) !void {
+    fn handleWithError(_: *@This(), _: *pereg.Request, resp: *pereg.Response) !void {
         _ = try resp.setBody("Kawww\n");
         const len_header = try pereg.Header.init(.{ .key = "Content-Length", .value = "6" });
         try resp.headers.append(len_header);
@@ -112,12 +113,8 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
-    const handler = try allocator.create(MyHandler);
-    defer allocator.destroy(handler);
-    const srv = try pereg.Server.init(.{
+    const srv = try pereg.Server(MyHandler).init(.{
         .allocator = allocator,
-        .handler = handler,
-        .handler_vtable = &MyHandler.vtable,
         .port = 3000,
     });
     std.debug.print("listening on 0.0.0.0:3000\n", .{});
@@ -125,7 +122,9 @@ pub fn main() !void {
 }
 ```
 
-The configuration is minimal, with reasonable defaults. Simply provide an allocator, port number, and a request handler. Your Handler must include the vtable field and the handle function, as in the example above.
+Using Zig's comptime metaprogramming, the Server is compiled with your handler interface. Simply implement the `init`, `deinit` and `handle` methods. Compile-time checks have your back.
+
+The configuration is minimal, with reasonable defaults. Simply provide an allocator and port number.
 
 The server will shutdown gracefully if an interrupt signal is received. Alternatively, you can call `Server.shutdown()`.
 

@@ -2,15 +2,12 @@ const std = @import("std");
 const pereg = @import("peregrine");
 
 const MyHandler = struct {
-    const vtable: pereg.HandlerVTable = .{
-        .handle = handle,
-    };
     main_allocator: std.mem.Allocator,
     counter: std.atomic.Value(usize),
     // ArenaAllocator lets us free all of a request's allocations at once.
     arena: std.heap.ArenaAllocator,
 
-    fn init(allocator: std.mem.Allocator) !*@This() {
+    pub fn init(allocator: std.mem.Allocator) !*@This() {
         const handler = try allocator.create(@This());
         handler.* = .{
             .main_allocator = allocator,
@@ -20,7 +17,7 @@ const MyHandler = struct {
         return handler;
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.arena.deinit();
         self.main_allocator.destroy(self);
     }
@@ -28,8 +25,7 @@ const MyHandler = struct {
     // Be mindful that this handler can be called from multiple threads
     // concurrently. You will need to handle synchronization. This is why
     // an atomic value is used in this example.
-    pub fn handle(ptr: *anyopaque, req: *pereg.Request, resp: *pereg.Response) void {
-        const self = @as(*@This(), @alignCast(@ptrCast(ptr)));
+    pub fn handle(self: *@This(), req: *pereg.Request, resp: *pereg.Response) void {
         self.handleWithError(req, resp) catch |err| {
             std.debug.print("error handling request: {any}\n", .{err});
         };
@@ -51,12 +47,8 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
-    const handler = try MyHandler.init(allocator);
-    defer handler.deinit();
-    const srv = try pereg.Server.init(.{
+    const srv = try pereg.Server(MyHandler).init(.{
         .allocator = allocator,
-        .handler = handler,
-        .handler_vtable = &MyHandler.vtable,
         .port = 3000,
     });
     std.debug.print("listening on 0.0.0.0:3000\n", .{});
