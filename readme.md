@@ -152,9 +152,7 @@ If you want a more substantial HTTP library, I suggest that you look at [Zap](ht
 Currently, Zap/Facil.io is around 15% faster for static GET requests. I am working to improve this, but as I'm new to systems programming, this is a challenge for me. I would be happy to match Zap/Facil.io's performance.
 
 ## To do
-- Redirect support
 - TLS support
-- Compression support
 - WebSocket support
 - HTTP/2 support
 - API reference

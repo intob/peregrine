@@ -262,3 +262,22 @@ const EpollHandler = struct {
         posix.close(self.epfd);
     }
 };
+
+test "keep alive" {
+    const allocator = std.testing.allocator;
+    const req = try Request.init(allocator);
+    defer req.deinit();
+    const resp = try Response.init(allocator, 1024);
+    defer resp.deinit();
+    // HTTP/1.1 default is true
+    req.version = .@"HTTP/1.1";
+    try std.testing.expectEqual(true, shouldKeepAlive(req));
+    // HTTP/1.1 default is false
+    req.version = .@"HTTP/1.0";
+    try std.testing.expectEqual(false, shouldKeepAlive(req));
+    // HTTP/1.1 client closed connection
+    req.headers[0] = try Header.init(.{ .key = "Connection", .value = "close" });
+    req.headers_len = 1;
+    req.version = .@"HTTP/1.1";
+    try std.testing.expectEqual(false, shouldKeepAlive(req));
+}
