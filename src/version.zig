@@ -1,16 +1,16 @@
 const testing = @import("std").testing;
 
-pub const Version = enum {
+pub const Version = enum(u1) {
     @"HTTP/1.0",
     @"HTTP/1.1",
 
     pub fn parse(version: []const u8) !Version {
-        // Verify minimum length for "HTTP/1.x"
         if (version.len != 8) return error.InvalidVersion;
-        // Skip checking "HTTP/" prefix, check only the version number
+        if (version[5] != '1') return error.UnsupportedVersion;
+        if (version[6] != '.') return error.InvalidVersion;
         return switch (version[7]) {
-            '0' => if (version[5] == '1' and version[6] == '.') .@"HTTP/1.0" else error.UnsupportedVersion,
-            '1' => if (version[5] == '1' and version[6] == '.') .@"HTTP/1.1" else error.UnsupportedVersion,
+            '0' => .@"HTTP/1.0",
+            '1' => .@"HTTP/1.1",
             else => error.UnsupportedVersion,
         };
     }
