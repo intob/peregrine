@@ -21,20 +21,21 @@ const MyHandler = struct {
     }
 
     fn deinit(self: *@This()) void {
+        self.arena.deinit();
         self.main_allocator.destroy(self);
     }
 
     // Be mindful that this handler can be called from multiple threads
     // concurrently. You will need to handle synchronization. This is why
     // an atomic value is used in this example.
-    pub fn handle(ptr: *anyopaque, _: *pereg.Request, resp: *pereg.Response) void {
-        const self = @as(*MyHandler, @alignCast(@ptrCast(ptr)));
-        self.handleWithError(resp) catch |err| {
+    pub fn handle(ptr: *anyopaque, req: *pereg.Request, resp: *pereg.Response) void {
+        const self = @as(*@This(), @alignCast(@ptrCast(ptr)));
+        self.handleWithError(req, resp) catch |err| {
             std.debug.print("error handling request: {any}\n", .{err});
         };
     }
 
-    fn handleWithError(self: *@This(), resp: *pereg.Response) !void {
+    fn handleWithError(self: *@This(), _: *pereg.Request, resp: *pereg.Response) !void {
         const count = self.counter.fetchAdd(1, .monotonic);
         const allocator = self.arena.allocator();
         const buf = try std.fmt.allocPrint(allocator, "counter={d}\n", .{count});

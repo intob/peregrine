@@ -134,7 +134,6 @@ pub const Server = struct {
         errdefer posix.close(clsock);
         try self.setClientSockOpt(clsock);
         const worker_id = @atomicRmw(usize, &self.next_worker, .Add, 1, .monotonic) % self.workers.len;
-        //std.debug.print("accepted sock {d}, sent to worker {d}\n", .{ clsock, worker_id });
         try self.workers[worker_id].addClient(clsock);
     }
 

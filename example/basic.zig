@@ -6,15 +6,15 @@ const MyHandler = struct {
         .handle = handle,
     };
 
-    pub fn handle(ptr: *anyopaque, _: *pereg.Request, resp: *pereg.Response) void {
+    pub fn handle(ptr: *anyopaque, req: *pereg.Request, resp: *pereg.Response) void {
         // Use @alignCast and @ptrCast together for safe pointer conversion
-        const self = @as(*MyHandler, @alignCast(@ptrCast(ptr)));
-        self.handleWithError(resp) catch |err| {
+        const self = @as(*@This(), @alignCast(@ptrCast(ptr)));
+        self.handleWithError(req, resp) catch |err| {
             std.debug.print("error handling request: {any}\n", .{err});
         };
     }
 
-    inline fn handleWithError(_: *MyHandler, resp: *pereg.Response) !void {
+    inline fn handleWithError(_: *@This(), _: *pereg.Request, resp: *pereg.Response) !void {
         _ = try resp.setBody("Kawww\n");
         const len_header = try pereg.Header.init(.{ .key = "Content-Length", .value = "6" });
         try resp.headers.append(len_header);

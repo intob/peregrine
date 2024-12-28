@@ -59,29 +59,29 @@ The server handles the following signals for graceful shutdown:
 
 ### Timeouts
 Connection timeouts are configured with:
-- Receive timeout: 2.5 seconds
-- Send timeout: 2.5 seconds
+- Receive timeout: 3 seconds
+- Send timeout: 3 seconds
 
 ## Usage
 
-### Run the example server natively
+### Run the counter example server natively
 ```bash
-zig build run-example
+zig build run-counter
 ```
 
-### Run the example in a Linux Docker container
+### Run the counter example in a Linux Docker container
 
 #### x86_64
 ```bash
 zig build -Dtarget=x86_64-linux-musl && \
-docker build -t example . -f ./example/Dockerfile && \
-docker run -p 3000:3000 example
+docker build -t counter . -f ./example/counter.Dockerfile && \
+docker run -p 3000:3000 counter
 ```
 #### aarch64 (ARM)
 ```bash
 zig build -Dtarget=aarch64-linux-musl && \
-docker build -t example . -f ./example/Dockerfile && \
-docker run -p 3000:3000 example
+docker build -t counter . -f ./example/counter.Dockerfile && \
+docker run -p 3000:3000 counter
 ```
 
 ### Implement a server
