@@ -45,6 +45,7 @@ pub fn Server(comptime Handler: type) type {
         }
 
         allocator: std.mem.Allocator,
+        handler: *Handler,
         address: std.net.Address,
         workers: []worker.Worker(Handler),
         next_worker: usize,
@@ -98,6 +99,7 @@ pub fn Server(comptime Handler: type) type {
             errdefer allocator.destroy(srv);
             srv.* = .{
                 .allocator = allocator,
+                .handler = try Handler.init(allocator),
                 .address = address,
                 .workers = try allocator.alloc(worker.Worker(Handler), worker_thread_count),
                 .next_worker = 0,
@@ -107,7 +109,10 @@ pub fn Server(comptime Handler: type) type {
                 .tcp_nodelay = cfg.tcp_nodelay,
             };
             for (srv.workers, 0..) |*w, i| {
-                try w.init(.{ .allocator = allocator, .id = i });
+                try w.init(srv.handler, .{
+                    .allocator = allocator,
+                    .id = i,
+                });
             }
             for (srv.accept_threads) |*thread| {
                 thread.* = try std.Thread.spawn(.{}, loop, .{srv});
@@ -161,6 +166,7 @@ pub fn Server(comptime Handler: type) type {
 
         fn cleanup(self: *Self) void {
             posix.close(self.listener);
+            self.handler.deinit();
             self.allocator.free(self.workers);
             self.allocator.free(self.accept_threads);
             self.allocator.destroy(self);

@@ -43,10 +43,10 @@ pub fn Worker(comptime Handler: type) type {
 
         const Self = @This();
 
-        pub fn init(self: *Self, cfg: WorkerConfig) !void {
+        pub fn init(self: *Self, handler: *Handler, cfg: WorkerConfig) !void {
             const allocator = cfg.allocator;
             errdefer self.deinit();
-            self.handler = try Handler.init(allocator);
+            self.handler = handler;
             self.allocator = allocator;
             self.io_handler = try IOHandler.init();
             self.id = cfg.id;
@@ -75,7 +75,6 @@ pub fn Worker(comptime Handler: type) type {
                 }
             }
             self.thread.join(); // Finish handling any requests
-            self.handler.deinit();
             self.req.deinit();
             self.resp.deinit();
             self.allocator.free(self.resp_header_buf);
@@ -120,8 +119,7 @@ pub fn Worker(comptime Handler: type) type {
                         else => unreachable,
                     };
                     self.readSocket(socket, reader) catch |err| {
-                        posix.close(socket);
-                        _ = self.connection_requests.remove(socket);
+                        self.closeSocket(socket);
                         switch (err) {
                             error.EOF => {}, // Expected case
                             else => std.debug.print("error reading socket: {any}\n", .{err}),
@@ -130,8 +128,7 @@ pub fn Worker(comptime Handler: type) type {
                     };
                     const requests_handled = self.connection_requests.get(socket) orelse 0;
                     if (requests_handled >= CONNECTION_MAX_REQUESTS) {
-                        posix.close(socket);
-                        _ = self.connection_requests.remove(socket);
+                        self.closeSocket(socket);
                     } else {
                         self.connection_requests.put(socket, requests_handled + 1) catch |err| {
                             std.debug.print("error updating socket request count: {any}\n", .{err});
@@ -139,6 +136,11 @@ pub fn Worker(comptime Handler: type) type {
                     }
                 }
             }
+        }
+
+        fn closeSocket(self: *Self, socket: posix.socket_t) void {
+            posix.close(socket);
+            _ = self.connection_requests.remove(socket);
         }
 
         fn readSocket(self: *Self, socket: posix.socket_t, reader: *RequestReader) !void {
