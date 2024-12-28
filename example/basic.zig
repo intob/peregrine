@@ -25,10 +25,7 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
-    const srv = try pereg.Server(MyHandler).init(.{
-        .allocator = allocator,
-        .port = 3000,
-    });
+    const srv = try pereg.Server(MyHandler).init(allocator, 3000, .{});
     std.debug.print("listening on 0.0.0.0:3000\n", .{});
     try srv.start(); // Blocks if there is no error
 }

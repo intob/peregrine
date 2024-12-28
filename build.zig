@@ -47,4 +47,19 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| counter_run_cmd.addArgs(args);
     const counter_run_step = b.step("run-counter", "Run the counter example");
     counter_run_step.dependOn(&counter_run_cmd.step);
+
+    // Fileserver example
+    const fileserver = b.addExecutable(.{
+        .name = "fileserver",
+        .root_source_file = b.path("./example/fileserver.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fileserver.root_module.addImport("peregrine", lib);
+    b.installArtifact(fileserver);
+    const fileserver_run_cmd = b.addRunArtifact(fileserver);
+    fileserver_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| fileserver_run_cmd.addArgs(args);
+    const fileserver_run_step = b.step("run-fileserver", "Run the fileserver example");
+    fileserver_run_step.dependOn(&fileserver_run_cmd.step);
 }

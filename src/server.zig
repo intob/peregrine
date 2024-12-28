@@ -14,10 +14,6 @@ fn handleSignal(sig: c_int) callconv(.C) void {
 }
 
 pub const ServerConfig = struct {
-    /// Main memory allocator
-    allocator: std.mem.Allocator,
-    /// Listening port
-    port: u16,
     /// Listening IP address
     ip: []const u8 = "0.0.0.0",
     /// Number of worker threads processing requests.
@@ -62,10 +58,9 @@ pub fn Server(comptime Handler: type) type {
             else => @compileError("Unsupported OS"),
         };
 
-        pub fn init(cfg: ServerConfig) !*Self {
-            const allocator = cfg.allocator;
+        pub fn init(allocator: std.mem.Allocator, port: u16, cfg: ServerConfig) !*Self {
             const sock_type: u32 = posix.SOCK.STREAM | posix.SOCK.NONBLOCK;
-            const address = try std.net.Address.parseIp(cfg.ip, cfg.port);
+            const address = try std.net.Address.parseIp(cfg.ip, port);
             const listener = try posix.socket(address.any.family, sock_type, posix.IPPROTO.TCP);
             try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
             // REUSEPORT allows accepting connections from multiple threads.
@@ -256,7 +251,7 @@ const EpollHandler = struct {
     fn poll(self: *Self) !bool {
         var events: [1]linux.epoll_event = undefined;
         const n = posix.epoll_wait(self.epfd, &events, 50);
-        if (n == 0) return;
+        if (n == 0) return false;
         const event = events[0];
         if (event.data.fd == self.listener) {
             return true;

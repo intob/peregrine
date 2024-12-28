@@ -68,6 +68,7 @@ pub const Response = struct {
 
     pub fn setBody(self: *Self, buf: []const u8) !usize {
         if (buf.len > self.body.len) {
+            std.debug.print("buf len: {d}, resp body len: {d}\n", .{ buf.len, self.body.len });
             return error.ResponseBodyBufferTooSmall;
         }
         @memcpy(self.body[0..buf.len], buf);

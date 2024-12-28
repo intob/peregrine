@@ -3,24 +3,35 @@ const pereg = @import("peregrine");
 
 const MyHandler = struct {
     allocator: std.mem.Allocator,
-    counter: std.atomic.Value(usize),
+    file: std.fs.File,
+    fileServer: *pereg.helper.FileServer,
 
     pub fn init(allocator: std.mem.Allocator) !*@This() {
+        const cwd_path = try std.fs.cwd().realpathAlloc(allocator, ".");
+        defer allocator.free(cwd_path);
+        std.debug.print("cwd: {s}\n", .{cwd_path});
+        const file = try std.fs.cwd().createFile("./example/index.html", .{
+            .read = true,
+            .truncate = false,
+        });
+        try file.chmod(0o666);
+        // By default, the file will be lazy loaded on the first request. You can
+        // override this using the configuration struct.
+        const fileServer = try pereg.helper.FileServer.init(allocator, file, .{});
         const handler = try allocator.create(@This());
         handler.* = .{
             .allocator = allocator,
-            .counter = std.atomic.Value(usize).init(0),
+            .file = file,
+            .fileServer = fileServer,
         };
         return handler;
     }
 
     pub fn deinit(self: *@This()) void {
+        self.fileServer.deinit();
         self.allocator.destroy(self);
     }
 
-    // Be mindful that this handler can be called from multiple threads
-    // concurrently. You will need to handle synchronization. This is why
-    // an atomic value is used in this example.
     pub fn handle(self: *@This(), req: *pereg.Request, resp: *pereg.Response) void {
         self.handleWithError(req, resp) catch |err| {
             std.debug.print("error handling request: {any}\n", .{err});
@@ -28,15 +39,7 @@ const MyHandler = struct {
     }
 
     fn handleWithError(self: *@This(), _: *pereg.Request, resp: *pereg.Response) !void {
-        const count = self.counter.fetchAdd(1, .monotonic);
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const allocator = arena.allocator();
-        const buf = try std.fmt.allocPrint(allocator, "counter={d}\n", .{count});
-        _ = try resp.setBody(buf);
-        const len_buf = try std.fmt.allocPrint(allocator, "{d}", .{buf.len});
-        const len_header = try pereg.Header.init(.{ .key = "Content-Length", .value = len_buf });
-        try resp.headers.append(len_header);
+        try self.fileServer.serve(resp);
     }
 };
 
