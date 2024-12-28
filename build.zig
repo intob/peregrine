@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
     // Basic example
     const basic = b.addExecutable(.{
         .name = "basic",
-        .root_source_file = b.path("./example/basic.zig"),
+        .root_source_file = b.path("./example/basic/basic.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -36,7 +36,7 @@ pub fn build(b: *std.Build) void {
     // Counter example
     const counter = b.addExecutable(.{
         .name = "counter",
-        .root_source_file = b.path("./example/counter.zig"),
+        .root_source_file = b.path("./example/counter/counter.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -51,7 +51,7 @@ pub fn build(b: *std.Build) void {
     // Fileserver example
     const fileserver = b.addExecutable(.{
         .name = "fileserver",
-        .root_source_file = b.path("./example/fileserver.zig"),
+        .root_source_file = b.path("./example/fileserver/fileserver.zig"),
         .target = target,
         .optimize = optimize,
     });
