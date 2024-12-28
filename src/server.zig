@@ -155,10 +155,9 @@ pub const Server = struct {
         // and closes connections automatically if the peer doesn't respond.
         try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(@as(c_int, 1)));
         // Disable Nagle's algorithm.
-        if (self.tcp_nodelay) {
-            const POSIX_TCP_NODELAY: u32 = 1; // posix.TCP is unavailable for macOS
-            try posix.setsockopt(sock, posix.IPPROTO.TCP, POSIX_TCP_NODELAY, &std.mem.toBytes(@as(c_int, 1)));
-        }
+        const TCP_NODELAY: u32 = 1; // posix.TCP is unavailable for macOS
+        const nodelay_opt: c_int = if (self.tcp_nodelay) 0 else 1; // Zero disables Nagle's algorithm
+        try posix.setsockopt(sock, posix.IPPROTO.TCP, TCP_NODELAY, &std.mem.toBytes(@as(c_int, nodelay_opt)));
         // Set send/recv timeouts
         const send_timeout = posix.timeval{ .sec = 2, .usec = 500_000 };
         const recv_timeout = posix.timeval{ .sec = 10_000, .usec = 0 };
