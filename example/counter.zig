@@ -2,24 +2,20 @@ const std = @import("std");
 const pereg = @import("peregrine");
 
 const MyHandler = struct {
-    main_allocator: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     counter: std.atomic.Value(usize),
-    // ArenaAllocator lets us free all of a request's allocations at once.
-    arena: std.heap.ArenaAllocator,
 
     pub fn init(allocator: std.mem.Allocator) !*@This() {
         const handler = try allocator.create(@This());
         handler.* = .{
-            .main_allocator = allocator,
+            .allocator = allocator,
             .counter = std.atomic.Value(usize).init(0),
-            .arena = std.heap.ArenaAllocator.init(allocator),
         };
         return handler;
     }
 
     pub fn deinit(self: *@This()) void {
-        self.arena.deinit();
-        self.main_allocator.destroy(self);
+        self.allocator.destroy(self);
     }
 
     // Be mindful that this handler can be called from multiple threads
@@ -33,13 +29,14 @@ const MyHandler = struct {
 
     fn handleWithError(self: *@This(), _: *pereg.Request, resp: *pereg.Response) !void {
         const count = self.counter.fetchAdd(1, .monotonic);
-        const allocator = self.arena.allocator();
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
         const buf = try std.fmt.allocPrint(allocator, "counter={d}\n", .{count});
         _ = try resp.setBody(buf);
         const len_buf = try std.fmt.allocPrint(allocator, "{d}", .{buf.len});
         const len_header = try pereg.Header.init(.{ .key = "Content-Length", .value = len_buf });
         try resp.headers.append(len_header);
-        _ = self.arena.reset(.retain_capacity);
     }
 };
 
