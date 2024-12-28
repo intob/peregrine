@@ -81,7 +81,7 @@ pub const RequestReader = struct {
                 if (read_amount == 0) return line_len;
                 self.len += read_amount;
             }
-            // Process 16 bytes at a time
+            // Process chunks of 16 bytes
             while (self.pos + 16 <= self.len) {
                 var chunk: [16]u8 align(16) = undefined;
                 @memcpy(&chunk, self.buffer[self.pos..][0..16]);

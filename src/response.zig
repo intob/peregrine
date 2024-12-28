@@ -66,12 +66,13 @@ pub const Response = struct {
         return n;
     }
 
-    pub fn setBody(self: *Self, buf: []const u8) !void {
+    pub fn setBody(self: *Self, buf: []const u8) !usize {
         if (buf.len > self.body.len) {
             return error.ResponseBodyBufferTooSmall;
         }
         @memcpy(self.body[0..buf.len], buf);
         self.body_len = buf.len;
+        return buf.len;
     }
 
     /// Prevent the response from being sent by the worker.
@@ -82,7 +83,7 @@ pub const Response = struct {
         self.hijacked = true;
     }
 
-    /// This is called automatically before on_request.
+    /// This is called automatically before Handler.handle.
     /// The response is reused so that no allocations are required per request.
     /// All fields must be reset to prevent exposing stale data.
     pub fn reset(self: *Self) void {

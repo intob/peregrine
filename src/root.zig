@@ -1,15 +1,9 @@
-pub const header = @import("./header.zig");
-pub const method = @import("./method.zig");
-pub const request = @import("./request.zig");
-pub const response = @import("./response.zig");
-pub const server = @import("./server.zig");
-pub const status = @import("./status.zig");
-pub const version = @import("./version.zig");
-
-pub const Header = header.Header;
-pub const Method = method.Method;
-pub const Request = request.Request;
-pub const Response = response.Response;
-pub const Server = server.Server;
-pub const Status = status.Status;
-pub const Version = version.Version;
+pub const HandlerVTable = @import("./handler.zig").HandlerVTable;
+pub const Header = @import("./header.zig").Header;
+pub const Method = @import("./method.zig").Method;
+pub const Request = @import("./request.zig").Request;
+pub const Response = @import("./response.zig").Response;
+pub const Server = @import("./server.zig").Server;
+pub const ServerConfig = @import("./server.zig").ServerConfig;
+pub const Status = @import("./status.zig").Status;
+pub const Version = @import("./version.zig").Version;

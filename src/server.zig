@@ -2,6 +2,7 @@ const native_os = @import("builtin").os.tag;
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
+const HandlerVTable = @import("./handler.zig").HandlerVTable;
 const Request = @import("./request.zig").Request;
 const Response = @import("./response.zig").Response;
 const worker = @import("./worker.zig");
@@ -14,13 +15,14 @@ fn handleSignal(sig: c_int) callconv(.C) void {
 }
 
 pub const ServerConfig = struct {
-    /// Main memory allocator.
+    /// Main memory allocator
     allocator: std.mem.Allocator,
-    /// Request handler function.
-    on_request: worker.RequestHandler,
-    /// Listening port.
+    /// Request handler
+    handler: *anyopaque,
+    handler_vtable: *const HandlerVTable,
+    /// Listening port
     port: u16,
-    /// Listening IP address.
+    /// Listening IP address
     ip: []const u8 = "0.0.0.0",
     /// Number of worker threads processing requests.
     /// Defaults to CPU core count.
@@ -96,7 +98,12 @@ pub const Server = struct {
             .tcp_nodelay = cfg.tcp_nodelay,
         };
         for (srv.workers, 0..) |*w, i| {
-            try w.init(.{ .allocator = allocator, .id = i, .on_request = cfg.on_request });
+            try w.init(.{
+                .allocator = allocator,
+                .id = i,
+                .handler = cfg.handler,
+                .handler_vtable = cfg.handler_vtable,
+            });
         }
         for (srv.accept_threads) |*thread| {
             thread.* = try std.Thread.spawn(.{}, loop, .{srv});
@@ -159,8 +166,8 @@ pub const Server = struct {
         const nodelay_opt: c_int = if (self.tcp_nodelay) 0 else 1; // Zero disables Nagle's algorithm
         try posix.setsockopt(sock, posix.IPPROTO.TCP, TCP_NODELAY, &std.mem.toBytes(@as(c_int, nodelay_opt)));
         // Set send/recv timeouts
-        const send_timeout = posix.timeval{ .sec = 2, .usec = 500_000 };
-        const recv_timeout = posix.timeval{ .sec = 10_000, .usec = 0 };
+        const send_timeout = posix.timeval{ .sec = 3, .usec = 0 };
+        const recv_timeout = posix.timeval{ .sec = 3, .usec = 0 };
         try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &std.mem.toBytes(send_timeout));
         try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(recv_timeout));
     }

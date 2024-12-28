@@ -2,30 +2,31 @@ const native_os = @import("builtin").os.tag;
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
-const RequestReader = @import("./reader.zig").RequestReader;
-const Request = @import("./request.zig").Request;
-const Response = @import("./response.zig").Response;
+const HandlerVTable = @import("./handler.zig").HandlerVTable;
 const Header = @import("./header.zig").Header;
+const Request = @import("./request.zig").Request;
+const RequestReader = @import("./reader.zig").RequestReader;
+const Response = @import("./response.zig").Response;
 const Status = @import("./status.zig").Status;
 
-pub const RequestHandler = *const fn (req: *Request, resp: *Response) void;
-
 // Extra CRLF to terminate headers
-const CONNECTION_MAX_REQUESTS: u32 = 100;
-const KEEP_ALIVE_HEADERS = "Connection: keep-alive\r\nKeep-Alive: timeout=10, max=100\r\n\r\n";
+const CONNECTION_MAX_REQUESTS: u32 = 200;
+const KEEP_ALIVE_HEADERS = "Connection: keep-alive\r\nKeep-Alive: timeout=3, max=200\r\n\r\n";
 const CLOSE_HEADER = "Connection: close\r\n\r\n";
 
 pub const WorkerConfig = struct {
     allocator: std.mem.Allocator,
     id: usize,
-    on_request: RequestHandler,
+    handler: *anyopaque,
+    handler_vtable: *const HandlerVTable,
 };
 
 pub const Worker = struct {
     allocator: std.mem.Allocator,
     io_handler: IOHandler,
     id: usize,
-    on_request: RequestHandler,
+    handler: *anyopaque,
+    handler_vtable: *const HandlerVTable,
     mutex: std.Thread.Mutex,
     req: *Request,
     resp: *Response,
@@ -52,7 +53,8 @@ pub const Worker = struct {
         self.allocator = allocator;
         self.io_handler = try IOHandler.init();
         self.id = cfg.id;
-        self.on_request = cfg.on_request;
+        self.handler = cfg.handler;
+        self.handler_vtable = cfg.handler_vtable;
         self.mutex = std.Thread.Mutex{};
         self.req = try Request.init(allocator);
         // TODO: make body buffer size configurable
@@ -155,7 +157,7 @@ pub const Worker = struct {
         try reader.readRequest(socket, self.req);
         keep_alive = shouldKeepAlive(self.req);
         self.resp.reset();
-        self.on_request(self.req, self.resp);
+        self.handler_vtable.handle(self.handler, self.req, self.resp);
         if (!self.resp.hijacked) {
             try self.respond(socket, keep_alive);
             // Returning EOF causes the connection to be closed by the caller.
