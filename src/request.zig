@@ -13,11 +13,13 @@ pub const Request = struct {
     allocator: std.mem.Allocator,
     socket: std.posix.socket_t,
     method: Method,
-    path_buf: [256]u8,
+    path: [256]u8,
     path_len: usize,
     headers: [32]Header,
     headers_len: usize,
     version: Version,
+    query_raw: [256]u8,
+    query_raw_len: usize,
     query: std.StringHashMap([]const u8),
 
     const Self = @This();
@@ -28,11 +30,13 @@ pub const Request = struct {
             .allocator = allocator,
             .socket = 0,
             .method = Method.GET,
-            .path_buf = [_]u8{0} ** 256,
+            .path = [_]u8{0} ** 256,
             .path_len = 0,
             .headers = undefined,
             .headers_len = 0,
             .version = Version.@"HTTP/1.1",
+            .query_raw = [_]u8{0} ** 256,
+            .query_raw_len = 0,
             .query = std.StringHashMap([]const u8).init(allocator),
         };
         return r;
@@ -57,7 +61,7 @@ pub const Request = struct {
     }
 
     pub inline fn getPath(self: *Self) []const u8 {
-        return self.path_buf[0..self.path_len];
+        return self.path[0..self.path_len];
     }
 
     // Call this BEFORE accessing the query map.
@@ -66,21 +70,22 @@ pub const Request = struct {
     // clearing it here; only when the query is to be used.
     pub fn parseQuery(self: *Self) !?std.StringHashMap([]const u8) {
         self.query.clearRetainingCapacity();
-        const query_start = std.mem.indexOfScalar(u8, self.path_buf[0..self.path_len], '?') orelse
-            return null; // Path has no query
-        var current_pos = query_start + 1;
-        while (current_pos < self.path_len) {
+        var current_pos: usize = 0;
+        while (current_pos < self.query_raw_len) {
             // Find the key-value separator
-            const equals_pos = std.mem.indexOfScalar(u8, self.path_buf[current_pos..], '=') orelse
+            const equals_pos = std.mem.indexOfScalar(u8, self.query_raw[current_pos..], '=') orelse
                 return null; // MalformedQuery
-            const key = self.path_buf[current_pos .. current_pos + equals_pos];
+            const key = self.query_raw[current_pos .. current_pos + equals_pos];
             const value_start = current_pos + equals_pos + 1;
             // Find the end of this value (either & or end of string)
-            if (std.mem.indexOfScalar(u8, self.path_buf[value_start..], '&')) |amp_pos| {
-                try self.query.put(key, self.path_buf[value_start .. value_start + amp_pos]);
-                current_pos = value_start + amp_pos + 1;
+            const value_slice = self.query_raw[value_start..self.query_raw_len];
+            const amp_pos = std.mem.indexOfScalar(u8, value_slice, '&');
+            if (amp_pos) |pos| {
+                try self.query.put(key, value_slice[0..pos]);
+                current_pos = value_start + pos + 1;
             } else {
-                try self.query.put(key, self.path_buf[value_start..self.path_len]);
+                // Handle the last key-value pair
+                try self.query.put(key, value_slice);
                 break;
             }
         }
@@ -102,10 +107,10 @@ test "parse query" {
     const allocator = gpa.allocator();
     var req = try Request.init(allocator);
     defer req.deinit();
-    const path = "/some-random-path?key1=value1&key2=value2";
-    @memcpy(req.path_buf[0..path.len], path[0..]);
-    req.path_len = path.len;
-    try req.parseQuery();
+    const query = "key1=value1&key2=value2";
+    @memcpy(req.query_raw[0..query.len], query[0..]);
+    req.query_raw_len = query.len;
+    _ = try req.parseQuery();
     try std.testing.expectEqual(2, req.query.count());
     if (req.query.get("key1")) |value1| {
         try std.testing.expectEqualStrings("value1", value1);

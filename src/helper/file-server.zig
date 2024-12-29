@@ -41,7 +41,16 @@ pub const FileServer = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn load(self: *@This()) !void {
+    pub fn serve(self: *@This(), resp: *Response) !void {
+        if (!self.loaded) try self.load();
+        _ = try resp.setBody(self.content);
+        try resp.headers.append(try Header.init(.{
+            .key = "Content-Length",
+            .value = self.content_len_header,
+        }));
+    }
+
+    fn load(self: *@This()) !void {
         self.load_mutex.lock();
         defer self.load_mutex.unlock();
         if (self.loaded) return;
@@ -52,14 +61,5 @@ pub const FileServer = struct {
         const n = try file.readAll(self.content);
         self.content_len_header = try std.fmt.allocPrint(self.allocator, "{d}", .{n});
         self.loaded = true;
-    }
-
-    pub fn serve(self: *@This(), resp: *Response) !void {
-        if (!self.loaded) try self.load();
-        _ = try resp.setBody(self.content);
-        try resp.headers.append(try Header.init(.{
-            .key = "Content-Length",
-            .value = self.content_len_header,
-        }));
     }
 };

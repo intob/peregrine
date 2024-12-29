@@ -62,4 +62,19 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| fileserver_run_cmd.addArgs(args);
     const fileserver_run_step = b.step("run-fileserver", "Run the fileserver example");
     fileserver_run_step.dependOn(&fileserver_run_cmd.step);
+
+    // Dirserver example
+    const dirserver = b.addExecutable(.{
+        .name = "dirserver",
+        .root_source_file = b.path("./example/dirserver/dirserver.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    dirserver.root_module.addImport("peregrine", lib);
+    b.installArtifact(dirserver);
+    const dirserver_run_cmd = b.addRunArtifact(dirserver);
+    dirserver_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| dirserver_run_cmd.addArgs(args);
+    const dirserver_run_step = b.step("run-dirserver", "Run the dirserver example");
+    dirserver_run_step.dependOn(&dirserver_run_cmd.step);
 }

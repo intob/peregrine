@@ -52,7 +52,7 @@ pub fn Worker(comptime Handler: type) type {
             self.id = cfg.id;
             self.req = try Request.init(allocator);
             // TODO: make body buffer size configurable
-            self.resp = try Response.init(allocator, 4096); // Aligned internally
+            self.resp = try Response.init(allocator, 200_000); // Aligned internally
             // Up to 32 headers, each  with [64]u8 key and [256]u8 value, plus ": " and "\n"
             const max_header_size = ((64 + 256 + 3) * 32) + "HTTP/1.1 500 Internal Server Error\n".len;
             const aligned_header_size = std.mem.alignForward(usize, max_header_size, 16);

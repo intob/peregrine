@@ -144,11 +144,20 @@ fn parseRequestLine(req: *Request, buffer: []const u8) !void {
     // Parse method and version first
     req.method = try Method.parse(buffer[0..method_end]);
     req.version = try Version.parse(buffer[version_start..line_end]);
-    // Path is everything between method and version
+    // Path and query is everything between method and version
     const path_start = method_end + 1;
-    const path_end = version_start - 1;
-    req.path_len = path_end - path_start;
-    @memcpy(req.path_buf[0..req.path_len], buffer[path_start..path_end]);
+    const path_and_query_end = version_start - 1;
+    const query_start_opt = std.mem.indexOfScalarPos(u8, buffer[0..path_and_query_end], path_start, '?');
+    if (query_start_opt) |query_start| {
+        req.query_raw_len = path_and_query_end - (query_start + 1);
+        @memcpy(req.query_raw[0..req.query_raw_len], buffer[query_start + 1 .. path_and_query_end]);
+        req.path_len = query_start - path_start;
+        @memcpy(req.path[0..req.path_len], buffer[path_start..query_start]); // IS THIS CORRECT OR OFF BY 1 DUE TO '?'
+    } else {
+        req.query_raw_len = 0;
+        req.path_len = path_and_query_end - path_start;
+        @memcpy(req.path[0..req.path_len], buffer[path_start..path_and_query_end]);
+    }
 }
 
 test "benchmark read and parse headers" {
@@ -178,11 +187,31 @@ test "test parse request line" {
     const allocator = gpa.allocator();
     var req = try Request.init(allocator);
     defer req.deinit();
-    const line = "GET /some-random-path?some=test HTTP/1.1\r\n";
+    const line = "GET /some-random-path HTTP/1.1\r\n";
     try parseRequestLine(req, line[0..]);
     try std.testing.expectEqual(Version.@"HTTP/1.1", req.version);
     try std.testing.expectEqual(Method.GET, req.method);
-    try std.testing.expectEqualStrings("/some-random-path?some=test", req.getPath());
+    try std.testing.expectEqualStrings("/some-random-path", req.getPath());
+    try std.testing.expectEqual(0, req.query_raw_len);
+}
+
+test "test parse request line with query" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+    var req = try Request.init(allocator);
+    defer req.deinit();
+    const line = "GET /some-random-path?some=test&another=test2 HTTP/1.1\r\n";
+    try parseRequestLine(req, line[0..]);
+    try std.testing.expectEqual(Version.@"HTTP/1.1", req.version);
+    try std.testing.expectEqual(Method.GET, req.method);
+    try std.testing.expectEqualStrings("/some-random-path", req.getPath());
+    _ = try req.parseQuery();
+    if (req.query.get("some")) |val| {
+        try std.testing.expectEqualStrings("test", val);
+    } else return error.QueryNotParsed;
+    if (req.query.get("another")) |val| {
+        try std.testing.expectEqualStrings("test2", val);
+    } else return error.QueryNotParsed;
 }
 
 test "test parse request line bare LF" {
