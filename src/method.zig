@@ -54,7 +54,7 @@ pub const Method = enum(u4) {
                     error.UnsupportedMethod,
                 else => error.UnsupportedMethod,
             },
-            6 => if (bytes[1] == 'E' and bytes[2] == 'L' and bytes[3] == 'E' and bytes[4] == 'T' and bytes[5] == 'E')
+            6 => if (bytes[0] == 'D' and bytes[1] == 'E' and bytes[2] == 'L' and bytes[3] == 'E' and bytes[4] == 'T' and bytes[5] == 'E')
                 Method.DELETE
             else
                 error.UnsupportedMethod,

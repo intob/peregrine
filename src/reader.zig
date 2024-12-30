@@ -111,7 +111,7 @@ pub const RequestReader = struct {
         }
     }
 
-    fn compact(self: *Self) void {
+    inline fn compact(self: *Self) void {
         if (self.start == 0) return;
         const len = self.len - self.start;
         std.mem.copyForwards(u8, self.buffer[0..len], self.buffer[self.start..self.len]);
