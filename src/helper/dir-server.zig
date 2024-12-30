@@ -124,20 +124,16 @@ pub const DirServer = struct {
         const req_path = req.getPath();
         if (!std.mem.startsWith(u8, req_path, self.req_path)) {
             resp.status = .not_found;
-            try resp.addNewHeader("Content-Length", "0");
             return;
         }
         const rel_path = req_path[self.req_path.len..];
-        std.debug.print("looking for [{s}]\n", .{rel_path});
         if (self.files.get(rel_path)) |hit| {
             for (hit.headers.items) |h| try resp.addHeader(h);
-            resp.status = .ok;
             _ = try resp.setBody(hit.contents);
         } else {
             // TODO: pre-allocate some standard responses like this,
             // so that we don't need to memcpy the header.
             resp.status = .not_found;
-            try resp.addNewHeader("Content-Length", "0");
             return;
         }
     }
@@ -163,14 +159,9 @@ pub const DirServer = struct {
             const dir_with_slash = try std.fmt.allocPrint(self.allocator, "{s}/", .{dir_path});
             try self.files.put(try self.allocator.dupe(u8, dir_path), hit);
             try self.files.put(dir_with_slash, hit);
-            std.debug.print("put entry [{s}, {s}, {s}]: ", .{ entry.path, dir_path, dir_with_slash });
+            std.debug.print("put entry [{s}, {s}, {s}]\n", .{ entry.path, dir_path, dir_with_slash });
         } else {
-            std.debug.print("put entry [{s}]: ", .{entry.path});
-        }
-        if (stat.size > 1000) {
-            std.debug.print("[FILE_TOO_LARGE]\n", .{});
-        } else {
-            std.debug.print("{s}\n", .{hit.contents});
+            std.debug.print("put entry [{s}]\n", .{entry.path});
         }
     }
 };

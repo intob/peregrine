@@ -35,7 +35,7 @@ Note: This project has just started, and is not yet a complete HTTP server imple
     - Header case-insensitivity handled when searching, not parsing (unused headers are not transformed)
     - Query only parsed on demand
     - Optimised header, method and version parsing
-    - Fixed sized array for request headers (faster than std.ArrayList)
+    - Fixed sized array for headers (faster than std.ArrayList)
 
 
 ## Architecture
@@ -152,10 +152,17 @@ if (req.query.get("some-key")) |value| {
 }
 ```
 
-## No magic behind the scenes
-For example, you need to set the Content-Length header yourself. Regardless of whether it's an ArrayList or a HashMap, checking if it was set already by the user would incur a cost (albeit small). Again, this library is designed to be reliable, performant, and simple.
+## Need to know
+### Response headers
+If the body is not zero-length, you must set the Content-Length header yourself. I will write a helper for this soon.
 
-Connection and Keep-Alive headers ARE set by the Worker. This is because there is internal logic to handle connection persistence, and it would hurt developer experience to not set these headers appropriately.
+Regardless of whether it's an ArrayList or a HashMap, checking if it was set already by the user would incur a cost (albeit small).
+
+If you do not give a response body, the "content-length: 0" header will be added automatically. This is because it's faster to add a hard-coded iovec than to serialise an extra header.
+
+Again, this library is designed to be reliable, performant, and simple. Occasionally simplicity is sacrificed for performance.
+
+Connection and keep-alive headers are set by the Worker. This is because there is internal logic to handle connection persistence, and it would hurt developer experience to not set these headers appropriately.
 
 ## I need your feedback
 I started this project as a way to learn Zig. As such, some of it will be garbage. I would value any feedback.
@@ -171,10 +178,12 @@ If you want a more substantial HTTP library, I suggest that you look at [Zap](ht
 Currently, Zap/Facil.io is around 15% faster for static GET requests. I am working to improve this, but as I'm new to systems programming, this is a challenge for me. I would be happy to match Zap/Facil.io's performance.
 
 ## To do
-- Static file helpers
-- Templating support
 - TLS support
 - WebSocket support
-- HTTP/2 support
 - API reference
+- HTTP/2 support
 - Windows support
+- Templating helper
+
+Also to do:
+Add a response helper to set content-length header from an integer. Maybe use a pre-allocated buffer so that the user does not need to provide an allocator or think about freeing/ownership.

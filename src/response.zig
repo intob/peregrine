@@ -52,7 +52,7 @@ pub const Response = struct {
         self.headers_len += 1;
     }
 
-    pub fn serialiseHeaders(self: *Self, bufRef: *[]u8) !usize {
+    pub fn serialiseStatusAndHeaders(self: *Self, bufRef: *[]u8) !usize {
         @setRuntimeSafety(false);
         var buf = bufRef.*;
         var n: usize = 0;

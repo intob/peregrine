@@ -9,7 +9,11 @@ const Response = @import("./response.zig").Response;
 const Status = @import("./status.zig").Status;
 
 const CONNECTION_MAX_REQUESTS: u32 = 200;
-// Extra CRLF to terminate headers
+// This is added to a response that contains no body. This is more efficient than
+// having the user provide the header to be serialised.
+const CONTENT_LENGTH_ZERO_HEADER = "content-length: 0\r\n";
+// These headers are added last, so they have an extra CRLF to terminate the headers.
+// This is simpler and more efficient than appending \r\n separately.
 const KEEP_ALIVE_HEADERS = "connection: keep-alive\r\nkeep-alive: timeout=3, max=200\r\n\r\n";
 const CLOSE_HEADER = "connection: close\r\n\r\n";
 
@@ -159,17 +163,21 @@ pub fn Worker(comptime Handler: type) type {
         }
 
         fn respond(self: *Self, socket: posix.socket_t, keep_alive: bool) !void {
-            const headers_len = try self.resp.serialiseHeaders(&self.resp_header_buf);
             self.iovecs.clearRetainingCapacity();
-            try self.iovecs.appendSlice(&.{
-                .{
-                    .base = @ptrCast(self.resp_header_buf[0..headers_len]),
-                    .len = headers_len,
-                },
-                .{
-                    .base = if (keep_alive) KEEP_ALIVE_HEADERS else CLOSE_HEADER,
-                    .len = if (keep_alive) KEEP_ALIVE_HEADERS.len else CLOSE_HEADER.len,
-                },
+            const status_len = try self.resp.serialiseStatusAndHeaders(&self.resp_header_buf);
+            try self.iovecs.append(.{
+                .base = @ptrCast(self.resp_header_buf[0..status_len]),
+                .len = status_len,
+            });
+            if (self.resp.body_len == 0) {
+                try self.iovecs.append(.{
+                    .base = CONTENT_LENGTH_ZERO_HEADER,
+                    .len = CONTENT_LENGTH_ZERO_HEADER.len,
+                });
+            }
+            try self.iovecs.append(.{
+                .base = if (keep_alive) KEEP_ALIVE_HEADERS else CLOSE_HEADER,
+                .len = if (keep_alive) KEEP_ALIVE_HEADERS.len else CLOSE_HEADER.len,
             });
             if (self.resp.body_len > 0) {
                 try self.iovecs.append(.{
@@ -177,7 +185,8 @@ pub fn Worker(comptime Handler: type) type {
                     .len = self.resp.body_len,
                 });
             }
-            const total_len = headers_len +
+            const total_len = status_len +
+                (if (self.resp.body_len == 0) CONTENT_LENGTH_ZERO_HEADER.len else 0) +
                 (if (keep_alive) KEEP_ALIVE_HEADERS.len else CLOSE_HEADER.len) +
                 self.resp.body_len;
             const written = try posix.writev(socket, self.iovecs.items);
