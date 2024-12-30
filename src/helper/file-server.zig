@@ -44,10 +44,7 @@ pub const FileServer = struct {
     pub fn serve(self: *@This(), resp: *Response) !void {
         if (!self.loaded) try self.load();
         _ = try resp.setBody(self.content);
-        try resp.headers.append(try Header.init(.{
-            .key = "Content-Length",
-            .value = self.content_len_header,
-        }));
+        try resp.headers.append(try Header.init("Content-Length", self.content_len_header));
     }
 
     fn load(self: *@This()) !void {

@@ -104,7 +104,7 @@ const MyHandler = struct {
 
     fn handleWithError(_: *@This(), _: *pereg.Request, resp: *pereg.Response) !void {
         _ = try resp.setBody("Kawww\n");
-        const len_header = try pereg.Header.init(.{ .key = "Content-Length", .value = "6" });
+        const len_header = try pereg.Header.init("Content-Length", "6");
         try resp.headers.append(len_header);
     }
 };
@@ -152,8 +152,6 @@ if (req.query.get("some-key")) |value| {
 For example, you need to set the Content-Length header yourself. Regardless of whether it's an ArrayList or a HashMap, checking if it was set already by the user would incur a cost (albeit small). Again, this library is designed to be reliable, performant, and simple.
 
 Connection and Keep-Alive headers ARE set by the Worker. This is because there is internal logic to handle connection persistence, and it would hurt developer experience to not set these headers appropriately.
-
-If you want to take complete control over the response, simply call `resp.hijack()`. This will prevent the Worker from sending any response. If you do this, you will need to write to the socket yourself. The socket is included in the request.
 
 ## I need your feedback
 I started this project as a way to learn Zig. As such, some of it will be garbage. I would value any feedback.

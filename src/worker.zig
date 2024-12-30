@@ -153,11 +153,9 @@ pub fn Worker(comptime Handler: type) type {
             keep_alive = shouldKeepAlive(self.req);
             self.resp.reset();
             self.handler.handle(self.req, self.resp);
-            if (!self.resp.hijacked) {
-                try self.respond(socket, keep_alive);
-                // Returning EOF causes the connection to be closed by the caller.
-                if (!keep_alive) return error.EOF;
-            }
+            try self.respond(socket, keep_alive);
+            // Returning EOF causes the connection to be closed by the caller.
+            if (!keep_alive) return error.EOF;
         }
 
         fn respond(self: *Self, socket: posix.socket_t, keep_alive: bool) !void {
@@ -274,7 +272,7 @@ test "keep alive" {
     req.version = .@"HTTP/1.0";
     try std.testing.expectEqual(false, shouldKeepAlive(req));
     // HTTP/1.1 client closed connection
-    req.headers[0] = try Header.init(.{ .key = "Connection", .value = "close" });
+    req.headers[0] = try Header.init("Connection", "close");
     req.headers_len = 1;
     req.version = .@"HTTP/1.1";
     try std.testing.expectEqual(false, shouldKeepAlive(req));

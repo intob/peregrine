@@ -124,7 +124,7 @@ pub const DirServer = struct {
         const req_path = req.getPath();
         if (!std.mem.startsWith(u8, req_path, self.req_path)) {
             resp.status = .not_found;
-            try resp.headers.append(try Header.init(.{ .key = "Content-Length", .value = "0" }));
+            try resp.headers.append(try Header.init("Content-Length", "0"));
             return;
         }
         const rel_path = req_path[self.req_path.len..];
@@ -137,7 +137,7 @@ pub const DirServer = struct {
             // TODO: pre-allocate some standard responses like this,
             // so that we don't need to memcpy the header.
             resp.status = .not_found;
-            try resp.headers.append(try Header.init(.{ .key = "Content-Length", .value = "0" }));
+            try resp.headers.append(try Header.init("Content-Length", "0"));
             return;
         }
     }
@@ -152,14 +152,11 @@ pub const DirServer = struct {
         _ = try file.readAll(hit.contents);
         const content_length = try std.fmt.allocPrint(self.allocator, "{d}", .{stat.size});
         defer self.allocator.free(content_length);
-        try hit.headers.append(try Header.init(.{
-            .key = "Content-Length",
-            .value = content_length,
-        }));
-        try hit.headers.append(try Header.init(.{
-            .key = "Content-Type",
-            .value = Mime.fromExtension(fs.path.extension(entry.basename)).toString(),
-        }));
+        try hit.headers.append(try Header.init("Content-Length", content_length));
+        try hit.headers.append(try Header.init(
+            "Content-Type",
+            Mime.fromExtension(fs.path.extension(entry.basename)).toString(),
+        ));
         try self.files.put(try self.allocator.dupe(u8, entry.path), hit);
         if (std.mem.eql(u8, entry.basename, "index.html")) {
             const dir_path = fs.path.dirname(entry.path) orelse "";

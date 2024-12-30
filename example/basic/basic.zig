@@ -16,7 +16,7 @@ const Handler = struct {
 
     fn handleWithError(_: *@This(), _: *pereg.Request, resp: *pereg.Response) !void {
         _ = try resp.setBody("Kawww\n");
-        const len_header = try pereg.Header.init(.{ .key = "Content-Length", .value = "6" });
+        const len_header = try pereg.Header.init("Content-Length", "6");
         try resp.headers.append(len_header);
     }
 };

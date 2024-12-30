@@ -11,10 +11,13 @@ const Version = @import("./version.zig").Version;
 /// If a field is added, it MUST be reset by the reset() method.
 pub const Request = struct {
     allocator: std.mem.Allocator,
-    socket: std.posix.socket_t,
     method: Method,
     path: [256]u8,
     path_len: usize,
+    // Benchmarks show this array to be significantly faster than
+    // std.ArrayList. Not sure why. A few headers parse in 361ns,
+    // vs 426ns using ArrayList. Benchmark used was "benchmark read
+    // and parse headers" in reader.zig.
     headers: [32]Header,
     headers_len: usize,
     version: Version,
@@ -28,14 +31,13 @@ pub const Request = struct {
         const r = try allocator.create(Self);
         r.* = .{
             .allocator = allocator,
-            .socket = 0,
             .method = Method.GET,
-            .path = [_]u8{0} ** 256,
+            .path = undefined,
             .path_len = 0,
             .headers = undefined,
             .headers_len = 0,
             .version = Version.@"HTTP/1.1",
-            .query_raw = [_]u8{0} ** 256,
+            .query_raw = undefined,
             .query_raw_len = 0,
             .query = std.StringHashMap([]const u8).init(allocator),
         };
@@ -92,7 +94,7 @@ pub const Request = struct {
         return self.query;
     }
 
-    // Socket, method, path_buf and path_len will always be overwritten by the
+    // Method, path_buf and path_len will always be overwritten by the
     // request reader. No need to reset them here also.
     // This method should be called BEFORE the call to RequestReader.readRequest.
     // The query map is reset in the parseQuery method, because we don't need to clear

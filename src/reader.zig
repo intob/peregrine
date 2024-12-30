@@ -30,7 +30,6 @@ pub const RequestReader = struct {
     }
 
     pub fn readRequest(self: *Self, socket: posix.socket_t, req: *Request) !void {
-        req.socket = socket;
         const n = try self.readLine(socket);
         if (n == 0) return error.EOF;
         if (n < "GET / HTTP/1.1".len) return error.InvalidRequest;
@@ -260,7 +259,7 @@ test "benchmark HTTP GET request parsing" {
     const write_fd = pipe_fds[1];
     defer posix.close(read_fd);
     defer posix.close(write_fd);
-    const iterations: usize = 1_000_000;
+    const iterations: usize = 10_000_000;
     var timer = try std.time.Timer.start();
     var i: usize = 0;
     while (i < iterations) : (i += 1) {

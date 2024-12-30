@@ -14,7 +14,6 @@ pub const Response = struct {
     headers: std.ArrayList(Header),
     body: []align(16) u8,
     body_len: usize,
-    hijacked: bool,
 
     const Self = @This();
 
@@ -26,7 +25,6 @@ pub const Response = struct {
             .headers = std.ArrayList(Header).init(allocator),
             .body = try allocator.alignedAlloc(u8, 16, std.mem.alignForward(usize, body_size, 16)),
             .body_len = 0,
-            .hijacked = false,
         };
         return resp;
     }
@@ -76,14 +74,6 @@ pub const Response = struct {
         return buf.len;
     }
 
-    /// Prevent the response from being sent by the worker.
-    /// This allows a library user to take complete control of the response.
-    /// This could be useful for some specific performance-critical scenarios.
-    /// If this is called, the caller becomes responsible for closing the socket.
-    pub fn hijack(self: *Self) void {
-        self.hijacked = true;
-    }
-
     /// This is called automatically before Handler.handle.
     /// The response is reused so that no allocations are required per request.
     /// All fields must be reset to prevent exposing stale data.
@@ -91,7 +81,6 @@ pub const Response = struct {
         self.status = Status.ok;
         self.headers.clearRetainingCapacity();
         self.body_len = 0;
-        self.hijacked = false;
     }
 };
 
@@ -100,8 +89,8 @@ test "serialise" {
     const allocator = gpa.allocator();
 
     var r = try Response.init(allocator, 1024);
-    try r.headers.append(try Header.init(.{ .key = "Content-Type", .value = "total/rubbish" }));
-    try r.headers.append(try Header.init(.{ .key = "Content-Length", .value = "0" }));
+    try r.headers.append(try Header.init("Content-Type", "total/rubbish"));
+    try r.headers.append(try Header.init("Content-Length", "0"));
 
     var buf = try allocator.alloc(u8, 128);
     const n = try r.serialiseHeaders(&buf);
@@ -115,15 +104,11 @@ test "serialise" {
 test "benchmark serialise" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
-    try benchmark(allocator);
-}
-
-fn benchmark(allocator: std.mem.Allocator) !void {
     var resp = try Response.init(allocator, 1024);
     defer resp.deinit();
-    try resp.headers.append(try Header.init(.{ .key = "Content-Type", .value = "total/rubbish" }));
-    try resp.headers.append(try Header.init(.{ .key = "Content-Length", .value = "11" }));
-    try resp.headers.append(try Header.init(.{ .key = "Etag", .value = "32456756753456" }));
+    try resp.headers.append(try Header.init("Content-Type", "total/rubbish"));
+    try resp.headers.append(try Header.init("Content-Length", "11"));
+    try resp.headers.append(try Header.init("Etag", "32456756753456"));
     var buffer = try allocator.alloc(u8, 1024);
     defer allocator.free(buffer);
     const iterations: usize = 10_000_000;
