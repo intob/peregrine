@@ -180,6 +180,9 @@ Currently, Zap/Facil.io is around 15% faster for static GET requests. I am worki
 ## To do
 - TLS support
 - WebSocket support
+- Make request and response buffer sizes configurable
+- Increase TCP buffer size
+- Increase socket backlog size
 - API reference
 - HTTP/2 support
 - Windows support
