@@ -6,7 +6,9 @@ pub const Header = struct {
     key_buf: [64]u8 = undefined,
     value_buf: [256]u8 = undefined,
 
-    pub fn init(comptime k: []const u8, v: []const u8) !Header {
+    // Inlining this yeilds a 50% improvement in "benchmark init" below,
+    // and 20% improvement in "benchmark serialise" in response.zig.
+    pub inline fn init(comptime k: []const u8, v: []const u8) !Header {
         if (comptime k.len > 64) return error.KeyTooLarge;
         if (v.len > 256) return error.ValueTooLarge;
         var h = Header{ .key_len = k.len, .value_len = v.len };
@@ -23,7 +25,9 @@ pub const Header = struct {
         return self.value_buf[0..self.value_len];
     }
 
-    pub fn parse(raw: []const u8) !Header {
+    // Inlining this yeilds a small improvement in "benchmark parse" below,
+    // and "benchmark read and parse headers" in reader.zig.
+    pub inline fn parse(raw: []const u8) !Header {
         var h = Header{};
         const colon_pos = std.mem.indexOfScalar(u8, raw, ':') orelse return error.InvalidHeader;
         if (colon_pos >= h.key_buf.len or raw.len - (colon_pos + 2) >= h.value_buf.len) {

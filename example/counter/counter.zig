@@ -35,8 +35,7 @@ const Handler = struct {
         const buf = try std.fmt.allocPrint(allocator, "counter={d}\n", .{count});
         _ = try resp.setBody(buf);
         const len_buf = try std.fmt.allocPrint(allocator, "{d}", .{buf.len});
-        const len_header = try pereg.Header.init("Content-Length", len_buf);
-        try resp.headers.append(len_header);
+        try resp.addNewHeader("Content-Length", len_buf);
     }
 };
 

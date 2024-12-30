@@ -11,7 +11,8 @@ const VERSION = "HTTP/1.1 ";
 pub const Response = struct {
     allocator: std.mem.Allocator,
     status: Status,
-    headers: std.ArrayList(Header),
+    headers: [32]Header,
+    headers_len: usize,
     body: []align(16) u8,
     body_len: usize,
 
@@ -22,7 +23,8 @@ pub const Response = struct {
         resp.* = .{
             .allocator = allocator,
             .status = Status.ok,
-            .headers = std.ArrayList(Header).init(allocator),
+            .headers = undefined,
+            .headers_len = 0,
             .body = try allocator.alignedAlloc(u8, 16, std.mem.alignForward(usize, body_size, 16)),
             .body_len = 0,
         };
@@ -30,9 +32,24 @@ pub const Response = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.headers.deinit();
         self.allocator.free(self.body);
         self.allocator.destroy(self);
+    }
+
+    pub fn addHeader(self: *Self, header: Header) !void {
+        if (self.headers_len >= self.headers.len) {
+            return error.HeadersFull;
+        }
+        self.headers[self.headers_len] = header;
+        self.headers_len += 1;
+    }
+
+    pub fn addNewHeader(self: *Self, comptime key: []const u8, value: []const u8) !void {
+        if (self.headers_len >= self.headers.len) {
+            return error.HeadersFull;
+        }
+        self.headers[self.headers_len] = try Header.init(key, value);
+        self.headers_len += 1;
     }
 
     pub fn serialiseHeaders(self: *Self, bufRef: *[]u8) !usize {
@@ -47,14 +64,15 @@ pub const Response = struct {
         buf[n] = '\r';
         buf[n + 1] = '\n';
         n += 2;
-        for (self.headers.items) |h| {
-            const key = h.key();
+        var i: usize = 0;
+        while (i < self.headers_len) : (i += 1) {
+            const key = self.headers[i].key();
             @memcpy(buf[n .. n + key.len], key);
             n += key.len;
             buf[n] = ':';
             buf[n + 1] = ' ';
             n += 2;
-            const value = h.value();
+            const value = self.headers[i].value();
             @memcpy(buf[n .. n + value.len], value);
             n += value.len;
             buf[n] = '\r';
@@ -79,39 +97,38 @@ pub const Response = struct {
     /// All fields must be reset to prevent exposing stale data.
     pub fn reset(self: *Self) void {
         self.status = Status.ok;
-        self.headers.clearRetainingCapacity();
+        self.headers_len = 0;
         self.body_len = 0;
     }
 };
 
 test "serialise" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-
+    var allocator = std.testing.allocator;
     var r = try Response.init(allocator, 1024);
-    try r.headers.append(try Header.init("Content-Type", "total/rubbish"));
-    try r.headers.append(try Header.init("Content-Length", "0"));
-
+    defer r.deinit();
+    r.headers[0] = try Header.init("Content-Type", "total/rubbish");
+    r.headers[1] = try Header.init("Content-Length", "0");
+    r.headers_len = 2;
     var buf = try allocator.alloc(u8, 128);
+    defer allocator.free(buf);
     const n = try r.serialiseHeaders(&buf);
-
     const expected = "HTTP/1.1 200 OK\r\nContent-Type: total/rubbish\r\nContent-Length: 0\r\n";
-
     try std.testing.expectEqualStrings(expected, buf[0..n]);
     try std.testing.expectEqual(expected.len, n);
 }
 
 test "benchmark serialise" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
     var resp = try Response.init(allocator, 1024);
     defer resp.deinit();
-    try resp.headers.append(try Header.init("Content-Type", "total/rubbish"));
-    try resp.headers.append(try Header.init("Content-Length", "11"));
-    try resp.headers.append(try Header.init("Etag", "32456756753456"));
+    resp.headers[0] = try Header.init("Content-Type", "total/rubbish");
+    resp.headers[1] = try Header.init("Content-Length", "11");
+    resp.headers[2] = try Header.init("Etag", "32456756753456");
+    resp.headers[3] = try Header.init("Some-Other", "HJFLAEKGJELIUO");
+    resp.headers_len = 4;
     var buffer = try allocator.alloc(u8, 1024);
     defer allocator.free(buffer);
-    const iterations: usize = 10_000_000;
+    const iterations: usize = 100_000_000;
     var timer = try std.time.Timer.start();
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
@@ -121,4 +138,22 @@ test "benchmark serialise" {
     const elapsed = timer.lap();
     const avg_ns = @divFloor(elapsed, iterations);
     std.debug.print("Average serialization time: {d}ns\n", .{avg_ns});
+}
+
+test "benchmark add header" {
+    const allocator = std.testing.allocator;
+    var resp = try Response.init(allocator, 1024);
+    defer resp.deinit();
+    const iterations: usize = 10_000_000;
+    var timer = try std.time.Timer.start();
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        inline for (0..resp.headers.len) |_| {
+            try resp.addNewHeader("key", "value");
+        }
+        resp.headers_len = 0;
+    }
+    const elapsed = timer.lap();
+    const avg_ns = @divFloor(elapsed, iterations);
+    std.debug.print("Average time: {d}ns\n", .{avg_ns});
 }

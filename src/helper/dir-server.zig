@@ -124,20 +124,20 @@ pub const DirServer = struct {
         const req_path = req.getPath();
         if (!std.mem.startsWith(u8, req_path, self.req_path)) {
             resp.status = .not_found;
-            try resp.headers.append(try Header.init("Content-Length", "0"));
+            try resp.addNewHeader("Content-Length", "0");
             return;
         }
         const rel_path = req_path[self.req_path.len..];
         std.debug.print("looking for [{s}]\n", .{rel_path});
         if (self.files.get(rel_path)) |hit| {
-            for (hit.headers.items) |h| try resp.headers.append(h);
+            for (hit.headers.items) |h| try resp.addHeader(h);
             resp.status = .ok;
             _ = try resp.setBody(hit.contents);
         } else {
             // TODO: pre-allocate some standard responses like this,
             // so that we don't need to memcpy the header.
             resp.status = .not_found;
-            try resp.headers.append(try Header.init("Content-Length", "0"));
+            try resp.addNewHeader("Content-Length", "0");
             return;
         }
     }
