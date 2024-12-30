@@ -8,10 +8,10 @@ const RequestReader = @import("./reader.zig").RequestReader;
 const Response = @import("./response.zig").Response;
 const Status = @import("./status.zig").Status;
 
-// Extra CRLF to terminate headers
 const CONNECTION_MAX_REQUESTS: u32 = 200;
-const KEEP_ALIVE_HEADERS = "Connection: keep-alive\r\nKeep-Alive: timeout=3, max=200\r\n\r\n";
-const CLOSE_HEADER = "Connection: close\r\n\r\n";
+// Extra CRLF to terminate headers
+const KEEP_ALIVE_HEADERS = "connection: keep-alive\r\nkeep-alive: timeout=3, max=200\r\n\r\n";
+const CLOSE_HEADER = "connection: close\r\n\r\n";
 
 pub const WorkerConfig = struct {
     allocator: std.mem.Allocator,
@@ -190,7 +190,7 @@ pub fn Worker(comptime Handler: type) type {
 
 fn shouldKeepAlive(req: *Request) bool {
     if (req.version == .@"HTTP/1.1") {
-        if (req.getHeader("Connection")) |connection| {
+        if (req.findHeader("connection")) |connection| {
             return !std.mem.eql(u8, connection, "close");
         }
         return true; // HTTP/1.1 defaults to keep-alive

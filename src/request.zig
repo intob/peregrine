@@ -49,13 +49,15 @@ pub const Request = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn getHeaders(self: *Self) []Header {
+    pub fn allHeaders(self: *Self) []Header {
         return self.headers[0..self.headers_len];
     }
 
-    pub fn getHeader(self: *Self, key: []const u8) ?[]const u8 {
+    /// SIMD-optimised case-insensitive search. RFC 9110 Section 5.1
+    /// "Field Names" explicitly states that "Field names are case-insensitive"
+    pub fn findHeader(self: *Self, key: []const u8) ?[]const u8 {
         for (self.headers[0..self.headers_len]) |h| {
-            if (std.mem.eql(u8, key, h.key())) {
+            if (std.ascii.eqlIgnoreCase(h.key(), key)) {
                 return h.value();
             }
         }

@@ -31,6 +31,11 @@ Note: This project has just started, and is not yet a complete HTTP server imple
     - Efficient event-driven architecture
     - Aligned buffer allocation for optimal IO performance
     - Vectored IO writes the response with a single syscall
+    - Zero heap allocations per-request
+    - Header case-insensitivity handled when searching, not parsing (unused headers are not transformed)
+    - Query only parsed on demand
+    - Optimised header, method and version parsing
+    - Fixed sized array for request headers (faster than std.ArrayList)
 
 
 ## Architecture
