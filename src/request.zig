@@ -15,14 +15,14 @@ pub const Request = struct {
     path: [256]u8,
     path_len: usize,
     // Benchmarks show this array to be significantly faster than
-    // std.ArrayList. Not sure why. A few headers parse in 361ns,
-    // vs 426ns using ArrayList. Benchmark used was "benchmark read
-    // and parse headers" in reader.zig.
+    // std.ArrayList. Not sure why. Benchmark used was "benchmark
+    // read and parse headers" in reader.zig.
     headers: [32]Header,
     headers_len: usize,
     version: Version,
     query_raw: [256]u8,
     query_raw_len: usize,
+    /// Before accessing this directly, call parseQuery()
     query: std.StringHashMap([]const u8),
 
     const Self = @This();
@@ -49,10 +49,6 @@ pub const Request = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn allHeaders(self: *Self) []Header {
-        return self.headers[0..self.headers_len];
-    }
-
     /// SIMD-optimised case-insensitive search. RFC 9110 Section 5.1
     /// "Field Names" explicitly states that "Field names are case-insensitive"
     pub fn findHeader(self: *Self, key: []const u8) ?[]const u8 {
@@ -68,10 +64,10 @@ pub const Request = struct {
         return self.path[0..self.path_len];
     }
 
-    // Call this BEFORE accessing the query map.
-    // The query map is NOT reset for each request, because clearing the map
-    // involves aquiring a mutex. Therefore, we can save some nanoseconds by
-    // clearing it here; only when the query is to be used.
+    /// Call this BEFORE accessing the query map.
+    /// The query map is NOT reset for each request, because clearing the map
+    /// involves aquiring a mutex. Therefore, we can save some nanoseconds by
+    /// clearing it here; only when the query is to be used.
     pub fn parseQuery(self: *Self) !?std.StringHashMap([]const u8) {
         self.query.clearRetainingCapacity();
         var current_pos: usize = 0;
