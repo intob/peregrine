@@ -37,7 +37,6 @@ Note: This project has just started, and is not yet a complete HTTP server imple
     - Optimised header, method and version parsing
     - Fixed sized array for headers (faster than std.ArrayList)
 
-
 ## Architecture
 
 ### Server
@@ -67,6 +66,27 @@ Connection timeouts are configured with:
 - Receive timeout: 3 seconds
 - Send timeout: 3 seconds
 
+## No TLS support (for now)
+I spent a couple of hours deliberating over how to either provide TLS support, or expose an interface for user's to provide their choice of TLS implementation. I'm looking for a clean way to handle this without sacrificing performance or usability.
+
+I think something like this would be ideal for the user:
+```zig
+const http_server = try pereg.Server(Handler).init(.{
+    .allocator = allocator,
+    .port = 3000,
+});
+// Or for HTTPS...
+const https_server = try pereg.TLSServer(Handler, TLS).init(.{
+    .allocator = allocator,
+    .port = 3000,
+});
+```
+When I tried to implement this, I quickly saw that it would be challenging to do it like this because TLSServer has a handshake, and the plain HTTP server does not. The two look entirely different at the socket level.
+
+Then I realised that even if I added TLS support, server performance would pale in comparison to the plain HTTP version. At this point, I'd rather offload TLS termination (to a load balancer, for example), allowing this server to focus on efficient HTTP parsing without becoming overwhelmingly complex.
+
+In future when I'm more familiar with comptime generics and interfaces in Zig, I may have another crack at this. For now, I don't see a way to win here... So, If you're looking for a Zig HTTP server that supports TLS, I suggest looking at [Zap](https://github.com/zigzap/zap).
+
 ## Usage
 
 ### Run the counter example server natively
@@ -94,7 +114,7 @@ docker run -p 3000:3000 counter
 const std = @import("std");
 const pereg = @import("peregrine");
 
-const MyHandler = struct {
+const Handler = struct {
     pub fn init(allocator: std.mem.Allocator) !*@This() {
         return try allocator.create(@This());
     }
@@ -117,7 +137,7 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
-    const srv = try pereg.Server(MyHandler).init(.{
+    const srv = try pereg.Server(Handler).init(.{
         .allocator = allocator,
         .port = 3000,
     });
@@ -131,6 +151,19 @@ Using Zig's comptime metaprogramming, the Server is compiled with your handler i
 The configuration is minimal, with reasonable defaults. Simply provide an allocator and port number.
 
 The server will shutdown gracefully if an interrupt signal is received. Alternatively, you can call `Server.shutdown()`.
+
+## Need to know
+
+### Response headers
+If the body is not zero-length, you must set the Content-Length header yourself. I will write a helper for this soon.
+
+Regardless of whether it's an ArrayList or a HashMap, checking if it was set already by the user would incur a cost (albeit small).
+
+If you do not give a response body, the "content-length: 0" header will be added automatically. This is because it's faster to add a hard-coded iovec than to serialise an extra header.
+
+Again, this library is designed to be reliable, performant, and simple. Occasionally simplicity is sacrificed for performance.
+
+Connection and keep-alive headers are set by the Worker. This is because there is internal logic to handle connection persistence, and it would hurt developer experience to not set these headers appropriately.
 
 ### Query params
 `req.parseQuery()` returns `!?std.StringHashMap([]const u8)` - an error union containing an optional hash map. The semantics are:
@@ -152,18 +185,6 @@ if (req.query.get("some-key")) |value| {
 }
 ```
 
-## Need to know
-### Response headers
-If the body is not zero-length, you must set the Content-Length header yourself. I will write a helper for this soon.
-
-Regardless of whether it's an ArrayList or a HashMap, checking if it was set already by the user would incur a cost (albeit small).
-
-If you do not give a response body, the "content-length: 0" header will be added automatically. This is because it's faster to add a hard-coded iovec than to serialise an extra header.
-
-Again, this library is designed to be reliable, performant, and simple. Occasionally simplicity is sacrificed for performance.
-
-Connection and keep-alive headers are set by the Worker. This is because there is internal logic to handle connection persistence, and it would hurt developer experience to not set these headers appropriately.
-
 ## I need your feedback
 I started this project as a way to learn Zig. As such, some of it will be garbage. I would value any feedback.
 
@@ -178,7 +199,6 @@ If you want a more substantial HTTP library, I suggest that you look at [Zap](ht
 Currently, Zap/Facil.io is around 15% faster for static GET requests. I am working to improve this, but as I'm new to systems programming, this is a challenge for me. I would be happy to match Zap/Facil.io's performance.
 
 ## To do
-- TLS support
 - WebSocket support
 - Make request and response buffer sizes configurable
 - Increase TCP buffer size
@@ -186,7 +206,7 @@ Currently, Zap/Facil.io is around 15% faster for static GET requests. I am worki
 - API reference
 - HTTP/2 support
 - Windows support
-- Templating helper
+- Templating helper (possibly extend helper.DirServer to be composable)
 
 Also to do:
 Add a response helper to set content-length header from an integer. Maybe use a pre-allocated buffer so that the user does not need to provide an allocator or think about freeing/ownership.
