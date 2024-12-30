@@ -67,7 +67,7 @@ Connection timeouts are configured with:
 - Send timeout: 3 seconds
 
 ## No TLS support (for now)
-I spent a couple of hours deliberating over how to either provide TLS support, or expose an interface for user's to provide their choice of TLS implementation. I'm looking for a clean way to handle this without sacrificing performance or usability.
+I spent a couple of hours deliberating over how to either provide TLS support, or expose an interface for users to provide their choice of TLS implementation. I'm looking for a clean way to handle this without sacrificing performance or usability.
 
 I think something like this would be ideal for the user:
 ```zig
@@ -81,7 +81,8 @@ const https_server = try pereg.TLSServer(Handler, TLS).init(.{
     .port = 3000,
 });
 ```
-When I tried to implement this, I quickly saw that it would be challenging to do it like this because TLSServer has a handshake, and the plain HTTP server does not. The two look entirely different at the socket level.
+
+When I tried to implement this, I quickly saw that it would be challenging because TLSServer has a handshake, and the plain HTTP server does not. The two look entirely different at the socket level.
 
 Then I realised that even if I added TLS support, server performance would pale in comparison to the plain HTTP version. At this point, I'd rather offload TLS termination (to a load balancer, for example), allowing this server to focus on efficient HTTP parsing without becoming overwhelmingly complex.
 
@@ -152,6 +153,23 @@ The configuration is minimal, with reasonable defaults. Simply provide an alloca
 
 The server will shutdown gracefully if an interrupt signal is received. Alternatively, you can call `Server.shutdown()`.
 
+## Memory Management Model
+
+### Request lifecycle
+The server manages request and response buffers internally, reusing them across requests to avoid allocations. When a handler processes a request, it must copy any data it needs to retain, as the underlying buffers will be reused for subsequent requests.
+
+### Handler responsibilities
+- Handlers own and manage their internal memory
+- Any data extracted from requests must be copied before the handler returns
+- Response bodies must be copied to handler-owned memory before being set
+- All handler-allocated memory must be freed within the handle function
+
+### Concurrent access
+The current design intentionally avoids an `after_request` hook because:
+- Handlers are shared across multiple worker threads
+- Adding post-processing would require mutex synchronization
+- Locking would create contention, hurting performance
+
 ## Need to know
 
 ### Response headers
@@ -196,7 +214,7 @@ I will provide some helpers to help with common use-cases, such as serving a dir
 If you want a more substantial HTTP library, I suggest that you look at [Zap](https://github.com/zigzap/zap), built on [Facil.io](http://facil.io). Facil.io is an excellent battle-tested library written in C.
 
 ## Benchmarks
-Currently, Zap/Facil.io is around 15% faster for static GET requests. I am working to improve this, but as I'm new to systems programming, this is a challenge for me. I would be happy to match Zap/Facil.io's performance.
+Currently, Zap/Facil.io is around 6% faster for static GET requests. I am working to improve this, but as I'm new to systems programming, this is a challenge for me. I would be happy to match Zap/Facil.io's performance.
 
 ## To do
 - WebSocket support

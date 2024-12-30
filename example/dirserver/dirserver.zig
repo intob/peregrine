@@ -28,13 +28,9 @@ const Handler = struct {
     }
 
     pub fn handle(self: *@This(), req: *pereg.Request, resp: *pereg.Response) void {
-        self.handleWithError(req, resp) catch |err| {
+        self.dirServer.serve(req, resp) catch |err| {
             std.debug.print("error handling request: {any}\n", .{err});
         };
-    }
-
-    fn handleWithError(self: *@This(), req: *pereg.Request, resp: *pereg.Response) !void {
-        try self.dirServer.serve(req, resp);
     }
 };
 
