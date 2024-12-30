@@ -44,6 +44,8 @@ pub const Response = struct {
         self.headers_len += 1;
     }
 
+    // Benchmarks show that duplicating addHeader is 10% faster than inlining it,
+    // not sure why.
     pub fn addNewHeader(self: *Self, comptime key: []const u8, value: []const u8) !void {
         if (self.headers_len >= self.headers.len) {
             return error.HeadersFull;
@@ -140,7 +142,7 @@ test "benchmark serialise" {
     std.debug.print("Average serialization time: {d}ns\n", .{avg_ns});
 }
 
-test "benchmark add header" {
+test "benchmark add new header" {
     const allocator = std.testing.allocator;
     var resp = try Response.init(allocator, 1024);
     defer resp.deinit();
