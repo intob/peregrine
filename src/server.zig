@@ -20,7 +20,7 @@ pub const ServerConfig = struct {
     /// Defaults to CPU core count.
     worker_thread_count: usize = 0,
     /// Number of threads accepting connections. Defaults to
-    /// worker_thread_count / 3.
+    /// worker_thread_count / 6.
     accept_thread_count: usize = 0,
     /// Disable Nagle's algorithm. Default is true (disabled).
     tcp_nodelay: bool = true,
@@ -84,7 +84,7 @@ pub fn Server(comptime Handler: type) type {
             const accept_thread_count = if (cfg.accept_thread_count > 0)
                 cfg.accept_thread_count
             else
-                @max(1, worker_thread_count / 3);
+                @max(1, worker_thread_count / 6);
             const io_handler = switch (native_os) {
                 .freebsd, .netbsd, .openbsd, .dragonfly, .macos => try KqueueHandler.init(listener),
                 .linux => try EpollHandler.init(listener),

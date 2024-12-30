@@ -138,10 +138,8 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
-    const srv = try pereg.Server(Handler).init(.{
-        .allocator = allocator,
-        .port = 3000,
-    });
+    const port: u16 = 3000;
+    const srv = try pereg.Server(Handler).init(allocator, port, .{});
     std.debug.print("listening on 0.0.0.0:3000\n", .{});
     try srv.start(); // Blocks if there is no error
 }
@@ -149,7 +147,7 @@ pub fn main() !void {
 
 Using Zig's comptime metaprogramming, the Server is compiled with your handler interface. Simply implement the `init`, `deinit` and `handle` methods. Compile-time checks have your back.
 
-The configuration is minimal, with reasonable defaults. Simply provide an allocator and port number.
+The configuration is minimal, with reasonable defaults. Simply provide an allocator and port number. Optionally set parameters in the configuration struct.
 
 The server will shutdown gracefully if an interrupt signal is received. Alternatively, you can call `Server.shutdown()`.
 
