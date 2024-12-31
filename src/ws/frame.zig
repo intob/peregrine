@@ -37,8 +37,9 @@ pub const Frame = struct {
 
     pub fn init(allocator: std.mem.Allocator, payload_size: usize) !*@This() {
         const self = try allocator.create(@This());
+        const aligned_payload_size = std.mem.alignForward(usize, payload_size, 16);
         self.allocator = allocator;
-        self.payload = try allocator.alignedAlloc(u8, 16, payload_size);
+        self.payload = try allocator.alignedAlloc(u8, 16, aligned_payload_size);
         return self;
     }
 

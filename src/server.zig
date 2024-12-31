@@ -25,6 +25,13 @@ pub const ServerConfig = struct {
     accept_thread_count: usize = 0,
     /// Disable Nagle's algorithm. Default is true (disabled).
     tcp_nodelay: bool = true,
+    /// Response buffer size. Defaults to 10MB.
+    /// Each worker has it's own response buffer.
+    /// Size is aligned internally.
+    response_body_buffer_size: usize = 1024 * 1024 * 10,
+    /// WebSocket reader buffer size. Defaults to 32KB.
+    /// Size is aligned internally.
+    websocket_buffer_size: usize = 1024 * 32,
 };
 
 pub fn Server(comptime Handler: type) type {
@@ -95,11 +102,10 @@ pub fn Server(comptime Handler: type) type {
             const srv = try allocator.create(Self);
             errdefer allocator.destroy(srv);
             const handler = try Handler.init(allocator);
-            const ws_buffer_size = std.mem.alignForward(usize, 32 * 1024, 16);
             srv.* = .{
                 .allocator = allocator,
                 .handler = handler,
-                .ws = try WebsocketServer(Handler).init(allocator, handler, ws_buffer_size),
+                .ws = try WebsocketServer(Handler).init(allocator, handler, cfg.websocket_buffer_size),
                 .address = address,
                 .workers = try allocator.alloc(worker.Worker(Handler), worker_thread_count),
                 .next_worker = 0,
@@ -112,6 +118,7 @@ pub fn Server(comptime Handler: type) type {
                 try w.init(srv.handler, srv.ws, .{
                     .allocator = allocator,
                     .id = i,
+                    .resp_buffer_size = cfg.response_buffer_size,
                 });
             }
             for (srv.accept_threads) |*thread| {
@@ -128,12 +135,12 @@ pub fn Server(comptime Handler: type) type {
         }
 
         pub fn shutdown(self: *Self) void {
-            should_shutdown.store(true, .release);
+            should_shutdown.store(true, .monotonic);
             self.waitForShutdown();
         }
 
         fn loop(self: *Self) !void {
-            while (!should_shutdown.load(.acquire)) {
+            while (!should_shutdown.load(.unordered)) {
                 const have_connection = try self.io_handler.poll();
                 if (have_connection) {
                     self.acceptConnection() catch |err| switch (err) {

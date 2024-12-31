@@ -24,6 +24,7 @@ const UPGRADE_HEADER = "connection: upgrade\r\n\r\n";
 pub const WorkerConfig = struct {
     allocator: std.mem.Allocator,
     id: usize,
+    resp_body_buffer_size: usize,
 };
 
 pub fn Worker(comptime Handler: type) type {
@@ -34,16 +35,13 @@ pub fn Worker(comptime Handler: type) type {
         handler: *Handler,
         req: *Request,
         resp: *Response,
-        resp_header_buf: []align(16) u8,
+        resp_buf: []align(16) u8,
         // TODO: Benchmark use of fixed size array for iovecs.
         // As for headers, it could be much faster than ArrayList.
-        iovecs: std.ArrayList(posix.iovec_const),
+        iovecs: [3]posix.iovec_const,
         connection_requests: std.AutoHashMap(posix.socket_t, u32),
         ws: *WebsocketServer(Handler),
         shutdown: std.atomic.Value(bool),
-        shutdown_cond: std.Thread.Condition,
-        shutdown_mutex: std.Thread.Mutex,
-        shutdown_done: bool,
         thread: std.Thread,
 
         const Self = @This();
@@ -57,34 +55,20 @@ pub fn Worker(comptime Handler: type) type {
             self.id = cfg.id;
             self.req = try Request.init(allocator);
             // TODO: make body buffer size configurable
-            self.resp = try Response.init(allocator, 200_000); // Aligned internally
-            // Up to 32 headers, each  with [64]u8 key and [256]u8 value, plus ": " and "\n"
-            const max_header_size = ((64 + 256 + 3) * 32) + "HTTP/1.1 500 Internal Server Error\n".len;
-            const aligned_header_size = std.mem.alignForward(usize, max_header_size, 16);
-            self.resp_header_buf = try allocator.alignedAlloc(u8, 16, aligned_header_size);
-            self.iovecs = std.ArrayList(posix.iovec_const).init(allocator);
+            self.resp = try Response.init(allocator, cfg.resp_body_buffer_size); // Aligned internally
+            self.resp_status_buf = try allocator.alignedAlloc(u8, 16, try calcResponseStatusBufferSize(allocator));
             self.connection_requests = std.AutoHashMap(posix.socket_t, u32).init(allocator);
             self.ws = ws;
             self.shutdown = std.atomic.Value(bool).init(false);
-            self.shutdown_cond = std.Thread.Condition{};
-            self.shutdown_mutex = std.Thread.Mutex{};
             self.thread = try std.Thread.spawn(.{}, workerLoop, .{self});
         }
 
         pub fn deinit(self: *Self) void {
-            self.shutdown.store(true, .release);
-            {
-                self.shutdown_mutex.lock();
-                defer self.shutdown_mutex.unlock();
-                while (!self.shutdown_done) {
-                    self.shutdown_cond.wait(&self.shutdown_mutex);
-                }
-            }
-            self.thread.join(); // Finish handling any requests
+            self.shutdown.store(true, .monotonic);
+            self.thread.join();
             self.req.deinit();
             self.resp.deinit();
-            self.allocator.free(self.resp_header_buf);
-            self.iovecs.deinit();
+            self.allocator.free(self.resp_buf);
             self.connection_requests.deinit();
             std.debug.print("worker-thread-{d} joined\n", .{self.id});
         }
@@ -94,12 +78,6 @@ pub fn Worker(comptime Handler: type) type {
         }
 
         fn workerLoop(self: *Self) void {
-            defer {
-                self.shutdown_mutex.lock();
-                defer self.shutdown_mutex.unlock();
-                self.shutdown_done = true;
-                self.shutdown_cond.signal();
-            }
             const EventType = switch (native_os) {
                 .freebsd, .netbsd, .openbsd, .dragonfly, .macos => posix.Kevent,
                 .linux => linux.epoll_event,
@@ -113,7 +91,7 @@ pub fn Worker(comptime Handler: type) type {
                 return;
             };
             defer reader.deinit();
-            while (!self.shutdown.load(.acquire)) {
+            while (!self.shutdown.load(.unordered)) {
                 const ready_count = self.io_handler.wait(&events) catch |err| {
                     std.debug.print("error waiting for events: {any}\n", .{err});
                     continue;
@@ -177,52 +155,44 @@ pub fn Worker(comptime Handler: type) type {
         }
 
         fn respond(self: *Self, fd: posix.socket_t, keep_alive: bool) !void {
-            self.iovecs.clearRetainingCapacity();
             // Status line and user headers
-            const status_len = try self.resp.serialiseStatusAndHeaders(&self.resp_header_buf);
-            try self.iovecs.append(.{
-                .base = @ptrCast(self.resp_header_buf[0..status_len]),
+            const status_len = try self.resp.serialiseStatusAndHeaders(&self.resp_status_buf);
+            self.iovecs[0] = .{
+                .base = @ptrCast(self.resp_status_buf[0..status_len]),
                 .len = status_len,
-            });
+            };
+            var iovecs_len: u2 = 1;
             // Set content-length header if zero
             if (self.resp.body_len == 0) {
-                try self.iovecs.append(.{
+                self.iovecs[1] = .{
                     .base = CONTENT_LENGTH_ZERO_HEADER,
                     .len = CONTENT_LENGTH_ZERO_HEADER.len,
-                });
+                };
+                iovecs_len += 1;
             }
             // Connection header
             if (self.resp.is_ws_upgrade) {
-                try self.iovecs.append(.{
+                self.iovecs[iovecs_len] = .{
                     .base = UPGRADE_HEADER,
                     .len = UPGRADE_HEADER.len,
-                });
+                };
             } else {
-                try self.iovecs.append(.{
+                self.iovecs[iovecs_len] = .{
                     .base = if (keep_alive) KEEP_ALIVE_HEADERS else CLOSE_HEADER,
                     .len = if (keep_alive) KEEP_ALIVE_HEADERS.len else CLOSE_HEADER.len,
-                });
+                };
             }
+            iovecs_len += 1;
             // Body
             if (self.resp.body_len > 0) {
-                try self.iovecs.append(.{
+                self.iovecs[iovecs_len] = .{
                     .base = @ptrCast(self.resp.body[0..self.resp.body_len]),
                     .len = self.resp.body_len,
-                });
+                };
+                iovecs_len += 1;
             }
             // Write to socket
-            // Maybe remove this length calculation, as it's unnecessary overhead...
-            var total_len = status_len + (if (self.resp.body_len == 0) CONTENT_LENGTH_ZERO_HEADER.len else 0);
-            if (self.resp.is_ws_upgrade) {
-                total_len += UPGRADE_HEADER.len;
-            } else {
-                total_len += if (keep_alive) KEEP_ALIVE_HEADERS.len else CLOSE_HEADER.len;
-                total_len += self.resp.body_len;
-            }
-            const written = try posix.writev(fd, self.iovecs.items);
-            if (written != total_len) {
-                return error.WriteError;
-            }
+            _ = try posix.writev(fd, self.iovecs[0..iovecs_len]);
         }
     };
 }
@@ -235,6 +205,16 @@ fn shouldKeepAlive(req: *Request) bool {
         return true; // HTTP/1.1 defaults to keep-alive
     }
     return false; // HTTP/1.0
+}
+
+// Calculate response status and header buffer size.
+fn calcResponseStatusBufferSize(allocator: std.mem.Allocator) !usize {
+    const h = Header{};
+    const resp = try Response.init(allocator, 0);
+    defer resp.deinit();
+    const headers_size = (h.key_buf.len + h.value_buf.len + 4) * resp.headers.len;
+    const resp_buf_size = headers_size + "HTTP/1.1 500 Internal Server Error\r\n".len;
+    return std.mem.alignForward(usize, resp_buf_size, 16);
 }
 
 test "keep alive" {

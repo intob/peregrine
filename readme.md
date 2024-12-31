@@ -246,7 +246,7 @@ If you want a more substantial HTTP library, I suggest that you look at [Zap](ht
 Currently, Zap/Facil.io is around 6% faster for static GET requests. I am working to improve this, but as I'm new to systems programming, this is a challenge for me. I would be happy to match Zap/Facil.io's performance.
 
 ## To do
-- Make request and response buffer sizes configurable
+- Handle request body
 - Increase TCP buffer size
 - Increase socket backlog size
 - API reference

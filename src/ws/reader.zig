@@ -13,10 +13,11 @@ pub const WebsocketReader = struct {
     const MIN_FRAME_SIZE = 2;
 
     pub fn init(allocator: std.mem.Allocator, buffer_size: usize) !*Self {
+        const aligned_buffer_size = std.mem.alignForward(usize, buffer_size, 16);
         const reader = try allocator.create(Self);
         reader.* = .{
             .allocator = allocator,
-            .buffer = try allocator.alignedAlloc(u8, 16, buffer_size),
+            .buffer = try allocator.alignedAlloc(u8, 16, aligned_buffer_size),
         };
         return reader;
     }
@@ -34,9 +35,7 @@ pub const WebsocketReader = struct {
         const second_byte = self.buffer[self.pos + 1];
         self.pos += 2;
         f.fin = (first_byte & 0x80) == 0x80;
-        if (Opcode.fromByte(first_byte & 0x0F)) |op| {
-            f.opcode = op;
-        } else return error.UnknownOpcode;
+        f.opcode = Opcode.fromByte(first_byte & 0x0F) orelse return error.UnknownOpcode;
         f.mask = (second_byte & 0x80) == 0x80;
         f.payload_len = switch (second_byte & 0x7F) {
             126 => try self.readU16(fd),
