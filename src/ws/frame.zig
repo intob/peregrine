@@ -1,9 +1,35 @@
 const std = @import("std");
 
+pub const Opcode = enum(u4) {
+    continuation = 0x0,
+    text = 0x1,
+    binary = 0x2,
+    close = 0x8,
+    ping = 0x9,
+    pong = 0xA,
+    _,
+
+    pub fn fromByte(byte: u8) ?Opcode {
+        return std.meta.intToEnum(Opcode, @as(u4, @truncate(byte))) catch null;
+    }
+
+    pub fn toString(self: Opcode) []const u8 {
+        return switch (self) {
+            .continuation => "continuation",
+            .text => "text",
+            .binary => "binary",
+            .close => "close",
+            .ping => "ping",
+            .pong => "pong",
+            _ => "unknown",
+        };
+    }
+};
+
 pub const Frame = struct {
     allocator: std.mem.Allocator,
     fin: bool,
-    opcode: u4,
+    opcode: Opcode,
     mask: bool,
     payload_len: usize,
     masking_key: ?[4]u8,

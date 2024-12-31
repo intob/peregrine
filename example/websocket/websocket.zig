@@ -45,17 +45,25 @@ const Handler = struct {
     }
 
     pub fn handleWSConn(_: *@This(), fd: posix.socket_t) void {
-        std.debug.print("handle ws conn... {d}\n", .{fd});
+        std.debug.print("{d} handle ws conn...\n", .{fd});
     }
 
     pub fn handleWSDisconn(_: *@This(), fd: posix.socket_t) void {
-        std.debug.print("handle ws disconn... {d}\n", .{fd});
+        std.debug.print("{d} handle ws disconn...\n", .{fd});
     }
 
     pub fn handleWSFrame(_: *@This(), fd: posix.socket_t, frame: *pereg.ws.Frame) void {
-        std.debug.print("handle ws frame... {d} {s}\n", .{ fd, frame.getPayload() });
+        if (frame.opcode == pereg.ws.Opcode.close) {
+            std.debug.print("{d} client closed websocket\n", .{fd});
+            return;
+        }
+        std.debug.print("{d} handle ws frame... {s} {s}\n", .{
+            fd,
+            frame.opcode.toString(),
+            frame.getPayload(),
+        });
         pereg.ws.writer.writeMessage(fd, "Hello client!", false) catch |err| {
-            std.debug.print("error writing websocket: {any}\n", .{err});
+            std.debug.print("{d} error writing websocket: {any}\n", .{ fd, err });
         };
     }
 };

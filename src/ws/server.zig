@@ -62,7 +62,6 @@ pub fn WebsocketServer(comptime Handler: type) type {
                         .linux => event.data.fd,
                         else => unreachable,
                     };
-                    std.debug.print("ws event: {d}\n", .{socket});
                     self.handleEvent(socket) catch |err| {
                         std.debug.print("error handling ws event: {any}\n", .{err});
                         self.io_handler.removeSocket(socket) catch |remove_err| {

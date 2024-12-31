@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const Frame = @import("./frame.zig").Frame;
+const Opcode = @import("./frame.zig").Opcode;
 
 pub const WebsocketReader = struct {
     allocator: std.mem.Allocator,
@@ -33,7 +34,9 @@ pub const WebsocketReader = struct {
         const second_byte = self.buffer[self.pos + 1];
         self.pos += 2;
         f.fin = (first_byte & 0x80) == 0x80;
-        f.opcode = @truncate(first_byte & 0x0F);
+        if (Opcode.fromByte(first_byte & 0x0F)) |op| {
+            f.opcode = op;
+        } else return error.UnknownOpcode;
         f.mask = (second_byte & 0x80) == 0x80;
         f.payload_len = switch (second_byte & 0x7F) {
             126 => try self.readU16(fd),
