@@ -23,7 +23,6 @@ pub const FdMap = struct {
     pub fn init(allocator: std.mem.Allocator, max_fds: usize) !*@This() {
         const self = try allocator.create(@This());
         const nextPow2 = nextPowerOf2(max_fds);
-        std.debug.print("using size {d} (next power of 2 from {d})\n", .{ nextPow2, max_fds });
         self.* = .{
             .allocator = allocator,
             .values = try allocator.alloc(u32, nextPow2),
@@ -158,9 +157,9 @@ test "benchmark get" {
 test "benchmark AutoHashMap put" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
-    const iterations = 100_000_000;
     var map = std.AutoHashMap(i32, u32).init(allocator);
     defer map.deinit();
+    const iterations = 100_000_000;
     var i: i32 = 0;
     var timer = try std.time.Timer.start();
     while (i < iterations) : (i += 1) {
@@ -174,9 +173,9 @@ test "benchmark AutoHashMap put" {
 test "benchmark AutoHashMap get" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
-    const iterations = 100_000_000;
     var map = std.AutoHashMap(i32, u32).init(allocator);
     defer map.deinit();
+    const iterations = 100_000_000;
     var i: i32 = 0;
     var timer = try std.time.Timer.start();
     while (i < iterations) : (i += 1) {
