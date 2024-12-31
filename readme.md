@@ -199,7 +199,7 @@ if (req.query.get("some-key")) |value| {
 ```
 
 ### WebSockets
-Implementing WebSockets is easy. Simply handle the upgrade request, and add the WS handler hooks.
+Implementing WebSockets is easy. Simply handle the upgrade request, and add the WS handler hooks. Check out the working example in `./example/websocket`.
 ```zig
 pub fn handleRequest(self: *@This(), req: *pereg.Request, resp: *pereg.Response) void {
     self.handleRequestWithError(req, resp) catch |err| {
