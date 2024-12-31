@@ -13,21 +13,16 @@ Note: This project has just started, and is not yet a complete HTTP server imple
 ## Features
 
 - Simple API
-
 - Support for HTTP/1.0 and HTTP/1.1
-
 - Support for WebSockets
-
 - Cross-platform IO Multiplexing
     - Kqueue support for BSD and MacOS systems
     - Epoll support for Linux systems
-
 - Multi-Worker Architecture
     - Automatic worker scaling based on CPU core count
     - Configurable worker-thread count
     - Configurable accept-thread count
     - Thread-safe request handling
-
 - Performance Optimisations
     - Non-blocking socket operations
     - Efficient event-driven architecture
@@ -124,13 +119,13 @@ const Handler = struct {
 
     pub fn deinit(_: *@This()) void {}
 
-    pub fn handle(self: *@This(), req: *pereg.Request, resp: *pereg.Response) void {
-        self.handleWithError(req, resp) catch |err| {
+    pub fn handleRequest(self: *@This(), req: *pereg.Request, resp: *pereg.Response) void {
+        self.handleRequestWithError(req, resp) catch |err| {
             std.debug.print("error handling request: {any}\n", .{err});
         };
     }
 
-    fn handleWithError(_: *@This(), _: *pereg.Request, resp: *pereg.Response) !void {
+    fn handleRequestWithError(_: *@This(), _: *pereg.Request, resp: *pereg.Response) !void {
         _ = try resp.setBody("Kawww\n");
         try resp.addNewHeader("Content-Length", "6");
     }
@@ -207,35 +202,35 @@ if (req.query.get("some-key")) |value| {
 Implementing WebSockets is easy. Simply handle the upgrade request, and add the WS handler hooks.
 ```zig
 pub fn handleRequest(self: *@This(), req: *pereg.Request, resp: *pereg.Response) void {
-        self.handleRequestWithError(req, resp) catch |err| {
-            std.debug.print("error handling request: {any}\n", .{err});
-        };
-    }
+    self.handleRequestWithError(req, resp) catch |err| {
+        std.debug.print("error handling request: {any}\n", .{err});
+    };
+}
 
-    fn handleRequestWithError(self: *@This(), req: *pereg.Request, resp: *pereg.Response) !void {
-        if (std.mem.eql(u8, req.getPath(), "/ws")) {
-            // You must explicitly handle the upgrade to support websockets.
-            try pereg.ws.upgrader.handleUpgrade(self.allocator, req, resp);
-            return;
-        }
-        try self.dirServer.serve(req, resp);
+fn handleRequestWithError(self: *@This(), req: *pereg.Request, resp: *pereg.Response) !void {
+    if (std.mem.eql(u8, req.getPath(), "/ws")) {
+        // You must explicitly handle the upgrade to support websockets.
+        try pereg.ws.upgrader.handleUpgrade(self.allocator, req, resp);
+        return;
     }
+    try self.dirServer.serve(req, resp);
+}
 
-    pub fn handleWSConn(_: *@This(), fd: posix.socket_t) void {
-        std.debug.print("handle ws conn... {d}\n", .{fd});
-    }
+pub fn handleWSConn(_: *@This(), fd: posix.socket_t) void {
+    std.debug.print("handle ws conn... {d}\n", .{fd});
+}
 
-    pub fn handleWSDisconn(_: *@This(), fd: posix.socket_t) void {
-        std.debug.print("handle ws disconn... {d}\n", .{fd});
-    }
+pub fn handleWSDisconn(_: *@This(), fd: posix.socket_t) void {
+    std.debug.print("handle ws disconn... {d}\n", .{fd});
+}
 
-    pub fn handleWSFrame(_: *@This(), fd: posix.socket_t, frame: *pereg.ws.Frame) void {
-        std.debug.print("handle ws frame... {d} {s}\n", .{ fd, frame.getPayload() });
-        // Reply to the client
-        pereg.ws.writer.writeMessage(fd, "Hello client!", false) catch |err| {
-            std.debug.print("error writing websocket: {any}\n", .{err});
-        };
-    }
+pub fn handleWSFrame(_: *@This(), fd: posix.socket_t, frame: *pereg.ws.Frame) void {
+    std.debug.print("handle ws frame... {d} {s}\n", .{ fd, frame.getPayload() });
+    // Reply to the client
+    pereg.ws.writer.writeMessage(fd, "Hello client!", false) catch |err| {
+        std.debug.print("error writing websocket: {any}\n", .{err});
+    };
+}
 ```
 
 
