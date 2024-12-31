@@ -3,49 +3,7 @@ const fs = std.fs;
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
 const Header = @import("../header.zig").Header;
-
-pub const DirServerConfig = struct {
-    request_path: []const u8 = "/",
-};
-
-const Mime = enum {
-    text_plain,
-    text_html,
-    text_css,
-    application_json,
-    application_javascript,
-    image_avif,
-
-    pub fn toString(self: Mime) []const u8 {
-        return switch (self) {
-            .text_plain => "text/plain",
-            .text_html => "text/html",
-            .text_css => "text/css",
-            .application_json => "application/json",
-            .application_javascript => "application/javascript",
-            .image_avif => "image/avif",
-        };
-    }
-
-    pub fn fromExtension(ext: []const u8) Mime {
-        if (std.mem.eql(u8, ext, ".html")) {
-            return .text_html;
-        }
-        if (std.mem.eql(u8, ext, ".css")) {
-            return .text_css;
-        }
-        if (std.mem.eql(u8, ext, ".json")) {
-            return .application_json;
-        }
-        if (std.mem.eql(u8, ext, ".js") or std.mem.eql(u8, ext, ".mjs")) {
-            return .application_javascript;
-        }
-        if (std.mem.eql(u8, ext, ".avif")) {
-            return .image_avif;
-        }
-        return .text_plain;
-    }
-};
+const Mime = @import("./mime.zig").Mime;
 
 const Hit = struct {
     allocator: std.mem.Allocator,
@@ -68,6 +26,12 @@ const Hit = struct {
     }
 };
 
+pub const DirServerConfig = struct {
+    request_path: []const u8 = "/",
+};
+
+/// DirServer simply loads all files into memory on init. This
+/// prevents risk of OOM errors without unloading existing entries.
 pub const DirServer = struct {
     allocator: std.mem.Allocator,
     abs_path: []const u8,
@@ -131,8 +95,6 @@ pub const DirServer = struct {
             for (hit.headers.items) |h| try resp.addHeader(h);
             _ = try resp.setBody(hit.contents);
         } else {
-            // TODO: pre-allocate some standard responses like this,
-            // so that we don't need to memcpy the header.
             resp.status = .not_found;
             return;
         }
@@ -148,9 +110,9 @@ pub const DirServer = struct {
         _ = try file.readAll(hit.contents);
         const content_length = try std.fmt.allocPrint(self.allocator, "{d}", .{stat.size});
         defer self.allocator.free(content_length);
-        try hit.headers.append(try Header.init("Content-Length", content_length));
+        try hit.headers.append(try Header.init("content-length", content_length));
         try hit.headers.append(try Header.init(
-            "Content-Type",
+            "content-type",
             Mime.fromExtension(fs.path.extension(entry.basename)).toString(),
         ));
         try self.files.put(try self.allocator.dupe(u8, entry.path), hit);

@@ -8,7 +8,7 @@ const Handler = struct {
 
     pub fn deinit(_: *@This()) void {}
 
-    pub fn handle(self: *@This(), req: *pereg.Request, resp: *pereg.Response) void {
+    pub fn handleRequest(self: *@This(), req: *pereg.Request, resp: *pereg.Response) void {
         self.handleWithError(req, resp) catch |err| {
             std.debug.print("error handling request: {any}\n", .{err});
         };

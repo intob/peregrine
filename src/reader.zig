@@ -29,17 +29,17 @@ pub const RequestReader = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn readRequest(self: *Self, socket: posix.socket_t, req: *Request) !void {
-        const n = try self.readLine(socket);
+    pub fn readRequest(self: *Self, fd: posix.socket_t, req: *Request) !void {
+        const n = try self.readLine(fd);
         if (n == 0) return error.EOF;
         if (n < "GET / HTTP/1.1".len) return error.InvalidRequest;
         try parseRequestLine(req, self.buffer[self.start - n .. self.start]);
-        try self.readHeaders(socket, req);
+        try self.readHeaders(fd, req);
     }
 
-    pub fn readHeaders(self: *Self, socket: posix.socket_t, req: *Request) !void {
+    pub fn readHeaders(self: *Self, fd: posix.socket_t, req: *Request) !void {
         while (true) {
-            const n = try self.readLine(socket);
+            const n = try self.readLine(fd);
             if (n == 0) return error.UnexpectedEOF;
             // Check for empty line (header section terminator)
             if (n == 2 and self.buffer[self.start - 2] == '\r' and self.buffer[self.start - 1] == '\n') {
@@ -65,7 +65,7 @@ pub const RequestReader = struct {
         self.start = 0;
     }
 
-    pub fn readLine(self: *Self, socket: posix.socket_t) !usize {
+    pub fn readLine(self: *Self, fd: posix.socket_t) !usize {
         var line_len: usize = 0;
         const Vector = @Vector(16, u8);
         const newline: Vector = @splat(@as(u8, '\n'));
@@ -76,7 +76,7 @@ pub const RequestReader = struct {
             if (self.pos >= self.len) {
                 const available = self.buffer.len - self.len;
                 if (available == 0) return error.LineTooLong;
-                const read_amount = try posix.read(socket, self.buffer[self.len..]);
+                const read_amount = try posix.read(fd, self.buffer[self.len..]);
                 if (read_amount == 0) return line_len;
                 self.len += read_amount;
             }

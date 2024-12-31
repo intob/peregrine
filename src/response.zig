@@ -15,6 +15,7 @@ pub const Response = struct {
     headers_len: usize,
     body: []align(16) u8,
     body_len: usize,
+    is_ws_upgrade: bool,
 
     const Self = @This();
 
@@ -27,6 +28,7 @@ pub const Response = struct {
             .headers_len = 0,
             .body = try allocator.alignedAlloc(u8, 16, std.mem.alignForward(usize, body_size, 16)),
             .body_len = 0,
+            .is_ws_upgrade = false,
         };
         return resp;
     }
@@ -101,6 +103,7 @@ pub const Response = struct {
         self.status = Status.ok;
         self.headers_len = 0;
         self.body_len = 0;
+        self.is_ws_upgrade = false;
     }
 };
 

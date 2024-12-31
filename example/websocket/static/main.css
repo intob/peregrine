@@ -1,0 +1,39 @@
+:root {
+    --dark-1: hsl(154, 100%, 1%);
+    --dark-2: hsl(194, 100%, 3%);
+    --lighten-1: #ffffff05;
+    --lighten-2: #ffffff20;
+    --lighten-3: #ffffff88;
+    --lighten-4: #fffffff0;
+    --gold: #EDAE49;
+    --blue: #084B83;
+    --red: #DB2B39;
+    --green: #4DAA57;
+  }
+  
+html {
+    background: linear-gradient(-0.0625turn, var(--dark-1), var(--dark-2));
+    color: var(--lighten-3);
+    font-size: 17px;
+}
+
+.message {
+    margin: 10px;
+}
+
+.sent-message {
+    color: var(--lighten-3);
+    text-align: right;
+}
+
+.received-message {
+    color: var(--lighten-4);
+    text-align: left;
+}
+
+.message div {
+    display: inline-flex;
+    background-color: rgba(255,255,255,0.1);
+    border-radius: 10px;
+    padding: 10px;
+}

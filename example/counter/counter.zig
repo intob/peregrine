@@ -21,7 +21,7 @@ const Handler = struct {
     // Be mindful that this handler can be called from multiple threads
     // concurrently. You will need to handle synchronization. This is why
     // an atomic value is used in this example.
-    pub fn handle(self: *@This(), req: *pereg.Request, resp: *pereg.Response) void {
+    pub fn handleRequest(self: *@This(), req: *pereg.Request, resp: *pereg.Response) void {
         self.handleWithError(req, resp) catch |err| {
             std.debug.print("error handling request: {any}\n", .{err});
         };

@@ -5,6 +5,7 @@ const linux = std.os.linux;
 const Request = @import("./request.zig").Request;
 const Response = @import("./response.zig").Response;
 const worker = @import("./worker.zig");
+const WebsocketServer = @import("./ws/server.zig").WebsocketServer;
 
 var should_shutdown: std.atomic.Value(bool) = undefined;
 
@@ -27,34 +28,34 @@ pub const ServerConfig = struct {
 };
 
 pub fn Server(comptime Handler: type) type {
-    return struct {
-        comptime {
-            if (!@hasDecl(Handler, "init")) {
-                @compileError("Handler must implement init(std.mem.Allocator) !*@This()");
-            }
-            if (!@hasDecl(Handler, "deinit")) {
-                @compileError("Handler must implement deinit(*@This()) void");
-            }
-            if (!@hasDecl(Handler, "handle")) {
-                @compileError("Handle must implement handle(*@This(), *Request, *Response) void");
-            }
+    comptime {
+        if (!@hasDecl(Handler, "init")) {
+            @compileError("Handler must implement init(std.mem.Allocator) !*@This()");
         }
-
+        if (!@hasDecl(Handler, "deinit")) {
+            @compileError("Handler must implement deinit(*@This()) void");
+        }
+        if (!@hasDecl(Handler, "handleRequest")) {
+            @compileError("Handler must implement handleRequest(*@This(), *Request, *Response) void");
+        }
+    }
+    return struct {
         allocator: std.mem.Allocator,
         handler: *Handler,
+        ws: *WebsocketServer(Handler),
         address: std.net.Address,
         workers: []worker.Worker(Handler),
         next_worker: usize,
         listener: posix.socket_t,
         accept_threads: []std.Thread,
-        io_handler: IOHandler,
+        io_handler: ListenerIOHandler,
         tcp_nodelay: bool,
 
         const Self = @This();
 
-        const IOHandler = switch (native_os) {
-            .freebsd, .netbsd, .openbsd, .dragonfly, .macos => KqueueHandler,
-            .linux => EpollHandler,
+        const ListenerIOHandler = switch (native_os) {
+            .freebsd, .netbsd, .openbsd, .dragonfly, .macos => ListenerKqueue,
+            .linux => ListenerEpoll,
             else => @compileError("Unsupported OS"),
         };
 
@@ -85,16 +86,20 @@ pub fn Server(comptime Handler: type) type {
                 cfg.accept_thread_count
             else
                 @max(1, worker_thread_count / 6);
+            // TODO: Clean this up with direct use of ListenerIOHandler interface.
             const io_handler = switch (native_os) {
-                .freebsd, .netbsd, .openbsd, .dragonfly, .macos => try KqueueHandler.init(listener),
-                .linux => try EpollHandler.init(listener),
+                .freebsd, .netbsd, .openbsd, .dragonfly, .macos => try ListenerKqueue.init(listener),
+                .linux => try ListenerEpoll.init(listener),
                 else => unreachable,
             };
             const srv = try allocator.create(Self);
             errdefer allocator.destroy(srv);
+            const handler = try Handler.init(allocator);
+            const ws_buffer_size = std.mem.alignForward(usize, 32 * 1024, 16);
             srv.* = .{
                 .allocator = allocator,
-                .handler = try Handler.init(allocator),
+                .handler = handler,
+                .ws = try WebsocketServer(Handler).init(allocator, handler, ws_buffer_size),
                 .address = address,
                 .workers = try allocator.alloc(worker.Worker(Handler), worker_thread_count),
                 .next_worker = 0,
@@ -104,7 +109,7 @@ pub fn Server(comptime Handler: type) type {
                 .tcp_nodelay = cfg.tcp_nodelay,
             };
             for (srv.workers, 0..) |*w, i| {
-                try w.init(srv.handler, .{
+                try w.init(srv.handler, srv.ws, .{
                     .allocator = allocator,
                     .id = i,
                 });
@@ -164,6 +169,7 @@ pub fn Server(comptime Handler: type) type {
             self.handler.deinit();
             self.allocator.free(self.workers);
             self.allocator.free(self.accept_threads);
+            self.ws.deinit();
             self.allocator.destroy(self);
         }
 
@@ -184,7 +190,7 @@ pub fn Server(comptime Handler: type) type {
     };
 }
 
-const KqueueHandler = struct {
+const ListenerKqueue = struct {
     kfd: i32,
     timeout: posix.timespec,
     listener_ident: usize,
@@ -227,7 +233,7 @@ const KqueueHandler = struct {
     }
 };
 
-const EpollHandler = struct {
+const ListenerEpoll = struct {
     epfd: i32,
     listener: posix.socket_t,
 

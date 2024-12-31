@@ -16,6 +16,8 @@ Note: This project has just started, and is not yet a complete HTTP server imple
 
 - Support for HTTP/1.0 and HTTP/1.1
 
+- Support for WebSockets
+
 - Cross-platform IO Multiplexing
     - Kqueue support for BSD and MacOS systems
     - Epoll support for Linux systems
@@ -201,13 +203,47 @@ if (req.query.get("some-key")) |value| {
 }
 ```
 
+### WebSockets
+Implementing WebSockets is easy. Simply handle the upgrade request, and add the WS handler hooks.
+```zig
+pub fn handleRequest(self: *@This(), req: *pereg.Request, resp: *pereg.Response) void {
+        self.handleRequestWithError(req, resp) catch |err| {
+            std.debug.print("error handling request: {any}\n", .{err});
+        };
+    }
+
+    fn handleRequestWithError(self: *@This(), req: *pereg.Request, resp: *pereg.Response) !void {
+        if (std.mem.eql(u8, req.getPath(), "/ws")) {
+            // You must explicitly handle the upgrade to support websockets.
+            try pereg.ws.upgrader.handleUpgrade(self.allocator, req, resp);
+            return;
+        }
+        try self.dirServer.serve(req, resp);
+    }
+
+    pub fn handleWSConn(_: *@This(), fd: posix.socket_t) void {
+        std.debug.print("handle ws conn... {d}\n", .{fd});
+    }
+
+    pub fn handleWSDisconn(_: *@This(), fd: posix.socket_t) void {
+        std.debug.print("handle ws disconn... {d}\n", .{fd});
+    }
+
+    pub fn handleWSFrame(_: *@This(), fd: posix.socket_t, frame: *pereg.ws.Frame) void {
+        std.debug.print("handle ws frame... {d} {s}\n", .{ fd, frame.getPayload() });
+        // Reply to the client
+        pereg.ws.writer.writeMessage(fd, "Hello client!", false) catch |err| {
+            std.debug.print("error writing websocket: {any}\n", .{err});
+        };
+    }
+```
+
+
 ## I need your feedback
 I started this project as a way to learn Zig. As such, some of it will be garbage. I would value any feedback.
 
 ## This is no framework
-This is not a framework for building web applications. This is purely a HTTP server designed from the ground up to be stable and performant. There are no built-in features such as routing or authentication.
-
-I will provide some helpers to help with common use-cases, such as serving a directory.
+This is not a framework for building web applications. This is purely a HTTP server designed from the ground up to be stable and performant. There are no built-in features such as routing or authentication. There are some utilities for common use-cases, such as serving a directory of static files, `util.DirServer`.
 
 If you want a more substantial HTTP library, I suggest that you look at [Zap](https://github.com/zigzap/zap), built on [Facil.io](http://facil.io). Facil.io is an excellent battle-tested library written in C.
 
@@ -215,14 +251,13 @@ If you want a more substantial HTTP library, I suggest that you look at [Zap](ht
 Currently, Zap/Facil.io is around 6% faster for static GET requests. I am working to improve this, but as I'm new to systems programming, this is a challenge for me. I would be happy to match Zap/Facil.io's performance.
 
 ## To do
-- WebSocket support
 - Make request and response buffer sizes configurable
 - Increase TCP buffer size
 - Increase socket backlog size
 - API reference
 - HTTP/2 support
 - Windows support
-- Templating helper (possibly extend helper.DirServer to be composable)
+- Templating util (possibly extend util.DirServer to be composable)
 
 Also to do:
-Add a response helper to set content-length header from an integer. Maybe use a pre-allocated buffer so that the user does not need to provide an allocator or think about freeing/ownership.
+Add a response helper to set content-length header from an integer. Maybe use a pre-allocated buffer that can be reused.

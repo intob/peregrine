@@ -7,4 +7,8 @@ pub const ServerConfig = @import("./server.zig").ServerConfig;
 pub const Status = @import("./status.zig").Status;
 pub const Version = @import("./version.zig").Version;
 
-pub const helper = @import("./helper/helper.zig");
+/// Utilities and helpers
+pub const util = @import("./util/util.zig");
+
+/// Websocket helpers
+pub const ws = @import("./ws/ws.zig");

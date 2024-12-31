@@ -1,4 +1,5 @@
 pub const Status = enum(u16) {
+    switching_protocols = 101,
     ok = 200,
     created = 201,
     accepted = 202,
@@ -33,6 +34,7 @@ pub const Status = enum(u16) {
 
     pub fn toString(self: Status) []const u8 {
         return switch (self) {
+            .switching_protocols => "101 Switching Protocols",
             .ok => "200 OK",
             .created => "201 Created",
             .accepted => "202 Accepted",

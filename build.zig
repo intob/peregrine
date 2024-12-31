@@ -18,6 +18,9 @@ pub fn build(b: *std.Build) void {
     const lib_test_step = b.step("test", "Run library tests");
     lib_test_step.dependOn(&b.addRunArtifact(lib_test).step);
 
+    // TODO: Clean up this mess. Zap has a good example of how to do this.
+    // Create a []struct, and iterate over it...
+
     // Basic example
     const basic = b.addExecutable(.{
         .name = "basic",
@@ -77,4 +80,19 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| dirserver_run_cmd.addArgs(args);
     const dirserver_run_step = b.step("run-dirserver", "Run the dirserver example");
     dirserver_run_step.dependOn(&dirserver_run_cmd.step);
+
+    // Websocket example
+    const websocket = b.addExecutable(.{
+        .name = "websocket",
+        .root_source_file = b.path("./example/websocket/websocket.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    websocket.root_module.addImport("peregrine", lib);
+    b.installArtifact(websocket);
+    const websocket_run_cmd = b.addRunArtifact(websocket);
+    websocket_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| websocket_run_cmd.addArgs(args);
+    const websocket_run_step = b.step("run-websocket", "Run the websocket example");
+    websocket_run_step.dependOn(&websocket_run_cmd.step);
 }

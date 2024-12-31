@@ -2,11 +2,13 @@ const native_os = @import("builtin").os.tag;
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
+const aio = @import("./aio.zig");
 const Header = @import("./header.zig").Header;
 const Request = @import("./request.zig").Request;
 const RequestReader = @import("./reader.zig").RequestReader;
 const Response = @import("./response.zig").Response;
 const Status = @import("./status.zig").Status;
+const WebsocketServer = @import("./ws/server.zig").WebsocketServer;
 
 const CONNECTION_MAX_REQUESTS: u32 = 200;
 // This is added to a response that contains no body. This is more efficient than
@@ -14,8 +16,10 @@ const CONNECTION_MAX_REQUESTS: u32 = 200;
 const CONTENT_LENGTH_ZERO_HEADER = "content-length: 0\r\n";
 // These headers are added last, so they have an extra CRLF to terminate the headers.
 // This is simpler and more efficient than appending \r\n separately.
+// TODO: I think that adding an extra \r\n IOVEC after headers would be cleaner at this point.
 const KEEP_ALIVE_HEADERS = "connection: keep-alive\r\nkeep-alive: timeout=3, max=200\r\n\r\n";
 const CLOSE_HEADER = "connection: close\r\n\r\n";
+const UPGRADE_HEADER = "connection: upgrade\r\n\r\n";
 
 pub const WorkerConfig = struct {
     allocator: std.mem.Allocator,
@@ -25,34 +29,31 @@ pub const WorkerConfig = struct {
 pub fn Worker(comptime Handler: type) type {
     return struct {
         allocator: std.mem.Allocator,
-        io_handler: IOHandler,
+        io_handler: aio.IOHandler,
         id: usize,
         handler: *Handler,
         req: *Request,
         resp: *Response,
         resp_header_buf: []align(16) u8,
+        // TODO: Benchmark use of fixed size array for iovecs.
+        // As for headers, it could be much faster than ArrayList.
         iovecs: std.ArrayList(posix.iovec_const),
         connection_requests: std.AutoHashMap(posix.socket_t, u32),
+        ws: *WebsocketServer(Handler),
         shutdown: std.atomic.Value(bool),
         shutdown_cond: std.Thread.Condition,
         shutdown_mutex: std.Thread.Mutex,
         shutdown_done: bool,
         thread: std.Thread,
 
-        const IOHandler = switch (native_os) {
-            .freebsd, .netbsd, .openbsd, .dragonfly, .macos => KqueueHandler,
-            .linux => EpollHandler,
-            else => @compileError("Unsupported OS"),
-        };
-
         const Self = @This();
 
-        pub fn init(self: *Self, handler: *Handler, cfg: WorkerConfig) !void {
+        pub fn init(self: *Self, handler: *Handler, ws: *WebsocketServer(Handler), cfg: WorkerConfig) !void {
             const allocator = cfg.allocator;
             errdefer self.deinit();
             self.handler = handler;
             self.allocator = allocator;
-            self.io_handler = try IOHandler.init();
+            self.io_handler = try aio.IOHandler.init();
             self.id = cfg.id;
             self.req = try Request.init(allocator);
             // TODO: make body buffer size configurable
@@ -63,6 +64,7 @@ pub fn Worker(comptime Handler: type) type {
             self.resp_header_buf = try allocator.alignedAlloc(u8, 16, aligned_header_size);
             self.iovecs = std.ArrayList(posix.iovec_const).init(allocator);
             self.connection_requests = std.AutoHashMap(posix.socket_t, u32).init(allocator);
+            self.ws = ws;
             self.shutdown = std.atomic.Value(bool).init(false);
             self.shutdown_cond = std.Thread.Condition{};
             self.shutdown_mutex = std.Thread.Mutex{};
@@ -87,8 +89,8 @@ pub fn Worker(comptime Handler: type) type {
             std.debug.print("worker-thread-{d} joined\n", .{self.id});
         }
 
-        pub fn addClient(self: *Self, socket: posix.socket_t) !void {
-            try self.io_handler.addSocket(socket);
+        pub fn addClient(self: *Self, fd: posix.socket_t) !void {
+            try self.io_handler.addSocket(fd);
         }
 
         fn workerLoop(self: *Self) void {
@@ -117,24 +119,24 @@ pub fn Worker(comptime Handler: type) type {
                     continue;
                 };
                 for (events[0..ready_count]) |event| {
-                    const socket: i32 = switch (native_os) {
+                    const fd: i32 = switch (native_os) {
                         .freebsd, .netbsd, .openbsd, .dragonfly, .macos => @intCast(event.udata),
                         .linux => event.data.fd,
                         else => unreachable,
                     };
-                    self.readSocket(socket, reader) catch |err| {
-                        self.closeSocket(socket);
+                    self.readSocket(fd, reader) catch |err| {
+                        self.closeSocket(fd);
                         switch (err) {
                             error.EOF => {}, // Expected case
                             else => std.debug.print("error reading socket: {any}\n", .{err}),
                         }
                         continue;
                     };
-                    const requests_handled = self.connection_requests.get(socket) orelse 0;
+                    const requests_handled = self.connection_requests.get(fd) orelse 0;
                     if (requests_handled >= CONNECTION_MAX_REQUESTS) {
-                        self.closeSocket(socket);
+                        self.closeSocket(fd);
                     } else {
-                        self.connection_requests.put(socket, requests_handled + 1) catch |err| {
+                        self.connection_requests.put(fd, requests_handled + 1) catch |err| {
                             std.debug.print("error updating socket request count: {any}\n", .{err});
                         };
                     }
@@ -142,54 +144,82 @@ pub fn Worker(comptime Handler: type) type {
             }
         }
 
-        fn closeSocket(self: *Self, socket: posix.socket_t) void {
-            posix.close(socket);
-            _ = self.connection_requests.remove(socket);
+        fn closeSocket(self: *Self, fd: posix.socket_t) void {
+            posix.close(fd);
+            _ = self.connection_requests.remove(fd);
         }
 
-        fn readSocket(self: *Self, socket: posix.socket_t, reader: *RequestReader) !void {
+        fn readSocket(self: *Self, fd: posix.socket_t, reader: *RequestReader) !void {
             var keep_alive = false;
             // Is this correct? What if we have read part of the next request?
             // The advantage is that this is faster than compacting the buffer.
             reader.reset();
             self.req.reset();
-            try reader.readRequest(socket, self.req);
+            try reader.readRequest(fd, self.req);
             keep_alive = shouldKeepAlive(self.req);
             self.resp.reset();
-            self.handler.handle(self.req, self.resp);
-            try self.respond(socket, keep_alive);
+            self.handler.handleRequest(self.req, self.resp);
+            try self.respond(fd, keep_alive);
+            // TODO: Think about how to make this nice for the user.
+            // Currently, they have to handle the upgrade by calling the upgrade handler.
+            // This requirement makes the protocol explicit, not doing magic behind the
+            // scenes. Also, if a user does not want to support websockets, they simply
+            // don't implement the upgrade handler.
+            if (self.resp.is_ws_upgrade) {
+                // Transfer socket to WS event bus
+                std.debug.print("transfer socket {d} to ws server\n", .{fd});
+                _ = self.connection_requests.remove(fd);
+                try self.io_handler.removeSocket(fd);
+                try self.ws.addSocket(fd);
+            }
             // Returning EOF causes the connection to be closed by the caller.
             if (!keep_alive) return error.EOF;
         }
 
-        fn respond(self: *Self, socket: posix.socket_t, keep_alive: bool) !void {
+        fn respond(self: *Self, fd: posix.socket_t, keep_alive: bool) !void {
             self.iovecs.clearRetainingCapacity();
+            // Status line and user headers
             const status_len = try self.resp.serialiseStatusAndHeaders(&self.resp_header_buf);
             try self.iovecs.append(.{
                 .base = @ptrCast(self.resp_header_buf[0..status_len]),
                 .len = status_len,
             });
+            // Set content-length header if zero
             if (self.resp.body_len == 0) {
                 try self.iovecs.append(.{
                     .base = CONTENT_LENGTH_ZERO_HEADER,
                     .len = CONTENT_LENGTH_ZERO_HEADER.len,
                 });
             }
-            try self.iovecs.append(.{
-                .base = if (keep_alive) KEEP_ALIVE_HEADERS else CLOSE_HEADER,
-                .len = if (keep_alive) KEEP_ALIVE_HEADERS.len else CLOSE_HEADER.len,
-            });
+            // Connection header
+            if (self.resp.is_ws_upgrade) {
+                try self.iovecs.append(.{
+                    .base = UPGRADE_HEADER,
+                    .len = UPGRADE_HEADER.len,
+                });
+            } else {
+                try self.iovecs.append(.{
+                    .base = if (keep_alive) KEEP_ALIVE_HEADERS else CLOSE_HEADER,
+                    .len = if (keep_alive) KEEP_ALIVE_HEADERS.len else CLOSE_HEADER.len,
+                });
+            }
+            // Body
             if (self.resp.body_len > 0) {
                 try self.iovecs.append(.{
                     .base = @ptrCast(self.resp.body[0..self.resp.body_len]),
                     .len = self.resp.body_len,
                 });
             }
-            const total_len = status_len +
-                (if (self.resp.body_len == 0) CONTENT_LENGTH_ZERO_HEADER.len else 0) +
-                (if (keep_alive) KEEP_ALIVE_HEADERS.len else CLOSE_HEADER.len) +
-                self.resp.body_len;
-            const written = try posix.writev(socket, self.iovecs.items);
+            // Write to socket
+            // Maybe remove this length calculation, as it's unnecessary overhead...
+            var total_len = status_len + (if (self.resp.body_len == 0) CONTENT_LENGTH_ZERO_HEADER.len else 0);
+            if (self.resp.is_ws_upgrade) {
+                total_len += UPGRADE_HEADER.len;
+            } else {
+                total_len += if (keep_alive) KEEP_ALIVE_HEADERS.len else CLOSE_HEADER.len;
+                total_len += self.resp.body_len;
+            }
+            const written = try posix.writev(fd, self.iovecs.items);
             if (written != total_len) {
                 return error.WriteError;
             }
@@ -206,67 +236,6 @@ fn shouldKeepAlive(req: *Request) bool {
     }
     return false; // HTTP/1.0
 }
-
-const KqueueHandler = struct {
-    kfd: i32,
-    timeout: posix.timespec,
-
-    const Self = @This();
-
-    pub fn init() !Self {
-        return .{
-            .kfd = try posix.kqueue(),
-            .timeout = posix.timespec{ .sec = 0, .nsec = 50_000_000 },
-        };
-    }
-
-    pub fn addSocket(self: *Self, socket: posix.socket_t) !void {
-        const event = posix.Kevent{
-            .ident = @intCast(socket),
-            .filter = posix.system.EVFILT.READ,
-            .flags = posix.system.EV.ADD | posix.system.EV.CLEAR,
-            .fflags = 0,
-            .data = 0,
-            .udata = @intCast(socket),
-        };
-        _ = try posix.kevent(self.kfd, &[_]posix.Kevent{event}, &.{}, null);
-    }
-
-    pub fn wait(self: *Self, events: []posix.Kevent) !usize {
-        return try posix.kevent(self.kfd, &.{}, events, &self.timeout);
-    }
-
-    pub fn deinit(self: *Self) void {
-        posix.close(self.kfd);
-    }
-};
-
-const EpollHandler = struct {
-    epfd: i32,
-
-    const Self = @This();
-
-    pub fn init() !Self {
-        const epfd = try posix.epoll_create1(0);
-        return .{ .epfd = epfd };
-    }
-
-    pub fn addSocket(self: *Self, socket: posix.socket_t) !void {
-        var event = linux.epoll_event{
-            .events = linux.EPOLL.IN | linux.EPOLL.ET,
-            .data = .{ .fd = socket },
-        };
-        try posix.epoll_ctl(self.epfd, linux.EPOLL.CTL_ADD, socket, &event);
-    }
-
-    pub fn wait(self: *Self, events: []linux.epoll_event) !usize {
-        return posix.epoll_wait(self.epfd, events, 50); // 50ms timeout
-    }
-
-    pub fn deinit(self: *Self) void {
-        posix.close(self.epfd);
-    }
-};
 
 test "keep alive" {
     const allocator = std.testing.allocator;

@@ -5,7 +5,7 @@ const DIR = "./example/dirserver/static";
 
 const Handler = struct {
     allocator: std.mem.Allocator,
-    dirServer: *pereg.helper.DirServer,
+    dirServer: *pereg.util.DirServer,
 
     pub fn init(allocator: std.mem.Allocator) !*@This() {
         const cwd_path = try std.fs.cwd().realpathAlloc(allocator, ".");
@@ -13,7 +13,7 @@ const Handler = struct {
         std.debug.print("cwd: {s}\n", .{cwd_path});
         const abs_path = try std.fs.path.join(allocator, &.{ cwd_path, DIR });
         defer allocator.free(abs_path);
-        const dirServer = try pereg.helper.DirServer.init(allocator, abs_path, .{});
+        const dirServer = try pereg.util.DirServer.init(allocator, abs_path, .{});
         const handler = try allocator.create(@This());
         handler.* = .{
             .allocator = allocator,
@@ -27,7 +27,7 @@ const Handler = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn handle(self: *@This(), req: *pereg.Request, resp: *pereg.Response) void {
+    pub fn handleRequest(self: *@This(), req: *pereg.Request, resp: *pereg.Response) void {
         self.dirServer.serve(req, resp) catch |err| {
             std.debug.print("error handling request: {any}\n", .{err});
         };

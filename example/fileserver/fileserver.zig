@@ -5,7 +5,7 @@ const FILE = "./example/fileserver/example.html";
 
 const Handler = struct {
     allocator: std.mem.Allocator,
-    fileServer: *pereg.helper.FileServer,
+    fileServer: *pereg.util.FileServer,
 
     pub fn init(allocator: std.mem.Allocator) !*@This() {
         const cwd_path = try std.fs.cwd().realpathAlloc(allocator, ".");
@@ -13,7 +13,7 @@ const Handler = struct {
         std.debug.print("cwd: {s}\n", .{cwd_path});
         const abs_file_path = try std.fs.path.join(allocator, &.{ cwd_path, FILE });
         defer allocator.free(abs_file_path);
-        const fileServer = try pereg.helper.FileServer.init(allocator, abs_file_path, .{});
+        const fileServer = try pereg.util.FileServer.init(allocator, abs_file_path, .{});
         const handler = try allocator.create(@This());
         handler.* = .{
             .allocator = allocator,
@@ -27,7 +27,7 @@ const Handler = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn handle(self: *@This(), req: *pereg.Request, resp: *pereg.Response) void {
+    pub fn handleRequest(self: *@This(), req: *pereg.Request, resp: *pereg.Response) void {
         self.handleWithError(req, resp) catch |err| {
             std.debug.print("error handling request: {any}\n", .{err});
         };
