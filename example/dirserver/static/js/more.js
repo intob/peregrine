@@ -1,1 +1,1 @@
-console.log("more js loaded");
+console.log("more js loaded")
