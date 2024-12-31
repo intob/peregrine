@@ -118,7 +118,7 @@ pub fn Server(comptime Handler: type) type {
                 try w.init(srv.handler, srv.ws, .{
                     .allocator = allocator,
                     .id = i,
-                    .resp_buffer_size = cfg.response_buffer_size,
+                    .resp_body_buffer_size = cfg.response_body_buffer_size,
                 });
             }
             for (srv.accept_threads) |*thread| {

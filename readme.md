@@ -23,16 +23,27 @@ Note: This project has just started, and is not yet a complete HTTP server imple
     - Configurable worker-thread count
     - Configurable accept-thread count
     - Thread-safe request handling
-- Performance Optimisations
-    - Non-blocking socket operations
-    - Efficient event-driven architecture
-    - Aligned buffer allocation for optimal IO performance
-    - Vectored IO writes the response with a single syscall
-    - Zero heap allocations per-request
-    - Header case-insensitivity handled when searching, not parsing (unused headers are not transformed)
-    - Query only parsed on demand
-    - Optimised header, method and version parsing
-    - Fixed sized array for headers (faster than std.ArrayList)
+
+## Performance optimisations
+
+- Non-blocking socket operations
+- Event-driven architecture
+- Aligned buffer allocation
+- Vectored IO writes the response with a single syscall
+- Zero heap allocations per-request
+- Header case-insensitivity handled when searching, not parsing (unused headers are not transformed)
+- Query only parsed on demand
+- Optimised header, method and version parsing
+- Fixed sized array for headers (faster than std.ArrayList)
+
+### Perfect hash table
+The worker's critical path looks up the socket file descriptor in a map. If the number of requests has exceeded the connection request limit, the connection is closed after processing the request. This means that for every request, one put and one get is done on the connection_requests hash map.
+
+Originally, I was using `std.AutoHashMap`, which was taking on average 460ns to put data. I had a feeling that this could be a bottleneck, and so I implemented a faster hash table. My first attempt reduced the time to 170ns.
+
+After watching [this video](https://www.youtube.com/watch?v=DMQ_HcNSOAI), I learned that sizing tables to powers of two can yeild improved performance. Ensuring that the array sizes were powers of two reduced this down to 9ns. Optimising the hash function based on the assumption that our array size is a power of two reduced this to 8ns.
+
+So, we end up with a fairly perfect hash table, with a modified FNV-1a hash function optimised for power-of-two sized tables.
 
 ## Architecture
 

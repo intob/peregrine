@@ -9,6 +9,7 @@ const RequestReader = @import("./reader.zig").RequestReader;
 const Response = @import("./response.zig").Response;
 const Status = @import("./status.zig").Status;
 const WebsocketServer = @import("./ws/server.zig").WebsocketServer;
+const FdMap = @import("./fdmap.zig").FdMap;
 
 const CONNECTION_MAX_REQUESTS: u32 = 200;
 // This is added to a response that contains no body. This is more efficient than
@@ -35,11 +36,11 @@ pub fn Worker(comptime Handler: type) type {
         handler: *Handler,
         req: *Request,
         resp: *Response,
-        resp_buf: []align(16) u8,
+        resp_status_buf: []align(16) u8,
         // TODO: Benchmark use of fixed size array for iovecs.
         // As for headers, it could be much faster than ArrayList.
         iovecs: [3]posix.iovec_const,
-        connection_requests: std.AutoHashMap(posix.socket_t, u32),
+        connection_requests: *FdMap,
         ws: *WebsocketServer(Handler),
         shutdown: std.atomic.Value(bool),
         thread: std.Thread,
@@ -57,7 +58,7 @@ pub fn Worker(comptime Handler: type) type {
             // TODO: make body buffer size configurable
             self.resp = try Response.init(allocator, cfg.resp_body_buffer_size); // Aligned internally
             self.resp_status_buf = try allocator.alignedAlloc(u8, 16, try calcResponseStatusBufferSize(allocator));
-            self.connection_requests = std.AutoHashMap(posix.socket_t, u32).init(allocator);
+            self.connection_requests = try FdMap.init(allocator, 1_000_000);
             self.ws = ws;
             self.shutdown = std.atomic.Value(bool).init(false);
             self.thread = try std.Thread.spawn(.{}, workerLoop, .{self});
@@ -68,7 +69,7 @@ pub fn Worker(comptime Handler: type) type {
             self.thread.join();
             self.req.deinit();
             self.resp.deinit();
-            self.allocator.free(self.resp_buf);
+            self.allocator.free(self.resp_status_buf);
             self.connection_requests.deinit();
             std.debug.print("worker-thread-{d} joined\n", .{self.id});
         }
