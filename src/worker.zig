@@ -76,7 +76,7 @@ pub fn Worker(comptime Handler: type) type {
             self.resp = try Response.init(allocator, cfg.resp_body_buffer_size);
             const resp_status_size = try calcResponseStatusBufferSize(allocator);
             self.resp_status_buf = try allocator.alignedAlloc(u8, 16, resp_status_size);
-            self.reader = try RequestReader.init(self.allocator, 50_000);
+            self.reader = try RequestReader.init(self.allocator, 20_000);
             self.connection_requests = try allocator.alloc(u8, std.math.maxInt(i16));
             self.ws = ws;
             self.shutdown = std.atomic.Value(bool).init(false);
@@ -217,7 +217,7 @@ fn shouldKeepAlive(req: *Request) bool {
 // Calculate response status and header buffer size.
 fn calcResponseStatusBufferSize(allocator: std.mem.Allocator) !usize {
     const h = Header{};
-    const resp = try Response.init(allocator, 0);
+    const resp = try Response.init(allocator, 1024);
     defer resp.deinit();
     const headers_size = (h.key_buf.len + h.value_buf.len + 4) * resp.headers.len;
     const resp_buf_size = headers_size + "HTTP/1.1 500 Internal Server Error\r\n".len;
