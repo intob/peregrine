@@ -1,7 +1,6 @@
 const std = @import("std");
 const Header = @import("./header.zig").Header;
 const Status = @import("./status.zig").Status;
-const alignment = @import("./alignment.zig");
 
 const VERSION = "HTTP/1.1 ";
 
@@ -21,7 +20,7 @@ pub const Response = struct {
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, body_size: usize) !*Self {
-        const aligned = std.mem.alignForward(usize, alignment.nextPowerOf2(body_size), 16);
+        const aligned = std.mem.alignForward(usize, try std.math.ceilPowerOfTwo(body_size), 16);
         const resp = try allocator.create(Self);
         resp.* = .{
             .allocator = allocator,

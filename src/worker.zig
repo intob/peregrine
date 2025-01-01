@@ -76,7 +76,7 @@ pub fn Worker(comptime Handler: type) type {
             self.resp = try Response.init(allocator, cfg.resp_body_buffer_size);
             const resp_status_size = try calcResponseStatusBufferSize(allocator);
             self.resp_status_buf = try allocator.alignedAlloc(u8, 16, resp_status_size);
-            self.reader = try RequestReader.init(self.allocator, 4096);
+            self.reader = try RequestReader.init(self.allocator, 50_000);
             self.connection_requests = try allocator.alloc(u8, std.math.maxInt(i16));
             self.ws = ws;
             self.shutdown = std.atomic.Value(bool).init(false);
