@@ -1,5 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
+const alignment = @import("./alignment.zig");
 
 /// A perfect hash table optimized for file descriptors, providing O(1) lookups with no collisions.
 /// This implementation uses a two-level perfect hashing scheme with FNV-1a for superior performance
@@ -22,7 +23,7 @@ pub const FdMap = struct {
 
     pub fn init(allocator: std.mem.Allocator, max_fds: usize) !*@This() {
         const self = try allocator.create(@This());
-        const nextPow2 = nextPowerOf2(max_fds);
+        const nextPow2 = alignment.nextPowerOf2(max_fds);
         self.* = .{
             .allocator = allocator,
             .values = try allocator.alloc(u32, nextPow2),
@@ -96,16 +97,6 @@ pub const FdMap = struct {
     inline fn hash(d: u32, fd: u32) u32 {
         const prime: u32 = 0x01000193;
         return (if (d == 0) prime else d) *% prime ^ fd;
-    }
-
-    fn nextPowerOf2(value: usize) usize {
-        var v = value -% 1;
-        v |= v >> 1;
-        v |= v >> 2;
-        v |= v >> 4;
-        v |= v >> 8;
-        v |= v >> 16;
-        return v +% 1;
     }
 };
 

@@ -4,6 +4,7 @@ const Request = @import("./request.zig").Request;
 const Header = @import("./header.zig").Header;
 const Method = @import("./method.zig").Method;
 const Version = @import("./version.zig").Version;
+const alignment = @import("./alignment.zig");
 
 pub const RequestReader = struct {
     allocator: std.mem.Allocator,
@@ -15,11 +16,11 @@ pub const RequestReader = struct {
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, buffer_size: usize) !*Self {
-        const aligned_size = std.mem.alignForward(usize, buffer_size, 16);
+        const aligned = std.mem.alignForward(usize, alignment.nextPowerOf2(buffer_size), 16);
         const reader = try allocator.create(Self);
         reader.* = .{
             .allocator = allocator,
-            .buffer = try allocator.alignedAlloc(u8, 16, aligned_size),
+            .buffer = try allocator.alignedAlloc(u8, 16, aligned),
         };
         return reader;
     }
@@ -126,32 +127,27 @@ pub const RequestReader = struct {
 // This implementation also handles both CRLF and bare LF line endings.
 // As HTTP/2 is a binary protocol, it will be handled in a different path.
 fn parseRequestLine(req: *Request, buffer: []const u8) !void {
-    // Find first space for method end
-    const method_end = std.mem.indexOfScalar(u8, buffer, ' ') orelse return error.InvalidRequest;
-    if (method_end > "OPTIONS".len) return error.InvalidRequest;
-    // Find version start from the end (looking for last space)
     const line_end = if (buffer[buffer.len - 2] == '\r' and buffer[buffer.len - 1] == '\n')
         buffer.len - 2 // CRLF ending
     else if (buffer[buffer.len - 1] == '\n')
         buffer.len - 1 // LF ending
     else
         return error.InvalidRequest;
-    if (line_end < method_end + 10) return error.InvalidRequest;
     // HTTP version is fixed length, so we can calculate version_start
     const version_start = line_end - 8; // Length of "HTTP/1.x"
     if (buffer[version_start - 1] != ' ') return error.InvalidRequest;
     // Parse method and version first
-    req.method = try Method.parse(buffer[0..method_end]);
+    req.method = try Method.parse(buffer[0..8]);
     req.version = try Version.parse(buffer[version_start..line_end]);
     // Path and query is everything between method and version
-    const path_start = method_end + 1;
+    const path_start = req.method.toLength() + 1;
     const path_and_query_end = version_start - 1;
-    const query_start_opt = std.mem.indexOfScalarPos(u8, buffer[0..path_and_query_end], path_start, '?');
+    const query_start_opt = std.mem.indexOfScalarPos(u8, buffer[path_start..path_and_query_end], path_start, '?');
     if (query_start_opt) |query_start| {
         req.query_raw_len = path_and_query_end - (query_start + 1);
         @memcpy(req.query_raw[0..req.query_raw_len], buffer[query_start + 1 .. path_and_query_end]);
         req.path_len = query_start - path_start;
-        @memcpy(req.path[0..req.path_len], buffer[path_start..query_start]); // IS THIS CORRECT OR OFF BY 1 DUE TO '?'
+        @memcpy(req.path[0..req.path_len], buffer[path_start..query_start]);
     } else {
         req.query_raw_len = 0;
         req.path_len = path_and_query_end - path_start;
@@ -243,7 +239,8 @@ test "benchmark parse request line" {
 }
 
 test "benchmark HTTP GET request parsing" {
-    const allocator = std.testing.allocator;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
     var req = try Request.init(allocator);
     defer req.deinit();
     var reader = try RequestReader.init(allocator, 4096);
@@ -259,7 +256,7 @@ test "benchmark HTTP GET request parsing" {
     const write_fd = pipe_fds[1];
     defer posix.close(read_fd);
     defer posix.close(write_fd);
-    const iterations: usize = 10_000_000;
+    const iterations: usize = 50_000_000;
     var timer = try std.time.Timer.start();
     var i: usize = 0;
     while (i < iterations) : (i += 1) {

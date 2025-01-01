@@ -10,6 +10,7 @@ const Response = @import("./response.zig").Response;
 const Status = @import("./status.zig").Status;
 const WebsocketServer = @import("./ws/server.zig").WebsocketServer;
 const FdMap = @import("./fdmap.zig").FdMap;
+const alignment = @import("./alignment.zig");
 
 const CONNECTION_MAX_REQUESTS: u32 = 200;
 // This is added to a response that contains no body. This is more efficient than
@@ -37,9 +38,7 @@ pub fn Worker(comptime Handler: type) type {
         req: *Request,
         resp: *Response,
         resp_status_buf: []align(16) u8,
-        // TODO: Benchmark use of fixed size array for iovecs.
-        // As for headers, it could be much faster than ArrayList.
-        iovecs: [3]posix.iovec_const,
+        iovecs: [4]posix.iovec_const,
         connection_requests: *FdMap,
         ws: *WebsocketServer(Handler),
         shutdown: std.atomic.Value(bool),
@@ -55,9 +54,9 @@ pub fn Worker(comptime Handler: type) type {
             self.io_handler = try aio.IOHandler.init();
             self.id = cfg.id;
             self.req = try Request.init(allocator);
-            // TODO: make body buffer size configurable
-            self.resp = try Response.init(allocator, cfg.resp_body_buffer_size); // Aligned internally
-            self.resp_status_buf = try allocator.alignedAlloc(u8, 16, try calcResponseStatusBufferSize(allocator));
+            self.resp = try Response.init(allocator, cfg.resp_body_buffer_size);
+            const resp_status_size = try calcResponseStatusBufferSize(allocator);
+            self.resp_status_buf = try allocator.alignedAlloc(u8, 16, resp_status_size);
             self.connection_requests = try FdMap.init(allocator, 1_000_000);
             self.ws = ws;
             self.shutdown = std.atomic.Value(bool).init(false);
@@ -129,15 +128,14 @@ pub fn Worker(comptime Handler: type) type {
         }
 
         fn readSocket(self: *Self, fd: posix.socket_t, reader: *RequestReader) !void {
-            var keep_alive = false;
             // Is this correct? What if we have read part of the next request?
             // The advantage is that this is faster than compacting the buffer.
             reader.reset();
             self.req.reset();
             try reader.readRequest(fd, self.req);
-            keep_alive = shouldKeepAlive(self.req);
             self.resp.reset();
             self.handler.handleRequest(self.req, self.resp);
+            const keep_alive = shouldKeepAlive(self.req);
             try self.respond(fd, keep_alive);
             // TODO: Think about how to make this nice for the user.
             // Currently, they have to handle the upgrade by calling the upgrade handler.
