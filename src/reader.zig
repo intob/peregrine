@@ -33,7 +33,7 @@ pub const RequestReader = struct {
     pub fn readRequest(self: *Self, fd: posix.socket_t, req: *Request) !void {
         const n = try self.readLine(fd);
         if (n == 0) return error.EOF;
-        if (n < "GET / HTTP/1.1".len) return error.InvalidRequest;
+        if (n < 14) return error.InvalidRequest; // GET / HTTP/1.1\n
         try parseRequestLine(req, self.buffer[self.start - n .. self.start]);
         try self.readHeaders(fd, req);
     }
@@ -41,7 +41,7 @@ pub const RequestReader = struct {
     pub fn readHeaders(self: *Self, fd: posix.socket_t, req: *Request) !void {
         while (true) {
             const n = try self.readLine(fd);
-            if (n == 0) return error.UnexpectedEOF;
+            if (n < 2) return error.UnexpectedEOF;
             // Check for empty line (header section terminator)
             if (n == 2 and self.buffer[self.start - 2] == '\r' and self.buffer[self.start - 1] == '\n') {
                 break; // End of headers
@@ -52,9 +52,7 @@ pub const RequestReader = struct {
             if (req.headers_len >= req.headers.len) {
                 return error.TooManyHeaders;
             }
-            const line_end_len: usize = if (n >= 2 and
-                self.buffer[self.start - 2] == '\r' and
-                self.buffer[self.start - 1] == '\n') 2 else 1;
+            const line_end_len: usize = if (self.buffer[self.start - 2] == '\r' and self.buffer[self.start - 1] == '\n') 2 else 1;
             req.headers[req.headers_len] = try Header.parse(self.buffer[self.start - n .. self.start - line_end_len]);
             req.headers_len += 1;
         }
@@ -70,46 +68,56 @@ pub const RequestReader = struct {
         var line_len: usize = 0;
         const Vector = @Vector(16, u8);
         const newline: Vector = @splat(@as(u8, '\n'));
-        while (true) {
-            if (self.pos > (self.buffer.len / 2)) {
+
+        // Prefetch data if buffer is empty
+        if (self.pos >= self.len) {
+            const available = self.buffer.len - self.len;
+            if (available == 0) return error.LineTooLong;
+
+            // Read larger chunks to reduce system calls
+            const read_amount = try posix.readv(fd, &[_]posix.iovec{
+                .{ .base = @ptrCast(&self.buffer[self.len]), .len = available },
+            });
+            if (read_amount == 0) return line_len;
+            self.len += read_amount;
+        }
+
+        // Process aligned chunks using SIMD
+        while (self.pos + 16 <= self.len) {
+            // Direct vector load without memcpy
+            const vec: Vector = @as(Vector, self.buffer[self.pos..][0..16].*);
+            const matches = vec == newline;
+            const mask = @as(u16, @bitCast(matches));
+
+            if (mask != 0) {
+                const offset = @ctz(mask);
+                self.pos += offset + 1;
+                self.start = self.pos;
+                return line_len + offset + 1;
+            }
+
+            self.pos += 16;
+            line_len += 16;
+
+            // Compact only when necessary
+            if (self.pos > (self.buffer.len * 3) / 4) {
                 self.compact();
             }
-            if (self.pos >= self.len) {
-                const available = self.buffer.len - self.len;
-                if (available == 0) return error.LineTooLong;
-                const read_amount = try posix.read(fd, self.buffer[self.len..]);
-                if (read_amount == 0) return line_len;
-                self.len += read_amount;
-            }
-            // Process chunks of 16 bytes
-            while (self.pos + 16 <= self.len) {
-                var chunk: [16]u8 align(16) = undefined;
-                @memcpy(&chunk, self.buffer[self.pos..][0..16]);
-                const vec: Vector = chunk;
-                const matches = vec == newline;
-                const mask = @as(u16, @bitCast(matches));
-                if (mask != 0) {
-                    const offset = @ctz(mask);
-                    line_len += offset + 1;
-                    self.pos += offset + 1;
-                    self.start = self.pos;
-                    return line_len;
-                }
-                self.pos += 16;
-                line_len += 16;
-            }
-            // Handle remaining bytes
-            while (self.pos < self.len) {
-                if (self.buffer[self.pos] == '\n') {
-                    self.pos += 1;
-                    line_len += 1;
-                    self.start = self.pos;
-                    return line_len;
-                }
-                self.pos += 1;
-                line_len += 1;
-            }
         }
+
+        // Optimize remaining bytes handling
+        const remaining = self.len - self.pos;
+        if (remaining > 0) {
+            if (std.mem.indexOfScalar(u8, self.buffer[self.pos..self.len], '\n')) |offset| {
+                self.pos += offset + 1;
+                self.start = self.pos;
+                return line_len + offset + 1;
+            }
+            self.pos += remaining;
+            line_len += remaining;
+        }
+
+        return line_len;
     }
 
     inline fn compact(self: *Self) void {
@@ -122,52 +130,79 @@ pub const RequestReader = struct {
     }
 };
 
-// This has been optimised to take advantage of the fixed length of HTTP/1.x
-// version. This saves us one search for the final ' ' marking the path ending.
-// This implementation also handles both CRLF and bare LF line endings.
-// As HTTP/2 is a binary protocol, it will be handled in a different path.
 fn parseRequestLine(req: *Request, buffer: []const u8) !void {
-    const line_end = if (buffer[buffer.len - 2] == '\r' and buffer[buffer.len - 1] == '\n')
-        buffer.len - 2 // CRLF ending
-    else if (buffer[buffer.len - 1] == '\n')
-        buffer.len - 1 // LF ending
-    else
+    if (buffer.len < 14) return error.InvalidRequest; // GET / HTTP/1.1
+
+    // Check line ending using single comparison
+    const line_end = switch (buffer[buffer.len - 2]) {
+        '\r' => buffer.len - 2,
+        '\n' => buffer.len - 1,
+        else => if (buffer[buffer.len - 1] == '\n')
+            buffer.len - 1
+        else
+            return error.InvalidRequest,
+    };
+
+    // Validate HTTP version position and space separator
+    const version_start = line_end - 8;
+    if (version_start < 6 or buffer[version_start - 1] != ' ') {
         return error.InvalidRequest;
-    // HTTP version is fixed length, so we can calculate version_start
-    const version_start = line_end - 8; // Length of "HTTP/1.x"
-    if (buffer[version_start - 1] != ' ') return error.InvalidRequest;
+    }
+
     // Parse method and version first
     req.method = try Method.parse(buffer[0..8]);
     req.version = try Version.parse(buffer[version_start..line_end]);
+
     // Path and query is everything between method and version
     const path_start = req.method.toLength() + 1;
-    const path_and_query_end = version_start - 1;
-    const query_start_opt = std.mem.indexOfScalarPos(u8, buffer[path_start..path_and_query_end], path_start, '?');
-    if (query_start_opt) |query_start| {
-        req.query_raw_len = path_and_query_end - (query_start + 1);
-        @memcpy(req.query_raw[0..req.query_raw_len], buffer[query_start + 1 .. path_and_query_end]);
-        req.path_len = query_start - path_start;
-        @memcpy(req.path[0..req.path_len], buffer[path_start..query_start]);
+    const path_and_query = buffer[path_start .. version_start - 1];
+    if (std.mem.indexOfScalar(u8, path_and_query, '?')) |query_start| {
+        req.query_raw_len = path_and_query.len - (query_start + 1);
+        @memcpy(req.query_raw[0..req.query_raw_len], path_and_query[query_start + 1 ..]);
+        req.path_len = query_start;
+        @memcpy(req.path[0..req.path_len], path_and_query[0..query_start]);
     } else {
         req.query_raw_len = 0;
-        req.path_len = path_and_query_end - path_start;
-        @memcpy(req.path[0..req.path_len], buffer[path_start..path_and_query_end]);
+        req.path_len = path_and_query.len;
+        @memcpy(req.path[0..req.path_len], path_and_query);
     }
 }
 
-test "benchmark read and parse headers" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-    var req = try Request.init(allocator);
+test "benchmark read line" {
+    var req = try Request.init(std.testing.allocator);
     defer req.deinit();
-    var reader = try RequestReader.init(allocator, 1024);
+    var reader = try RequestReader.init(std.testing.allocator, 1024);
+    defer reader.deinit();
     const raw = "Header-1: header-1-value\r\nHeader-2: header-2-value\r\nHeader-3: header-3-value\r\n\r\n";
     const iterations: usize = 10_000_000;
     var i: usize = 0;
     var timer = try std.time.Timer.start();
+    @memcpy(reader.buffer[0..raw.len], raw);
     while (i < iterations) : (i += 1) {
-        reader.reset();
-        @memcpy(reader.buffer[0..raw.len], raw);
+        reader.pos = 0;
+        reader.start = 0;
+        reader.len = raw.len;
+        _ = try reader.readLine(0);
+    }
+    const elapsed = timer.lap();
+    const avg_ns = @divFloor(elapsed, iterations);
+    std.debug.print("Average time: {d}ns\n", .{avg_ns});
+}
+
+test "benchmark read and parse headers" {
+    var req = try Request.init(std.testing.allocator);
+    defer req.deinit();
+    var reader = try RequestReader.init(std.testing.allocator, 1024);
+    defer reader.deinit();
+    const raw = "Header-1: header-1-value\r\nHeader-2: header-2-value\r\nHeader-3: header-3-value\r\n\r\n";
+    const iterations: usize = 10_000_000;
+    var i: usize = 0;
+    @memcpy(reader.buffer[0..raw.len], raw);
+    var timer = try std.time.Timer.start();
+    while (i < iterations) : (i += 1) {
+        reader.pos = 0;
+        reader.start = 0;
+        reader.len = raw.len;
         reader.len = raw.len;
         req.reset();
         try reader.readHeaders(0, req);
@@ -178,9 +213,7 @@ test "benchmark read and parse headers" {
 }
 
 test "test parse request line" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-    var req = try Request.init(allocator);
+    var req = try Request.init(std.testing.allocator);
     defer req.deinit();
     const line = "GET /some-random-path HTTP/1.1\r\n";
     try parseRequestLine(req, line[0..]);
@@ -238,7 +271,7 @@ test "benchmark parse request line" {
     std.debug.print("Average time: {d}ns\n", .{avg_ns});
 }
 
-test "benchmark HTTP GET request parsing" {
+test "benchmark parse GET request" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
     var req = try Request.init(allocator);
@@ -251,19 +284,16 @@ test "benchmark HTTP GET request parsing" {
         "User-Agent: test-client\r\n" ++
         "Accept: */*\r\n" ++
         "Connection: keep-alive\r\n\r\n";
-    const pipe_fds = try posix.pipe();
-    const read_fd = pipe_fds[0];
-    const write_fd = pipe_fds[1];
-    defer posix.close(read_fd);
-    defer posix.close(write_fd);
+    @memcpy(reader.buffer[0..request_data.len], request_data);
     const iterations: usize = 50_000_000;
     var timer = try std.time.Timer.start();
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
-        _ = try posix.write(write_fd, request_data);
-        reader.reset();
+        reader.pos = 0;
+        reader.start = 0;
+        reader.len = request_data.len;
         req.reset();
-        try reader.readRequest(read_fd, req);
+        try reader.readRequest(0, req);
     }
     const elapsed = timer.lap();
     const avg_ns = @divFloor(elapsed, iterations);

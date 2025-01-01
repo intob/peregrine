@@ -9,7 +9,6 @@ const RequestReader = @import("./reader.zig").RequestReader;
 const Response = @import("./response.zig").Response;
 const Status = @import("./status.zig").Status;
 const WebsocketServer = @import("./ws/server.zig").WebsocketServer;
-const alignment = @import("./alignment.zig");
 
 const CONNECTION_MAX_REQUESTS: u8 = 200;
 // This is added to a response that contains no body. This is more efficient than
@@ -37,6 +36,7 @@ pub fn Worker(comptime Handler: type) type {
         req: *Request,
         resp: *Response,
         resp_status_buf: []align(16) u8,
+        reader: *RequestReader,
         iovecs: [4]posix.iovec_const,
         connection_requests: []u8,
         ws: *WebsocketServer(Handler),
@@ -56,6 +56,7 @@ pub fn Worker(comptime Handler: type) type {
             self.resp = try Response.init(allocator, cfg.resp_body_buffer_size);
             const resp_status_size = try calcResponseStatusBufferSize(allocator);
             self.resp_status_buf = try allocator.alignedAlloc(u8, 16, resp_status_size);
+            self.reader = try RequestReader.init(self.allocator, 4096);
             self.connection_requests = try allocator.alloc(u8, std.math.maxInt(i16));
             self.ws = ws;
             self.shutdown = std.atomic.Value(bool).init(false);
@@ -65,6 +66,7 @@ pub fn Worker(comptime Handler: type) type {
         pub fn deinit(self: *Self) void {
             self.shutdown.store(true, .monotonic);
             self.thread.join();
+            self.reader.deinit();
             self.req.deinit();
             self.resp.deinit();
             self.allocator.free(self.resp_status_buf);
@@ -83,13 +85,6 @@ pub fn Worker(comptime Handler: type) type {
                 else => unreachable,
             };
             var events: [256]EventType = undefined;
-            // TODO: make request reader buffer size configurable
-            // Buffer is aligned internally
-            const reader = RequestReader.init(self.allocator, 4096) catch |err| {
-                std.debug.print("error allocating reader: {any}\n", .{err});
-                return;
-            };
-            defer reader.deinit();
 
             const getFileDescriptor = comptime blk: {
                 break :blk switch (native_os) {
@@ -116,7 +111,7 @@ pub fn Worker(comptime Handler: type) type {
                     const fd: i32 = getFileDescriptor(event);
                     if (fd < 0) continue;
                     const fd_idx: usize = if (fd < 0) continue else @intCast(fd);
-                    self.readSocket(fd, reader) catch |err| {
+                    self.readSocket(fd) catch |err| {
                         self.closeSocket(fd, fd_idx);
                         switch (err) {
                             error.EOF => {}, // Expected case
@@ -138,24 +133,14 @@ pub fn Worker(comptime Handler: type) type {
             self.connection_requests[fd_idx] = 0;
         }
 
-        fn readSocket(self: *Self, fd: posix.socket_t, reader: *RequestReader) !void {
-            // Is this correct? What if we have read part of the next request?
-            // The advantage is that this is faster than compacting the buffer.
-            reader.reset();
+        fn readSocket(self: *Self, fd: posix.socket_t) !void {
             self.req.reset();
-            try reader.readRequest(fd, self.req);
+            try self.reader.readRequest(fd, self.req);
             self.resp.reset();
             self.handler.handleRequest(self.req, self.resp);
             const keep_alive = shouldKeepAlive(self.req);
             try self.respond(fd, keep_alive);
-            // TODO: Think about how to make this nice for the user.
-            // Currently, they have to handle the upgrade by calling the upgrade handler.
-            // This requirement makes the protocol explicit, not doing magic behind the
-            // scenes. Also, if a user does not want to support websockets, they simply
-            // don't implement the upgrade handler.
             if (self.resp.is_ws_upgrade) {
-                // Transfer socket to WS event bus
-                std.debug.print("transfer socket {d} to ws server\n", .{fd});
                 self.connection_requests[@intCast(fd)] = 0;
                 try self.io_handler.removeSocket(fd);
                 try self.ws.addSocket(fd);
