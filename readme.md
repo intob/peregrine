@@ -1,5 +1,5 @@
-# Peregrine - a bleeding fast HTTP server 🦅
-This is a high-performance, event-driven HTTP server. Written in pure Zig, with no dependencies other than Zig's standard library. Supports Linux (epoll) and BSD/MacOS (kqueue) systems.
+# Peregrine - a simple high-performance HTTP server
+This is an event-driven HTTP server. Written in pure Zig, with no dependencies other than Zig's standard library. Supports Linux (epoll) and BSD/MacOS (kqueue) systems.
 
 The main goal of this project is to provide a HTTP server with the following priorities (in order of prevalence):
 - Reliability
@@ -8,7 +8,7 @@ The main goal of this project is to provide a HTTP server with the following pri
 
 Currently, all heap allocations are made during startup. Internally, no heap allocations are made per-request unless pre-allocated buffers overflow.
 
-Note: This project has just started, and is not yet a complete HTTP server implementation. See [To do section](#to-do). The API is likely to change.
+Note: This project has just started, and is not yet a complete HTTP server implementation. See [To do section](#to-do). The API is likely to change. It is currently NOT FIT FOR PRODUCTION use.
 
 ## Features
 
@@ -35,15 +35,6 @@ Note: This project has just started, and is not yet a complete HTTP server imple
 - Query only parsed on demand
 - Optimised header, method and version parsing
 - Fixed sized array for headers (faster than std.ArrayList)
-
-### Perfect hash table
-The worker's critical path looks up the socket file descriptor in a map. If the number of requests has exceeded the connection request limit, the connection is closed after processing the request. This means that for every request, one put and one get is done on the connection_requests hash map.
-
-Originally, I was using `std.AutoHashMap`, which was taking on average 460ns to put data. I had a feeling that this could be a bottleneck, and so I implemented a faster hash table. My first attempt reduced the time to 170ns.
-
-After watching [this video](https://www.youtube.com/watch?v=DMQ_HcNSOAI), I learned that sizing tables to powers of two can yeild improved performance. Ensuring that the array sizes were powers of two reduced this down to 9ns. Optimising the hash function based on the assumption that our array size is a power of two reduced this to 8ns.
-
-So, we end up with a fairly perfect hash table, with a modified FNV-1a hash function optimised for power-of-two sized tables.
 
 ## Architecture
 
@@ -95,6 +86,8 @@ When I tried to implement this, I quickly saw that it would be challenging becau
 Then I realised that even if I added TLS support, server performance would pale in comparison to the plain HTTP version. At this point, I'd rather offload TLS termination (to a load balancer, for example), allowing this server to focus on efficient HTTP parsing without becoming overwhelmingly complex.
 
 In future when I'm more familiar with comptime generics and interfaces in Zig, I may have another crack at this. For now, I don't see a way to win here... So, If you're looking for a Zig HTTP server that supports TLS, I suggest looking at [Zap](https://github.com/zigzap/zap).
+
+In addition, I am absolutely not ready to implement TLS from scratch. It would be the death of this project if I tried.
 
 ## Usage
 

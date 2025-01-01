@@ -9,10 +9,9 @@ const RequestReader = @import("./reader.zig").RequestReader;
 const Response = @import("./response.zig").Response;
 const Status = @import("./status.zig").Status;
 const WebsocketServer = @import("./ws/server.zig").WebsocketServer;
-const FdMap = @import("./fdmap.zig").FdMap;
 const alignment = @import("./alignment.zig");
 
-const CONNECTION_MAX_REQUESTS: u32 = 200;
+const CONNECTION_MAX_REQUESTS: u8 = 200;
 // This is added to a response that contains no body. This is more efficient than
 // having the user provide the header to be serialised.
 const CONTENT_LENGTH_ZERO_HEADER = "content-length: 0\r\n";
@@ -39,7 +38,7 @@ pub fn Worker(comptime Handler: type) type {
         resp: *Response,
         resp_status_buf: []align(16) u8,
         iovecs: [4]posix.iovec_const,
-        connection_requests: *FdMap,
+        connection_requests: []u8,
         ws: *WebsocketServer(Handler),
         shutdown: std.atomic.Value(bool),
         thread: std.Thread,
@@ -57,7 +56,7 @@ pub fn Worker(comptime Handler: type) type {
             self.resp = try Response.init(allocator, cfg.resp_body_buffer_size);
             const resp_status_size = try calcResponseStatusBufferSize(allocator);
             self.resp_status_buf = try allocator.alignedAlloc(u8, 16, resp_status_size);
-            self.connection_requests = try FdMap.init(allocator, 1_000_000);
+            self.connection_requests = try allocator.alloc(u8, std.math.maxInt(i16));
             self.ws = ws;
             self.shutdown = std.atomic.Value(bool).init(false);
             self.thread = try std.Thread.spawn(.{}, workerLoop, .{self});
@@ -69,7 +68,7 @@ pub fn Worker(comptime Handler: type) type {
             self.req.deinit();
             self.resp.deinit();
             self.allocator.free(self.resp_status_buf);
-            self.connection_requests.deinit();
+            self.allocator.free(self.connection_requests);
             std.debug.print("worker-thread-{d} joined\n", .{self.id});
         }
 
@@ -78,7 +77,7 @@ pub fn Worker(comptime Handler: type) type {
         }
 
         fn workerLoop(self: *Self) void {
-            const EventType = switch (native_os) {
+            const EventType = comptime switch (native_os) {
                 .freebsd, .netbsd, .openbsd, .dragonfly, .macos => posix.Kevent,
                 .linux => linux.epoll_event,
                 else => unreachable,
@@ -91,40 +90,52 @@ pub fn Worker(comptime Handler: type) type {
                 return;
             };
             defer reader.deinit();
+
+            const getFileDescriptor = comptime blk: {
+                break :blk switch (native_os) {
+                    .freebsd, .netbsd, .openbsd, .dragonfly, .macos => struct {
+                        fn get(event: posix.Kevent) i32 {
+                            return @intCast(event.udata);
+                        }
+                    }.get,
+                    .linux => struct {
+                        fn get(event: linux.epoll_event) i32 {
+                            return event.data.fd;
+                        }
+                    }.get,
+                    else => unreachable,
+                };
+            };
+
             while (!self.shutdown.load(.unordered)) {
                 const ready_count = self.io_handler.wait(&events) catch |err| {
                     std.debug.print("error waiting for events: {any}\n", .{err});
                     continue;
                 };
                 for (events[0..ready_count]) |event| {
-                    const fd: i32 = switch (native_os) {
-                        .freebsd, .netbsd, .openbsd, .dragonfly, .macos => @intCast(event.udata),
-                        .linux => event.data.fd,
-                        else => unreachable,
-                    };
+                    const fd: i32 = getFileDescriptor(event);
+                    if (fd < 0) continue;
+                    const fd_idx: usize = if (fd < 0) continue else @intCast(fd);
                     self.readSocket(fd, reader) catch |err| {
-                        self.closeSocket(fd);
+                        self.closeSocket(fd, fd_idx);
                         switch (err) {
                             error.EOF => {}, // Expected case
                             else => std.debug.print("error reading socket: {any}\n", .{err}),
                         }
                         continue;
                     };
-                    const requests_handled = self.connection_requests.get(fd) orelse 0;
-                    if (requests_handled >= CONNECTION_MAX_REQUESTS) {
-                        self.closeSocket(fd);
+                    if (self.connection_requests[fd_idx] >= CONNECTION_MAX_REQUESTS) {
+                        self.closeSocket(fd, fd_idx);
                     } else {
-                        self.connection_requests.put(fd, requests_handled + 1) catch |err| {
-                            std.debug.print("error updating socket request count: {any}\n", .{err});
-                        };
+                        self.connection_requests[fd_idx] += 1;
                     }
                 }
             }
         }
 
-        fn closeSocket(self: *Self, fd: posix.socket_t) void {
+        inline fn closeSocket(self: *Self, fd: posix.socket_t, fd_idx: usize) void {
             posix.close(fd);
-            _ = self.connection_requests.remove(fd);
+            self.connection_requests[fd_idx] = 0;
         }
 
         fn readSocket(self: *Self, fd: posix.socket_t, reader: *RequestReader) !void {
@@ -145,7 +156,7 @@ pub fn Worker(comptime Handler: type) type {
             if (self.resp.is_ws_upgrade) {
                 // Transfer socket to WS event bus
                 std.debug.print("transfer socket {d} to ws server\n", .{fd});
-                _ = self.connection_requests.remove(fd);
+                self.connection_requests[@intCast(fd)] = 0;
                 try self.io_handler.removeSocket(fd);
                 try self.ws.addSocket(fd);
             }
