@@ -107,7 +107,6 @@ pub fn Worker(comptime Handler: type) type {
                 };
                 for (events[0..ready_count]) |event| {
                     const fd: i32 = getFileDescriptor(event);
-                    if (fd < 0) continue;
                     const fd_idx: usize = if (fd < 0) continue else @intCast(fd);
                     self.readSocket(fd) catch |err| {
                         posix.close(fd);
