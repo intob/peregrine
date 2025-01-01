@@ -2,19 +2,15 @@ const std = @import("std");
 const pereg = @import("peregrine");
 
 const Handler = struct {
-    pub fn init(allocator: std.mem.Allocator) !*@This() {
-        return try allocator.create(@This());
+    const Self = @This();
+
+    pub fn init(allocator: std.mem.Allocator) !*Self {
+        return try allocator.create(Self);
     }
 
-    pub fn deinit(_: *@This()) void {}
+    pub fn deinit(_: *Self) void {}
 
-    pub fn handleRequest(self: *@This(), req: *pereg.Request, resp: *pereg.Response) void {
-        self.handleWithError(req, resp) catch |err| {
-            std.debug.print("error handling request: {any}\n", .{err});
-        };
-    }
-
-    fn handleWithError(_: *@This(), _: *pereg.Request, resp: *pereg.Response) !void {
+    pub fn handleRequest(_: *Self, _: *pereg.Request, resp: *pereg.Response) void {
         _ = try resp.setBody("Kawww\n");
         try resp.addNewHeader("Content-Length", "6");
     }

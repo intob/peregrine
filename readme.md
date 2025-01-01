@@ -117,21 +117,18 @@ const std = @import("std");
 const pereg = @import("peregrine");
 
 const Handler = struct {
-    pub fn init(allocator: std.mem.Allocator) !*@This() {
-        return try allocator.create(@This());
+    const Self = @This();
+
+    pub fn init(allocator: std.mem.Allocator) !*Self {
+        return try allocator.create(Self);
     }
 
-    pub fn deinit(_: *@This()) void {}
+    pub fn deinit(_: *Self) void {}
 
-    pub fn handleRequest(self: *@This(), req: *pereg.Request, resp: *pereg.Response) void {
-        self.handleRequestWithError(req, resp) catch |err| {
-            std.debug.print("error handling request: {any}\n", .{err});
-        };
-    }
-
-    fn handleRequestWithError(_: *@This(), _: *pereg.Request, resp: *pereg.Response) !void {
-        _ = try resp.setBody("Kawww\n");
-        try resp.addNewHeader("Content-Length", "6");
+    // Error handling omitted for brevity
+    pub fn handleRequest(_: *Self, _: *pereg.Request, resp: *pereg.Response) void {
+        _ = resp.setBody("Kawww\n") catch {};
+        resp.addNewHeader("Content-Length", "6") catch {};
     }
 };
 
@@ -144,6 +141,7 @@ pub fn main() !void {
     std.debug.print("listening on 0.0.0.0:3000\n", .{});
     try srv.start(); // Blocks if there is no error
 }
+
 ```
 
 Using Zig's comptime metaprogramming, the Server is compiled with your handler interface. Simply implement the `init`, `deinit` and `handle` methods. Compile-time checks have your back.
@@ -229,14 +227,12 @@ pub fn handleWSDisconn(_: *@This(), fd: posix.socket_t) void {
 }
 
 pub fn handleWSFrame(_: *@This(), fd: posix.socket_t, frame: *pereg.ws.Frame) void {
-    std.debug.print("handle ws frame... {d} {s}\n", .{ fd, frame.getPayload() });
     // Reply to the client
     pereg.ws.writer.writeMessage(fd, "Hello client!", false) catch |err| {
         std.debug.print("error writing websocket: {any}\n", .{err});
     };
 }
 ```
-
 
 ## I need your feedback
 I started this project as a way to learn Zig. As such, some of it will be garbage. I would value any feedback.
