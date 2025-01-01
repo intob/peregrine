@@ -29,6 +29,28 @@ pub const WorkerConfig = struct {
 
 pub fn Worker(comptime Handler: type) type {
     return struct {
+        const Self = @This();
+        const EventType = switch (native_os) {
+            .freebsd, .netbsd, .openbsd, .dragonfly, .macos => posix.Kevent,
+            .linux => linux.epoll_event,
+            else => unreachable,
+        };
+        const getFileDescriptor = blk: {
+            break :blk switch (native_os) {
+                .freebsd, .netbsd, .openbsd, .dragonfly, .macos => struct {
+                    fn get(event: posix.Kevent) i32 {
+                        return @intCast(event.udata);
+                    }
+                }.get,
+                .linux => struct {
+                    fn get(event: linux.epoll_event) i32 {
+                        return event.data.fd;
+                    }
+                }.get,
+                else => unreachable,
+            };
+        };
+
         allocator: std.mem.Allocator,
         io_handler: aio.IOHandler,
         id: usize,
@@ -42,8 +64,6 @@ pub fn Worker(comptime Handler: type) type {
         ws: *WebsocketServer(Handler),
         shutdown: std.atomic.Value(bool),
         thread: std.Thread,
-
-        const Self = @This();
 
         pub fn init(self: *Self, handler: *Handler, ws: *WebsocketServer(Handler), cfg: WorkerConfig) !void {
             const allocator = cfg.allocator;
@@ -79,29 +99,7 @@ pub fn Worker(comptime Handler: type) type {
         }
 
         fn workerLoop(self: *Self) void {
-            const EventType = comptime switch (native_os) {
-                .freebsd, .netbsd, .openbsd, .dragonfly, .macos => posix.Kevent,
-                .linux => linux.epoll_event,
-                else => unreachable,
-            };
             var events: [256]EventType = undefined;
-
-            const getFileDescriptor = comptime blk: {
-                break :blk switch (native_os) {
-                    .freebsd, .netbsd, .openbsd, .dragonfly, .macos => struct {
-                        fn get(event: posix.Kevent) i32 {
-                            return @intCast(event.udata);
-                        }
-                    }.get,
-                    .linux => struct {
-                        fn get(event: linux.epoll_event) i32 {
-                            return event.data.fd;
-                        }
-                    }.get,
-                    else => unreachable,
-                };
-            };
-
             while (!self.shutdown.load(.unordered)) {
                 const ready_count = self.io_handler.wait(&events) catch |err| {
                     std.debug.print("error waiting for events: {any}\n", .{err});
@@ -112,7 +110,8 @@ pub fn Worker(comptime Handler: type) type {
                     if (fd < 0) continue;
                     const fd_idx: usize = if (fd < 0) continue else @intCast(fd);
                     self.readSocket(fd) catch |err| {
-                        self.closeSocket(fd, fd_idx);
+                        posix.close(fd);
+                        self.connection_requests[fd_idx] = 0;
                         switch (err) {
                             error.EOF => {}, // Expected case
                             else => std.debug.print("error reading socket: {any}\n", .{err}),
@@ -120,17 +119,13 @@ pub fn Worker(comptime Handler: type) type {
                         continue;
                     };
                     if (self.connection_requests[fd_idx] >= CONNECTION_MAX_REQUESTS) {
-                        self.closeSocket(fd, fd_idx);
+                        posix.close(fd);
+                        self.connection_requests[fd_idx] = 0;
                     } else {
                         self.connection_requests[fd_idx] += 1;
                     }
                 }
             }
-        }
-
-        inline fn closeSocket(self: *Self, fd: posix.socket_t, fd_idx: usize) void {
-            posix.close(fd);
-            self.connection_requests[fd_idx] = 0;
         }
 
         fn readSocket(self: *Self, fd: posix.socket_t) !void {
@@ -152,6 +147,7 @@ pub fn Worker(comptime Handler: type) type {
         fn respond(self: *Self, fd: posix.socket_t, keep_alive: bool) !void {
             // Status line and user headers
             const status_len = try self.resp.serialiseStatusAndHeaders(&self.resp_status_buf);
+            var total = status_len;
             self.iovecs[0] = .{
                 .base = @ptrCast(self.resp_status_buf[0..status_len]),
                 .len = status_len,
@@ -164,6 +160,7 @@ pub fn Worker(comptime Handler: type) type {
                     .len = CONTENT_LENGTH_ZERO_HEADER.len,
                 };
                 iovecs_len += 1;
+                total += CONTENT_LENGTH_ZERO_HEADER.len;
             }
             // Connection header
             if (self.resp.is_ws_upgrade) {
@@ -171,11 +168,21 @@ pub fn Worker(comptime Handler: type) type {
                     .base = UPGRADE_HEADER,
                     .len = UPGRADE_HEADER.len,
                 };
+                total += UPGRADE_HEADER.len;
             } else {
-                self.iovecs[iovecs_len] = .{
-                    .base = if (keep_alive) KEEP_ALIVE_HEADERS else CLOSE_HEADER,
-                    .len = if (keep_alive) KEEP_ALIVE_HEADERS.len else CLOSE_HEADER.len,
-                };
+                if (keep_alive) {
+                    self.iovecs[iovecs_len] = .{
+                        .base = KEEP_ALIVE_HEADERS,
+                        .len = KEEP_ALIVE_HEADERS.len,
+                    };
+                    total += KEEP_ALIVE_HEADERS.len;
+                } else {
+                    self.iovecs[iovecs_len] = .{
+                        .base = CLOSE_HEADER,
+                        .len = CLOSE_HEADER.len,
+                    };
+                    total += CLOSE_HEADER.len;
+                }
             }
             iovecs_len += 1;
             // Body
@@ -185,9 +192,13 @@ pub fn Worker(comptime Handler: type) type {
                     .len = self.resp.body_len,
                 };
                 iovecs_len += 1;
+                total += self.resp.body_len;
             }
             // Write to socket
-            _ = try posix.writev(fd, self.iovecs[0..iovecs_len]);
+            const n = try posix.writev(fd, self.iovecs[0..iovecs_len]);
+            if (n != total) {
+                return error.PartialWrite;
+            }
         }
     };
 }
@@ -195,7 +206,9 @@ pub fn Worker(comptime Handler: type) type {
 fn shouldKeepAlive(req: *Request) bool {
     if (req.version == .@"HTTP/1.1") {
         if (req.findHeader("connection")) |connection| {
-            return !std.mem.eql(u8, connection, "close");
+            if (connection.len == "close".len and
+                connection[0] == 'c' and
+                connection[1] == 'l') return false;
         }
         return true; // HTTP/1.1 defaults to keep-alive
     }
