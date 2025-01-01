@@ -20,7 +20,8 @@ pub const Response = struct {
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, body_size: usize) !*Self {
-        const aligned = std.mem.alignForward(usize, try std.math.ceilPowerOfTwo(body_size), 16);
+        const next_pow2 = try std.math.ceilPowerOfTwo(usize, body_size);
+        const aligned = std.mem.alignForward(usize, next_pow2, 16);
         const resp = try allocator.create(Self);
         resp.* = .{
             .allocator = allocator,

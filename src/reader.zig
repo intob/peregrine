@@ -4,7 +4,6 @@ const Request = @import("./request.zig").Request;
 const Header = @import("./header.zig").Header;
 const Method = @import("./method.zig").Method;
 const Version = @import("./version.zig").Version;
-const alignment = @import("./alignment.zig");
 
 pub const RequestReader = struct {
     const Self = @This();
@@ -17,7 +16,8 @@ pub const RequestReader = struct {
     compact_threshold: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, buffer_size: usize) !*Self {
-        const aligned = std.mem.alignForward(usize, try std.math.ceilPowerOfTwo(buffer_size), 16);
+        const next_pow2 = try std.math.ceilPowerOfTwo(usize, buffer_size);
+        const aligned = std.mem.alignForward(usize, next_pow2, 16);
         const reader = try allocator.create(Self);
         reader.* = .{
             .allocator = allocator,
