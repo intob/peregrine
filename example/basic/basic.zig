@@ -11,8 +11,8 @@ const Handler = struct {
     pub fn deinit(_: *Self) void {}
 
     pub fn handleRequest(_: *Self, _: *pereg.Request, resp: *pereg.Response) void {
-        _ = try resp.setBody("Kawww\n");
-        try resp.addNewHeader("Content-Length", "6");
+        _ = resp.setBody("Kawww\n") catch {};
+        resp.addNewHeader("Content-Length", "6") catch {};
     }
 };
 
