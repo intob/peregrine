@@ -10,14 +10,14 @@ const Response = @import("./response.zig").Response;
 const Status = @import("./status.zig").Status;
 const WebsocketServer = @import("./ws/server.zig").WebsocketServer;
 
-const CONNECTION_MAX_REQUESTS: u8 = 200;
+const CONNECTION_MAX_REQUESTS: u16 = 65535;
 // This is added to a response that contains no body. This is more efficient than
 // having the user provide the header to be serialised.
 const CONTENT_LENGTH_ZERO_HEADER = "content-length: 0\r\n";
 // These headers are added last, so they have an extra CRLF to terminate the headers.
 // This is simpler and more efficient than appending \r\n separately.
 // TODO: I think that adding an extra \r\n IOVEC after headers would be cleaner at this point.
-const KEEP_ALIVE_HEADERS = "connection: keep-alive\r\nkeep-alive: timeout=3, max=200\r\n\r\n";
+const KEEP_ALIVE_HEADERS = "connection: keep-alive\r\nkeep-alive: timeout=10, max=65535\r\n\r\n";
 const CLOSE_HEADER = "connection: close\r\n\r\n";
 const UPGRADE_HEADER = "connection: upgrade\r\n\r\n";
 
@@ -61,10 +61,10 @@ pub fn Worker(comptime Handler: type) type {
         id: usize,
         req: *Request,
         resp: *Response,
-        resp_status_buf: []align(16) u8,
+        resp_status_buf: []align(64) u8,
         reader: *RequestReader,
         iovecs: [4]posix.iovec_const,
-        connection_requests: []u8,
+        connection_requests: []u16,
         ws: *WebsocketServer(Handler),
         shutdown: std.atomic.Value(bool),
         thread: std.Thread,
@@ -78,9 +78,9 @@ pub fn Worker(comptime Handler: type) type {
             self.req = try Request.init(allocator);
             self.resp = try Response.init(allocator, cfg.resp_body_buffer_size);
             const resp_status_size = try calcResponseStatusBufferSize(allocator);
-            self.resp_status_buf = try allocator.alignedAlloc(u8, 16, resp_status_size);
+            self.resp_status_buf = try allocator.alignedAlloc(u8, 64, resp_status_size);
             self.reader = try RequestReader.init(self.allocator, cfg.req_buffer_size);
-            self.connection_requests = try allocator.alloc(u8, std.math.maxInt(i16));
+            self.connection_requests = try allocator.alloc(u16, std.math.maxInt(i16));
             self.ws = cfg.ws;
             self.shutdown = std.atomic.Value(bool).init(false);
             self.thread = try std.Thread.spawn(.{
@@ -105,7 +105,7 @@ pub fn Worker(comptime Handler: type) type {
         }
 
         fn workerLoop(self: *Self) void {
-            var events: [256]EventType = undefined;
+            var events: [1024]EventType = undefined;
             while (!self.shutdown.load(.unordered)) {
                 const ready_count = self.io_handler.wait(&events) catch |err| {
                     std.debug.print("error waiting for events: {any}\n", .{err});

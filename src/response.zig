@@ -15,20 +15,20 @@ pub const Response = struct {
     status: Status,
     headers: [32]Header,
     headers_len: usize,
-    body: []align(16) u8,
+    body: []align(64) u8,
     body_len: usize,
     is_ws_upgrade: bool,
 
     pub fn init(allocator: std.mem.Allocator, body_size: usize) !*Self {
         const next_pow2 = try std.math.ceilPowerOfTwo(usize, body_size);
-        const aligned = std.mem.alignForward(usize, next_pow2, 16);
+        const aligned = std.mem.alignForward(usize, next_pow2, 64);
         const resp = try allocator.create(Self);
         resp.* = .{
             .allocator = allocator,
             .status = Status.ok,
             .headers = undefined,
             .headers_len = 0,
-            .body = try allocator.alignedAlloc(u8, 16, aligned),
+            .body = try allocator.alignedAlloc(u8, 64, aligned),
             .body_len = 0,
             .is_ws_upgrade = false,
         };

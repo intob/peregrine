@@ -9,7 +9,7 @@ pub const RequestReader = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
-    buf: []align(16) u8,
+    buf: []align(64) u8,
     pos: usize = 0, // Current position in buffer
     len: usize = 0, // Amount of valid data in buffer
     start: usize = 0, // Start of unprocessed data
@@ -17,11 +17,11 @@ pub const RequestReader = struct {
 
     pub fn init(allocator: std.mem.Allocator, buffer_size: usize) !*Self {
         const next_pow2 = try std.math.ceilPowerOfTwo(usize, buffer_size);
-        const aligned = std.mem.alignForward(usize, next_pow2, 16);
+        const aligned = std.mem.alignForward(usize, next_pow2, 64);
         const reader = try allocator.create(Self);
         reader.* = .{
             .allocator = allocator,
-            .buf = try allocator.alignedAlloc(u8, 16, aligned),
+            .buf = try allocator.alignedAlloc(u8, 64, aligned),
             .compact_threshold = (aligned * 3) / 4,
         };
         return reader;

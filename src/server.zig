@@ -9,22 +9,18 @@ const WebsocketServer = @import("./ws/server.zig").WebsocketServer;
 
 var should_shutdown: std.atomic.Value(bool) = undefined;
 
-fn handleSignal(sig: c_int) callconv(.C) void {
-    std.debug.print("received sig {d}\n", .{sig});
+fn handleSignal(_: c_int) callconv(.C) void {
     should_shutdown.store(true, .release);
 }
 
 pub const ServerConfig = struct {
     /// Listening IP address
     ip: []const u8 = "0.0.0.0",
-    /// Number of worker threads processing requests.
+    /// Number of threads processing requests.
     /// Defaults to CPU core count.
     worker_thread_count: usize = 0,
     /// Stack size for each worker thread. Defaults to 1MB.
     worker_stack_size: usize = 1024 * 1024,
-    /// Number of threads accepting connections. Defaults to
-    /// worker_thread_count / 6.
-    accept_thread_count: usize = 0,
     /// Disable Nagle's algorithm. Default is true (disabled).
     tcp_nodelay: bool = true,
     /// Defaults to 10MB. Each worker has it's own buffer.
@@ -64,21 +60,23 @@ pub fn Server(comptime Handler: type) type {
         workers: []worker.Worker(Handler),
         next_worker: usize = 0,
         listener: posix.socket_t,
-        accept_threads: []std.Thread,
         io_handler: ListenerIOHandler,
-        tcp_nodelay: bool,
 
         pub fn init(allocator: std.mem.Allocator, port: u16, cfg: ServerConfig) !*Self {
             const sock_type: u32 = posix.SOCK.STREAM | posix.SOCK.NONBLOCK;
             const address = try std.net.Address.parseIp(cfg.ip, port);
             const listener = try posix.socket(address.any.family, sock_type, posix.IPPROTO.TCP);
             try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-            // REUSEPORT allows accepting connections from multiple threads.
             if (@hasDecl(posix.SO, "REUSEPORT_LB")) {
                 try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEPORT_LB, &std.mem.toBytes(@as(c_int, 1)));
             } else if (@hasDecl(posix.SO, "REUSEPORT")) {
                 try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
             }
+            const TCP_NODELAY: u32 = 1; // posix.TCP is unavailable for macOS
+            const nodelay_opt: c_int = if (cfg.tcp_nodelay) 0 else 1; // Zero disables Nagle's algorithm
+            try posix.setsockopt(listener, posix.IPPROTO.TCP, TCP_NODELAY, &std.mem.toBytes(@as(c_int, nodelay_opt)));
+            try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.RCVBUF, &std.mem.toBytes(@as(c_int, 1 << 19)));
+            try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, 1 << 19)));
             try posix.bind(listener, &address.any, address.getOsSockLen());
             var sig_action = posix.Sigaction{
                 .handler = .{ .handler = handleSignal },
@@ -91,10 +89,6 @@ pub fn Server(comptime Handler: type) type {
                 cfg.worker_thread_count
             else
                 try std.Thread.getCpuCount();
-            const accept_thread_count = if (cfg.accept_thread_count > 0)
-                cfg.accept_thread_count
-            else
-                @max(1, worker_thread_count / 6);
             const io_handler = try ListenerIOHandler.init(listener);
             const srv = try allocator.create(Self);
             errdefer allocator.destroy(srv);
@@ -106,9 +100,7 @@ pub fn Server(comptime Handler: type) type {
                 .address = address,
                 .workers = try allocator.alloc(worker.Worker(Handler), worker_thread_count),
                 .listener = listener,
-                .accept_threads = try allocator.alloc(std.Thread, accept_thread_count),
                 .io_handler = io_handler,
-                .tcp_nodelay = cfg.tcp_nodelay,
             };
             for (srv.workers, 0..) |*w, i| {
                 try w.init(.{
@@ -121,19 +113,14 @@ pub fn Server(comptime Handler: type) type {
                     .ws = srv.ws,
                 });
             }
-            for (srv.accept_threads) |*thread| {
-                thread.* = try std.Thread.spawn(.{
-                    .allocator = allocator,
-                    .stack_size = 1024,
-                }, loop, .{srv});
-            }
             return srv;
         }
 
         /// Blocks until the server is shutdown.
-        pub fn start(self: *Self) posix.ListenError!void {
+        pub fn start(self: *Self) !void {
             should_shutdown = std.atomic.Value(bool).init(false);
-            try posix.listen(self.listener, 1024);
+            try posix.listen(self.listener, std.math.maxInt(i16));
+            try self.loop();
             self.waitForShutdown();
         }
 
@@ -148,7 +135,7 @@ pub fn Server(comptime Handler: type) type {
                 if (have_connection) {
                     self.acceptConnection() catch |err| switch (err) {
                         error.WouldBlock => {}, // Expected case
-                        else => std.debug.print("error accepting connection: {any}\n", .{err}),
+                        else => return err,
                     };
                 }
             }
@@ -157,16 +144,16 @@ pub fn Server(comptime Handler: type) type {
         fn acceptConnection(self: *Self) !void {
             const clsock = try posix.accept(self.listener, null, null, posix.SOCK.NONBLOCK);
             errdefer posix.close(clsock);
-            try self.setClientSockOpt(clsock);
+            const send_timeout = posix.timeval{ .sec = 10, .usec = 0 };
+            const recv_timeout = posix.timeval{ .sec = 10, .usec = 0 };
+            try posix.setsockopt(clsock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &std.mem.toBytes(send_timeout));
+            try posix.setsockopt(clsock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(recv_timeout));
+            try posix.setsockopt(clsock, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(@as(c_int, 1)));
             const worker_id = @atomicRmw(usize, &self.next_worker, .Add, 1, .monotonic) % self.workers.len;
             try self.workers[worker_id].addClient(clsock);
         }
 
         fn waitForShutdown(self: *Self) void {
-            for (self.accept_threads, 0..) |t, i| {
-                t.join();
-                std.debug.print("accept-thread-{d} joined\n", .{i});
-            }
             for (self.workers) |*w| {
                 w.deinit();
             }
@@ -178,24 +165,8 @@ pub fn Server(comptime Handler: type) type {
             posix.close(self.listener);
             self.handler.deinit();
             self.allocator.free(self.workers);
-            self.allocator.free(self.accept_threads);
             self.ws.deinit();
             self.allocator.destroy(self);
-        }
-
-        fn setClientSockOpt(self: *Self, sock: posix.socket_t) !void {
-            // KEEPALIVE sends periodic probes on idle connections, detects if a peer is still alive,
-            // and closes connections automatically if the peer doesn't respond.
-            try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(@as(c_int, 1)));
-            // Disable Nagle's algorithm.
-            const TCP_NODELAY: u32 = 1; // posix.TCP is unavailable for macOS
-            const nodelay_opt: c_int = if (self.tcp_nodelay) 0 else 1; // Zero disables Nagle's algorithm
-            try posix.setsockopt(sock, posix.IPPROTO.TCP, TCP_NODELAY, &std.mem.toBytes(@as(c_int, nodelay_opt)));
-            // Set send/recv timeouts
-            const send_timeout = posix.timeval{ .sec = 3, .usec = 0 };
-            const recv_timeout = posix.timeval{ .sec = 3, .usec = 0 };
-            try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &std.mem.toBytes(send_timeout));
-            try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(recv_timeout));
         }
     };
 }
