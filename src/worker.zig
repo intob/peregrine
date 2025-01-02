@@ -21,12 +21,6 @@ const KEEP_ALIVE_HEADERS = "connection: keep-alive\r\nkeep-alive: timeout=3, max
 const CLOSE_HEADER = "connection: close\r\n\r\n";
 const UPGRADE_HEADER = "connection: upgrade\r\n\r\n";
 
-pub const WorkerConfig = struct {
-    allocator: std.mem.Allocator,
-    id: usize,
-    resp_body_buffer_size: usize,
-};
-
 pub fn Worker(comptime Handler: type) type {
     return struct {
         const Self = @This();
@@ -35,6 +29,14 @@ pub fn Worker(comptime Handler: type) type {
             .linux => linux.epoll_event,
             else => unreachable,
         };
+        const WorkerConfig = struct {
+            allocator: std.mem.Allocator,
+            id: usize,
+            resp_body_buffer_size: usize,
+            handler: *Handler,
+            ws: *WebsocketServer(Handler),
+        };
+
         const getFileDescriptor = blk: {
             break :blk switch (native_os) {
                 .freebsd, .netbsd, .openbsd, .dragonfly, .macos => struct {
@@ -52,9 +54,9 @@ pub fn Worker(comptime Handler: type) type {
         };
 
         allocator: std.mem.Allocator,
+        handler: *Handler,
         io_handler: aio.IOHandler,
         id: usize,
-        handler: *Handler,
         req: *Request,
         resp: *Response,
         resp_status_buf: []align(16) u8,
@@ -65,11 +67,10 @@ pub fn Worker(comptime Handler: type) type {
         shutdown: std.atomic.Value(bool),
         thread: std.Thread,
 
-        pub fn init(self: *Self, handler: *Handler, ws: *WebsocketServer(Handler), cfg: WorkerConfig) !void {
+        pub fn init(self: *Self, cfg: WorkerConfig) !void {
             const allocator = cfg.allocator;
-            errdefer self.deinit();
-            self.handler = handler;
             self.allocator = allocator;
+            self.handler = cfg.handler;
             self.io_handler = try aio.IOHandler.init();
             self.id = cfg.id;
             self.req = try Request.init(allocator);
@@ -78,7 +79,7 @@ pub fn Worker(comptime Handler: type) type {
             self.resp_status_buf = try allocator.alignedAlloc(u8, 16, resp_status_size);
             self.reader = try RequestReader.init(self.allocator, 20_000);
             self.connection_requests = try allocator.alloc(u8, std.math.maxInt(i16));
-            self.ws = ws;
+            self.ws = cfg.ws;
             self.shutdown = std.atomic.Value(bool).init(false);
             self.thread = try std.Thread.spawn(.{}, workerLoop, .{self});
         }

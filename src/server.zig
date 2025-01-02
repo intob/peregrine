@@ -59,7 +59,7 @@ pub fn Server(comptime Handler: type) type {
         ws: *WebsocketServer(Handler),
         address: std.net.Address,
         workers: []worker.Worker(Handler),
-        next_worker: usize,
+        next_worker: usize = 0,
         listener: posix.socket_t,
         accept_threads: []std.Thread,
         io_handler: ListenerIOHandler,
@@ -102,17 +102,18 @@ pub fn Server(comptime Handler: type) type {
                 .ws = try WebsocketServer(Handler).init(allocator, handler, cfg.websocket_buffer_size),
                 .address = address,
                 .workers = try allocator.alloc(worker.Worker(Handler), worker_thread_count),
-                .next_worker = 0,
                 .listener = listener,
                 .accept_threads = try allocator.alloc(std.Thread, accept_thread_count),
                 .io_handler = io_handler,
                 .tcp_nodelay = cfg.tcp_nodelay,
             };
             for (srv.workers, 0..) |*w, i| {
-                try w.init(srv.handler, srv.ws, .{
+                try w.init(.{
                     .allocator = allocator,
                     .id = i,
                     .resp_body_buffer_size = cfg.response_body_buffer_size,
+                    .handler = srv.handler,
+                    .ws = srv.ws,
                 });
             }
             for (srv.accept_threads) |*thread| {

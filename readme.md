@@ -25,17 +25,17 @@ Note: This project has just started, and is not yet a complete HTTP server imple
     - Thread-safe request handling
 
 ## Benchmarks
-On an M2 Pro, currently we can process over 230k static get requests per second. This simply measures the overhead of the server, and does not indicate real-world performance unless you're only serving static files.
+On an M2 Pro, currently it can process over **250k** static GET requests per second. This simply measures the overhead of the server, and does not indicate real-world performance unless you're only serving static files. For this test, the response length was 287 bytes.
 ```
 joey@jm2 peregrine % wrk -t 12 -c 48 -d 10s http://127.0.0.1:3000
 Running 10s test @ http://127.0.0.1:3000
   12 threads and 48 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     5.02ms   19.40ms 172.71ms   93.66%
-    Req/Sec    19.66k     7.79k   31.66k    69.75%
-  2322195 requests in 10.04s, 0.88GB read
-Requests/sec: 231363.32
-Transfer/sec:     89.98MB
+    Latency   384.20us    1.51ms  57.77ms   97.04%
+    Req/Sec    21.28k     6.32k   64.81k    69.77%
+  2551907 requests in 10.10s, 0.97GB read
+Requests/sec: 252541.26
+Transfer/sec:     98.22MB
 ```
 
 ## Performance optimisations
@@ -262,6 +262,6 @@ Also to do:
 Add a response helper to set content-length header from an integer. Maybe use a pre-allocated buffer that can be reused.
 
 ## Thanks
-Thanks to Karl Seguin's excellent guide to [writing TCP servers in Zig](https://www.openmymind.net/TCP-Server-In-Zig-Part-1-Single-Threaded/). The start of this project was an exercise in learning Zig, and I found this guide to be very helpful for getting started.
+Thank you to [Bo](https://github.com/boazsegev) for his advice (not all applied yet), and also for his library [Facil.io](https://facil.io). This served as a great model for robust server design, and a solid performance benchmark.
 
-Also, thanks to Bo for writing [Facil.io](https://facil.io). This served as a great model for robust server design, and a solid performance benchmark.
+Also, thanks to Karl Seguin's excellent guide to [writing TCP servers in Zig](https://www.openmymind.net/TCP-Server-In-Zig-Part-1-Single-Threaded/). The start of this project was an exercise in learning Zig, and I found this guide to be very helpful for getting started.
