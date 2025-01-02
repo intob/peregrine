@@ -203,7 +203,7 @@ const ListenerKqueue = struct {
         try initializeEvents(kfd, listener);
         return .{
             .kfd = kfd,
-            .timeout = posix.timespec{ .sec = 1, .nsec = 0 },
+            .timeout = posix.timespec{ .sec = 0, .nsec = 50_000_000 },
             .listener_ident = @intCast(listener),
         };
     }

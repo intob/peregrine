@@ -108,7 +108,7 @@ pub fn Worker(comptime Handler: type) type {
                 for (events[0..ready_count]) |event| {
                     const fd: i32 = getFileDescriptor(event);
                     const fd_idx: usize = if (fd < 0) continue else @intCast(fd);
-                    self.readSocket(fd) catch |err| {
+                    self.readSocket(fd, fd_idx) catch |err| {
                         posix.close(fd);
                         self.connection_requests[fd_idx] = 0;
                         switch (err) {
@@ -117,22 +117,22 @@ pub fn Worker(comptime Handler: type) type {
                         }
                         continue;
                     };
-                    if (self.connection_requests[fd_idx] >= CONNECTION_MAX_REQUESTS) {
-                        posix.close(fd);
-                        self.connection_requests[fd_idx] = 0;
-                    } else {
-                        self.connection_requests[fd_idx] += 1;
-                    }
                 }
             }
         }
 
-        fn readSocket(self: *Self, fd: posix.socket_t) !void {
+        fn readSocket(self: *Self, fd: posix.socket_t, fd_idx: usize) !void {
+            var keep_alive: bool = undefined;
+            if (self.connection_requests[fd_idx] >= CONNECTION_MAX_REQUESTS - 1) {
+                keep_alive = false;
+            } else {
+                self.connection_requests[fd_idx] += 1;
+                keep_alive = shouldKeepAlive(self.req);
+            }
             self.req.reset();
             try self.reader.readRequest(fd, self.req);
             self.resp.reset();
             self.handler.handleRequest(self.req, self.resp);
-            const keep_alive = shouldKeepAlive(self.req);
             try self.respond(fd, keep_alive);
             if (self.resp.is_ws_upgrade) {
                 self.connection_requests[@intCast(fd)] = 0;
