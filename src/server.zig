@@ -192,11 +192,11 @@ pub fn Server(comptime Handler: type) type {
 }
 
 const ListenerKqueue = struct {
+    const Self = @This();
+
     kfd: i32,
     timeout: posix.timespec,
     listener_ident: usize,
-
-    const Self = @This();
 
     fn init(listener: posix.socket_t) !Self {
         const kfd = try posix.kqueue();
@@ -235,10 +235,10 @@ const ListenerKqueue = struct {
 };
 
 const ListenerEpoll = struct {
+    const Self = @This();
+
     epfd: i32,
     listener: posix.socket_t,
-
-    const Self = @This();
 
     fn init(listener: posix.socket_t) !Self {
         const epfd = try posix.epoll_create1(0);

@@ -33,17 +33,15 @@ pub const DirServerConfig = struct {
 /// DirServer simply loads all files into memory on init. This
 /// prevents risk of OOM errors without unloading existing entries.
 pub const DirServer = struct {
+    const Self = @This();
+
     allocator: std.mem.Allocator,
     abs_path: []const u8,
     req_path: []const u8,
     files: std.StringHashMap(*Hit),
 
-    pub fn init(
-        allocator: std.mem.Allocator,
-        absolute_path: []const u8,
-        cfg: DirServerConfig,
-    ) !*@This() {
-        const self = try allocator.create(@This());
+    pub fn init(allocator: std.mem.Allocator, absolute_path: []const u8, cfg: DirServerConfig) !*Self {
+        const self = try allocator.create(Self);
         self.* = .{
             .allocator = allocator,
             .abs_path = absolute_path,
@@ -64,7 +62,7 @@ pub const DirServer = struct {
         return self;
     }
 
-    pub fn deinit(self: *@This()) void {
+    pub fn deinit(self: *Self) void {
         var seen = std.AutoHashMap(usize, void).init(self.allocator);
         var iterator = self.files.iterator();
         while (iterator.next()) |entry| {
@@ -84,7 +82,7 @@ pub const DirServer = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn serve(self: *@This(), req: *Request, resp: *Response) !void {
+    pub fn serve(self: *Self, req: *Request, resp: *Response) !void {
         const req_path = req.getPath();
         if (!std.mem.startsWith(u8, req_path, self.req_path)) {
             resp.status = .not_found;
@@ -100,7 +98,7 @@ pub const DirServer = struct {
         }
     }
 
-    fn loadEntry(self: *@This(), entry: fs.Dir.Walker.Entry) !void {
+    fn loadEntry(self: *Self, entry: fs.Dir.Walker.Entry) !void {
         const file = try entry.dir.openFile(entry.basename, .{ .mode = .read_only });
         defer file.close();
         const stat = try file.stat();

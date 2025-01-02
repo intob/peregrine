@@ -9,6 +9,8 @@ const VERSION = "HTTP/1.1 ";
 /// IMPORTANT:
 /// If a field is added, it MUST be reset by the reset() method.
 pub const Response = struct {
+    const Self = @This();
+
     allocator: std.mem.Allocator,
     status: Status,
     headers: [32]Header,
@@ -16,8 +18,6 @@ pub const Response = struct {
     body: []align(16) u8,
     body_len: usize,
     is_ws_upgrade: bool,
-
-    const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, body_size: usize) !*Self {
         const next_pow2 = try std.math.ceilPowerOfTwo(usize, body_size);

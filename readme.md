@@ -74,7 +74,7 @@ Transfer/sec:     89.98MB
 - Manage WebSocket connections
 - Parse and handle WebSocket frames
 
-### Signal Handling
+### Signal handling
 The server handles the following signals for graceful shutdown:
 - SIGINT (Ctrl+C)
 - SIGTERM
@@ -123,13 +123,18 @@ const pereg = @import("peregrine");
 const Handler = struct {
     const Self = @This();
 
+    allocator: std.mem.Allocator,
+
     pub fn init(allocator: std.mem.Allocator) !*Self {
-        return try allocator.create(Self);
+        const self = try allocator.create(Self);
+        self.allocator = allocator;
+        return self;
     }
 
-    pub fn deinit(_: *Self) void {}
+    pub fn deinit(self: *Self) void {
+        self.allocator.destroy(self);
+    }
 
-    // Error handling omitted for brevity
     pub fn handleRequest(_: *Self, _: *pereg.Request, resp: *pereg.Response) void {
         _ = resp.setBody("Kawww\n") catch {};
         resp.addNewHeader("Content-Length", "6") catch {};
@@ -154,7 +159,7 @@ The configuration is minimal, with reasonable defaults. Simply provide an alloca
 
 The server will shutdown gracefully if an interrupt signal is received. Alternatively, you can call `Server.shutdown()`.
 
-## Memory Management Model
+## Memory management model
 
 ### Request lifecycle
 The server manages request and response buffers internally, reusing them across requests to avoid allocations. When a handler processes a request, it must copy any data it needs to retain, as the underlying buffers will be reused for subsequent requests.
@@ -162,8 +167,6 @@ The server manages request and response buffers internally, reusing them across 
 ### Handler responsibilities
 - Handlers own and manage their internal memory
 - Any data extracted from requests must be copied before the handler returns
-- Response bodies must be copied to handler-owned memory before being set
-- All handler-allocated memory must be freed within the handle function
 
 ### Concurrent access
 The current design intentionally avoids an `after_request` hook because:

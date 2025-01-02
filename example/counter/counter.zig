@@ -2,11 +2,13 @@ const std = @import("std");
 const pereg = @import("peregrine");
 
 const Handler = struct {
+    const Self = @This();
+
     allocator: std.mem.Allocator,
     counter: std.atomic.Value(usize),
 
-    pub fn init(allocator: std.mem.Allocator) !*@This() {
-        const handler = try allocator.create(@This());
+    pub fn init(allocator: std.mem.Allocator) !*Self {
+        const handler = try allocator.create(Self);
         handler.* = .{
             .allocator = allocator,
             .counter = std.atomic.Value(usize).init(0),
@@ -14,20 +16,20 @@ const Handler = struct {
         return handler;
     }
 
-    pub fn deinit(self: *@This()) void {
+    pub fn deinit(self: *Self) void {
         self.allocator.destroy(self);
     }
 
     // Be mindful that this handler can be called from multiple threads
     // concurrently. You will need to handle synchronization. This is why
     // an atomic value is used in this example.
-    pub fn handleRequest(self: *@This(), req: *pereg.Request, resp: *pereg.Response) void {
+    pub fn handleRequest(self: *Self, req: *pereg.Request, resp: *pereg.Response) void {
         self.handleWithError(req, resp) catch |err| {
             std.debug.print("error handling request: {any}\n", .{err});
         };
     }
 
-    fn handleWithError(self: *@This(), _: *pereg.Request, resp: *pereg.Response) !void {
+    fn handleWithError(self: *Self, _: *pereg.Request, resp: *pereg.Response) !void {
         const count = self.counter.fetchAdd(1, .monotonic);
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();

@@ -8,6 +8,8 @@ pub const FileServerConfig = struct {
 };
 
 pub const FileServer = struct {
+    const Self = @This();
+
     allocator: std.mem.Allocator,
     absolute_path: []const u8,
     content: []u8,
@@ -15,11 +17,11 @@ pub const FileServer = struct {
     loaded: bool,
     load_mutex: std.Thread.Mutex,
 
-    pub fn init(allocator: std.mem.Allocator, absolute_path: []const u8, cfg: FileServerConfig) !*@This() {
+    pub fn init(allocator: std.mem.Allocator, absolute_path: []const u8, cfg: FileServerConfig) !*Self {
         // Verify that file exists and can be opened for reading
         const file = try std.fs.openFileAbsolute(absolute_path, .{ .mode = .read_only });
         file.close();
-        const self = try allocator.create(@This());
+        const self = try allocator.create(Self);
         self.* = .{
             .allocator = allocator,
             .absolute_path = try allocator.dupe(u8, absolute_path),
@@ -32,7 +34,7 @@ pub const FileServer = struct {
         return self;
     }
 
-    pub fn deinit(self: *@This()) void {
+    pub fn deinit(self: *Self) void {
         self.allocator.free(self.absolute_path);
         if (self.loaded) {
             self.allocator.free(self.content);
@@ -41,13 +43,13 @@ pub const FileServer = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn serve(self: *@This(), resp: *Response) !void {
+    pub fn serve(self: *Self, resp: *Response) !void {
         if (!self.loaded) try self.load();
         _ = try resp.setBody(self.content);
         try resp.addNewHeader("Content-Length", self.content_len_header);
     }
 
-    fn load(self: *@This()) !void {
+    fn load(self: *Self) !void {
         self.load_mutex.lock();
         defer self.load_mutex.unlock();
         if (self.loaded) return;

@@ -10,6 +10,8 @@ const Version = @import("./version.zig").Version;
 /// IMPORTANT:
 /// If a field is added, it MUST be reset by the reset() method.
 pub const Request = struct {
+    const Self = @This();
+
     allocator: std.mem.Allocator,
     method: Method,
     path: [256]u8,
@@ -24,8 +26,6 @@ pub const Request = struct {
     query_raw_len: usize,
     /// Before accessing this directly, call parseQuery()
     query: std.StringHashMap([]const u8),
-
-    const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator) !*Self {
         const r = try allocator.create(Self);

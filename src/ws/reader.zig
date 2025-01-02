@@ -4,13 +4,13 @@ const Frame = @import("./frame.zig").Frame;
 const Opcode = @import("./frame.zig").Opcode;
 
 pub const WebsocketReader = struct {
+    const Self = @This();
+    const MIN_FRAME_SIZE = 2;
+
     allocator: std.mem.Allocator,
     buffer: []align(16) u8,
     pos: usize = 0,
     len: usize = 0,
-
-    const Self = @This();
-    const MIN_FRAME_SIZE = 2;
 
     pub fn init(allocator: std.mem.Allocator, buffer_size: usize) !*Self {
         const aligned_buffer_size = std.mem.alignForward(usize, buffer_size, 16);

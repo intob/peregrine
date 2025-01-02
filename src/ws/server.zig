@@ -8,6 +8,8 @@ const Frame = @import("./frame.zig").Frame;
 
 pub fn WebsocketServer(comptime Handler: type) type {
     return struct {
+        const Self = @This();
+
         allocator: std.mem.Allocator,
         handler: *Handler,
         io_handler: aio.IOHandler,
@@ -16,8 +18,8 @@ pub fn WebsocketServer(comptime Handler: type) type {
         frame: *Frame,
         shutdown: std.atomic.Value(bool),
 
-        pub fn init(allocator: std.mem.Allocator, handler: *Handler, buffer_size: usize) !*@This() {
-            const self = try allocator.create(@This());
+        pub fn init(allocator: std.mem.Allocator, handler: *Handler, buffer_size: usize) !*Self {
+            const self = try allocator.create(Self);
             self.* = .{
                 .allocator = allocator,
                 .handler = handler,
@@ -30,7 +32,7 @@ pub fn WebsocketServer(comptime Handler: type) type {
             return self;
         }
 
-        pub fn deinit(self: *@This()) void {
+        pub fn deinit(self: *Self) void {
             self.shutdown.store(true, .monotonic);
             self.thread.join();
             std.debug.print("websocket server shutdown\n", .{});
@@ -39,7 +41,7 @@ pub fn WebsocketServer(comptime Handler: type) type {
             self.allocator.destroy(self);
         }
 
-        pub fn addSocket(self: *@This(), fd: posix.socket_t) !void {
+        pub fn addSocket(self: *Self, fd: posix.socket_t) !void {
             try self.io_handler.addSocket(fd);
             if (@hasDecl(Handler, "handleWSConn")) {
                 self.handler.handleWSConn(fd);
@@ -48,7 +50,7 @@ pub fn WebsocketServer(comptime Handler: type) type {
             }
         }
 
-        fn loop(self: *@This()) void {
+        fn loop(self: *Self) void {
             if (!@hasDecl(Handler, "handleWSFrame")) {
                 std.debug.print("websocket loop joined (handler not implemented)\n", .{});
                 return;
@@ -85,7 +87,7 @@ pub fn WebsocketServer(comptime Handler: type) type {
             }
         }
 
-        fn handleEvent(self: *@This(), fd: posix.socket_t) !void {
+        fn handleEvent(self: *Self, fd: posix.socket_t) !void {
             try self.reader.readFrame(fd, self.frame);
             if (@hasDecl(Handler, "handleWSFrame")) {
                 self.handler.handleWSFrame(fd, self.frame);

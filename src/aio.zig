@@ -9,10 +9,10 @@ pub const IOHandler = switch (native_os) {
 };
 
 pub const KqueueHandler = struct {
+    const Self = @This();
+
     kfd: i32,
     timeout: posix.timespec,
-
-    const Self = @This();
 
     pub fn init() !Self {
         return .{
