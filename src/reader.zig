@@ -37,25 +37,15 @@ pub const RequestReader = struct {
         try self.parseHeaders(fd, req);
     }
 
-    fn parseRequestLine(self: *Self, fd: posix.socket_t, req: *Request) !void {
+    inline fn parseRequestLine(self: *Self, fd: posix.socket_t, req: *Request) !void {
         const n = try self.readLine(fd);
-        if (n == 0) return error.EOF;
-        if (n < 14) return error.InvalidRequest; // GET / HTTP/1.1\n
-        const line = self.buf[self.start - n .. self.start];
-        if (line.len < 14) return error.InvalidRequest; // GET / HTTP/1.1
-        // Check line ending using single comparison
-        const line_end = switch (line[line.len - 2]) {
-            '\r' => line.len - 2,
-            else => if (line[line.len - 1] == '\n') line.len - 1 else return error.InvalidRequest,
-        };
-        // Validate HTTP version position and space separator
-        const version_start = line_end - 8;
-        if (version_start < 6 or line[version_start - 1] != ' ') {
-            return error.InvalidRequest;
-        }
+        if (n < "GET / HTTP/1.1".len) return error.InvalidRequest;
+        // Go back by 2 to account for line ending
+        const line = self.buf[self.start - n - 2 .. self.start - 2];
         // Parse method and version first
         req.method = try Method.parse(line[0..8]);
-        req.version = try Version.parse(line[version_start..line_end]);
+        const version_start = n - 8;
+        req.version = try Version.parse(line[version_start..]);
         // Path and query is everything between method and version
         const path_start = req.method.toLength() + 1;
         const path_and_query = line[path_start .. version_start - 1];
@@ -63,7 +53,7 @@ pub const RequestReader = struct {
             req.query_raw_len = path_and_query.len - (query_start + 1);
             @memcpy(req.query_raw[0..req.query_raw_len], path_and_query[query_start + 1 ..]);
             req.path_len = query_start;
-            @memcpy(req.path[0..req.path_len], path_and_query[0..query_start]);
+            @memcpy(req.path[0..query_start], path_and_query[0..query_start]);
         } else {
             req.query_raw_len = 0;
             req.path_len = path_and_query.len;
@@ -71,19 +61,14 @@ pub const RequestReader = struct {
         }
     }
 
-    fn parseHeaders(self: *Self, fd: posix.socket_t, req: *Request) !void {
+    inline fn parseHeaders(self: *Self, fd: posix.socket_t, req: *Request) !void {
         while (true) {
             const n = try self.readLine(fd);
-            if (n < 2) return error.UnexpectedEOF;
-            // Check for empty line (header section terminator)
-            if (n == 2 and self.buf[self.start - 2] == '\r' and self.buf[self.start - 1] == '\n') {
-                break; // End of headers
-            }
-            if (n == 1 and self.buf[self.start - 1] == '\n') break; // Handle bare LF (lenient parsing)
+            if (n == 0) break;
+            if (n < "a: b".len) return error.InvalidHeader;
             if (req.headers_len >= req.headers.len) return error.TooManyHeaders;
-            const line_end_len: usize = if (self.buf[self.start - 2] == '\r' and
-                self.buf[self.start - 1] == '\n') 2 else 1;
-            req.headers[req.headers_len] = try Header.parse(self.buf[self.start - n .. self.start - line_end_len]);
+            const raw = self.buf[self.start - n - 2 .. self.start - 2];
+            req.headers[req.headers_len] = try Header.parse(raw);
             req.headers_len += 1;
         }
     }
@@ -92,55 +77,46 @@ pub const RequestReader = struct {
         var line_len: usize = 0;
         const Vector = @Vector(16, u8);
         const newline: Vector = @splat(@as(u8, '\n'));
-
-        // Prefetch data if buffer is empty
         if (self.pos >= self.len) {
             const available = self.buf.len - self.len;
             if (available == 0) return error.LineTooLong;
 
-            // Read larger chunks to reduce system calls
             const read_amount = try posix.readv(fd, &[_]posix.iovec{
                 .{ .base = @ptrCast(&self.buf[self.len]), .len = available },
             });
             if (read_amount == 0) return line_len;
             self.len += read_amount;
         }
-
-        // Process aligned chunks using SIMD
         while (self.pos + 16 <= self.len) {
-            // Direct vector load without memcpy
-            const vec: Vector = @as(Vector, self.buf[self.pos..][0..16].*);
+            const chunk = self.buf[self.pos..][0..16];
+            const vec: Vector = @as(Vector, chunk.*);
             const matches = vec == newline;
             const mask = @as(u16, @bitCast(matches));
 
             if (mask != 0) {
                 const offset = @ctz(mask);
+                line_len += offset - 1;
                 self.pos += offset + 1;
                 self.start = self.pos;
-                return line_len + offset + 1;
+                return line_len;
             }
-
             self.pos += 16;
             line_len += 16;
-
-            // Compact only when necessary
             if (self.pos > self.compact_threshold) {
                 self.compact();
             }
         }
-
-        // Optimize remaining bytes handling
         const remaining = self.len - self.pos;
         if (remaining > 0) {
             if (indexOf(self.buf[self.pos..self.len], '\n')) |offset| {
+                line_len += offset - 1;
                 self.pos += offset + 1;
                 self.start = self.pos;
-                return line_len + offset + 1;
+                return line_len;
             }
             self.pos += remaining;
             line_len += remaining;
         }
-
         return line_len;
     }
 
@@ -154,6 +130,7 @@ pub const RequestReader = struct {
     }
 };
 
+// Explicitly not scalar because we're searching through less than 16 bytes
 inline fn indexOf(haystack: []const u8, needle: u8) ?usize {
     var i: usize = 0;
     while (i < haystack.len) : (i += 1) {

@@ -174,14 +174,14 @@ pub fn Server(comptime Handler: type) type {
             self.allocator.destroy(self);
         }
 
-        fn setClientSockOpt(_: *Self, sock: posix.socket_t) !void {
+        fn setClientSockOpt(self: *Self, sock: posix.socket_t) !void {
             // KEEPALIVE sends periodic probes on idle connections, detects if a peer is still alive,
             // and closes connections automatically if the peer doesn't respond.
             try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(@as(c_int, 1)));
             // Disable Nagle's algorithm.
-            //const TCP_NODELAY: u32 = 1; // posix.TCP is unavailable for macOS
-            //const nodelay_opt: c_int = if (self.tcp_nodelay) 0 else 1; // Zero disables Nagle's algorithm
-            //try posix.setsockopt(sock, posix.IPPROTO.TCP, TCP_NODELAY, &std.mem.toBytes(@as(c_int, nodelay_opt)));
+            const TCP_NODELAY: u32 = 1; // posix.TCP is unavailable for macOS
+            const nodelay_opt: c_int = if (self.tcp_nodelay) 0 else 1; // Zero disables Nagle's algorithm
+            try posix.setsockopt(sock, posix.IPPROTO.TCP, TCP_NODELAY, &std.mem.toBytes(@as(c_int, nodelay_opt)));
             // Set send/recv timeouts
             const send_timeout = posix.timeval{ .sec = 3, .usec = 0 };
             const recv_timeout = posix.timeval{ .sec = 3, .usec = 0 };

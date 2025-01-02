@@ -24,6 +24,20 @@ Note: This project has just started, and is not yet a complete HTTP server imple
     - Configurable accept-thread count
     - Thread-safe request handling
 
+## Benchmarks
+On an M2 Pro, currently we can process over 230k static get requests per second. This simply measures the overhead of the server, and does not indicate real-world performance unless you're only serving static files.
+```
+joey@jm2 peregrine % wrk -t 12 -c 48 -d 10s http://127.0.0.1:3000
+Running 10s test @ http://127.0.0.1:3000
+  12 threads and 48 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     5.02ms   19.40ms 172.71ms   93.66%
+    Req/Sec    19.66k     7.79k   31.66k    69.75%
+  2322195 requests in 10.04s, 0.88GB read
+Requests/sec: 231363.32
+Transfer/sec:     89.98MB
+```
+
 ## Performance optimisations
 
 - Non-blocking socket operations
@@ -44,43 +58,33 @@ Note: This project has just started, and is not yet a complete HTTP server imple
 - Signal handling for graceful shutdown
 - Platform-specific I/O handlers
 
-### Worker Threads
-- Request parsing and handling
-- Response serialisation
-- Connection management
+### Worker threads
+- Manage connections
+- Parse and handle requests
+- Serialise and write responses
 
-### Accept Threads
-- Accepts connections
-- Sets client socket options
-- Assigns the socket to the next worker
-- Monotonically increments the next_worker counter
+### Accept threads
+- Accept connections
+- Set client socket options
+- Assign each client to the next worker
+- Monotonically increment the next_worker counter
+
+### WebSocket threads
+- Join immediately if there are no WS handlers
+- Manage WebSocket connections
+- Parse and handle WebSocket frames
 
 ### Signal Handling
 The server handles the following signals for graceful shutdown:
 - SIGINT (Ctrl+C)
 - SIGTERM
 
-### Timeouts
-Connection timeouts are configured with:
-- Receive timeout: 3 seconds
-- Send timeout: 3 seconds
-
 ## No TLS support (for now)
-I spent a couple of hours deliberating over how to either provide TLS support, or expose an interface for users to provide their choice of TLS implementation. I'm looking for a clean way to handle this without sacrificing performance or usability.
-
-I think something like this would be ideal for the user:
+I spent a couple of hours deliberating over how to either provide TLS support, or expose an interface for users to provide their choice of TLS implementation. I'm looking for a clean way to handle this without sacrificing performance or usability. I think something like this would be ideal for the user:
 ```zig
-const http_server = try pereg.Server(Handler).init(.{
-    .allocator = allocator,
-    .port = 3000,
-});
-// Or for HTTPS...
-const https_server = try pereg.TLSServer(Handler, TLS).init(.{
-    .allocator = allocator,
-    .port = 3000,
-});
+const http_server = try pereg.Server(Handler).init(allocator, port, .{});
+const https_server = try pereg.TLSServer(Handler, TLS).init(allocator, port, .{});
 ```
-
 When I tried to implement this, I quickly saw that it would be challenging because TLSServer has a handshake, and the plain HTTP server does not. The two look entirely different at the socket level.
 
 Then I realised that even if I added TLS support, server performance would pale in comparison to the plain HTTP version. At this point, I'd rather offload TLS termination (to a load balancer, for example), allowing this server to focus on efficient HTTP parsing without becoming overwhelmingly complex.
@@ -242,9 +246,6 @@ This is not a framework for building web applications. This is purely a HTTP ser
 
 If you want a more substantial HTTP library, I suggest that you look at [Zap](https://github.com/zigzap/zap), built on [Facil.io](http://facil.io). Facil.io is an excellent battle-tested library written in C.
 
-## Benchmarks
-Currently, Zap/Facil.io is around 6% faster for static GET requests. I am working to improve this, but as I'm new to systems programming, this is a challenge for me. I would be happy to match Zap/Facil.io's performance.
-
 ## To do
 - Handle request body
 - Increase TCP buffer size
@@ -256,3 +257,8 @@ Currently, Zap/Facil.io is around 6% faster for static GET requests. I am workin
 
 Also to do:
 Add a response helper to set content-length header from an integer. Maybe use a pre-allocated buffer that can be reused.
+
+## Thanks
+Thanks to Karl Seguin's excellent guide to [writing TCP servers in Zig](https://www.openmymind.net/TCP-Server-In-Zig-Part-1-Single-Threaded/). The start of this project was an exercise in learning Zig, and I found this guide to be very helpful for getting started.
+
+Also, thanks to Bo for writing [Facil.io](https://facil.io). This served as a great model for robust server design, and a solid performance benchmark.
