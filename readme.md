@@ -167,14 +167,25 @@ The server manages request and response buffers internally, reusing them across 
 ### Handler responsibilities
 - Handlers own and manage their internal memory
 - Any data extracted from requests must be copied before the handler returns
-
-### Concurrent access
-The current design intentionally avoids an `after_request` hook because:
 - Handlers are shared across multiple worker threads
-- Adding post-processing would require mutex synchronization
-- Locking would create contention, hurting performance
 
 ## Need to know
+
+### Memory usage
+Each worker thread gets it's own resources (obviously). By default, the number of worker threads is equal to the number of CPU cores. Therefore, the memory usage will depend on allocated buffer sizes, stack sizes, and the number of worker threads. You can adjust these parameters in the configuration struct. Example memory usage:
+```
+Workers:    Response buffer:    10MB
+            Request buffer:     1MB
+            Stack size:         1MB
+
+Accepters:  Stack size:         1KB
+_______________________________________________________________________
+            Worker count:       12
+            Accepter count:     1
+            Main thread stack:  ~200KB (currently dependent on the OS)
+            Total:              12 * 12 + 0.1 + 0.2 = **144.3MB**
+```
+Thanks to the zero-allocation design, even under high load, these numbers won't change beyond what your handler allocates. Thanks to Zig, you can be sure that your server won't (B)OOM under load.
 
 ### Response headers
 If the body is not zero-length, you must set the Content-Length header yourself. I will write a helper for this soon.

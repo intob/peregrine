@@ -20,15 +20,18 @@ pub const ServerConfig = struct {
     /// Number of worker threads processing requests.
     /// Defaults to CPU core count.
     worker_thread_count: usize = 0,
+    /// Stack size for each worker thread. Defaults to 1MB.
+    worker_stack_size: usize = 1024 * 1024,
     /// Number of threads accepting connections. Defaults to
     /// worker_thread_count / 6.
     accept_thread_count: usize = 0,
     /// Disable Nagle's algorithm. Default is true (disabled).
     tcp_nodelay: bool = true,
-    /// Response buffer size. Defaults to 10MB.
-    /// Each worker has it's own response buffer.
+    /// Defaults to 10MB. Each worker has it's own buffer.
     /// Size is aligned internally.
     response_body_buffer_size: usize = 1024 * 1024 * 10,
+    /// Defaults to 1MB. Each worker has it's own buffer.
+    request_buffer_size: usize = 1024 * 1024,
     /// WebSocket reader buffer size. Defaults to 32KB.
     /// Size is aligned internally.
     websocket_buffer_size: usize = 1024 * 32,
@@ -112,12 +115,17 @@ pub fn Server(comptime Handler: type) type {
                     .allocator = allocator,
                     .id = i,
                     .resp_body_buffer_size = cfg.response_body_buffer_size,
+                    .req_buffer_size = cfg.request_buffer_size,
+                    .stack_size = cfg.worker_stack_size,
                     .handler = srv.handler,
                     .ws = srv.ws,
                 });
             }
             for (srv.accept_threads) |*thread| {
-                thread.* = try std.Thread.spawn(.{}, loop, .{srv});
+                thread.* = try std.Thread.spawn(.{
+                    .allocator = allocator,
+                    .stack_size = 1024,
+                }, loop, .{srv});
             }
             return srv;
         }

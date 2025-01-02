@@ -33,6 +33,8 @@ pub fn Worker(comptime Handler: type) type {
             allocator: std.mem.Allocator,
             id: usize,
             resp_body_buffer_size: usize,
+            req_buffer_size: usize,
+            stack_size: usize,
             handler: *Handler,
             ws: *WebsocketServer(Handler),
         };
@@ -77,11 +79,14 @@ pub fn Worker(comptime Handler: type) type {
             self.resp = try Response.init(allocator, cfg.resp_body_buffer_size);
             const resp_status_size = try calcResponseStatusBufferSize(allocator);
             self.resp_status_buf = try allocator.alignedAlloc(u8, 16, resp_status_size);
-            self.reader = try RequestReader.init(self.allocator, 20_000);
+            self.reader = try RequestReader.init(self.allocator, cfg.req_buffer_size);
             self.connection_requests = try allocator.alloc(u8, std.math.maxInt(i16));
             self.ws = cfg.ws;
             self.shutdown = std.atomic.Value(bool).init(false);
-            self.thread = try std.Thread.spawn(.{}, workerLoop, .{self});
+            self.thread = try std.Thread.spawn(.{
+                .stack_size = cfg.stack_size,
+                .allocator = allocator,
+            }, workerLoop, .{self});
         }
 
         pub fn deinit(self: *Self) void {
