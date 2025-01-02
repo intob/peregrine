@@ -222,18 +222,12 @@ if (req.query.get("some-key")) |value| {
 Implementing WebSockets is easy. Simply handle the upgrade request, and add the WS handler hooks. Check out the working example in `./example/websocket`.
 ```zig
 pub fn handleRequest(self: *Self, req: *pereg.Request, resp: *pereg.Response) void {
-    self.handleRequestWithError(req, resp) catch |err| {
-        std.debug.print("error handling request: {any}\n", .{err});
-    };
-}
-
-fn handleRequestWithError(self: *Self, req: *pereg.Request, resp: *pereg.Response) !void {
     if (std.mem.eql(u8, req.getPath(), "/ws")) {
         // You must explicitly handle the upgrade to support websockets.
-        try pereg.ws.upgrader.handleUpgrade(self.allocator, req, resp);
+        pereg.ws.upgrader.handleUpgrade(self.allocator, req, resp) catch {};
         return;
     }
-    try self.dirServer.serve(req, resp);
+    self.dirServer.serve(req, resp) catch {};
 }
 
 pub fn handleWSConn(_: *Self, fd: posix.socket_t) void {
