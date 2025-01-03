@@ -82,8 +82,8 @@ The server handles the following signals for graceful shutdown:
 ## No TLS support (for now)
 I spent a couple of hours deliberating over how to either provide TLS support, or expose an interface for users to provide their choice of TLS implementation. I'm looking for a clean way to handle this without sacrificing performance or usability. I think something like this would be ideal for the user:
 ```zig
-const http_server = try pereg.Server(Handler).init(allocator, port, .{});
-const https_server = try pereg.TLSServer(Handler, TLS).init(allocator, port, .{});
+const http_server = try per.Server(Handler).init(allocator, port, .{});
+const https_server = try per.TLSServer(Handler, TLS).init(allocator, port, .{});
 ```
 When I tried to implement this, I quickly saw that it would be challenging because TLSServer has a handshake, and the plain HTTP server does not. The two look entirely different at the socket level.
 
@@ -118,7 +118,7 @@ docker run -p 3000:3000 counter
 ### Implement a server
 ```zig
 const std = @import("std");
-const pereg = @import("peregrine");
+const per = @import("peregrine");
 
 const Handler = struct {
     const Self = @This();
@@ -135,7 +135,7 @@ const Handler = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn handleRequest(_: *Self, _: *pereg.Request, resp: *pereg.Response) void {
+    pub fn handleRequest(_: *Self, _: *per.Request, resp: *per.Response) void {
         _ = resp.setBody("Kawww\n") catch {};
         resp.addNewHeader("Content-Length", "6") catch {};
     }
@@ -143,10 +143,8 @@ const Handler = struct {
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
     defer _ = gpa.deinit();
-    const port: u16 = 3000;
-    const srv = try pereg.Server(Handler).init(allocator, port, .{});
+    const srv = try per.Server(Handler).init(gpa.allocator(), 3000, .{});
     std.debug.print("listening on 0.0.0.0:3000\n", .{});
     try srv.start(); // Blocks if there is no error
 }
@@ -177,13 +175,13 @@ Each worker thread gets it's own resources (obviously). By default, the number o
 Workers:    Response buffer:    10MB
             Request buffer:     1MB
             Stack size:         1MB
+            Overhead:           ~70KB
 
-Accepters:  Stack size:         1KB
+            Total:              12.07MB
 _______________________________________________________________________
             Worker count:       12
-            Accepter count:     1
-            Main thread stack:  ~200KB (currently dependent on the OS)
-            Total:              12 * 12 + 0.1 + 0.2 = **144.3MB**
+            Main thread stack:  ~1MB (currently dependent on the OS)
+            Total:              12.07 * 12 + 0.1 + 0.2 = **145.14MB**
 ```
 Thanks to the zero-allocation design, even under high load, these numbers won't change beyond what your handler allocates. Thanks to Zig, you can be sure that your server won't (B)OOM under load.
 
@@ -221,10 +219,10 @@ if (req.query.get("some-key")) |value| {
 ### WebSockets
 Implementing WebSockets is easy. Simply handle the upgrade request, and add the WS handler hooks. Check out the working example in `./example/websocket`.
 ```zig
-pub fn handleRequest(self: *Self, req: *pereg.Request, resp: *pereg.Response) void {
+pub fn handleRequest(self: *Self, req: *per.Request, resp: *per.Response) void {
     if (std.mem.eql(u8, req.getPath(), "/ws")) {
         // You must explicitly handle the upgrade to support websockets.
-        pereg.ws.upgrader.handleUpgrade(self.allocator, req, resp) catch {};
+        per.ws.upgrader.handleUpgrade(self.allocator, req, resp) catch {};
         return;
     }
     self.dirServer.serve(req, resp) catch {};
@@ -238,9 +236,9 @@ pub fn handleWSDisconn(_: *Self, fd: posix.socket_t) void {
     std.debug.print("handle ws disconn... {d}\n", .{fd});
 }
 
-pub fn handleWSFrame(_: *Self, fd: posix.socket_t, frame: *pereg.ws.Frame) void {
+pub fn handleWSFrame(_: *Self, fd: posix.socket_t, frame: *per.ws.Frame) void {
     // Reply to the client
-    pereg.ws.writer.writeMessage(fd, "Hello client!", false) catch |err| {
+    per.ws.writer.writeMessage(fd, "Hello client!", false) catch |err| {
         std.debug.print("error writing websocket: {any}\n", .{err});
     };
 }

@@ -21,6 +21,8 @@ pub const ServerConfig = struct {
     worker_thread_count: usize = 0,
     /// Stack size for each worker thread. Defaults to 1MB.
     worker_stack_size: usize = 1024 * 1024,
+    /// Number of threads accepting connections. Defaults to 1.
+    accept_thread_count: usize = 1,
     /// Disable Nagle's algorithm. Default is true (disabled).
     tcp_nodelay: bool = true,
     /// Defaults to 10MB. Each worker has it's own buffer.
@@ -61,6 +63,7 @@ pub fn Server(comptime Handler: type) type {
         next_worker: usize = 0,
         listener: posix.socket_t,
         io_handler: ListenerIOHandler,
+        accept_threads: []std.Thread,
 
         pub fn init(allocator: std.mem.Allocator, port: u16, cfg: ServerConfig) !*Self {
             const sock_type: u32 = posix.SOCK.STREAM | posix.SOCK.NONBLOCK;
@@ -101,7 +104,11 @@ pub fn Server(comptime Handler: type) type {
                 .workers = try allocator.alloc(worker.Worker(Handler), worker_thread_count),
                 .listener = listener,
                 .io_handler = io_handler,
+                .accept_threads = try allocator.alloc(std.Thread, @max(0, cfg.accept_thread_count - 1)),
             };
+            for (srv.accept_threads) |*t| {
+                t.* = try std.Thread.spawn(.{ .allocator = allocator, .stack_size = 1024 }, loop, .{srv});
+            }
             for (srv.workers, 0..) |*w, i| {
                 try w.init(.{
                     .allocator = allocator,
@@ -121,12 +128,12 @@ pub fn Server(comptime Handler: type) type {
             should_shutdown = std.atomic.Value(bool).init(false);
             try posix.listen(self.listener, std.math.maxInt(i16));
             try self.loop();
+            std.debug.print("accept-thread-0 joined\n", .{});
             self.waitForShutdown();
         }
 
-        pub fn shutdown(self: *Self) void {
+        pub fn shutdown(_: *Self) void {
             should_shutdown.store(true, .monotonic);
-            self.waitForShutdown();
         }
 
         fn loop(self: *Self) !void {
@@ -154,6 +161,10 @@ pub fn Server(comptime Handler: type) type {
         }
 
         fn waitForShutdown(self: *Self) void {
+            for (self.accept_threads, 1..) |*t, i| {
+                t.join();
+                std.debug.print("accept-thread-{d} joined\n", .{i});
+            }
             for (self.workers) |*w| {
                 w.deinit();
             }

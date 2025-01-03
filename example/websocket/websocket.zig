@@ -1,6 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
-const pereg = @import("peregrine");
+const per = @import("peregrine");
 
 const DIR = "./example/websocket/static";
 
@@ -9,7 +9,7 @@ const Handler = struct {
 
     allocator: std.mem.Allocator,
     counter: std.atomic.Value(usize),
-    dirServer: *pereg.util.DirServer,
+    dirServer: *per.util.DirServer,
 
     pub fn init(allocator: std.mem.Allocator) !*Self {
         const cwd_path = try std.fs.cwd().realpathAlloc(allocator, ".");
@@ -21,7 +21,7 @@ const Handler = struct {
         handler.* = .{
             .allocator = allocator,
             .counter = std.atomic.Value(usize).init(0),
-            .dirServer = try pereg.util.DirServer.init(allocator, abs_path, .{}),
+            .dirServer = try per.util.DirServer.init(allocator, abs_path, .{}),
         };
         return handler;
     }
@@ -31,16 +31,16 @@ const Handler = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn handleRequest(self: *Self, req: *pereg.Request, resp: *pereg.Response) void {
+    pub fn handleRequest(self: *Self, req: *per.Request, resp: *per.Response) void {
         self.handleRequestWithError(req, resp) catch |err| {
             std.debug.print("error handling request: {any}\n", .{err});
         };
     }
 
-    fn handleRequestWithError(self: *Self, req: *pereg.Request, resp: *pereg.Response) !void {
+    fn handleRequestWithError(self: *Self, req: *per.Request, resp: *per.Response) !void {
         if (std.mem.eql(u8, req.getPath(), "/ws")) {
             // Explicitly handle the upgrade to support websockets.
-            try pereg.ws.upgrader.handleUpgrade(self.allocator, req, resp);
+            try per.ws.upgrader.handleUpgrade(self.allocator, req, resp);
             return;
         }
         try self.dirServer.serve(req, resp);
@@ -54,8 +54,8 @@ const Handler = struct {
         std.debug.print("{d} handle ws disconn...\n", .{fd});
     }
 
-    pub fn handleWSFrame(_: *Self, fd: posix.socket_t, frame: *pereg.ws.Frame) void {
-        if (frame.opcode == pereg.ws.Opcode.close) {
+    pub fn handleWSFrame(_: *Self, fd: posix.socket_t, frame: *per.ws.Frame) void {
+        if (frame.opcode == per.ws.Opcode.close) {
             std.debug.print("{d} client closed websocket\n", .{fd});
             return;
         }
@@ -64,7 +64,7 @@ const Handler = struct {
             frame.opcode.toString(),
             frame.getPayload(),
         });
-        pereg.ws.writer.writeMessage(fd, "Hello client!", false) catch |err| {
+        per.ws.writer.writeMessage(fd, "Hello client!", false) catch |err| {
             std.debug.print("{d} error writing websocket: {any}\n", .{ fd, err });
         };
     }
@@ -72,9 +72,8 @@ const Handler = struct {
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
     defer _ = gpa.deinit();
-    const srv = try pereg.Server(Handler).init(allocator, 3000, .{});
+    const srv = try per.Server(Handler).init(gpa.allocator(), 3000, .{});
     std.debug.print("listening on 0.0.0.0:3000\n", .{});
     try srv.start(); // Blocks if there is no error
 }

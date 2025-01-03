@@ -1,5 +1,5 @@
 const std = @import("std");
-const pereg = @import("peregrine");
+const per = @import("peregrine");
 
 const Handler = struct {
     const Self = @This();
@@ -23,13 +23,13 @@ const Handler = struct {
     // Be mindful that this handler can be called from multiple threads
     // concurrently. You will need to handle synchronization. This is why
     // an atomic value is used in this example.
-    pub fn handleRequest(self: *Self, req: *pereg.Request, resp: *pereg.Response) void {
+    pub fn handleRequest(self: *Self, req: *per.Request, resp: *per.Response) void {
         self.handleWithError(req, resp) catch |err| {
             std.debug.print("error handling request: {any}\n", .{err});
         };
     }
 
-    fn handleWithError(self: *Self, _: *pereg.Request, resp: *pereg.Response) !void {
+    fn handleWithError(self: *Self, _: *per.Request, resp: *per.Response) !void {
         const count = self.counter.fetchAdd(1, .monotonic);
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -43,9 +43,8 @@ const Handler = struct {
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
     defer _ = gpa.deinit();
-    const srv = try pereg.Server(Handler).init(allocator, 3000, .{});
+    const srv = try per.Server(Handler).init(gpa.allocator(), 3000, .{});
     std.debug.print("listening on 0.0.0.0:3000\n", .{});
     try srv.start(); // Blocks if there is no error
 }
