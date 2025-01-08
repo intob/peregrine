@@ -98,6 +98,7 @@ pub fn Worker(comptime Handler: type) type {
             self.allocator.free(self.resp_status_buf);
             self.allocator.free(self.connection_requests);
             std.debug.print("worker-thread-{d} joined\n", .{self.id});
+            // server frees worker
         }
 
         pub fn addClient(self: *Self, fd: posix.socket_t) !void {
@@ -133,7 +134,7 @@ pub fn Worker(comptime Handler: type) type {
                 keep_alive = false;
             } else {
                 self.connection_requests[fd_idx] += 1;
-                keep_alive = shouldKeepAlive(self.req);
+                keep_alive = self.req.version == .@"HTTP/1.1" and self.req.keep_alive;
             }
             self.req.reset();
             try self.reader.readRequest(fd, self.req);
@@ -208,18 +209,6 @@ pub fn Worker(comptime Handler: type) type {
     };
 }
 
-fn shouldKeepAlive(req: *Request) bool {
-    if (req.version == .@"HTTP/1.1") {
-        if (req.findHeader("connection")) |connection| {
-            if (connection.len == "close".len and
-                connection[0] == 'c' and
-                connection[1] == 'l') return false;
-        }
-        return true; // HTTP/1.1 defaults to keep-alive
-    }
-    return false; // HTTP/1.0
-}
-
 // Calculate response status and header buffer size.
 fn calcResponseStatusBufferSize(allocator: std.mem.Allocator) !usize {
     const h = Header{};
@@ -228,23 +217,4 @@ fn calcResponseStatusBufferSize(allocator: std.mem.Allocator) !usize {
     const headers_size = (h.key_buf.len + h.value_buf.len + 4) * resp.headers.len;
     const resp_buf_size = headers_size + "HTTP/1.1 500 Internal Server Error\r\n".len;
     return std.mem.alignForward(usize, resp_buf_size, 16);
-}
-
-test "keep alive" {
-    const allocator = std.testing.allocator;
-    const req = try Request.init(allocator);
-    defer req.deinit();
-    const resp = try Response.init(allocator, 1024);
-    defer resp.deinit();
-    // HTTP/1.1 default is true
-    req.version = .@"HTTP/1.1";
-    try std.testing.expectEqual(true, shouldKeepAlive(req));
-    // HTTP/1.1 default is false
-    req.version = .@"HTTP/1.0";
-    try std.testing.expectEqual(false, shouldKeepAlive(req));
-    // HTTP/1.1 client closed connection
-    req.headers[0] = try Header.init("Connection", "close");
-    req.headers_len = 1;
-    req.version = .@"HTTP/1.1";
-    try std.testing.expectEqual(false, shouldKeepAlive(req));
 }

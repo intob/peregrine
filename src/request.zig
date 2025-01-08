@@ -13,17 +13,18 @@ pub const Request = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
-    method: Method,
-    path: [256]u8,
-    path_len: usize,
+    method: Method = .GET,
+    path: [256]u8 = undefined,
+    path_len: usize = 0,
     // Benchmarks show this array to be significantly faster than
     // std.ArrayList. Not sure why. Benchmark used was "benchmark
     // read and parse headers" in reader.zig.
-    headers: [32]Header,
-    headers_len: usize,
-    version: Version,
-    query_raw: [256]u8,
-    query_raw_len: usize,
+    headers: [32]Header = undefined,
+    headers_len: usize = 0,
+    keep_alive: bool = true,
+    version: Version = .@"HTTP/1.1",
+    query_raw: [256]u8 = undefined,
+    query_raw_len: usize = 0,
     /// Before accessing this directly, call parseQuery()
     query: std.StringHashMap([]const u8),
 
@@ -31,14 +32,6 @@ pub const Request = struct {
         const r = try allocator.create(Self);
         r.* = .{
             .allocator = allocator,
-            .method = Method.GET,
-            .path = undefined,
-            .path_len = 0,
-            .headers = undefined,
-            .headers_len = 0,
-            .version = Version.@"HTTP/1.1",
-            .query_raw = undefined,
-            .query_raw_len = 0,
             .query = std.StringHashMap([]const u8).init(allocator),
         };
         return r;
@@ -99,6 +92,7 @@ pub const Request = struct {
     // the map unless we want to use it.
     pub fn reset(self: *Self) void {
         self.headers_len = 0;
+        self.keep_alive = true;
     }
 };
 

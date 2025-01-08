@@ -62,12 +62,25 @@ pub const RequestReader = struct {
     }
 
     inline fn parseHeaders(self: *Self, fd: posix.socket_t, req: *Request) !void {
+        var conn_header_found = false;
         while (true) {
             const n = try self.readLine(fd);
             if (n == 0) break;
             if (n < "a: b".len) return error.InvalidHeader;
             if (req.headers_len >= req.headers.len) return error.TooManyHeaders;
             const raw = self.buf[self.start - n - 2 .. self.start - 2];
+            // Really ugly, but fast and simple...
+            // This finds the connection header (if not already found), and
+            // Sets keep_alive to false if header is "connection: close". It's more efficient
+            // to do this here than iterating through headers later.
+            if (!conn_header_found and raw.len >= "connection: close".len and
+                raw.len <= "connection: keep-alive".len and isConnectionHeader(raw[0.."connection".len]))
+            {
+                conn_header_found = true;
+                if (raw.len == "connection: close".len and raw[12] == 'c' and raw[13] == 'l') {
+                    req.keep_alive = false; // req.keep_alive is reset to true
+                }
+            }
             req.headers[req.headers_len] = try Header.parse(raw);
             req.headers_len += 1;
         }
@@ -139,6 +152,22 @@ inline fn indexOf(haystack: []const u8, needle: u8) ?usize {
     return null;
 }
 
+inline fn isConnectionHeader(key: []const u8) bool {
+    if (key.len != "connection".len) return false;
+    if (key[0] != 'c' and key[0] != 'C') return false;
+    // Extending this to "onnection" is probably unnecessary
+    inline for ("onn".*, 1..) |char, i| {
+        if (key[i] != char) return false;
+    }
+    return true;
+}
+
+test isConnectionHeader {
+    try std.testing.expectEqual(false, isConnectionHeader("Host"));
+    try std.testing.expect(isConnectionHeader("connection"));
+    try std.testing.expect(isConnectionHeader("Connection"));
+}
+
 test "test parse GET request" {
     var req = try Request.init(std.testing.allocator);
     defer req.deinit();
@@ -168,6 +197,7 @@ test "test parse GET request" {
     try std.testing.expectEqualStrings("*/*", req.headers[2].value());
     try std.testing.expectEqualStrings("Connection", req.headers[3].key());
     try std.testing.expectEqualStrings("keep-alive", req.headers[3].value());
+    try std.testing.expect(req.keep_alive);
 }
 
 test "benchmark read line" {

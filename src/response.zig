@@ -12,12 +12,12 @@ pub const Response = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
-    status: Status,
-    headers: [32]Header,
-    headers_len: usize,
+    status: Status = .ok,
+    headers: [32]Header = undefined,
+    headers_len: usize = 0,
     body: []align(64) u8,
-    body_len: usize,
-    is_ws_upgrade: bool,
+    body_len: usize = 0,
+    is_ws_upgrade: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, body_size: usize) !*Self {
         const next_pow2 = try std.math.ceilPowerOfTwo(usize, body_size);
@@ -25,12 +25,7 @@ pub const Response = struct {
         const resp = try allocator.create(Self);
         resp.* = .{
             .allocator = allocator,
-            .status = Status.ok,
-            .headers = undefined,
-            .headers_len = 0,
             .body = try allocator.alignedAlloc(u8, 64, aligned),
-            .body_len = 0,
-            .is_ws_upgrade = false,
         };
         return resp;
     }
