@@ -158,7 +158,7 @@ pub fn Worker(comptime Handler: type) type {
                 .base = @ptrCast(self.resp_status_buf[0..status_len]),
                 .len = status_len,
             };
-            var iovecs_len: u2 = 1;
+            var iovecs_len: u8 = 1;
             // Set content-length header if zero
             if (self.resp.body_len == 0) {
                 self.iovecs[1] = .{

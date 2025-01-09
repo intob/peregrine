@@ -12,12 +12,11 @@ pub const KqueueHandler = struct {
     const Self = @This();
 
     kfd: i32,
-    timeout: posix.timespec,
+    timeout: posix.timespec = .{ .sec = 0, .nsec = 50_000_000 },
 
     pub fn init() !Self {
         return .{
             .kfd = try posix.kqueue(),
-            .timeout = posix.timespec{ .sec = 0, .nsec = 50_000_000 },
         };
     }
 

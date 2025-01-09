@@ -16,22 +16,6 @@ pub const Status = enum(u16) {
     bad_gateway = 502,
     service_unavailable = 503,
 
-    pub fn isSuccess(self: Status) bool {
-        return @intFromEnum(self) >= 200 and @intFromEnum(self) < 300;
-    }
-
-    pub fn isRedirect(self: Status) bool {
-        return @intFromEnum(self) >= 300 and @intFromEnum(self) < 400;
-    }
-
-    pub fn isClientError(self: Status) bool {
-        return @intFromEnum(self) >= 400 and @intFromEnum(self) < 500;
-    }
-
-    pub fn isServerError(self: Status) bool {
-        return @intFromEnum(self) >= 500 and @intFromEnum(self) < 600;
-    }
-
     pub fn toString(self: Status) []const u8 {
         return switch (self) {
             .switching_protocols => "101 Switching Protocols",

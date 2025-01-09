@@ -93,7 +93,6 @@ pub const RequestReader = struct {
         if (self.pos >= self.len) {
             const available = self.buf.len - self.len;
             if (available == 0) return error.LineTooLong;
-
             const read_amount = try posix.readv(fd, &[_]posix.iovec{
                 .{ .base = @ptrCast(&self.buf[self.len]), .len = available },
             });
@@ -105,7 +104,6 @@ pub const RequestReader = struct {
             const vec: Vector = @as(Vector, chunk.*);
             const matches = vec == newline;
             const mask = @as(u16, @bitCast(matches));
-
             if (mask != 0) {
                 const offset = @ctz(mask);
                 line_len += offset - 1;
