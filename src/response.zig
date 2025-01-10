@@ -53,9 +53,7 @@ pub const Response = struct {
         self.headers_len += 1;
     }
 
-    pub fn serialiseStatusAndHeaders(self: *Self, bufRef: *[]u8) !usize {
-        @setRuntimeSafety(false);
-        var buf = bufRef.*;
+    pub fn serialiseStatusAndHeaders(self: *Self, buf: []u8) !usize {
         var n: usize = 0;
         @memcpy(buf[n .. n + VERSION.len], VERSION);
         n += VERSION.len;
@@ -96,7 +94,7 @@ pub const Response = struct {
     /// This is called automatically before Handler.handle.
     /// The response is reused so that no allocations are required per request.
     /// All fields must be reset to prevent exposing stale data.
-    pub fn reset(self: *Self) void {
+    pub inline fn reset(self: *Self) void {
         self.status = Status.ok;
         self.headers_len = 0;
         self.body_len = 0;

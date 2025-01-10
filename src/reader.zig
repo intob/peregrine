@@ -33,11 +33,11 @@ pub const RequestReader = struct {
     }
 
     pub fn readRequest(self: *Self, fd: posix.socket_t, req: *Request) !void {
-        try self.parseRequestLine(fd, req);
-        try self.parseHeaders(fd, req);
+        try self.readRequestLine(fd, req);
+        try self.readHeaders(fd, req);
     }
 
-    inline fn parseRequestLine(self: *Self, fd: posix.socket_t, req: *Request) !void {
+    inline fn readRequestLine(self: *Self, fd: posix.socket_t, req: *Request) !void {
         const n = try self.readLine(fd);
         if (n < "GET / HTTP/1.1".len) return error.InvalidRequest;
         // Go back by 2 to account for line ending
@@ -48,13 +48,12 @@ pub const RequestReader = struct {
         req.version = try Version.parse(line[version_start..]);
         // Path and query is everything between method and version
         const path_start = req.method.toLength() + 1;
-        // Benchmark if this is faster without the stack allocation
         const path_and_query = line[path_start .. version_start - 1];
         req.path_and_query_len = path_and_query.len;
         @memcpy(req.path_and_query[0..path_and_query.len], path_and_query);
     }
 
-    inline fn parseHeaders(self: *Self, fd: posix.socket_t, req: *Request) !void {
+    inline fn readHeaders(self: *Self, fd: posix.socket_t, req: *Request) !void {
         var conn_header_found = false;
         while (true) {
             const n = try self.readLine(fd);
@@ -87,9 +86,7 @@ pub const RequestReader = struct {
         if (self.pos >= self.len) {
             const available = self.buf.len - self.len;
             if (available == 0) return error.LineTooLong;
-            const read_amount = try posix.readv(fd, &[_]posix.iovec{
-                .{ .base = @ptrCast(&self.buf[self.len]), .len = available },
-            });
+            const read_amount = try posix.read(fd, self.buf[self.len..]);
             if (read_amount == 0) return line_len;
             self.len += read_amount;
         }
@@ -213,7 +210,7 @@ test "benchmark read line" {
     std.debug.print("Average time: {d}ns\n", .{avg_ns});
 }
 
-test "benchmark read and parse headers" {
+test "benchmark read headers" {
     var req = try Request.init(std.testing.allocator);
     defer req.deinit();
     var reader = try RequestReader.init(std.testing.allocator, 1024);
@@ -228,7 +225,7 @@ test "benchmark read and parse headers" {
         reader.start = 0;
         reader.len = raw.len;
         req.reset();
-        try reader.parseHeaders(0, req);
+        try reader.readHeaders(0, req);
     }
     const elapsed = timer.lap();
     const avg_ns = @divFloor(elapsed, iterations);

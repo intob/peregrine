@@ -102,7 +102,7 @@ pub const Request = struct {
     // This method should be called BEFORE the call to RequestReader.readRequest.
     // The query map is reset in the parseQuery method, because we don't need to clear
     // the map unless we want to use it.
-    pub fn reset(self: *Self) void {
+    pub inline fn reset(self: *Self) void {
         self.headers_len = 0;
         self.keep_alive = true;
     }

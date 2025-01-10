@@ -39,7 +39,7 @@ pub fn Worker(comptime Handler: type) type {
             ws: *WebsocketServer(Handler),
         };
 
-        const getFileDescriptor = blk: {
+        const getFd = blk: {
             break :blk switch (native_os) {
                 .freebsd, .netbsd, .openbsd, .dragonfly, .macos => struct {
                     fn get(event: posix.Kevent) i32 {
@@ -106,20 +106,20 @@ pub fn Worker(comptime Handler: type) type {
         }
 
         fn workerLoop(self: *Self) void {
-            var events: [1024]EventType = undefined;
+            var events: [256]EventType = undefined;
             while (!self.shutdown.load(.unordered)) {
                 const ready_count = self.io_handler.wait(&events) catch |err| {
                     std.debug.print("error waiting for events: {any}\n", .{err});
                     continue;
                 };
                 for (events[0..ready_count]) |event| {
-                    const fd: i32 = getFileDescriptor(event);
-                    const fd_idx: usize = if (fd < 0) continue else @intCast(fd);
+                    const fd: i32 = getFd(event);
+                    const fd_idx: usize = @intCast(fd);
                     self.readSocket(fd, fd_idx) catch |err| {
                         posix.close(fd);
                         self.connection_requests[fd_idx] = 0;
                         switch (err) {
-                            error.EOF => {}, // Expected case
+                            error.DoNotKeepAlive => {}, // Expected case
                             else => std.debug.print("error reading socket: {any}\n", .{err}),
                         }
                         continue;
@@ -128,7 +128,7 @@ pub fn Worker(comptime Handler: type) type {
             }
         }
 
-        fn readSocket(self: *Self, fd: posix.socket_t, fd_idx: usize) !void {
+        inline fn readSocket(self: *Self, fd: posix.socket_t, fd_idx: usize) !void {
             var keep_alive: bool = undefined;
             if (self.connection_requests[fd_idx] >= CONNECTION_MAX_REQUESTS - 1) {
                 keep_alive = false;
@@ -146,20 +146,17 @@ pub fn Worker(comptime Handler: type) type {
                 try self.io_handler.removeSocket(fd);
                 try self.ws.addSocket(fd);
             }
-            // Returning EOF causes the connection to be closed by the caller.
-            if (!keep_alive) return error.EOF;
+            if (!keep_alive) return error.DoNotKeepAlive;
         }
 
-        fn respond(self: *Self, fd: posix.socket_t, keep_alive: bool) !void {
-            // Status line and user headers
-            const status_len = try self.resp.serialiseStatusAndHeaders(&self.resp_status_buf);
+        inline fn respond(self: *Self, fd: posix.socket_t, keep_alive: bool) !void {
+            const status_len = try self.resp.serialiseStatusAndHeaders(self.resp_status_buf);
             var total = status_len;
             self.iovecs[0] = .{
                 .base = @ptrCast(self.resp_status_buf[0..status_len]),
                 .len = status_len,
             };
             var iovecs_len: u8 = 1;
-            // Set content-length header if zero
             if (self.resp.body_len == 0) {
                 self.iovecs[1] = .{
                     .base = CONTENT_LENGTH_ZERO_HEADER,
@@ -168,7 +165,6 @@ pub fn Worker(comptime Handler: type) type {
                 iovecs_len += 1;
                 total += CONTENT_LENGTH_ZERO_HEADER.len;
             }
-            // Connection header
             if (self.resp.is_ws_upgrade) {
                 self.iovecs[iovecs_len] = .{
                     .base = UPGRADE_HEADER,
@@ -191,7 +187,6 @@ pub fn Worker(comptime Handler: type) type {
                 }
             }
             iovecs_len += 1;
-            // Body
             if (self.resp.body_len > 0) {
                 self.iovecs[iovecs_len] = .{
                     .base = @ptrCast(self.resp.body[0..self.resp.body_len]),
@@ -200,7 +195,6 @@ pub fn Worker(comptime Handler: type) type {
                 iovecs_len += 1;
                 total += self.resp.body_len;
             }
-            // Write to socket
             const n = try posix.writev(fd, self.iovecs[0..iovecs_len]);
             if (n != total) {
                 return error.PartialWrite;
@@ -209,7 +203,6 @@ pub fn Worker(comptime Handler: type) type {
     };
 }
 
-// Calculate response status and header buffer size.
 fn calcResponseStatusBufferSize(allocator: std.mem.Allocator) !usize {
     const h = Header{};
     const resp = try Response.init(allocator, 1024);
