@@ -73,15 +73,16 @@ pub const RequestReader = struct {
             // This finds the connection header (if not already found), and
             // Sets keep_alive to false if header is "connection: close". It's more efficient
             // to do this here than iterating through headers later.
-            if (!conn_header_found and raw.len >= "connection: close".len and
-                raw.len <= "connection: keep-alive".len and isConnectionHeader(raw[0.."connection".len]))
+            if (!conn_header_found and
+                (raw.len == "connection: close".len or raw.len == "connection: keep-alive".len) and
+                isConnectionHeader(raw[0.."connection".len]))
             {
                 conn_header_found = true;
                 if (raw.len == "connection: close".len and raw[12] == 'c' and raw[13] == 'l') {
                     req.keep_alive = false; // req.keep_alive is reset to true
                 }
             }
-            req.headers[req.headers_len] = try Header.parse(raw);
+            try req.headers[req.headers_len].parse(raw);
             req.headers_len += 1;
         }
     }
@@ -151,7 +152,7 @@ inline fn indexOf(haystack: []const u8, needle: u8) ?usize {
 }
 
 inline fn isConnectionHeader(key: []const u8) bool {
-    if (key.len != "connection".len) return false;
+    // Length check ommited, see caller
     if (key[0] != 'c' and key[0] != 'C') return false;
     // Extending this to "onnection" is probably unnecessary
     inline for ("onn".*, 1..) |char, i| {

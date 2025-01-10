@@ -28,29 +28,28 @@ pub const Header = struct {
         return self.value_buf[0..self.value_len];
     }
 
-    pub inline fn parse(raw: []const u8) !Header {
-        var h = Header{};
+    pub inline fn parse(self: *Header, raw: []const u8) !void {
         const colon_pos = std.mem.indexOfScalar(u8, raw, ':') orelse return error.InvalidHeader;
-        if (colon_pos >= h.key_buf.len or raw.len - (colon_pos + 2) >= h.value_buf.len) {
-            return if (colon_pos >= h.key_buf.len)
+        if (colon_pos >= self.key_buf.len or raw.len - (colon_pos + 2) >= self.value_buf.len) {
+            return if (colon_pos >= self.key_buf.len)
                 error.KeyTooLong
             else
                 error.ValueTooLong;
         }
-        @memcpy(h.key_buf[0..colon_pos], raw[0..colon_pos]);
+        @memcpy(self.key_buf[0..colon_pos], raw[0..colon_pos]);
         const val = raw[colon_pos + 2 ..];
-        @memcpy(h.value_buf[0..val.len], val);
-        h.key_len = colon_pos;
-        h.value_len = val.len;
-        return h;
+        @memcpy(self.value_buf[0..val.len], val);
+        self.key_len = colon_pos;
+        self.value_len = val.len;
     }
 };
 
 test "parse header" {
     const raw: []const u8 = "Content-Type: text/html";
-    const parsed = try Header.parse(raw);
-    try std.testing.expectEqualStrings("Content-Type", parsed.key());
-    try std.testing.expectEqualStrings("text/html", parsed.value());
+    var h = Header{};
+    try h.parse(raw);
+    try std.testing.expectEqualStrings("Content-Type", h.key());
+    try std.testing.expectEqualStrings("text/html", h.value());
 }
 
 test "benchmark init" {
@@ -71,7 +70,8 @@ test "benchmark parse" {
     var i: usize = 0;
     var timer = try std.time.Timer.start();
     while (i < iterations) : (i += 1) {
-        const h = try Header.parse("Content-Type: text/plain");
+        var h = Header{};
+        try h.parse("Content-Type: text/plain");
         std.mem.doNotOptimizeAway(h);
     }
     const elapsed = timer.lap();
