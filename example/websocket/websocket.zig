@@ -38,7 +38,7 @@ const Handler = struct {
     }
 
     fn handleRequestWithError(self: *Self, req: *per.Request, resp: *per.Response) !void {
-        if (std.mem.eql(u8, req.getPath(), "/ws")) {
+        if (std.mem.eql(u8, req.getPathAndQueryRaw(), "/ws")) {
             // Explicitly handle the upgrade to support websockets.
             try per.ws.upgrader.handleUpgrade(self.allocator, req, resp);
             return;

@@ -14,8 +14,8 @@ pub const Request = struct {
 
     allocator: std.mem.Allocator,
     method: Method = .GET,
-    path: [256]u8 = undefined,
-    path_len: usize = 0,
+    path_and_query: [256]u8 = undefined,
+    path_and_query_len: usize = 0,
     // Benchmarks show this array to be significantly faster than
     // std.ArrayList. Not sure why. Benchmark used was "benchmark
     // read and parse headers" in reader.zig.
@@ -23,8 +23,6 @@ pub const Request = struct {
     headers_len: usize = 0,
     keep_alive: bool = true,
     version: Version = .@"HTTP/1.1",
-    query_raw: [256]u8 = undefined,
-    query_raw_len: usize = 0,
     /// Before accessing this directly, call parseQuery()
     query: std.StringHashMap([]const u8),
 
@@ -53,8 +51,19 @@ pub const Request = struct {
         return null;
     }
 
+    /// This is faster than getPath, and you can use this if you don't expect
+    /// a query. The reason that this is faster is that there is no scalar search
+    /// for '?' to find the query start.
+    pub inline fn getPathAndQueryRaw(self: *Self) []const u8 {
+        return self.path_and_query[0..self.path_and_query_len];
+    }
+
+    /// For best performance, use getPathAndQueryRaw unless you're expecting a
+    /// query. This method will search for '?', returning everything before it.
     pub inline fn getPath(self: *Self) []const u8 {
-        return self.path[0..self.path_len];
+        const query_start = std.mem.indexOfScalar(u8, self.getPathAndQueryRaw(), '?') orelse
+            return self.getPathAndQueryRaw();
+        return self.path_and_query[0..query_start];
     }
 
     /// Call this BEFORE accessing the query map.
@@ -62,16 +71,19 @@ pub const Request = struct {
     /// involves aquiring a mutex. Therefore, we can save some nanoseconds by
     /// clearing it here; only when the query is to be used.
     pub fn parseQuery(self: *Self) !?std.StringHashMap([]const u8) {
+        const query_start = std.mem.indexOfScalar(u8, self.path_and_query[0..self.path_and_query_len], '?') orelse
+            return null;
         self.query.clearRetainingCapacity();
+        const raw = self.path_and_query[query_start + 1 .. self.path_and_query_len];
         var current_pos: usize = 0;
-        while (current_pos < self.query_raw_len) {
+        while (current_pos < raw.len) {
             // Find the key-value separator
-            const equals_pos = std.mem.indexOfScalar(u8, self.query_raw[current_pos..], '=') orelse
+            const equals_pos = std.mem.indexOfScalar(u8, raw[current_pos..], '=') orelse
                 return null; // MalformedQuery
-            const key = self.query_raw[current_pos .. current_pos + equals_pos];
+            const key = raw[current_pos .. current_pos + equals_pos];
             const value_start = current_pos + equals_pos + 1;
             // Find the end of this value (either & or end of string)
-            const value_slice = self.query_raw[value_start..self.query_raw_len];
+            const value_slice = raw[value_start..];
             const amp_pos = std.mem.indexOfScalar(u8, value_slice, '&');
             if (amp_pos) |pos| {
                 try self.query.put(key, value_slice[0..pos]);
@@ -97,13 +109,11 @@ pub const Request = struct {
 };
 
 test "parse query" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-    var req = try Request.init(allocator);
+    var req = try Request.init(std.testing.allocator);
     defer req.deinit();
-    const query = "key1=value1&key2=value2";
-    @memcpy(req.query_raw[0..query.len], query[0..]);
-    req.query_raw_len = query.len;
+    const raw = "/path?key1=value1&key2=value2";
+    @memcpy(req.path_and_query[0..raw.len], raw[0..]);
+    req.path_and_query_len = raw.len;
     _ = try req.parseQuery();
     try std.testing.expectEqual(2, req.query.count());
     if (req.query.get("key1")) |value1| {
@@ -112,4 +122,13 @@ test "parse query" {
     if (req.query.get("key2")) |value2| {
         try std.testing.expectEqualStrings("value2", value2);
     } else return error.KeyNotFound;
+}
+
+test "get path" {
+    var req = try Request.init(std.testing.allocator);
+    defer req.deinit();
+    const raw = "/path?key1=value1&key2=value2";
+    @memcpy(req.path_and_query[0..raw.len], raw[0..]);
+    req.path_and_query_len = raw.len;
+    try std.testing.expectEqualSlices("/path", req.getPath());
 }

@@ -83,7 +83,7 @@ pub const DirServer = struct {
     }
 
     pub fn serve(self: *Self, req: *Request, resp: *Response) !void {
-        const req_path = req.getPath();
+        const req_path = req.getPathAndQueryRaw();
         if (!std.mem.startsWith(u8, req_path, self.req_path)) {
             resp.status = .not_found;
             return;

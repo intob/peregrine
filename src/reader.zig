@@ -48,17 +48,10 @@ pub const RequestReader = struct {
         req.version = try Version.parse(line[version_start..]);
         // Path and query is everything between method and version
         const path_start = req.method.toLength() + 1;
+        // Benchmark if this is faster without the stack allocation
         const path_and_query = line[path_start .. version_start - 1];
-        if (std.mem.indexOfScalar(u8, path_and_query, '?')) |query_start| {
-            req.query_raw_len = path_and_query.len - (query_start + 1);
-            @memcpy(req.query_raw[0..req.query_raw_len], path_and_query[query_start + 1 ..]);
-            req.path_len = query_start;
-            @memcpy(req.path[0..query_start], path_and_query[0..query_start]);
-        } else {
-            req.query_raw_len = 0;
-            req.path_len = path_and_query.len;
-            @memcpy(req.path[0..req.path_len], path_and_query);
-        }
+        req.path_and_query_len = path_and_query.len;
+        @memcpy(req.path_and_query[0..path_and_query.len], path_and_query);
     }
 
     inline fn parseHeaders(self: *Self, fd: posix.socket_t, req: *Request) !void {
