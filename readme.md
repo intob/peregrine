@@ -172,9 +172,9 @@ Workers:    Response buffer:    10MB
 _______________________________________________________________________
             Worker count:       12
             Main thread stack:  ~1MB (currently dependent on the OS)
-            Total:              12.07 * 12 + 0.1 + 0.2 = **145.14MB**
+            Total:              12.07 * 12 + 0.1 + 0.2 = 145.14MB
 ```
-Thanks to the zero-allocation design, even under high load, these numbers won't change beyond what your handler allocates. Thanks to Zig, you can be sure that your server won't (B)OOM under load.
+Thanks to the zero-allocation design, even under high load, these numbers won't change beyond what your handler allocates.
 
 ### Response headers
 If the body is not zero-length, you must set the Content-Length header yourself. I will write a helper for this soon.
