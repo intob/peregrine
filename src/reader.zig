@@ -32,6 +32,12 @@ pub const RequestReader = struct {
         self.allocator.destroy(self);
     }
 
+    pub inline fn reset(self: *Self) void {
+        self.pos = 0;
+        self.len = 0;
+        self.start = 0;
+    }
+
     pub fn readRequest(self: *Self, fd: posix.socket_t, req: *Request) !void {
         try self.readRequestLine(fd, req);
         try self.readHeaders(fd, req);

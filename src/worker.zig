@@ -137,6 +137,7 @@ pub fn Worker(comptime Handler: type) type {
                 keep_alive = self.req.version == .@"HTTP/1.1" and self.req.keep_alive;
             }
             self.req.reset();
+            self.reader.reset();
             try self.reader.readRequest(fd, self.req);
             self.resp.reset();
             self.handler.handleRequest(self.req, self.resp);

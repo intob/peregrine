@@ -25,18 +25,9 @@ Note: This project has just started, and is not yet a complete HTTP server imple
     - Thread-safe request handling
 
 ## Benchmarks
-On an M2 Pro, currently it can process over **250k** static GET requests per second. This simply measures the overhead of the server, and does not indicate real-world performance unless you're only serving static files. For this test, the response length was 287 bytes.
-```
-joey@jm2 peregrine % wrk -t 12 -c 48 -d 10s http://127.0.0.1:3000
-Running 10s test @ http://127.0.0.1:3000
-  12 threads and 48 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency   384.20us    1.51ms  57.77ms   97.04%
-    Req/Sec    21.28k     6.32k   64.81k    69.77%
-  2551907 requests in 10.10s, 0.97GB read
-Requests/sec: 252541.26
-Transfer/sec:     98.22MB
-```
+With 1000 connections, Peregrine outperforms Go stdlib and NGINX by around 2x, and h2o by around 1.15x. Facil.io stays in the lead, outperforming Peregrine by 1.06x.
+
+Note that this simply measures the overhead of the server, and does not indicate real-world performance unless you're only serving static files. For this test, the response length was 6150 bytes.
 
 ## Performance optimisations
 

@@ -8,7 +8,7 @@ pub const IOHandler = switch (native_os) {
     else => @compileError("Unsupported OS"),
 };
 
-pub const KqueueHandler = struct {
+const KqueueHandler = struct {
     const Self = @This();
 
     kfd: i32,
@@ -53,7 +53,7 @@ pub const KqueueHandler = struct {
     }
 };
 
-pub const EpollHandler = struct {
+const EpollHandler = struct {
     epfd: i32,
 
     const Self = @This();
