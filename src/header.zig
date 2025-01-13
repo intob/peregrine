@@ -1,10 +1,10 @@
 const std = @import("std");
 
 pub const Header = struct {
-    key_len: usize = 0,
-    value_len: usize = 0,
-    key_buf: [64]u8 = undefined,
-    value_buf: [256]u8 = undefined,
+    key_len: usize align(64) = 0,
+    value_len: usize align(64) = 0,
+    key_buf: [64]u8 align(64) = undefined,
+    value_buf: [256]u8 align(64) = undefined,
 
     pub const MAX_KEY_LEN = 64;
     pub const MAX_VALUE_LEN = 256;
@@ -77,43 +77,4 @@ test "benchmark parse" {
     const elapsed = timer.lap();
     const avg_ns = @divFloor(elapsed, iterations);
     std.debug.print("Average time: {d}ns\n", .{avg_ns});
-}
-
-// This is maybe 2ns faster (53ns rather than 55ns).
-// It's also more complicated. Also, indexOfScalar does basically
-// the same thing under the hood. I prefer the implementation above.
-pub fn moreComplicatedParser(raw: []const u8) !Header {
-    if (raw.len < 3) return error.InvalidHeader; // Minimum valid length: "a:b"
-    // Use SIMD to find colon
-    const colon_pos = blk: {
-        const chunk_size = 16;
-        const colon_vec: @Vector(chunk_size, u8) = @splat(':');
-        var i: usize = 0;
-        while (i + chunk_size <= raw.len) : (i += chunk_size) {
-            const chunk: @Vector(chunk_size, u8) = raw[i..][0..chunk_size].*;
-            const mask = chunk == colon_vec;
-            if (@reduce(.Or, mask)) {
-                break :blk i + @ctz(@as(u16, @bitCast(mask)));
-            }
-        }
-        // Fallback to scalar search for remaining bytes
-        break :blk std.mem.indexOfScalarPos(u8, raw, i, ':') orelse return error.InvalidHeader;
-    };
-    // Early bounds check
-    if (colon_pos >= Header.MAX_KEY_LEN) return error.KeyTooLong;
-    const value_length = raw.len - (colon_pos + 2); // +2 for ": "
-    if (value_length >= Header.MAX_VALUE_LEN) return error.ValueTooLong;
-    var h = Header{
-        .key_len = colon_pos,
-        .value_len = value_length,
-    };
-    // Single bounds check for key copy
-    @memcpy(h.key_buf[0..colon_pos], raw[0..colon_pos]);
-    // Skip colon and space, copy value
-    if (colon_pos + 2 < raw.len) {
-        const val = raw[colon_pos + 2 ..];
-        @memcpy(h.value_buf[0..val.len], val);
-    }
-
-    return h;
 }

@@ -8,12 +8,12 @@ const Version = @import("./version.zig").Version;
 pub const RequestReader = struct {
     const Self = @This();
 
-    allocator: std.mem.Allocator,
     buf: []align(64) u8,
-    pos: usize = 0, // Current position in buffer
-    len: usize = 0, // Amount of valid data in buffer
-    start: usize = 0, // Start of unprocessed data
-    compact_threshold: usize = 0,
+    pos: usize align(64) = 0, // Current position in buffer
+    len: usize align(64) = 0, // Amount of valid data in buffer
+    start: usize align(64) = 0, // Start of unprocessed data
+    compact_threshold: usize align(64) = 0,
+    allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, buffer_size: usize) !*Self {
         const next_pow2 = try std.math.ceilPowerOfTwo(usize, buffer_size);

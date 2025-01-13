@@ -72,7 +72,7 @@ pub fn Worker(comptime Handler: type) type {
             };
         };
 
-        shutdown: std.atomic.Value(bool) align(16),
+        shutdown: std.atomic.Value(bool) align(64),
         connection_requests: []u16 align(64),
         handler: *Handler,
         io_handler: aio.IOHandler,
@@ -97,7 +97,7 @@ pub fn Worker(comptime Handler: type) type {
             const resp_status_size = try calcResponseStatusBufferSize(allocator);
             self.resp_status_buf = try allocator.alignedAlloc(u8, 64, resp_status_size);
             self.reader = try RequestReader.init(self.allocator, cfg.req_buffer_size);
-            self.connection_requests = try allocator.alloc(u16, std.math.maxInt(i16));
+            self.connection_requests = try allocator.alignedAlloc(u16, 64, std.math.maxInt(i16));
             self.ws = cfg.ws;
             self.shutdown = std.atomic.Value(bool).init(false);
             self.thread = try std.Thread.spawn(.{
@@ -123,7 +123,7 @@ pub fn Worker(comptime Handler: type) type {
         }
 
         fn workerLoop(self: *Self) void {
-            var events: [256]EventType = undefined;
+            var events: [256]EventType align(64) = undefined;
             while (!self.shutdown.load(.unordered)) {
                 const ready_count = self.io_handler.wait(&events) catch |err| {
                     std.debug.print("error waiting for events: {any}\n", .{err});

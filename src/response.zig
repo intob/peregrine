@@ -11,13 +11,13 @@ const VERSION = "HTTP/1.1 ";
 pub const Response = struct {
     const Self = @This();
 
-    allocator: std.mem.Allocator,
-    status: Status = .ok,
-    headers: [32]Header = undefined,
-    headers_len: usize = 0,
+    status: Status align(64) = .ok,
+    headers: [32]Header align(64) = undefined,
+    headers_len: usize align(64) = 0,
     body: []align(64) u8,
-    body_len: usize = 0,
-    is_ws_upgrade: bool = false,
+    body_len: usize align(64) = 0,
+    is_ws_upgrade: bool align(64) = false,
+    allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, body_size: usize) !*Self {
         const next_pow2 = try std.math.ceilPowerOfTwo(usize, body_size);
@@ -97,7 +97,6 @@ pub const Response = struct {
     pub inline fn reset(self: *Self) void {
         self.status = Status.ok;
         self.headers_len = 0;
-        self.body_len = 0;
         self.is_ws_upgrade = false;
     }
 };

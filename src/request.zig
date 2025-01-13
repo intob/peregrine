@@ -12,19 +12,19 @@ const Version = @import("./version.zig").Version;
 pub const Request = struct {
     const Self = @This();
 
-    allocator: std.mem.Allocator,
-    method: Method = .GET,
-    path_and_query: [256]u8 = undefined,
-    path_and_query_len: usize = 0,
+    method: Method align(64) = .GET,
+    path_and_query: [256]u8 align(64) = undefined,
+    path_and_query_len: usize align(64) = 0,
     // Benchmarks show this array to be significantly faster than
     // std.ArrayList. Not sure why. Benchmark used was "benchmark
     // read and parse headers" in reader.zig.
-    headers: [32]Header = undefined,
-    headers_len: usize = 0,
-    keep_alive: bool = true,
-    version: Version = .@"HTTP/1.1",
+    headers: [32]Header align(64) = undefined,
+    headers_len: usize align(64) = 0,
+    keep_alive: bool align(64) = true,
+    version: Version align(64) = .@"HTTP/1.1",
     /// Before accessing this directly, call parseQuery()
     query: std.StringHashMap([]const u8),
+    allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) !*Self {
         const r = try allocator.create(Self);

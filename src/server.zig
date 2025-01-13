@@ -55,15 +55,15 @@ pub fn Server(comptime Handler: type) type {
             else => @compileError("Unsupported OS"),
         };
 
-        allocator: std.mem.Allocator,
         handler: *Handler,
         ws: *WebsocketServer(Handler),
         address: std.net.Address,
         workers: []worker.Worker(Handler),
-        next_worker: usize = 0,
+        next_worker: usize align(64) = 0,
         listener: posix.socket_t,
         io_handler: ListenerIOHandler,
         accept_threads: []std.Thread,
+        allocator: std.mem.Allocator,
 
         pub fn init(allocator: std.mem.Allocator, port: u16, cfg: ServerConfig) !*Self {
             const sock_type: u32 = posix.SOCK.STREAM | posix.SOCK.NONBLOCK;
