@@ -16,10 +16,28 @@ const CONNECTION_MAX_REQUESTS: u16 = 65535;
 const CONTENT_LENGTH_ZERO_HEADER = "content-length: 0\r\n";
 // These headers are added last, so they have an extra CRLF to terminate the headers.
 // This is simpler and more efficient than appending \r\n separately.
-// TODO: I think that adding an extra \r\n IOVEC after headers would be cleaner at this point.
 const KEEP_ALIVE_HEADERS = "connection: keep-alive\r\nkeep-alive: timeout=10, max=65535\r\n\r\n";
 const CLOSE_HEADER = "connection: close\r\n\r\n";
 const UPGRADE_HEADER = "connection: upgrade\r\n\r\n";
+
+const CommonIovecs = struct {
+    const content_len_zero: posix.iovec_const align(64) = .{
+        .base = CONTENT_LENGTH_ZERO_HEADER,
+        .len = CONTENT_LENGTH_ZERO_HEADER.len,
+    };
+    const keep_alive: posix.iovec_const align(64) = .{
+        .base = KEEP_ALIVE_HEADERS,
+        .len = KEEP_ALIVE_HEADERS.len,
+    };
+    const close: posix.iovec_const align(64) = .{
+        .base = CLOSE_HEADER,
+        .len = CLOSE_HEADER.len,
+    };
+    const upgrade: posix.iovec_const align(64) = .{
+        .base = UPGRADE_HEADER,
+        .len = UPGRADE_HEADER.len,
+    };
+};
 
 pub fn Worker(comptime Handler: type) type {
     return struct {
@@ -38,7 +56,6 @@ pub fn Worker(comptime Handler: type) type {
             handler: *Handler,
             ws: *WebsocketServer(Handler),
         };
-
         const getFd = blk: {
             break :blk switch (native_os) {
                 .freebsd, .netbsd, .openbsd, .dragonfly, .macos => struct {
@@ -55,19 +72,19 @@ pub fn Worker(comptime Handler: type) type {
             };
         };
 
-        allocator: std.mem.Allocator,
+        shutdown: std.atomic.Value(bool) align(16),
+        connection_requests: []u16 align(64),
         handler: *Handler,
         io_handler: aio.IOHandler,
-        id: usize,
+        reader: *RequestReader,
         req: *Request,
         resp: *Response,
         resp_status_buf: []align(64) u8,
-        reader: *RequestReader,
-        iovecs: [4]posix.iovec_const,
-        connection_requests: []u16,
+        iovecs: [4]posix.iovec_const align(64),
         ws: *WebsocketServer(Handler),
-        shutdown: std.atomic.Value(bool),
+        id: usize,
         thread: std.Thread,
+        allocator: std.mem.Allocator,
 
         pub fn init(self: *Self, cfg: WorkerConfig) !void {
             const allocator = cfg.allocator;
@@ -152,38 +169,26 @@ pub fn Worker(comptime Handler: type) type {
 
         inline fn respond(self: *Self, fd: posix.socket_t, keep_alive: bool) !void {
             const status_len = try self.resp.serialiseStatusAndHeaders(self.resp_status_buf);
-            var total = status_len;
             self.iovecs[0] = .{
                 .base = @ptrCast(self.resp_status_buf[0..status_len]),
                 .len = status_len,
             };
+            var total = status_len;
             var iovecs_len: u8 = 1;
             if (self.resp.body_len == 0) {
-                self.iovecs[1] = .{
-                    .base = CONTENT_LENGTH_ZERO_HEADER,
-                    .len = CONTENT_LENGTH_ZERO_HEADER.len,
-                };
+                self.iovecs[1] = CommonIovecs.content_len_zero;
                 iovecs_len += 1;
                 total += CONTENT_LENGTH_ZERO_HEADER.len;
             }
             if (self.resp.is_ws_upgrade) {
-                self.iovecs[iovecs_len] = .{
-                    .base = UPGRADE_HEADER,
-                    .len = UPGRADE_HEADER.len,
-                };
+                self.iovecs[iovecs_len] = CommonIovecs.upgrade;
                 total += UPGRADE_HEADER.len;
             } else {
                 if (keep_alive) {
-                    self.iovecs[iovecs_len] = .{
-                        .base = KEEP_ALIVE_HEADERS,
-                        .len = KEEP_ALIVE_HEADERS.len,
-                    };
+                    self.iovecs[iovecs_len] = CommonIovecs.keep_alive;
                     total += KEEP_ALIVE_HEADERS.len;
                 } else {
-                    self.iovecs[iovecs_len] = .{
-                        .base = CLOSE_HEADER,
-                        .len = CLOSE_HEADER.len,
-                    };
+                    self.iovecs[iovecs_len] = CommonIovecs.close;
                     total += CLOSE_HEADER.len;
                 }
             }

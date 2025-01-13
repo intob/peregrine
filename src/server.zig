@@ -75,11 +75,11 @@ pub fn Server(comptime Handler: type) type {
             } else if (@hasDecl(posix.SO, "REUSEPORT")) {
                 try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
             }
-            const TCP_NODELAY: u32 = 1; // posix.TCP is unavailable for macOS
-            const nodelay_opt: c_int = if (cfg.tcp_nodelay) 0 else 1; // Zero disables Nagle's algorithm
-            try posix.setsockopt(listener, posix.IPPROTO.TCP, TCP_NODELAY, &std.mem.toBytes(@as(c_int, nodelay_opt)));
-            try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.RCVBUF, &std.mem.toBytes(@as(c_int, 1 << 19)));
-            try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, 1 << 19)));
+            //const TCP_NODELAY: u32 = 1; // posix.TCP is unavailable for macOS
+            //const nodelay_opt: c_int = if (cfg.tcp_nodelay) 0 else 1; // Zero disables Nagle's algorithm
+            //try posix.setsockopt(listener, posix.IPPROTO.TCP, TCP_NODELAY, &std.mem.toBytes(@as(c_int, nodelay_opt)));
+            try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.RCVBUF, &std.mem.toBytes(@as(c_int, 1 << 20)));
+            try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, 1 << 20)));
             try posix.bind(listener, &address.any, address.getOsSockLen());
             var sig_action = posix.Sigaction{
                 .handler = .{ .handler = handleSignal },
@@ -151,11 +151,13 @@ pub fn Server(comptime Handler: type) type {
         fn acceptConnection(self: *Self) !void {
             const clsock = try posix.accept(self.listener, null, null, posix.SOCK.NONBLOCK);
             errdefer posix.close(clsock);
-            const send_timeout = posix.timeval{ .sec = 10, .usec = 0 };
-            const recv_timeout = posix.timeval{ .sec = 10, .usec = 0 };
+            const send_timeout = posix.timeval{ .sec = 3, .usec = 0 };
+            const recv_timeout = posix.timeval{ .sec = 3, .usec = 0 };
             try posix.setsockopt(clsock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &std.mem.toBytes(send_timeout));
             try posix.setsockopt(clsock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(recv_timeout));
             try posix.setsockopt(clsock, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(@as(c_int, 1)));
+            try posix.setsockopt(clsock, posix.SOL.SOCKET, posix.SO.RCVBUF, &std.mem.toBytes(@as(c_int, 1 << 19)));
+            try posix.setsockopt(clsock, posix.SOL.SOCKET, posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, 1 << 19)));
             const worker_id = @atomicRmw(usize, &self.next_worker, .Add, 1, .monotonic) % self.workers.len;
             try self.workers[worker_id].addClient(clsock);
         }
@@ -194,7 +196,7 @@ const ListenerKqueue = struct {
         try initializeEvents(kfd, listener);
         return .{
             .kfd = kfd,
-            .timeout = posix.timespec{ .sec = 0, .nsec = 50_000_000 },
+            .timeout = posix.timespec{ .sec = 0, .nsec = 500_000 }, // 500us
             .listener_ident = @intCast(listener),
         };
     }
@@ -248,7 +250,7 @@ const ListenerEpoll = struct {
 
     fn poll(self: *Self) !bool {
         var events: [1]linux.epoll_event = undefined;
-        const n = posix.epoll_wait(self.epfd, &events, 50);
+        const n = posix.epoll_wait(self.epfd, &events, 1);
         if (n == 0) return false;
         const event = events[0];
         if (event.data.fd == self.listener) {
