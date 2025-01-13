@@ -25,15 +25,18 @@ Note: This project has just started, and is not yet a complete HTTP server imple
     - Thread-safe request handling
 
 ## Benchmarks
-With 1000 connections, Peregrine outperforms Go stdlib and NGINX by around 2x, and h2o by around 1.15x. Facil.io stays in the lead, outperforming Peregrine by 1.06x.
+With 1000 connections, Peregrine outperforms Go stdlib and NGINX by around 2x, and h2o by around 1.15x. Facil.io stays in the lead, outperforming Peregrine by around 1.1x.
 
-Note that this simply measures the overhead of the server, and does not indicate real-world performance unless you're only serving static files. For this test, the response length was 6150 bytes.
+Facil.io is still superior to this library in terms of stddev of response times under load, and overall throughput with many concurrent connections. While working on this library, I've seen just how well-implemented and stable Facil.io is... In addition, it supports TLS.
+
+Note that my benchmarks simply measured the overhead of the server, and they do not indicate real-world performance unless you're only serving static files. For these tests, the response length was 6150 bytes.
 
 ## Performance optimisations
 
 - Non-blocking socket operations
 - Event-driven architecture
 - Aligned buffer allocation
+- SIMD operations
 - Vectored IO writes the response with a single syscall
 - Zero heap allocations per-request
 - Header case-insensitivity handled when searching, not parsing (unused headers are not transformed)
@@ -244,18 +247,24 @@ This is not a framework for building web applications. This is purely a HTTP ser
 If you want a more substantial HTTP library, I suggest that you look at [Zap](https://github.com/zigzap/zap), built on [Facil.io](http://facil.io). Facil.io is an excellent battle-tested library written in C.
 
 ## To do
-- Handle request body
-- Increase TCP buffer size
-- Increase socket backlog size
-- API reference
-- HTTP/2 support
-- Windows support
-- Templating util (possibly extend util.DirServer to be composable)
+Until these things are done, I don't think that this project can possibly be considered production-ready.
 
-Also to do:
-Add a response helper to set content-length header from an integer. Maybe use a pre-allocated buffer that can be reused.
+- Implement better worker selection than round-robin
+- Set Worker thread CPU affinity
+- Make WebSocket component multi-threaded
+- Benchmark connection-pooling (will it improve response times under load?)
+- Handle request body (deferred until I'm happy with overall performance and stability)
+- API reference
+- TLS 1.3 support (hard, but I need to do it at some point)
+- Add a response helper to set content-length header from an integer. Maybe use a pre-allocated buffer that can be reused.
+
+## Nice to have
+- HTTP/2 support
+- HTTP/3 support
+- Windows support
+- Templating util (possibly adapt util.DirServer to be composable)
 
 ## Thanks
-Thank you to [Bo](https://github.com/boazsegev) for his advice (not all applied yet), and also for his library [Facil.io](https://facil.io). This served as a great model for robust server design, and a solid performance benchmark.
+Thank you to [Bo](https://github.com/boazsegev) for his advice (not all applied yet), and also for his library [Facil.io](https://facil.io). This served as a great model for robust server design, and a solid performance benchmark. The more I work on this project, the more I've come to appreciate Facil.io's astonishing performance under load.
 
 Also, thanks to Karl Seguin for his excellent guide to [writing TCP servers in Zig](https://www.openmymind.net/TCP-Server-In-Zig-Part-1-Single-Threaded/). The start of this project was an exercise in learning Zig, and I found this guide to be very helpful for getting started.
