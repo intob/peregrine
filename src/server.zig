@@ -75,9 +75,10 @@ pub fn Server(comptime Handler: type) type {
             } else if (@hasDecl(posix.SO, "REUSEPORT")) {
                 try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
             }
-            //const TCP_NODELAY: u32 = 1; // posix.TCP is unavailable for macOS
-            //const nodelay_opt: c_int = if (cfg.tcp_nodelay) 0 else 1; // Zero disables Nagle's algorithm
-            //try posix.setsockopt(listener, posix.IPPROTO.TCP, TCP_NODELAY, &std.mem.toBytes(@as(c_int, nodelay_opt)));
+            const TCP_NODELAY: u32 = 1; // posix.TCP is unavailable for macOS
+            const nodelay_opt: c_int = if (cfg.tcp_nodelay) 0 else 1; // Zero disables Nagle's algorithm
+            try posix.setsockopt(listener, posix.IPPROTO.TCP, TCP_NODELAY, &std.mem.toBytes(@as(c_int, nodelay_opt)));
+            //try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.ACCEPTFILTER, &std.mem.toBytes(@as(c_int, 1)));
             try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.RCVBUF, &std.mem.toBytes(@as(c_int, 1 << 20)));
             try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, 1 << 20)));
             try posix.bind(listener, &address.any, address.getOsSockLen());
@@ -196,7 +197,7 @@ const ListenerKqueue = struct {
         try initializeEvents(kfd, listener);
         return .{
             .kfd = kfd,
-            .timeout = posix.timespec{ .sec = 0, .nsec = 500_000 }, // 500us
+            .timeout = posix.timespec{ .sec = 0, .nsec = 50_000_000 },
             .listener_ident = @intCast(listener),
         };
     }

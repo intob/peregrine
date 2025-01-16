@@ -16,7 +16,7 @@ const CONNECTION_MAX_REQUESTS: u16 = 65535;
 const CONTENT_LENGTH_ZERO_HEADER = "content-length: 0\r\n";
 // These headers are added last, so they have an extra CRLF to terminate the headers.
 // This is simpler and more efficient than appending \r\n separately.
-const KEEP_ALIVE_HEADERS = "connection: keep-alive\r\nkeep-alive: timeout=10, max=65535\r\n\r\n";
+const KEEP_ALIVE_HEADERS = "connection: keep-alive\r\nkeep-alive: timeout=3, max=65535\r\n\r\n";
 const CLOSE_HEADER = "connection: close\r\n\r\n";
 const UPGRADE_HEADER = "connection: upgrade\r\n\r\n";
 
@@ -79,7 +79,6 @@ pub fn Worker(comptime Handler: type) type {
         reader: *RequestReader,
         req: *Request,
         resp: *Response,
-        resp_status_buf: []align(64) u8,
         iovecs: [4]posix.iovec_const align(64),
         ws: *WebsocketServer(Handler),
         id: usize,
@@ -94,8 +93,6 @@ pub fn Worker(comptime Handler: type) type {
             self.id = cfg.id;
             self.req = try Request.init(allocator);
             self.resp = try Response.init(allocator, cfg.resp_body_buffer_size);
-            const resp_status_size = try calcResponseStatusBufferSize(allocator);
-            self.resp_status_buf = try allocator.alignedAlloc(u8, 64, resp_status_size);
             self.reader = try RequestReader.init(self.allocator, cfg.req_buffer_size);
             self.connection_requests = try allocator.alignedAlloc(u16, 64, std.math.maxInt(i16));
             self.ws = cfg.ws;
@@ -112,7 +109,6 @@ pub fn Worker(comptime Handler: type) type {
             self.reader.deinit();
             self.req.deinit();
             self.resp.deinit();
-            self.allocator.free(self.resp_status_buf);
             self.allocator.free(self.connection_requests);
             std.debug.print("worker-thread-{d} joined\n", .{self.id});
             // server frees worker
@@ -123,15 +119,18 @@ pub fn Worker(comptime Handler: type) type {
         }
 
         fn workerLoop(self: *Self) void {
-            var events: [256]EventType align(64) = undefined;
+            var events: [1024]EventType align(64) = undefined;
+            var ready_count: usize align(64) = 0;
+            var fd: i32 align(64) = 0;
+            var fd_idx: usize align(64) = 0;
             while (!self.shutdown.load(.unordered)) {
-                const ready_count = self.io_handler.wait(&events) catch |err| {
+                ready_count = self.io_handler.wait(&events) catch |err| {
                     std.debug.print("error waiting for events: {any}\n", .{err});
                     continue;
                 };
                 for (events[0..ready_count]) |event| {
-                    const fd: i32 = getFd(event);
-                    const fd_idx: usize = @intCast(fd);
+                    fd = getFd(event);
+                    fd_idx = @intCast(fd);
                     self.readSocket(fd, fd_idx) catch |err| {
                         posix.close(fd);
                         self.connection_requests[fd_idx] = 0;
@@ -151,7 +150,7 @@ pub fn Worker(comptime Handler: type) type {
                 keep_alive = false;
             } else {
                 self.connection_requests[fd_idx] += 1;
-                keep_alive = self.req.version == .@"HTTP/1.1" and self.req.keep_alive;
+                keep_alive = self.req.version == .@"HTTP/1.1" or self.req.keep_alive;
             }
             self.req.reset();
             self.reader.reset();
@@ -164,13 +163,13 @@ pub fn Worker(comptime Handler: type) type {
                 try self.io_handler.removeSocket(fd);
                 try self.ws.addSocket(fd);
             }
-            if (!keep_alive) return error.DoNotKeepAlive;
+            if (!keep_alive and !self.resp.is_ws_upgrade) return error.DoNotKeepAlive;
         }
 
         inline fn respond(self: *Self, fd: posix.socket_t, keep_alive: bool) !void {
-            const status_len = try self.resp.serialiseStatusAndHeaders(self.resp_status_buf);
+            const status_len = try self.resp.serialiseStatusAndHeaders();
             self.iovecs[0] = .{
-                .base = @ptrCast(self.resp_status_buf[0..status_len]),
+                .base = @ptrCast(self.resp.status_buf[0..status_len]),
                 .len = status_len,
             };
             var total = status_len;
@@ -207,13 +206,4 @@ pub fn Worker(comptime Handler: type) type {
             }
         }
     };
-}
-
-fn calcResponseStatusBufferSize(allocator: std.mem.Allocator) !usize {
-    const h = Header{};
-    const resp = try Response.init(allocator, 1024);
-    defer resp.deinit();
-    const headers_size = (h.key_buf.len + h.value_buf.len + 4) * resp.headers.len;
-    const resp_buf_size = headers_size + "HTTP/1.1 500 Internal Server Error\r\n".len;
-    return std.mem.alignForward(usize, resp_buf_size, 16);
 }

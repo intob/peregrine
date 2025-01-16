@@ -76,7 +76,7 @@ const EpollHandler = struct {
     }
 
     pub fn wait(self: *Self, events: []linux.epoll_event) !usize {
-        return posix.epoll_wait(self.epfd, events, 50); // 50ms timeout
+        return posix.epoll_wait(self.epfd, events, 1);
     }
 
     pub fn deinit(self: *Self) void {

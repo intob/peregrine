@@ -12,7 +12,7 @@ const Handler = struct {
 
     pub fn handleRequest(_: *Self, _: *per.Request, resp: *per.Response) void {
         _ = resp.setBody("Kawww\n") catch {};
-        resp.addNewHeader("Content-Length", "6") catch {};
+        resp.addNewHeader("content-length", "6") catch {};
     }
 };
 

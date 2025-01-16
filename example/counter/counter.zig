@@ -37,7 +37,7 @@ const Handler = struct {
         const buf = try std.fmt.allocPrint(allocator, "counter={d}\n", .{count});
         _ = try resp.setBody(buf);
         const len_buf = try std.fmt.allocPrint(allocator, "{d}", .{buf.len});
-        try resp.addNewHeader("Content-Length", len_buf);
+        try resp.addNewHeader("content-length", len_buf);
     }
 };
 

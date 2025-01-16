@@ -13,14 +13,14 @@ pub const Request = struct {
     const Self = @This();
 
     method: Method align(64) = .GET,
-    path_and_query: [256]u8 align(64) = undefined,
-    path_and_query_len: usize align(64) = 0,
+    path_and_query: []u8 align(64) = undefined,
     // Benchmarks show this array to be significantly faster than
     // std.ArrayList. Not sure why. Benchmark used was "benchmark
     // read and parse headers" in reader.zig.
     headers: [32]Header align(64) = undefined,
     headers_len: usize align(64) = 0,
-    keep_alive: bool align(64) = true,
+    // TODO: make this an optional, for when unspecified.
+    keep_alive: bool align(64) = false,
     version: Version align(64) = .@"HTTP/1.1",
     /// Before accessing this directly, call parseQuery()
     query: std.StringHashMap([]const u8),
@@ -51,18 +51,11 @@ pub const Request = struct {
         return null;
     }
 
-    /// This is faster than getPath, and you can use this if you don't expect
-    /// a query. The reason that this is faster is that there is no scalar search
-    /// for '?' to find the query start.
-    pub inline fn getPathAndQueryRaw(self: *Self) []const u8 {
-        return self.path_and_query[0..self.path_and_query_len];
-    }
-
-    /// For best performance, use getPathAndQueryRaw unless you're expecting a
+    /// For best performance access path_and_query directly, unless you're expecting a
     /// query. This method will search for '?', returning everything before it.
     pub inline fn getPath(self: *Self) []const u8 {
-        const query_start = std.mem.indexOfScalar(u8, self.getPathAndQueryRaw(), '?') orelse
-            return self.getPathAndQueryRaw();
+        const query_start = std.mem.indexOfScalar(u8, self.path_and_query, '?') orelse
+            return self.path_and_query;
         return self.path_and_query[0..query_start];
     }
 
@@ -71,10 +64,10 @@ pub const Request = struct {
     /// involves aquiring a mutex. Therefore, we can save some nanoseconds by
     /// clearing it here; only when the query is to be used.
     pub fn parseQuery(self: *Self) !?std.StringHashMap([]const u8) {
-        const query_start = std.mem.indexOfScalar(u8, self.path_and_query[0..self.path_and_query_len], '?') orelse
+        const query_start = std.mem.indexOfScalar(u8, self.path_and_query, '?') orelse
             return null;
         self.query.clearRetainingCapacity();
-        const raw = self.path_and_query[query_start + 1 .. self.path_and_query_len];
+        const raw = self.path_and_query[query_start + 1 ..];
         var current_pos: usize = 0;
         while (current_pos < raw.len) {
             // Find the key-value separator
@@ -104,16 +97,16 @@ pub const Request = struct {
     // the map unless we want to use it.
     pub inline fn reset(self: *Self) void {
         self.headers_len = 0;
-        self.keep_alive = true;
+        self.keep_alive = false;
     }
 };
 
 test "parse query" {
     var req = try Request.init(std.testing.allocator);
     defer req.deinit();
-    const raw = "/path?key1=value1&key2=value2";
-    @memcpy(req.path_and_query[0..raw.len], raw[0..]);
-    req.path_and_query_len = raw.len;
+    const raw = try std.testing.allocator.dupe(u8, "/path?key1=value1&key2=value2");
+    defer std.testing.allocator.free(raw);
+    req.path_and_query = raw;
     _ = try req.parseQuery();
     try std.testing.expectEqual(2, req.query.count());
     if (req.query.get("key1")) |value1| {
@@ -127,8 +120,8 @@ test "parse query" {
 test "get path" {
     var req = try Request.init(std.testing.allocator);
     defer req.deinit();
-    const raw = "/path?key1=value1&key2=value2";
-    @memcpy(req.path_and_query[0..raw.len], raw[0..]);
-    req.path_and_query_len = raw.len;
-    try std.testing.expectEqualSlices("/path", req.getPath());
+    const raw = try std.testing.allocator.dupe(u8, "/path?key1=value1&key2=value2");
+    defer std.testing.allocator.free(raw);
+    req.path_and_query = raw;
+    try std.testing.expectEqualSlices(u8, "/path", req.getPath());
 }

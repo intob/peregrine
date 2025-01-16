@@ -12,7 +12,6 @@ pub const RequestReader = struct {
     pos: usize align(64) = 0, // Current position in buffer
     len: usize align(64) = 0, // Amount of valid data in buffer
     start: usize align(64) = 0, // Start of unprocessed data
-    compact_threshold: usize align(64) = 0,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, buffer_size: usize) !*Self {
@@ -22,7 +21,6 @@ pub const RequestReader = struct {
         reader.* = .{
             .allocator = allocator,
             .buf = try allocator.alignedAlloc(u8, 64, aligned),
-            .compact_threshold = (aligned * 3) / 4,
         };
         return reader;
     }
@@ -54,9 +52,7 @@ pub const RequestReader = struct {
         req.version = try Version.parse(line[version_start..]);
         // Path and query is everything between method and version
         const path_start = req.method.toLength() + 1;
-        const path_and_query = line[path_start .. version_start - 1];
-        req.path_and_query_len = path_and_query.len;
-        @memcpy(req.path_and_query[0..path_and_query.len], path_and_query);
+        req.path_and_query = line[path_start .. version_start - 1];
     }
 
     inline fn readHeaders(self: *Self, fd: posix.socket_t, req: *Request) !void {
@@ -67,18 +63,21 @@ pub const RequestReader = struct {
             if (n < "a: b".len) return error.InvalidHeader;
             if (req.headers_len >= req.headers.len) return error.TooManyHeaders;
             const raw = self.buf[self.start - n - 2 .. self.start - 2];
-            // Really ugly, but fast and simple...
-            // This finds the connection header (if not already found), and
-            // Sets keep_alive to false if header is "connection: close". It's more efficient
-            // to do this here than iterating through headers later.
-            if (!conn_header_found and
-                (raw.len == "connection: close".len or raw.len == "connection: keep-alive".len) and
-                isConnectionHeader(raw[0.."connection".len]))
-            {
+            if (!conn_header_found and isConnectionHeader(raw)) {
                 conn_header_found = true;
-                if (raw.len == "connection: close".len and raw[12] == 'c' and raw[13] == 'l') {
-                    req.keep_alive = false; // req.keep_alive is reset to true
+                // We don't need to parse the header, we can copy it directly.
+                const key = raw[0.."connection".len];
+                @memcpy(req.headers[req.headers_len].key_buf[0..key.len], key);
+                req.headers[req.headers_len].key_len = key.len;
+                // Length is checked by isConnectionHeader, so this is safe.
+                const val = raw[12..];
+                @memcpy(req.headers[req.headers_len].value_buf[0..val.len], val);
+                req.headers[req.headers_len].value_len = val.len;
+                req.headers_len += 1;
+                if (raw[12] == 'k') {
+                    req.keep_alive = true;
                 }
+                continue;
             }
             try req.headers[req.headers_len].parse(raw);
             req.headers_len += 1;
@@ -87,8 +86,8 @@ pub const RequestReader = struct {
 
     fn readLine(self: *Self, fd: posix.socket_t) !usize {
         var line_len: usize = 0;
-        const Vector = @Vector(16, u8);
-        const newline: Vector = @splat(@as(u8, '\n'));
+        const V16 = @Vector(16, u8);
+        const newline: V16 = @splat(@as(u8, '\n'));
         if (self.pos >= self.len) {
             const available = self.buf.len - self.len;
             if (available == 0) return error.LineTooLong;
@@ -96,9 +95,9 @@ pub const RequestReader = struct {
             if (read_amount == 0) return line_len;
             self.len += read_amount;
         }
-        while (self.pos + 16 <= self.len) {
-            const chunk = self.buf[self.pos..][0..16];
-            const vec: Vector = @as(Vector, chunk.*);
+        while (self.pos + @sizeOf(V16) <= self.len) {
+            const chunk = self.buf[self.pos..][0..@sizeOf(V16)];
+            const vec = @as(V16, chunk.*);
             const matches = vec == newline;
             const mask = @as(u16, @bitCast(matches));
             if (mask != 0) {
@@ -110,9 +109,6 @@ pub const RequestReader = struct {
             }
             self.pos += 16;
             line_len += 16;
-            if (self.pos > self.compact_threshold) {
-                self.compact();
-            }
         }
         const remaining = self.len - self.pos;
         if (remaining > 0) {
@@ -127,15 +123,6 @@ pub const RequestReader = struct {
         }
         return line_len;
     }
-
-    inline fn compact(self: *Self) void {
-        if (self.start == 0) return;
-        const len = self.len - self.start;
-        std.mem.copyForwards(u8, self.buf[0..len], self.buf[self.start..self.len]);
-        self.len = len;
-        self.pos -= self.start;
-        self.start = 0;
-    }
 };
 
 // Explicitly not scalar because we're searching through less than 16 bytes
@@ -147,20 +134,22 @@ inline fn indexOf(haystack: []const u8, needle: u8) ?usize {
     return null;
 }
 
-inline fn isConnectionHeader(key: []const u8) bool {
-    // Length check ommited, see caller
-    if (key[0] != 'c' and key[0] != 'C') return false;
+inline fn isConnectionHeader(raw: []const u8) bool {
+    if (raw.len != "connection: close".len and raw.len != "connection: keep-alive".len) {
+        return false;
+    }
+    if (raw[0] != 'c' and raw[0] != 'C') return false;
     // Extending this to "onnection" is probably unnecessary
     inline for ("onn".*, 1..) |char, i| {
-        if (key[i] != char) return false;
+        if (raw[i] != char) return false;
     }
     return true;
 }
 
 test isConnectionHeader {
-    try std.testing.expectEqual(false, isConnectionHeader("Host"));
-    try std.testing.expect(isConnectionHeader("connection"));
-    try std.testing.expect(isConnectionHeader("Connection"));
+    try std.testing.expectEqual(false, isConnectionHeader("Host: localhost"));
+    try std.testing.expect(isConnectionHeader("connection: close"));
+    try std.testing.expect(isConnectionHeader("Connection: keep-alive"));
 }
 
 test "test parse GET request" {

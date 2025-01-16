@@ -83,12 +83,11 @@ pub const DirServer = struct {
     }
 
     pub fn serve(self: *Self, req: *Request, resp: *Response) !void {
-        const req_path = req.getPathAndQueryRaw();
-        if (!std.mem.startsWith(u8, req_path, self.req_path)) {
+        if (!std.mem.startsWith(u8, req.path_and_query, self.req_path)) {
             resp.status = .not_found;
             return;
         }
-        const rel_path = req_path[self.req_path.len..];
+        const rel_path = req.path_and_query[self.req_path.len..];
         if (self.files.get(rel_path)) |hit| {
             for (hit.headers.items) |h| try resp.addHeader(h);
             _ = try resp.setBody(hit.contents);
