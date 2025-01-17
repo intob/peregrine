@@ -25,11 +25,18 @@ Note: This project has just started, and is not yet a complete HTTP server imple
     - Thread-safe request handling
 
 ## Benchmarks
-With 1000 connections, Peregrine outperforms Go stdlib and NGINX by around 2x, and h2o by around 1.15x. Facil.io stays in the lead, outperforming Peregrine by around 1.1x.
+Run using wrk on an M2 Pro with 1000 connections.
 
-Facil.io is still superior to this library in terms of stddev of response times under load, and overall throughput with many concurrent connections. While working on this library, I've seen just how well-implemented and stable Facil.io is... In addition, it supports TLS.
+| Metric | NGINX | h2o | Zap (Facil.io) | Peregrine |
+|--------|-------|-----|----------------|-----------|
+| Requests/sec | 81,852 | 149,267 | 167,963 | **175,675** |
+| Avg Latency | 12.19ms | 8.54ms | **4.84ms** | 5.64ms |
+| Latency Stdev | 4.19ms | 8.87ms | 2.23ms | 412.57μs |
+| Latency +/- Stdev | 74.74% | 90.81 | 78.32% | **93.00%** |
 
-Note that my benchmarks simply measured the overhead of the server, and they do not indicate real-world performance unless you're only serving static files. For these tests, the response length was 6150 bytes.
+Facil.io is still superior to this library as it is battle-tested, production-ready and supports TLS. While working on this library, I've seen just how well-implemented and stable Facil.io is...
+
+Note that this benchmark simply measured serving static GET requests, and they do not indicate real-world performance unless you're only serving static files. For these tests, the response length was 6150 bytes.
 
 ## Performance optimisations
 
@@ -54,7 +61,7 @@ Note that my benchmarks simply measured the overhead of the server, and they do 
 
 ### Worker threads
 - Manage connections
-- Parse and handle requests
+- Parse and handle requess
 - Serialise and write responses
 
 ### Accept threads
