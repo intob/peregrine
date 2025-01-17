@@ -2,7 +2,7 @@ const native_os = @import("builtin").os.tag;
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
-const aio = @import("./aio.zig");
+const Poller = @import("./poller.zig").Poller;
 const Header = @import("./header.zig").Header;
 const Request = @import("./request.zig").Request;
 const RequestReader = @import("./reader.zig").RequestReader;
@@ -49,7 +49,6 @@ pub fn Worker(comptime Handler: type) type {
         };
         const WorkerConfig = struct {
             allocator: std.mem.Allocator,
-            id: usize,
             resp_body_buffer_size: usize,
             req_buffer_size: usize,
             stack_size: usize,
@@ -75,13 +74,12 @@ pub fn Worker(comptime Handler: type) type {
         shutdown: std.atomic.Value(bool) align(64),
         connection_requests: []u16 align(64),
         handler: *Handler,
-        io_handler: aio.IOHandler,
+        poller: Poller,
         reader: *RequestReader,
         req: *Request,
         resp: *Response,
         iovecs: [4]posix.iovec_const align(64),
         ws: *WebsocketServer(Handler),
-        id: usize,
         thread: std.Thread,
         allocator: std.mem.Allocator,
 
@@ -89,8 +87,7 @@ pub fn Worker(comptime Handler: type) type {
             const allocator = cfg.allocator;
             self.allocator = allocator;
             self.handler = cfg.handler;
-            self.io_handler = try aio.IOHandler.init();
-            self.id = cfg.id;
+            self.poller = try Poller.init();
             self.req = try Request.init(allocator);
             self.resp = try Response.init(allocator, cfg.resp_body_buffer_size);
             self.reader = try RequestReader.init(self.allocator, cfg.req_buffer_size);
@@ -110,12 +107,11 @@ pub fn Worker(comptime Handler: type) type {
             self.req.deinit();
             self.resp.deinit();
             self.allocator.free(self.connection_requests);
-            std.debug.print("worker-thread-{d} joined\n", .{self.id});
             // server frees worker
         }
 
         pub fn addClient(self: *Self, fd: posix.socket_t) !void {
-            try self.io_handler.addSocket(fd);
+            try self.poller.addSocket(fd);
         }
 
         fn workerLoop(self: *Self) void {
@@ -124,7 +120,7 @@ pub fn Worker(comptime Handler: type) type {
             var fd: i32 align(64) = 0;
             var fd_idx: usize align(64) = 0;
             while (!self.shutdown.load(.unordered)) {
-                ready_count = self.io_handler.wait(&events) catch |err| {
+                ready_count = self.poller.wait(&events) catch |err| {
                     std.debug.print("error waiting for events: {any}\n", .{err});
                     continue;
                 };
@@ -160,7 +156,7 @@ pub fn Worker(comptime Handler: type) type {
             try self.respond(fd, keep_alive);
             if (self.resp.is_ws_upgrade) {
                 self.connection_requests[@intCast(fd)] = 0;
-                try self.io_handler.removeSocket(fd);
+                try self.poller.removeSocket(fd);
                 try self.ws.addSocket(fd);
             }
             if (!keep_alive and !self.resp.is_ws_upgrade) return error.DoNotKeepAlive;

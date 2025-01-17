@@ -36,7 +36,10 @@ const Handler = struct {
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    const srv = try per.Server(Handler).init(gpa.allocator(), 3000, .{});
+    const srv = try per.Server(Handler).init(gpa.allocator(), 3000, .{
+        .accept_thread_count = 2,
+        .worker_thread_count = 6,
+    });
     std.debug.print("listening on 0.0.0.0:3000\n", .{});
     try srv.start(); // Blocks if there is no error
 }

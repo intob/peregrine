@@ -5,6 +5,7 @@ const linux = std.os.linux;
 const Request = @import("./request.zig").Request;
 const Response = @import("./response.zig").Response;
 const worker = @import("./worker.zig");
+const tls_worker = @import("./tls_worker.zig");
 const WebsocketServer = @import("./ws/server.zig").WebsocketServer;
 
 var should_shutdown: std.atomic.Value(bool) = undefined;
@@ -13,7 +14,9 @@ fn handleSignal(_: c_int) callconv(.C) void {
     should_shutdown.store(true, .release);
 }
 
-pub const ServerConfig = struct {
+pub const Mode = enum { TLSEnabled, TLSDisabled };
+
+pub const Config = struct {
     /// Listening IP address
     ip: []const u8 = "0.0.0.0",
     /// Number of threads processing requests.
@@ -33,9 +36,13 @@ pub const ServerConfig = struct {
     /// WebSocket reader buffer size. Defaults to 32KB.
     /// Size is aligned internally.
     websocket_buffer_size: usize = 1024 * 32,
+    /// TLS certificate filename
+    tls_cert_filename: []const u8 = "",
+    /// TLS key filename
+    tls_key_filename: []const u8 = "",
 };
 
-pub fn Server(comptime Handler: type) type {
+pub fn Server(comptime Handler: type, comptime mode: Mode) type {
     comptime {
         if (!@hasDecl(Handler, "init")) {
             @compileError("Handler must implement init(std.mem.Allocator) !*@This()");
@@ -54,18 +61,22 @@ pub fn Server(comptime Handler: type) type {
             .linux => ListenerEpoll,
             else => @compileError("Unsupported OS"),
         };
+        const Worker = switch (mode) {
+            .TLSDisabled => worker.Worker(Handler),
+            .TLSEnabled => tls_worker.TLSWorker(Handler),
+        };
 
         handler: *Handler,
         ws: *WebsocketServer(Handler),
         address: std.net.Address,
-        workers: []worker.Worker(Handler),
+        workers: []Worker,
         next_worker: usize align(64) = 0,
         listener: posix.socket_t,
         io_handler: ListenerIOHandler,
         accept_threads: []std.Thread,
         allocator: std.mem.Allocator,
 
-        pub fn init(allocator: std.mem.Allocator, port: u16, cfg: ServerConfig) !*Self {
+        pub fn init(allocator: std.mem.Allocator, port: u16, cfg: Config) !*Self {
             const sock_type: u32 = posix.SOCK.STREAM | posix.SOCK.NONBLOCK;
             const address = try std.net.Address.parseIp(cfg.ip, port);
             const listener = try posix.socket(address.any.family, sock_type, posix.IPPROTO.TCP);
@@ -102,7 +113,7 @@ pub fn Server(comptime Handler: type) type {
                 .handler = handler,
                 .ws = try WebsocketServer(Handler).init(allocator, handler, cfg.websocket_buffer_size),
                 .address = address,
-                .workers = try allocator.alloc(worker.Worker(Handler), worker_thread_count),
+                .workers = try allocator.alloc(Worker, worker_thread_count),
                 .listener = listener,
                 .io_handler = io_handler,
                 .accept_threads = try allocator.alloc(std.Thread, @max(0, cfg.accept_thread_count - 1)),
@@ -110,16 +121,31 @@ pub fn Server(comptime Handler: type) type {
             for (srv.accept_threads) |*t| {
                 t.* = try std.Thread.spawn(.{ .allocator = allocator, .stack_size = 1024 }, loop, .{srv});
             }
-            for (srv.workers, 0..) |*w, i| {
-                try w.init(.{
-                    .allocator = allocator,
-                    .id = i,
-                    .resp_body_buffer_size = cfg.response_body_buffer_size,
-                    .req_buffer_size = cfg.request_buffer_size,
-                    .stack_size = cfg.worker_stack_size,
-                    .handler = srv.handler,
-                    .ws = srv.ws,
-                });
+            for (srv.workers) |*w| {
+                switch (mode) {
+                    .TLSDisabled => {
+                        try w.init(.{
+                            .allocator = allocator,
+                            .resp_body_buffer_size = cfg.response_body_buffer_size,
+                            .req_buffer_size = cfg.request_buffer_size,
+                            .stack_size = cfg.worker_stack_size,
+                            .handler = srv.handler,
+                            .ws = srv.ws,
+                        });
+                    },
+                    .TLSEnabled => {
+                        try w.init(.{
+                            .allocator = allocator,
+                            .resp_body_buffer_size = cfg.response_body_buffer_size,
+                            .req_buffer_size = cfg.request_buffer_size,
+                            .stack_size = cfg.worker_stack_size,
+                            .handler = srv.handler,
+                            .ws = srv.ws,
+                            .cert_filename = cfg.tls_cert_filename,
+                            .key_filename = cfg.tls_key_filename,
+                        });
+                    },
+                }
             }
             return srv;
         }
@@ -130,7 +156,21 @@ pub fn Server(comptime Handler: type) type {
             try posix.listen(self.listener, std.math.maxInt(i16));
             try self.loop();
             std.debug.print("accept-thread-0 joined\n", .{});
-            self.waitForShutdown();
+            for (self.accept_threads, 1..) |*t, i| {
+                t.join();
+                std.debug.print("accept-thread-{d} joined\n", .{i});
+            }
+            for (self.workers, 0..) |*w, i| {
+                w.deinit();
+                std.debug.print("worker-thread-{d} joined\n", .{i});
+            }
+            posix.close(self.listener);
+            self.handler.deinit();
+            self.allocator.free(self.workers);
+            self.allocator.free(self.accept_threads);
+            self.ws.deinit();
+            self.allocator.destroy(self);
+            std.debug.print("shutdown complete\n", .{});
         }
 
         pub fn shutdown(_: *Self) void {
@@ -161,26 +201,6 @@ pub fn Server(comptime Handler: type) type {
             try posix.setsockopt(clsock, posix.SOL.SOCKET, posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, 1 << 19)));
             const worker_id = @atomicRmw(usize, &self.next_worker, .Add, 1, .monotonic) % self.workers.len;
             try self.workers[worker_id].addClient(clsock);
-        }
-
-        fn waitForShutdown(self: *Self) void {
-            for (self.accept_threads, 1..) |*t, i| {
-                t.join();
-                std.debug.print("accept-thread-{d} joined\n", .{i});
-            }
-            for (self.workers) |*w| {
-                w.deinit();
-            }
-            self.cleanup();
-            std.debug.print("shutdown complete\n", .{});
-        }
-
-        fn cleanup(self: *Self) void {
-            posix.close(self.listener);
-            self.handler.deinit();
-            self.allocator.free(self.workers);
-            self.ws.deinit();
-            self.allocator.destroy(self);
         }
     };
 }

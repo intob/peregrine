@@ -2,7 +2,7 @@ const native_os = @import("builtin").os.tag;
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
-const aio = @import("../aio.zig");
+const Poller = @import("../poller.zig").Poller;
 const WebsocketReader = @import("./reader.zig").WebsocketReader;
 const Frame = @import("./frame.zig").Frame;
 
@@ -12,7 +12,7 @@ pub fn WebsocketServer(comptime Handler: type) type {
 
         allocator: std.mem.Allocator,
         handler: *Handler,
-        io_handler: aio.IOHandler,
+        poller: Poller,
         thread: std.Thread,
         reader: *WebsocketReader,
         frame: *Frame,
@@ -23,7 +23,7 @@ pub fn WebsocketServer(comptime Handler: type) type {
             self.* = .{
                 .allocator = allocator,
                 .handler = handler,
-                .io_handler = try aio.IOHandler.init(),
+                .poller = try Poller.init(),
                 .thread = try std.Thread.spawn(.{}, loop, .{self}),
                 .reader = try WebsocketReader.init(allocator, buffer_size),
                 .frame = try Frame.init(allocator, buffer_size),
@@ -42,7 +42,7 @@ pub fn WebsocketServer(comptime Handler: type) type {
         }
 
         pub fn addSocket(self: *Self, fd: posix.socket_t) !void {
-            try self.io_handler.addSocket(fd);
+            try self.poller.addSocket(fd);
             if (@hasDecl(Handler, "handleWSConn")) {
                 self.handler.handleWSConn(fd);
             } else {
@@ -62,7 +62,7 @@ pub fn WebsocketServer(comptime Handler: type) type {
             };
             var events: [256]EventType = undefined;
             while (!self.shutdown.load(.unordered)) {
-                const ready_count = self.io_handler.wait(&events) catch |err| {
+                const ready_count = self.poller.wait(&events) catch |err| {
                     std.debug.print("error waiting for events: {any}\n", .{err});
                     continue;
                 };
@@ -74,7 +74,7 @@ pub fn WebsocketServer(comptime Handler: type) type {
                     };
                     self.handleEvent(socket) catch |err| {
                         std.debug.print("error handling ws event: {any}\n", .{err});
-                        self.io_handler.removeSocket(socket) catch |remove_err| {
+                        self.poller.removeSocket(socket) catch |remove_err| {
                             std.debug.print("error removing socket: {any}\n", .{remove_err});
                         };
                         if (@hasDecl(Handler, "handleWSDisconn")) {

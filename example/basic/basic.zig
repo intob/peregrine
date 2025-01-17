@@ -20,7 +20,12 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
-    const srv = try per.Server(Handler).init(allocator, 3000, .{});
+    const srv = try per.Server(Handler, .TLSEnabled).init(allocator, 3000, .{
+        .accept_thread_count = 1,
+        .worker_thread_count = 6,
+        .tls_cert_filename = "./example/basic/cert.pem",
+        .tls_key_filename = "./example/basic.key.pem",
+    });
     std.debug.print("listening on 0.0.0.0:3000\n", .{});
     try srv.start(); // Blocks if there is no error
 }
