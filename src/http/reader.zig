@@ -1,9 +1,9 @@
 const std = @import("std");
 const posix = std.posix;
-const Request = @import("./request.zig").Request;
-const Header = @import("./header.zig").Header;
-const Method = @import("./method.zig").Method;
-const Version = @import("./version.zig").Version;
+const Request = @import("../request.zig").Request;
+const Header = @import("../header.zig").Header;
+const Method = @import("../method.zig").Method;
+const Version = @import("../version.zig").Version;
 
 pub const RequestReader = struct {
     const Self = @This();

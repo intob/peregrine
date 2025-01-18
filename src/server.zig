@@ -4,8 +4,8 @@ const posix = std.posix;
 const linux = std.os.linux;
 const Request = @import("./request.zig").Request;
 const Response = @import("./response.zig").Response;
-const worker = @import("./worker.zig");
-const tls_worker = @import("./tls_worker.zig");
+const http_worker = @import("./http/worker.zig");
+const https_worker = @import("./https/worker.zig");
 const WebsocketServer = @import("./ws/server.zig").WebsocketServer;
 
 var should_shutdown: std.atomic.Value(bool) = undefined;
@@ -62,8 +62,8 @@ pub fn Server(comptime Handler: type, comptime mode: Mode) type {
             else => @compileError("Unsupported OS"),
         };
         const Worker = switch (mode) {
-            .TLSDisabled => worker.Worker(Handler),
-            .TLSEnabled => tls_worker.TLSWorker(Handler),
+            .TLSDisabled => http_worker.Worker(Handler),
+            .TLSEnabled => https_worker.TLSWorker(Handler),
         };
 
         handler: *Handler,

@@ -2,13 +2,13 @@ const native_os = @import("builtin").os.tag;
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
-const Poller = @import("./poller.zig").Poller;
-const Header = @import("./header.zig").Header;
-const Request = @import("./request.zig").Request;
-const RequestReader = @import("./reader.zig").RequestReader;
-const Response = @import("./response.zig").Response;
-const Status = @import("./status.zig").Status;
-const WebsocketServer = @import("./ws/server.zig").WebsocketServer;
+const Poller = @import("../poller.zig").Poller;
+const Header = @import("../header.zig").Header;
+const Request = @import("../request.zig").Request;
+const TLSReader = @import("./reader.zig").TLSReader;
+const Response = @import("../response.zig").Response;
+const Status = @import("../status.zig").Status;
+const WebsocketServer = @import("../ws/server.zig").WebsocketServer;
 
 const CONNECTION_MAX_REQUESTS: u16 = 65535;
 // This is added to a response that contains no body. This is more efficient than
@@ -73,15 +73,16 @@ pub fn TLSWorker(comptime Handler: type) type {
             };
         };
         const ConnectionState = enum {
-            Hello,
+            ClientHello,
             Goodbye,
         };
         const Connection = struct {
             state: ConnectionState,
             requests: u16,
+            client_random: [32]u8,
 
             pub fn reset(self: *Connection) void {
-                self.state = .Hello;
+                self.state = .ClientHello;
                 self.requests = 0;
             }
         };
@@ -90,7 +91,7 @@ pub fn TLSWorker(comptime Handler: type) type {
         connections: []Connection align(64),
         handler: *Handler,
         poller: Poller,
-        reader: *RequestReader,
+        reader: *TLSReader,
         req: *Request,
         resp: *Response,
         iovecs: [4]posix.iovec_const align(64),
@@ -105,7 +106,7 @@ pub fn TLSWorker(comptime Handler: type) type {
             self.poller = try Poller.init();
             self.req = try Request.init(allocator);
             self.resp = try Response.init(allocator, cfg.resp_body_buffer_size);
-            self.reader = try RequestReader.init(self.allocator, cfg.req_buffer_size);
+            self.reader = try TLSReader.init(self.allocator, cfg.req_buffer_size);
             self.connections = try allocator.alignedAlloc(Connection, 64, std.math.maxInt(i16));
             self.ws = cfg.ws;
             self.shutdown = std.atomic.Value(bool).init(false);
@@ -134,7 +135,7 @@ pub fn TLSWorker(comptime Handler: type) type {
             var events: [1024]EventType align(64) = undefined;
             var ready_count: usize align(64) = 0;
             var fd: i32 align(64) = 0;
-            var fd_idx: usize align(64) = 0;
+            var conn: *Connection = undefined;
             while (!self.shutdown.load(.unordered)) {
                 ready_count = self.poller.wait(&events) catch |err| {
                     std.debug.print("error waiting for events: {any}\n", .{err});
@@ -142,10 +143,10 @@ pub fn TLSWorker(comptime Handler: type) type {
                 };
                 for (events[0..ready_count]) |event| {
                     fd = getFd(event);
-                    fd_idx = @intCast(fd);
-                    self.readSocket(fd, fd_idx) catch |err| {
+                    conn = &self.connections[@intCast(fd)];
+                    self.readSocket(conn, fd) catch |err| {
                         posix.close(fd);
-                        self.connections[fd_idx].reset();
+                        conn.reset();
                         switch (err) {
                             error.DoNotKeepAlive => {}, // Expected case
                             else => std.debug.print("error reading socket: {any}\n", .{err}),
@@ -156,26 +157,68 @@ pub fn TLSWorker(comptime Handler: type) type {
             }
         }
 
-        inline fn readSocket(self: *Self, fd: posix.socket_t, fd_idx: usize) !void {
+        inline fn readSocket(self: *Self, conn: *Connection, fd: posix.socket_t) !void {
+            switch (conn.state) {
+                .ClientHello => try self.readClientHello(conn, fd),
+                else => std.debug.print("I'm a teapot\n", .{}),
+            }
+
             var keep_alive: bool = undefined;
-            if (self.connections[fd_idx].requests >= CONNECTION_MAX_REQUESTS - 1) {
+            if (conn.requests >= CONNECTION_MAX_REQUESTS - 1) {
                 keep_alive = false;
             } else {
-                self.connections[fd_idx].requests += 1;
+                conn.requests += 1;
                 keep_alive = self.req.version == .@"HTTP/1.1" or self.req.keep_alive;
             }
             self.req.reset();
             self.reader.reset();
-            try self.reader.readRequest(fd, self.req);
+            //try self.reader.readRequest(fd, self.req);
             self.resp.reset();
             self.handler.handleRequest(self.req, self.resp);
             try self.respond(fd, keep_alive);
             if (self.resp.is_ws_upgrade) {
-                self.connections[fd_idx].reset();
+                conn.reset();
                 try self.poller.removeSocket(fd);
                 try self.ws.addSocket(fd);
             }
             if (!keep_alive and !self.resp.is_ws_upgrade) return error.DoNotKeepAlive;
+        }
+
+        pub fn readClientHello(self: *Self, conn: *Connection, fd: posix.socket_t) !void {
+            // Read client random data
+            const record_header = try self.reader.read(fd, 5);
+            if (record_header[0] != 0x16) {
+                std.debug.print("expected 0x16 got 0x{x}\n", .{record_header[0]});
+                return error.ExpectedHandshakeRecord;
+            }
+            if (record_header[1] != 0x03 and record_header[2] != 0x04) {
+                return error.IncompatibleTLSVersion;
+            }
+            const record_len = std.mem.readInt(u16, record_header[3..5], .big);
+            const handshake = try self.reader.read(fd, @intCast(record_len));
+            if (handshake[0] != 0x01) {
+                return error.ExpectedClientHello;
+            }
+            const handshake_len = std.mem.readInt(u24, handshake[1..4], .big);
+            std.debug.print("Handshake length: {}\n", .{handshake_len});
+            // Discard client version (2 bytes)
+            @memcpy(conn.client_random[0..], handshake[6 .. 6 + 32]);
+            var i: usize = 6 + 32;
+            // Discard session ID
+            const session_id_len = handshake[i];
+            i += 1 + session_id_len;
+            // Read cipher suites
+            const cipher_suites_len = std.mem.readInt(u16, handshake[i .. i + 2][0..2], .big);
+            i += 2;
+            //const cipher_suites = handshake[i .. i + cipher_suites_len];
+            i += cipher_suites_len;
+            // Discard compression methods (2 bytes)
+            i += 2;
+            const extensions_len = std.mem.readInt(u16, handshake[i .. i + 2][0..2], .big);
+            i += 2;
+            //const extensions = try self.reader.read(fd, @intCast(extensions_len));
+            // TODO: parse extensions
+            i += extensions_len;
         }
 
         inline fn respond(self: *Self, fd: posix.socket_t, keep_alive: bool) !void {

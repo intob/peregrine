@@ -2,13 +2,13 @@ const native_os = @import("builtin").os.tag;
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
-const Poller = @import("./poller.zig").Poller;
-const Header = @import("./header.zig").Header;
-const Request = @import("./request.zig").Request;
+const Poller = @import("../poller.zig").Poller;
+const Header = @import("../header.zig").Header;
+const Request = @import("../request.zig").Request;
 const RequestReader = @import("./reader.zig").RequestReader;
-const Response = @import("./response.zig").Response;
-const Status = @import("./status.zig").Status;
-const WebsocketServer = @import("./ws/server.zig").WebsocketServer;
+const Response = @import("../response.zig").Response;
+const Status = @import("../status.zig").Status;
+const WebsocketServer = @import("../ws/server.zig").WebsocketServer;
 
 const CONNECTION_MAX_REQUESTS: u16 = 65535;
 // This is added to a response that contains no body. This is more efficient than
