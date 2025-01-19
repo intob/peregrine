@@ -80,20 +80,6 @@ The server handles the following signals for graceful shutdown:
 - SIGINT (Ctrl+C)
 - SIGTERM
 
-## No TLS support (for now)
-I spent a couple of hours deliberating over how to either provide TLS support, or expose an interface for users to provide their choice of TLS implementation. I'm looking for a clean way to handle this without sacrificing performance or usability. I think something like this would be ideal for the user:
-```zig
-const http_server = try per.Server(Handler).init(allocator, port, .{});
-const https_server = try per.TLSServer(Handler, TLS).init(allocator, port, .{});
-```
-When I tried to implement this, I quickly saw that it would be challenging because TLSServer has a handshake, and the plain HTTP server does not. The two look entirely different at the socket level.
-
-Then I realised that even if I added TLS support, server performance would pale in comparison to the plain HTTP version. At this point, I'd rather offload TLS termination (to a load balancer, for example), allowing this server to focus on efficient HTTP parsing without becoming overwhelmingly complex.
-
-In future when I'm more familiar with comptime generics and interfaces in Zig, I may have another crack at this. For now, I don't see a way to win here... So, If you're looking for a Zig HTTP server that supports TLS, I suggest looking at [Zap](https://github.com/zigzap/zap).
-
-In addition, I am absolutely not ready to implement TLS from scratch. It would be the death of this project if I tried.
-
 ## Usage
 
 ### Run the counter example server natively
@@ -256,13 +242,13 @@ If you want a more substantial HTTP library, I suggest that you look at [Zap](ht
 ## To do
 Until these things are done, I don't think that this project can possibly be considered production-ready.
 
+- TLS 1.3 support
+- Handle request body
 - Implement better worker selection than round-robin
 - Set Worker thread CPU affinity
 - Make WebSocket component multi-threaded
 - Benchmark connection-pooling (will it improve response times under load?)
-- Handle request body (deferred until I'm happy with overall performance and stability)
 - API reference
-- TLS 1.3 support (hard, but I need to do it at some point)
 - Add a response helper to set content-length header from an integer. Maybe use a pre-allocated buffer that can be reused.
 
 ## Nice to have
