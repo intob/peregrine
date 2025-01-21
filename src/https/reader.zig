@@ -9,8 +9,8 @@ pub const TLSReader = struct {
     const Self = @This();
 
     buf: []align(64) u8,
-    pos: usize align(64) = 0, // Current position in buffer
-    len: usize align(64) = 0, // Amount of valid data in buffer
+    pos: usize align(64) = 0,
+    len: usize align(64) = 0,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, buffer_size: usize) !*Self {
@@ -34,7 +34,7 @@ pub const TLSReader = struct {
         self.len = 0;
     }
 
-    pub fn read(self: *Self, fd: posix.socket_t, want: usize) ![]const u8 {
+    pub fn read(self: *Self, fd: i32, want: usize) ![]const u8 {
         if (self.len - self.pos < want) {
             const n = try posix.read(fd, self.buf[self.pos..]);
             if (n == 0) return error.EOF;
