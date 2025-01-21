@@ -7,7 +7,6 @@ pub const RecordType = enum(u8) {
 
 pub const HandshakeType = enum(u8) {
     client_hello = 0x01,
-    //server_hello = 0x02,
     encrypted_extensions = 0x08,
     certificate = 0x0b,
     certificate_verify = 0x0f,
@@ -65,7 +64,7 @@ pub const SignatureAlgorithm = enum(u16) {
     ed448 = 0x0808,
 };
 
-const KeyShare = struct {
+pub const KeyShare = struct {
     group: CryptoGroup,
     key_exchange: []const u8,
 };
@@ -74,6 +73,8 @@ pub const ClientHello = struct {
     allocator: std.mem.Allocator,
     random: [32]u8 = undefined,
     session_id: []const u8 = undefined,
+    // TODO: simplify these lists to single values,
+    // as they can be set when parsing.
     cipher_suites: std.ArrayList(CipherSuite),
     supported_groups: std.ArrayList(CryptoGroup),
     signature_algorithms: std.ArrayList(SignatureAlgorithm),
@@ -155,6 +156,8 @@ pub fn parseClientHello(allocator: std.mem.Allocator, data: []const u8) !*Client
         pos += 2;
         try parseExtensions(data[pos..][0..extensions_len], &extensions);
     }
+
+    var supported_versions_found = false;
     for (extensions.items) |ext| {
         switch (ext.extension_type) {
             .supported_versions => {
@@ -162,6 +165,7 @@ pub fn parseClientHello(allocator: std.mem.Allocator, data: []const u8) !*Client
                 if (!supports.tls_1_3) {
                     return error.NoTLS1_3_Support;
                 }
+                supported_versions_found = true;
             },
             .supported_groups => try parseExtSupportedGroups(ext.data, &result.supported_groups),
             .signature_algorithms => try parseExtSignatureAlgorithms(ext.data, &result.signature_algorithms),
@@ -169,6 +173,7 @@ pub fn parseClientHello(allocator: std.mem.Allocator, data: []const u8) !*Client
             else => std.debug.print("unhandled extension: {}\n", .{ext.extension_type}),
         }
     }
+    if (!supported_versions_found) return error.MissingSupportedVersionsExtension;
 
     return result;
 }

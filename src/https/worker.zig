@@ -151,12 +151,14 @@ pub fn TLSWorker(comptime Handler: type) type {
             switch (conn.state) {
                 .@"01_ClientHello" => {
                     try self.readClientHello(conn, fd);
+                    // Send server hello
+                    // Generate handshake keys
                 },
                 else => std.debug.print("I'm a teapot\n", .{}),
             }
         }
 
-        pub fn readClientHello(self: *Self, _: *Connection, fd: i32) !void {
+        pub fn readClientHello(self: *Self, conn: *Connection, fd: i32) !void {
             const record = try parser.parseRecord(self.reader, fd);
             if (record.record_type != .handshake) return error.ExpectedHandshake;
             const hello = try parser.parseClientHello(self.allocator, record.data);
@@ -166,6 +168,8 @@ pub fn TLSWorker(comptime Handler: type) type {
             for (hello.supported_groups.items) |sg| {
                 std.debug.print("supported group: {}\n", .{sg});
             }
+            if (hello.supported_groups.items.len == 0) return error.NoSupportedGroups;
+            try conn.generateKey(hello.supported_groups.items[0]);
             for (hello.signature_algorithms.items) |sa| {
                 std.debug.print("signature algorithm: {}\n", .{sa});
             }
