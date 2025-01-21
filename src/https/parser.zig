@@ -44,12 +44,40 @@ pub const CryptoGroup = enum(u16) {
     x25519_kyber768d00 = 0x6244,
 };
 
+pub const SignatureAlgorithm = enum(u16) {
+    // Legacy RSASSA-PKCS1-v1_5 algorithms
+    rsa_pkcs1_sha256 = 0x0401,
+    rsa_pkcs1_sha384 = 0x0501,
+    rsa_pkcs1_sha512 = 0x0601,
+
+    // ECDSA algorithms
+    ecdsa_secp256r1_sha256 = 0x0403,
+    ecdsa_secp384r1_sha384 = 0x0503,
+    ecdsa_secp521r1_sha512 = 0x0603,
+
+    // RSASSA-PSS algorithms with public key OID rsaEncryption
+    rsa_pss_sha256 = 0x0804,
+    rsa_pss_sha384 = 0x0805,
+    rsa_pss_sha512 = 0x0806,
+
+    // EdDSA algorithms
+    ed25519 = 0x0807,
+    ed448 = 0x0808,
+};
+
+const KeyShare = struct {
+    group: CryptoGroup,
+    key_exchange: []const u8,
+};
+
 pub const ClientHello = struct {
     allocator: std.mem.Allocator,
     random: [32]u8 = undefined,
     session_id: []const u8 = undefined,
     cipher_suites: std.ArrayList(CipherSuite),
     supported_groups: std.ArrayList(CryptoGroup),
+    signature_algorithms: std.ArrayList(SignatureAlgorithm),
+    key_shares: std.ArrayList(KeyShare),
 
     pub fn init(allocator: std.mem.Allocator) !*ClientHello {
         const result = try allocator.create(ClientHello);
@@ -57,6 +85,8 @@ pub const ClientHello = struct {
             .allocator = allocator,
             .cipher_suites = std.ArrayList(CipherSuite).init(allocator),
             .supported_groups = std.ArrayList(CryptoGroup).init(allocator),
+            .signature_algorithms = std.ArrayList(SignatureAlgorithm).init(allocator),
+            .key_shares = std.ArrayList(KeyShare).init(allocator),
         };
         return result;
     }
@@ -64,6 +94,8 @@ pub const ClientHello = struct {
     pub fn deinit(self: *ClientHello) void {
         self.cipher_suites.deinit();
         self.supported_groups.deinit();
+        self.signature_algorithms.deinit();
+        self.key_shares.deinit();
         self.allocator.destroy(self);
     }
 };
@@ -131,9 +163,9 @@ pub fn parseClientHello(allocator: std.mem.Allocator, data: []const u8) !*Client
                     return error.NoTLS1_3_Support;
                 }
             },
-            .supported_groups => {
-                try parseExtSupportedGroups(ext.data, &result.supported_groups);
-            },
+            .supported_groups => try parseExtSupportedGroups(ext.data, &result.supported_groups),
+            .signature_algorithms => try parseExtSignatureAlgorithms(ext.data, &result.signature_algorithms),
+            .key_share => try parseExtKeyShare(ext.data, &result.key_shares),
             else => std.debug.print("unhandled extension: {}\n", .{ext.extension_type}),
         }
     }
@@ -150,7 +182,7 @@ fn parseExtensions(data: []const u8, extensions: *std.ArrayList(Extension)) !voi
         pos += 2;
         defer pos += ext_len;
         const ext_type = std.meta.intToEnum(ExtensionType, ext_type_raw) catch {
-            std.debug.print("skipping unknown extension type: {}\n", .{ext_type_raw});
+            //std.debug.print("skipping unknown extension type: {}\n", .{ext_type_raw});
             continue;
         };
         try extensions.append(.{
@@ -197,11 +229,64 @@ fn parseExtSupportedGroups(data: []const u8, list: *std.ArrayList(CryptoGroup)) 
 
     var i: usize = 2;
     while (i < 2 + list_len) : (i += 2) {
-        const group_id = (@as(u16, data[i]) << 8) | data[i + 1];
-        const group = std.meta.intToEnum(CryptoGroup, group_id) catch {
-            std.debug.print("skipping unsupported group: {}\n", .{group_id});
+        const raw = (@as(u16, data[i]) << 8) | data[i + 1];
+        const group = std.meta.intToEnum(CryptoGroup, raw) catch {
+            //std.debug.print("skipping unsupported group: {}\n", .{raw});
             continue;
         };
         try list.append(group);
     }
+}
+
+fn parseExtSignatureAlgorithms(data: []const u8, list: *std.ArrayList(SignatureAlgorithm)) !void {
+    if (data.len < 2) return error.InvalidLength;
+
+    // First 2 bytes are the length of the signature algorithms list
+    const list_len = (@as(u16, data[0]) << 8) | data[1];
+    if (data.len < 2 + list_len) return error.InvalidLength;
+
+    // Each signature algorithm is 2 bytes
+    if (list_len % 2 != 0) return error.InvalidFormat;
+
+    var i: usize = 2;
+    while (i < 2 + list_len) : (i += 2) {
+        const raw = (@as(u16, data[i]) << 8) | data[i + 1];
+        const sig_alg = std.meta.intToEnum(SignatureAlgorithm, raw) catch {
+            //std.debug.print("skipping unsupported sig alg: {}\n", .{raw});
+            continue;
+        };
+        try list.append(sig_alg);
+    }
+}
+
+fn parseExtKeyShare(data: []const u8, list: *std.ArrayList(KeyShare)) !void {
+    if (data.len < 2) return error.InvalidLength;
+
+    // First 2 bytes are the length of all key share entries
+    const list_len = (@as(u16, data[0]) << 8) | data[1];
+    if (data.len < 2 + list_len) return error.InvalidLength;
+
+    var offset: usize = 2;
+    while (offset < 2 + list_len) {
+        if (offset + 4 > data.len) return error.InvalidLength;
+
+        // Parse group (2 bytes)
+        const group_id = (@as(u16, data[offset]) << 8) | data[offset + 1];
+        offset += 2;
+
+        // Parse key exchange length (2 bytes)
+        const key_exchange_len = (@as(u16, data[offset]) << 8) | data[offset + 1];
+        offset += 2;
+
+        if (offset + key_exchange_len > data.len) return error.InvalidLength;
+
+        try list.append(.{
+            .group = @enumFromInt(group_id),
+            .key_exchange = data[offset .. offset + key_exchange_len],
+        });
+
+        offset += key_exchange_len;
+    }
+
+    if (offset != 2 + list_len) return error.InvalidFormat;
 }

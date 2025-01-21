@@ -166,6 +166,12 @@ pub fn TLSWorker(comptime Handler: type) type {
             for (hello.supported_groups.items) |sg| {
                 std.debug.print("supported group: {}\n", .{sg});
             }
+            for (hello.signature_algorithms.items) |sa| {
+                std.debug.print("signature algorithm: {}\n", .{sa});
+            }
+            for (hello.key_shares.items) |ks| {
+                std.debug.print("key share: {}\n", .{ks});
+            }
         }
 
         inline fn respond(self: *Self, fd: posix.socket_t, keep_alive: bool) !void {
