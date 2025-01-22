@@ -28,18 +28,27 @@ pub const Connection = struct {
     server_key: ServerKey,
     cipher_suite: parser.CipherSuite,
     client_key_share: parser.KeyShare,
+    handshake_to_digest: std.ArrayList(u8),
+    shared_secret: std.ArrayList(u8),
 
     pub fn init(self: *Connection, allocator: std.mem.Allocator) void {
         self.allocator = allocator;
         self.server_key = .{ .none = {} };
+        self.handshake_to_digest = std.ArrayList(u8).init(allocator);
+        self.shared_secret = std.ArrayList(u8).init(allocator);
     }
 
-    pub fn deinit(_: *Connection) void {}
+    pub fn deinit(self: *Connection) void {
+        self.handshake_to_digest.deinit();
+        self.shared_secret.deinit();
+    }
 
     pub fn reset(self: *Connection) void {
         self.state = .@"01_ClientHello";
         self.requests = 0;
         self.server_key = .{ .none = {} };
+        self.handshake_to_digest.clearRetainingCapacity();
+        self.shared_secret.clearRetainingCapacity();
     }
 
     pub fn generateKey(self: *Connection, group: parser.CryptoGroup) !void {

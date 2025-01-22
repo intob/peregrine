@@ -19,8 +19,6 @@ pub const CipherSuite = enum(u16) {
     TLS_AES_128_GCM_SHA256 = 0x1301,
     TLS_AES_256_GCM_SHA384 = 0x1302,
     TLS_CHACHA20_POLY1305_SHA256 = 0x1303,
-    TLS_EMPTY_RENEGOTIATION_INFO_SCSV = 0x00ff,
-    _,
 };
 
 pub const Extension = struct {

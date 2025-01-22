@@ -2,6 +2,10 @@ const native_os = @import("builtin").os.tag;
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
+const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha384 = std.crypto.hash.sha2.Sha384;
+const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
+const HkdfSha384 = @import("./hkdf_sha384.zig").HkdfSha384;
 const Poller = @import("../poller.zig").Poller;
 const Header = @import("../header.zig").Header;
 const Request = @import("../request.zig").Request;
@@ -153,36 +157,17 @@ pub fn TLSWorker(comptime Handler: type) type {
                 .@"01_ClientHello" => {
                     try self.readClientHello(conn, fd);
                     try conn.generateKey(conn.client_key_share.group);
-                    const response = try writer.buildServerHello(self.allocator, .{
-                        .cs = conn.cipher_suite,
-                        .ks = .{
-                            .group = conn.client_key_share.group,
-                            .key_exchange = switch (conn.client_key_share.group) {
-                                .x25519 => conn.server_key.ecdhe.public_key[0..],
-                                else => return error.KeyShareNotImplemented,
-                            },
-                        },
-                        .legacy_session_id = conn.legacy_session_id,
-                    });
-                    defer {
-                        response.deinit();
-                        self.allocator.destroy(response);
-                    }
-                    // TODO: calculate the hash of the response (excluding the 5-byte header)
-                    // RESUME HERE!!!
-                    var n: usize = 0;
-                    while (n < response.items.len) {
-                        n += try posix.write(fd, response.items[n..]);
-                    }
-                    std.debug.print("responsed with {x}\n", .{response.items});
+                    try self.writeServerHello(conn, fd);
+                    try self.deriveKeys(conn);
                 },
                 else => std.debug.print("I'm a teapot\n", .{}),
             }
         }
 
-        pub fn readClientHello(self: *Self, conn: *Connection, fd: i32) !void {
+        fn readClientHello(self: *Self, conn: *Connection, fd: i32) !void {
             const record = try parser.parseRecord(self.reader, fd);
             if (record.record_type != .handshake) return error.ExpectedHandshake;
+            try conn.handshake_to_digest.appendSlice(record.data[5..]);
             const hello = try parser.parseClientHello(self.allocator, record.data);
             defer hello.deinit(); // Must copy everything that we need
             // TODO: check if TLS 1.3 session ID is always 32 bytes,
@@ -208,7 +193,123 @@ pub fn TLSWorker(comptime Handler: type) type {
             conn.client_key_share = hello.key_shares.items[0];
         }
 
-        inline fn respond(self: *Self, fd: posix.socket_t, keep_alive: bool) !void {
+        fn writeServerHello(self: *Self, conn: *Connection, fd: i32) !void {
+            const response = try writer.buildServerHello(self.allocator, .{
+                .cs = conn.cipher_suite,
+                .ks = .{
+                    .group = conn.client_key_share.group,
+                    .key_exchange = switch (conn.client_key_share.group) {
+                        .x25519 => conn.server_key.ecdhe.public_key[0..],
+                        else => return error.KeyShareNotImplemented,
+                    },
+                },
+                .legacy_session_id = conn.legacy_session_id,
+            });
+            defer {
+                response.deinit();
+                self.allocator.destroy(response);
+            }
+            try conn.handshake_to_digest.appendSlice(response.items[5..]);
+            var n: usize = 0;
+            while (n < response.items.len) {
+                n += try posix.write(fd, response.items[n..]);
+            }
+            std.debug.print("responsed with {x}\n", .{response.items});
+        }
+
+        fn deriveKeys(_: *Self, conn: *Connection) !void {
+            switch (conn.client_key_share.group) {
+                .x25519 => {
+                    var client_key: [32]u8 = undefined;
+                    @memcpy(client_key[0..], conn.client_key_share.key_exchange[0..]);
+                    const shared_secret = try std.crypto.dh.X25519.scalarmult(conn.server_key.ecdhe.secret_key, client_key);
+                    try conn.shared_secret.appendSlice(shared_secret[0..]);
+                },
+                else => std.debug.print("key type not implemented", .{}),
+            }
+            switch (conn.cipher_suite) {
+                .TLS_AES_128_GCM_SHA256, .TLS_CHACHA20_POLY1305_SHA256 => {
+                    var hello_digest: [32]u8 = undefined;
+                    Sha256.hash(conn.handshake_to_digest.items, &hello_digest, .{});
+                    const empty_hash = comptime blk: {
+                        @setEvalBranchQuota(10000);
+                        var hash: [32]u8 = undefined;
+                        var hasher = Sha256.init(.{});
+                        hasher.final(&hash);
+                        break :blk hash;
+                    };
+                    const early_secret = HkdfSha256.extract(&[_]u8{0x00}, &[_]u8{0} ** 32);
+                    var derived_secret: [32]u8 = undefined;
+                    hkdfSha256ExpandLabel(&derived_secret, early_secret, "derived", &empty_hash);
+                    std.debug.print("derived secret: {x}\n", .{derived_secret});
+                },
+                .TLS_AES_256_GCM_SHA384 => {
+                    var hello_digest: [48]u8 = undefined;
+                    Sha384.hash(conn.handshake_to_digest.items, &hello_digest, .{});
+                    const empty_hash = comptime blk: {
+                        @setEvalBranchQuota(10000);
+                        var hash: [48]u8 = undefined;
+                        var hasher = Sha384.init(.{});
+                        hasher.final(&hash);
+                        break :blk hash;
+                    };
+                    const early_secret = HkdfSha384.extract(&[_]u8{0x00}, &[_]u8{0} ** 48);
+                    var derived_secret: [48]u8 = undefined;
+                    hkdfSha384ExpandLabel(&derived_secret, early_secret, "derived", &empty_hash);
+                    std.debug.print("derived secret: {x}\n", .{derived_secret});
+                    const handshake_secret = HkdfSha384.extract(derived_secret[0..], conn.shared_secret.items);
+                    std.debug.print("handshake secret: {x}\n", .{handshake_secret});
+                },
+            }
+        }
+
+        fn hkdfSha256ExpandLabel(out: []u8, secret: [32]u8, label: []const u8, context: []const u8) void {
+            const tls13_label = "tls13 ";
+            var hkdf_label: [512]u8 = undefined;
+            var i: usize = 0;
+            // Length (2 bytes)
+            hkdf_label[i] = 0;
+            hkdf_label[i + 1] = @intCast(out.len);
+            i += 2;
+            // Label length and label
+            hkdf_label[i] = @intCast(tls13_label.len + label.len);
+            i += 1;
+            @memcpy(hkdf_label[i..][0..tls13_label.len], tls13_label);
+            i += tls13_label.len;
+            @memcpy(hkdf_label[i..][0..label.len], label);
+            i += label.len;
+            // Context length and context
+            hkdf_label[i] = @intCast(context.len);
+            i += 1;
+            @memcpy(hkdf_label[i..][0..context.len], context);
+            i += context.len;
+            HkdfSha256.expand(out, hkdf_label[0..i], secret);
+        }
+
+        fn hkdfSha384ExpandLabel(out: []u8, secret: [48]u8, label: []const u8, context: []const u8) void {
+            const tls13_label = "tls13 ";
+            var hkdf_label: [512]u8 = undefined;
+            var i: usize = 0;
+            // Length (2 bytes)
+            hkdf_label[i] = 0;
+            hkdf_label[i + 1] = @intCast(out.len);
+            i += 2;
+            // Label length and label
+            hkdf_label[i] = @intCast(tls13_label.len + label.len);
+            i += 1;
+            @memcpy(hkdf_label[i..][0..tls13_label.len], tls13_label);
+            i += tls13_label.len;
+            @memcpy(hkdf_label[i..][0..label.len], label);
+            i += label.len;
+            // Context length and context
+            hkdf_label[i] = @intCast(context.len);
+            i += 1;
+            @memcpy(hkdf_label[i..][0..context.len], context);
+            i += context.len;
+            HkdfSha384.expand(out, hkdf_label[0..i], secret);
+        }
+
+        fn respond(self: *Self, fd: posix.socket_t, keep_alive: bool) !void {
             const status_len = try self.resp.serialiseStatusAndHeaders();
             self.iovecs[0] = .{
                 .base = @ptrCast(self.resp.status_buf[0..status_len]),
