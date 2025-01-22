@@ -24,7 +24,10 @@ pub const Connection = struct {
     state: ConnectionState,
     requests: u16,
     client_random: [32]u8,
+    legacy_session_id: ?[32]u8,
     server_key: ServerKey,
+    cipher_suite: parser.CipherSuite,
+    client_key_share: parser.KeyShare,
 
     pub fn init(self: *Connection, allocator: std.mem.Allocator) void {
         self.allocator = allocator;

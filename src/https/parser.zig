@@ -7,6 +7,7 @@ pub const RecordType = enum(u8) {
 
 pub const HandshakeType = enum(u8) {
     client_hello = 0x01,
+    server_hello = 0x02,
     encrypted_extensions = 0x08,
     certificate = 0x0b,
     certificate_verify = 0x0f,
@@ -72,7 +73,7 @@ pub const KeyShare = struct {
 pub const ClientHello = struct {
     allocator: std.mem.Allocator,
     random: [32]u8 = undefined,
-    session_id: []const u8 = undefined,
+    legacy_session_id: ?[32]u8 = null,
     // TODO: simplify these lists to single values,
     // as they can be set when parsing.
     cipher_suites: std.ArrayList(CipherSuite),
@@ -134,8 +135,14 @@ pub fn parseClientHello(allocator: std.mem.Allocator, data: []const u8) !*Client
 
     const session_id_len = data[pos];
     pos += 1;
-    result.session_id = data[pos..][0..session_id_len];
-    pos += session_id_len;
+    if (session_id_len == 0) {
+        result.legacy_session_id = null;
+    } else {
+        if (session_id_len != 32) return error.UnsupportedLegacySessionIDLen;
+        result.legacy_session_id = [_]u8{0} ** 32;
+        @memcpy(result.legacy_session_id.?[0..32], data[pos..][0..32]);
+        pos += session_id_len;
+    }
 
     const cipher_suites_len = std.mem.readInt(u16, data[pos..][0..2], .big);
     pos += 2;

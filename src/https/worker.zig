@@ -10,6 +10,7 @@ const Response = @import("../response.zig").Response;
 const Status = @import("../status.zig").Status;
 const WebsocketServer = @import("../ws/server.zig").WebsocketServer;
 const parser = @import("./parser.zig");
+const writer = @import("./writer.zig");
 const Connection = @import("./connection.zig").Connection;
 
 const CONNECTION_MAX_REQUESTS: u16 = 65535;
@@ -151,8 +152,29 @@ pub fn TLSWorker(comptime Handler: type) type {
             switch (conn.state) {
                 .@"01_ClientHello" => {
                     try self.readClientHello(conn, fd);
-                    // Send server hello
-                    // Generate handshake keys
+                    try conn.generateKey(conn.client_key_share.group);
+                    const response = try writer.buildServerHello(self.allocator, .{
+                        .cs = conn.cipher_suite,
+                        .ks = .{
+                            .group = conn.client_key_share.group,
+                            .key_exchange = switch (conn.client_key_share.group) {
+                                .x25519 => conn.server_key.ecdhe.public_key[0..],
+                                else => return error.KeyShareNotImplemented,
+                            },
+                        },
+                        .legacy_session_id = conn.legacy_session_id,
+                    });
+                    defer {
+                        response.deinit();
+                        self.allocator.destroy(response);
+                    }
+                    // TODO: calculate the hash of the response (excluding the 5-byte header)
+                    // RESUME HERE!!!
+                    var n: usize = 0;
+                    while (n < response.items.len) {
+                        n += try posix.write(fd, response.items[n..]);
+                    }
+                    std.debug.print("responsed with {x}\n", .{response.items});
                 },
                 else => std.debug.print("I'm a teapot\n", .{}),
             }
@@ -162,9 +184,15 @@ pub fn TLSWorker(comptime Handler: type) type {
             const record = try parser.parseRecord(self.reader, fd);
             if (record.record_type != .handshake) return error.ExpectedHandshake;
             const hello = try parser.parseClientHello(self.allocator, record.data);
+            defer hello.deinit(); // Must copy everything that we need
+            // TODO: check if TLS 1.3 session ID is always 32 bytes,
+            // if so, we can just keep it on the stack for simplicity.
+            conn.legacy_session_id = hello.legacy_session_id;
             for (hello.cipher_suites.items) |cs| {
                 std.debug.print("cipher suite: {}\n", .{cs});
             }
+            if (hello.cipher_suites.items.len == 0) return error.NoCipherSuites;
+            conn.cipher_suite = hello.cipher_suites.items[0];
             for (hello.supported_groups.items) |sg| {
                 std.debug.print("supported group: {}\n", .{sg});
             }
@@ -176,6 +204,8 @@ pub fn TLSWorker(comptime Handler: type) type {
             for (hello.key_shares.items) |ks| {
                 std.debug.print("key share: {}\n", .{ks});
             }
+            if (hello.key_shares.items.len == 0) return error.NoKeyShares;
+            conn.client_key_share = hello.key_shares.items[0];
         }
 
         inline fn respond(self: *Self, fd: posix.socket_t, keep_alive: bool) !void {
