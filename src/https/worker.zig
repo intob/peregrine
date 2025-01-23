@@ -4,8 +4,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha384 = std.crypto.hash.sha2.Sha384;
-const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
-const HkdfSha384 = @import("./hkdf_sha384.zig").HkdfSha384;
+const hkdf = std.crypto.kdf.hkdf;
 const Poller = @import("../poller.zig").Poller;
 const Header = @import("../header.zig").Header;
 const Request = @import("../request.zig").Request;
@@ -238,12 +237,15 @@ pub fn TLSWorker(comptime Handler: type) type {
                         hasher.final(&hash);
                         break :blk hash;
                     };
-                    const early_secret = HkdfSha256.extract(&[_]u8{0x00}, &[_]u8{0} ** 32);
+                    const early_secret = hkdf.HkdfSha256.extract(&[_]u8{0x00}, &[_]u8{0} ** 32);
                     var derived_secret: [32]u8 = undefined;
-                    hkdfSha256ExpandLabel(&derived_secret, early_secret, "derived", &empty_hash);
+                    hkdfExpandLabel(hkdf.HkdfSha256, &derived_secret, early_secret, "derived", &empty_hash);
                     std.debug.print("derived secret: {x}\n", .{derived_secret});
+                    const handshake_secret = hkdf.HkdfSha256.extract(derived_secret[0..], conn.shared_secret.items);
+                    std.debug.print("handshake secret: {x}\n", .{handshake_secret});
                 },
                 .TLS_AES_256_GCM_SHA384 => {
+                    const HkdfSha384 = hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384);
                     var hello_digest: [48]u8 = undefined;
                     Sha384.hash(conn.handshake_to_digest.items, &hello_digest, .{});
                     const empty_hash = comptime blk: {
@@ -255,7 +257,7 @@ pub fn TLSWorker(comptime Handler: type) type {
                     };
                     const early_secret = HkdfSha384.extract(&[_]u8{0x00}, &[_]u8{0} ** 48);
                     var derived_secret: [48]u8 = undefined;
-                    hkdfSha384ExpandLabel(&derived_secret, early_secret, "derived", &empty_hash);
+                    hkdfExpandLabel(HkdfSha384, &derived_secret, early_secret, "derived", &empty_hash);
                     std.debug.print("derived secret: {x}\n", .{derived_secret});
                     const handshake_secret = HkdfSha384.extract(derived_secret[0..], conn.shared_secret.items);
                     std.debug.print("handshake secret: {x}\n", .{handshake_secret});
@@ -263,7 +265,13 @@ pub fn TLSWorker(comptime Handler: type) type {
             }
         }
 
-        fn hkdfSha256ExpandLabel(out: []u8, secret: [32]u8, label: []const u8, context: []const u8) void {
+        fn hkdfExpandLabel(
+            comptime hkdf_t: type,
+            out: *[hkdf_t.prk_length]u8,
+            secret: [hkdf_t.prk_length]u8,
+            label: []const u8,
+            context: []const u8,
+        ) void {
             const tls13_label = "tls13 ";
             var hkdf_label: [512]u8 = undefined;
             var i: usize = 0;
@@ -283,30 +291,7 @@ pub fn TLSWorker(comptime Handler: type) type {
             i += 1;
             @memcpy(hkdf_label[i..][0..context.len], context);
             i += context.len;
-            HkdfSha256.expand(out, hkdf_label[0..i], secret);
-        }
-
-        fn hkdfSha384ExpandLabel(out: []u8, secret: [48]u8, label: []const u8, context: []const u8) void {
-            const tls13_label = "tls13 ";
-            var hkdf_label: [512]u8 = undefined;
-            var i: usize = 0;
-            // Length (2 bytes)
-            hkdf_label[i] = 0;
-            hkdf_label[i + 1] = @intCast(out.len);
-            i += 2;
-            // Label length and label
-            hkdf_label[i] = @intCast(tls13_label.len + label.len);
-            i += 1;
-            @memcpy(hkdf_label[i..][0..tls13_label.len], tls13_label);
-            i += tls13_label.len;
-            @memcpy(hkdf_label[i..][0..label.len], label);
-            i += label.len;
-            // Context length and context
-            hkdf_label[i] = @intCast(context.len);
-            i += 1;
-            @memcpy(hkdf_label[i..][0..context.len], context);
-            i += context.len;
-            HkdfSha384.expand(out, hkdf_label[0..i], secret);
+            hkdf_t.expand(out, hkdf_label[0..i], secret);
         }
 
         fn respond(self: *Self, fd: posix.socket_t, keep_alive: bool) !void {
