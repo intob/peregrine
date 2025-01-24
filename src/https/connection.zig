@@ -19,6 +19,24 @@ pub const ServerKey = union(enum) {
     none: void, // No key exchange data
 };
 
+const HashKeys = union(enum) {
+    SHA256: struct {
+        traffic_secret: [32]u8,
+        handshake_key: [32]u8,
+        handshake_iv: [12]u8,
+    },
+    SHA384: struct {
+        traffic_secret: [48]u8,
+        handshake_key: [48]u8,
+        handshake_iv: [12]u8,
+    },
+};
+
+const Hash = enum {
+    SHA256,
+    SHA384,
+};
+
 pub const Connection = struct {
     allocator: std.mem.Allocator,
     state: ConnectionState,
@@ -27,9 +45,12 @@ pub const Connection = struct {
     legacy_session_id: ?[32]u8,
     server_key: ServerKey,
     cipher_suite: parser.CipherSuite,
+    hash: Hash,
     client_key_share: parser.KeyShare,
     handshake_to_digest: std.ArrayList(u8),
     shared_secret: std.ArrayList(u8),
+    client_hash_keys: HashKeys,
+    server_hash_keys: HashKeys,
 
     pub fn init(self: *Connection, allocator: std.mem.Allocator) void {
         self.allocator = allocator;

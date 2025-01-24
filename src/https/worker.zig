@@ -177,6 +177,10 @@ pub fn TLSWorker(comptime Handler: type) type {
             }
             if (hello.cipher_suites.items.len == 0) return error.NoCipherSuites;
             conn.cipher_suite = hello.cipher_suites.items[0];
+            conn.hash = switch (conn.cipher_suite) {
+                .TLS_AES_128_GCM_SHA256, .TLS_CHACHA20_POLY1305_SHA256 => .SHA256,
+                .TLS_AES_256_GCM_SHA384 => .SHA384,
+            };
             for (hello.supported_groups.items) |sg| {
                 std.debug.print("supported group: {}\n", .{sg});
             }
@@ -224,10 +228,12 @@ pub fn TLSWorker(comptime Handler: type) type {
                     const shared_secret = try std.crypto.dh.X25519.scalarmult(conn.server_key.ecdhe.secret_key, client_key);
                     try conn.shared_secret.appendSlice(shared_secret[0..]);
                 },
-                else => std.debug.print("key type not implemented", .{}),
+                else => return error.KeyTypeNotImplemented,
             }
-            switch (conn.cipher_suite) {
-                .TLS_AES_128_GCM_SHA256, .TLS_CHACHA20_POLY1305_SHA256 => {
+            // TODO: the following can be de-duped by parameterising the digest length.
+            // The handshake initial value length is always 12 bytes.
+            switch (conn.hash) {
+                .SHA256 => {
                     var hello_digest: [32]u8 = undefined;
                     Sha256.hash(conn.handshake_to_digest.items, &hello_digest, .{});
                     const empty_hash = comptime blk: {
@@ -239,12 +245,12 @@ pub fn TLSWorker(comptime Handler: type) type {
                     };
                     const early_secret = hkdf.HkdfSha256.extract(&[_]u8{0x00}, &[_]u8{0} ** 32);
                     var derived_secret: [32]u8 = undefined;
-                    hkdfExpandLabel(hkdf.HkdfSha256, &derived_secret, early_secret, "derived", &empty_hash);
+                    hkdfExpandLabel(hkdf.HkdfSha256, 32, &derived_secret, early_secret, "derived", &empty_hash);
                     std.debug.print("derived secret: {x}\n", .{derived_secret});
                     const handshake_secret = hkdf.HkdfSha256.extract(derived_secret[0..], conn.shared_secret.items);
                     std.debug.print("handshake secret: {x}\n", .{handshake_secret});
                 },
-                .TLS_AES_256_GCM_SHA384 => {
+                .SHA384 => {
                     const HkdfSha384 = hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384);
                     var hello_digest: [48]u8 = undefined;
                     Sha384.hash(conn.handshake_to_digest.items, &hello_digest, .{});
@@ -257,41 +263,47 @@ pub fn TLSWorker(comptime Handler: type) type {
                     };
                     const early_secret = HkdfSha384.extract(&[_]u8{0x00}, &[_]u8{0} ** 48);
                     var derived_secret: [48]u8 = undefined;
-                    hkdfExpandLabel(HkdfSha384, &derived_secret, early_secret, "derived", &empty_hash);
+                    hkdfExpandLabel(HkdfSha384, 48, &derived_secret, early_secret, "derived", &empty_hash);
                     std.debug.print("derived secret: {x}\n", .{derived_secret});
                     const handshake_secret = HkdfSha384.extract(derived_secret[0..], conn.shared_secret.items);
                     std.debug.print("handshake secret: {x}\n", .{handshake_secret});
+                    var server_traffic_secret: [48]u8 = undefined;
+                    hkdfExpandLabel(HkdfSha384, 48, &server_traffic_secret, handshake_secret, "s hs traffic", &hello_digest);
+                    std.debug.print("server secret: {x}\n", .{server_traffic_secret});
+                    var server_handshake_key: [48]u8 = undefined;
+                    hkdfExpandLabel(HkdfSha384, 48, &server_handshake_key, server_traffic_secret, "key", "");
+                    std.debug.print("server handshake key: {x}\n", .{server_handshake_key});
+                    var server_handshake_iv: [12]u8 = undefined;
+                    hkdfExpandLabel(HkdfSha384, 12, &server_handshake_iv, server_traffic_secret, "iv", "");
+                    std.debug.print("server handshake IV: {x}\n", .{server_handshake_iv});
+                    conn.server_hash_keys = .{ .SHA384 = .{
+                        .handshake_iv = server_handshake_iv,
+                        .handshake_key = server_handshake_key,
+                        .traffic_secret = server_traffic_secret,
+                    } };
                 },
             }
         }
 
         fn hkdfExpandLabel(
             comptime hkdf_t: type,
-            out: *[hkdf_t.prk_length]u8,
+            comptime len: u8,
+            out: *[len]u8,
             secret: [hkdf_t.prk_length]u8,
             label: []const u8,
             context: []const u8,
         ) void {
             const tls13_label = "tls13 ";
             var hkdf_label: [512]u8 = undefined;
-            var i: usize = 0;
-            // Length (2 bytes)
-            hkdf_label[i] = 0;
-            hkdf_label[i + 1] = @intCast(out.len);
-            i += 2;
-            // Label length and label
-            hkdf_label[i] = @intCast(tls13_label.len + label.len);
-            i += 1;
-            @memcpy(hkdf_label[i..][0..tls13_label.len], tls13_label);
-            i += tls13_label.len;
-            @memcpy(hkdf_label[i..][0..label.len], label);
-            i += label.len;
-            // Context length and context
-            hkdf_label[i] = @intCast(context.len);
-            i += 1;
-            @memcpy(hkdf_label[i..][0..context.len], context);
-            i += context.len;
-            hkdf_t.expand(out, hkdf_label[0..i], secret);
+            hkdf_label[0] = 0;
+            hkdf_label[1] = len;
+            hkdf_label[2] = @intCast(tls13_label.len + label.len);
+            @memcpy(hkdf_label[3..][0..tls13_label.len], tls13_label);
+            @memcpy(hkdf_label[3 + tls13_label.len ..][0..label.len], label);
+            hkdf_label[3 + tls13_label.len + label.len] = @intCast(context.len);
+            @memcpy(hkdf_label[4 + tls13_label.len + label.len ..][0..context.len], context);
+            const total_len = 4 + tls13_label.len + label.len + context.len;
+            hkdf_t.expand(out, hkdf_label[0..total_len], secret);
         }
 
         fn respond(self: *Self, fd: posix.socket_t, keep_alive: bool) !void {
