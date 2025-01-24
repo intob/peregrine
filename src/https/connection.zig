@@ -1,5 +1,8 @@
 const std = @import("std");
 const parser = @import("./parser.zig");
+const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha384 = std.crypto.hash.sha2.Sha384;
+const hkdf = std.crypto.kdf.hkdf;
 
 pub const ConnectionState = enum {
     @"01_ClientHello",
@@ -32,10 +35,7 @@ const HashKeys = union(enum) {
     },
 };
 
-const Hash = enum {
-    SHA256,
-    SHA384,
-};
+const Hash = enum { SHA256, SHA384 };
 
 pub const Connection = struct {
     allocator: std.mem.Allocator,
@@ -72,12 +72,147 @@ pub const Connection = struct {
         self.shared_secret.clearRetainingCapacity();
     }
 
-    pub fn generateKey(self: *Connection, group: parser.CryptoGroup) !void {
-        switch (group) {
+    pub fn generateKey(self: *Connection) !void {
+        switch (self.client_key_share.group) {
             .x25519 => {
                 self.server_key = .{ .ecdhe = std.crypto.dh.X25519.KeyPair.generate() };
             },
             else => return error.UnsupportedGroup,
         }
     }
+
+    pub fn deriveKeys(self: *Connection) !void {
+        switch (self.client_key_share.group) {
+            .x25519 => try self.deriveX25519SharedSecret(),
+            else => return error.KeyTypeNotImplemented,
+        }
+        switch (self.hash) {
+            .SHA256 => {
+                var hello_digest: [32]u8 = undefined;
+                Sha256.hash(self.handshake_to_digest.items, &hello_digest, .{});
+                try self.deriveHashSecrets(hkdf.HkdfSha256, 32, &hello_digest, getEmptyHash(Sha256));
+            },
+            .SHA384 => {
+                var hello_digest: [48]u8 = undefined;
+                Sha384.hash(self.handshake_to_digest.items, &hello_digest, .{});
+                const HkdfSha384 = hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384);
+                try self.deriveHashSecrets(HkdfSha384, 48, &hello_digest, getEmptyHash(Sha384));
+            },
+        }
+    }
+
+    fn deriveX25519SharedSecret(self: *Connection) !void {
+        var client_key: [32]u8 = undefined;
+        @memcpy(client_key[0..], self.client_key_share.key_exchange[0..]);
+        const shared_secret = try std.crypto.dh.X25519.scalarmult(self.server_key.ecdhe.secret_key, client_key);
+        try self.shared_secret.appendSlice(shared_secret[0..]);
+    }
+
+    fn deriveHashSecrets(
+        self: *Connection,
+        comptime HkdfType: type,
+        comptime hash_len: usize,
+        hello_digest: []const u8,
+        empty_hash: [hash_len]u8,
+    ) !void {
+        const zeros = [_]u8{0} ** hash_len;
+
+        const early_secret = HkdfType.extract(&[_]u8{0x00}, &zeros);
+        var derived_secret: [hash_len]u8 = undefined;
+        hkdfExpandLabel(HkdfType, hash_len, &derived_secret, early_secret, "derived", &empty_hash);
+
+        const handshake_secret = HkdfType.extract(derived_secret[0..], self.shared_secret.items);
+
+        var server_traffic_secret: [hash_len]u8 = undefined;
+        hkdfExpandLabel(HkdfType, hash_len, &server_traffic_secret, handshake_secret, "s hs traffic", hello_digest);
+        const server_keys = deriveTrafficKeys(HkdfType, hash_len, server_traffic_secret);
+
+        var client_traffic_secret: [hash_len]u8 = undefined;
+        hkdfExpandLabel(HkdfType, hash_len, &client_traffic_secret, handshake_secret, "c hs traffic", hello_digest);
+        const client_keys = deriveTrafficKeys(HkdfType, hash_len, client_traffic_secret);
+
+        switch (hash_len) {
+            32 => {
+                self.server_hash_keys = .{
+                    .SHA256 = .{
+                        .traffic_secret = server_traffic_secret,
+                        .handshake_key = server_keys.key,
+                        .handshake_iv = server_keys.iv,
+                    },
+                };
+                self.client_hash_keys = .{
+                    .SHA256 = .{
+                        .traffic_secret = client_traffic_secret,
+                        .handshake_key = client_keys.key,
+                        .handshake_iv = client_keys.iv,
+                    },
+                };
+            },
+            48 => {
+                self.server_hash_keys = .{
+                    .SHA384 = .{
+                        .traffic_secret = server_traffic_secret,
+                        .handshake_key = server_keys.key,
+                        .handshake_iv = server_keys.iv,
+                    },
+                };
+                self.client_hash_keys = .{
+                    .SHA384 = .{
+                        .traffic_secret = client_traffic_secret,
+                        .handshake_key = client_keys.key,
+                        .handshake_iv = client_keys.iv,
+                    },
+                };
+            },
+            else => error.UnsupportedHashLen,
+        }
+
+        std.debug.print("client key: {x}\n", .{client_keys.key});
+        std.debug.print("client iv: {x}\n", .{client_keys.iv});
+        std.debug.print("server key: {x}\n", .{server_keys.key});
+        std.debug.print("server iv: {x}\n", .{server_keys.iv});
+    }
 };
+
+fn getEmptyHash(comptime T: type) [T.digest_length]u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(10000);
+        var hash: [T.digest_length]u8 = undefined;
+        var hasher = T.init(.{});
+        hasher.final(&hash);
+        break :blk hash;
+    };
+}
+
+fn deriveTrafficKeys(
+    comptime HkdfType: type,
+    comptime hash_len: usize,
+    traffic_secret: [hash_len]u8,
+) struct { key: [hash_len]u8, iv: [12]u8 } {
+    var key: [hash_len]u8 = undefined;
+    var iv: [12]u8 = undefined;
+    hkdfExpandLabel(HkdfType, hash_len, &key, traffic_secret, "key", "");
+    hkdfExpandLabel(HkdfType, 12, &iv, traffic_secret, "iv", "");
+    return .{ .key = key, .iv = iv };
+}
+
+fn hkdfExpandLabel(
+    comptime hkdf_t: type,
+    comptime len: u8,
+    out: *[len]u8,
+    secret: [hkdf_t.prk_length]u8,
+    label: []const u8,
+    context: []const u8,
+) void {
+    const tls13_label = "tls13 ";
+    var hkdf_label: [512]u8 = undefined;
+    hkdf_label[0] = 0;
+    hkdf_label[1] = len;
+    hkdf_label[2] = @intCast(tls13_label.len + label.len);
+    @memcpy(hkdf_label[3..][0..tls13_label.len], tls13_label);
+    @memcpy(hkdf_label[3 + tls13_label.len ..][0..label.len], label);
+    hkdf_label[3 + tls13_label.len + label.len] = @intCast(context.len);
+    @memcpy(hkdf_label[4 + tls13_label.len + label.len ..][0..context.len], context);
+    const total_len = 4 + tls13_label.len + label.len + context.len;
+    hkdf_t.expand(out, hkdf_label[0..total_len], secret);
+}
