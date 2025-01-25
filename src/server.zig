@@ -118,6 +118,11 @@ pub fn Server(comptime Handler: type, comptime mode: Mode) type {
                 .io_handler = io_handler,
                 .accept_threads = try allocator.alloc(std.Thread, @max(0, cfg.accept_thread_count - 1)),
             };
+            errdefer {
+                srv.ws.deinit();
+                allocator.free(srv.workers);
+                allocator.free(srv.accept_threads);
+            }
             for (srv.accept_threads) |*t| {
                 t.* = try std.Thread.spawn(.{ .allocator = allocator, .stack_size = 1024 }, loop, .{srv});
             }

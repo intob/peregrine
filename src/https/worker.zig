@@ -12,6 +12,7 @@ const WebsocketServer = @import("../ws/server.zig").WebsocketServer;
 const parser = @import("./parser.zig");
 const writer = @import("./writer.zig");
 const Connection = @import("./connection.zig").Connection;
+const cert = @import("./cert.zig");
 
 const CONNECTION_MAX_REQUESTS: u16 = 65535;
 // This is added to a response that contains no body. This is more efficient than
@@ -81,6 +82,8 @@ pub fn TLSWorker(comptime Handler: type) type {
         handler: *Handler,
         poller: Poller,
         reader: *TLSReader,
+        tls_cert: []const u8,
+        tls_key: []const u8,
         req: *Request,
         resp: *Response,
         iovecs: [4]posix.iovec_const align(64),
@@ -94,16 +97,23 @@ pub fn TLSWorker(comptime Handler: type) type {
             self.handler = cfg.handler;
             self.poller = try Poller.init();
             self.req = try Request.init(allocator);
+            errdefer self.req.deinit();
             self.resp = try Response.init(allocator, cfg.resp_body_buffer_size);
+            errdefer self.resp.deinit();
             self.reader = try TLSReader.init(self.allocator, cfg.req_buffer_size);
+            errdefer self.reader.deinit();
+            self.tls_cert = try cert.readCertificateFile(allocator, cfg.cert_filename);
+            errdefer allocator.free(self.tls_cert);
+            self.tls_key = try cert.readPrivateKeyFile(allocator, cfg.key_filename);
+            errdefer allocator.free(self.tls_key);
             self.connections = try allocator.alignedAlloc(Connection, 64, std.math.maxInt(i16));
+            errdefer allocator.free(self.connections);
             self.ws = cfg.ws;
             self.shutdown = std.atomic.Value(bool).init(false);
             self.thread = try std.Thread.spawn(.{
                 .stack_size = cfg.stack_size,
                 .allocator = allocator,
             }, workerLoop, .{self});
-            std.debug.print("{s}, {s}\n", .{ cfg.cert_filename, cfg.key_filename });
             for (self.connections) |*c| {
                 c.init(allocator);
             }
@@ -115,6 +125,8 @@ pub fn TLSWorker(comptime Handler: type) type {
             self.reader.deinit();
             self.req.deinit();
             self.resp.deinit();
+            self.allocator.free(self.tls_cert);
+            self.allocator.free(self.tls_key);
             for (self.connections) |*c| {
                 c.deinit();
             }
@@ -156,11 +168,11 @@ pub fn TLSWorker(comptime Handler: type) type {
                     try self.writeServerHello(conn, fd);
                     try conn.deriveKeys();
                     try self.writeEncryptedExtensions(conn, fd);
-                    //try self.writeCertificate(conn, fd);
+                    try self.writeCertificate(conn, fd);
                     //try self.writeCertificateVerify(conn, fd);
                     //try self.writeFinished(conn, fd);
                     conn.state = .@"02_WaitClientFinished";
-                    std.debug.print("fd {} now in state {}", .{ fd, conn.state });
+                    std.debug.print("fd {} now in state {}\n", .{ fd, conn.state });
                 },
                 else => std.debug.print("I'm a teapot. State: {}\n", .{conn.state}),
             }
@@ -205,7 +217,6 @@ pub fn TLSWorker(comptime Handler: type) type {
             while (n < response.items.len) {
                 n += try posix.write(fd, response.items[n..]);
             }
-            std.debug.print("responsed with {x}\n", .{response.items});
         }
 
         fn writeEncryptedExtensions(self: *Self, conn: *Connection, fd: i32) !void {
@@ -217,6 +228,52 @@ pub fn TLSWorker(comptime Handler: type) type {
             switch (conn.hash) {
                 .SHA256 => try self.writeEncrypted(32, conn, fd, &msg),
                 .SHA384 => try self.writeEncrypted(48, conn, fd, &msg),
+            }
+        }
+
+        fn writeCertificate(self: *Self, conn: *Connection, fd: i32) !void {
+            var buffer = std.ArrayList(u8).init(self.allocator);
+            defer buffer.deinit();
+
+            // Certificate message header
+            try buffer.append(@intFromEnum(parser.HandshakeType.certificate));
+            try buffer.appendSlice(&[_]u8{ 0x00, 0x00, 0x00 }); // length placeholder
+
+            // Certificate request context (empty for server)
+            try buffer.append(0x00);
+
+            // Certificate list length (placeholder)
+            try buffer.appendSlice(&[_]u8{ 0x00, 0x00, 0x00 });
+
+            // Add certificate
+            const cert_len = self.tls_cert.len;
+            try buffer.append(@intCast((cert_len >> 16) & 0xFF));
+            try buffer.append(@intCast((cert_len >> 8) & 0xFF));
+            try buffer.append(@intCast(cert_len & 0xFF));
+            try buffer.appendSlice(self.tls_cert);
+
+            // Certificate extensions length (0 for now)
+            try buffer.appendSlice(&[_]u8{ 0x00, 0x00 });
+
+            // Update message length
+            const msg_len = buffer.items.len - 4;
+            buffer.items[1] = @intCast((msg_len >> 16) & 0xFF);
+            buffer.items[2] = @intCast((msg_len >> 8) & 0xFF);
+            buffer.items[3] = @intCast(msg_len & 0xFF);
+
+            // Update certificate list length
+            const cert_list_len = msg_len - 1; // subtract context length
+            buffer.items[5] = @intCast((cert_list_len >> 16) & 0xFF);
+            buffer.items[6] = @intCast((cert_list_len >> 8) & 0xFF);
+            buffer.items[7] = @intCast(cert_list_len & 0xFF);
+
+            // Write to handshake digest
+            try conn.handshake_to_digest.appendSlice(buffer.items);
+
+            // Encrypt and send
+            switch (conn.hash) {
+                .SHA256 => try self.writeEncrypted(32, conn, fd, buffer.items),
+                .SHA384 => try self.writeEncrypted(48, conn, fd, buffer.items),
             }
         }
 
