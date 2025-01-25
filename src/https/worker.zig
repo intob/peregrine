@@ -1,5 +1,6 @@
 const native_os = @import("builtin").os.tag;
 const std = @import("std");
+const hkdf = std.crypto.kdf.hkdf;
 const posix = std.posix;
 const linux = std.os.linux;
 const Poller = @import("../poller.zig").Poller;
@@ -13,6 +14,7 @@ const parser = @import("./parser.zig");
 const writer = @import("./writer.zig");
 const Connection = @import("./connection.zig").Connection;
 const cert = @import("./cert.zig");
+const hkdf_expand = @import("./hkdf_expand.zig");
 
 const CONNECTION_MAX_REQUESTS: u16 = 65535;
 // This is added to a response that contains no body. This is more efficient than
@@ -83,7 +85,7 @@ pub fn TLSWorker(comptime Handler: type) type {
         poller: Poller,
         reader: *TLSReader,
         tls_cert: []const u8,
-        tls_key: []const u8,
+        tls_key: std.crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair, // TODO: support other schemes
         req: *Request,
         resp: *Response,
         iovecs: [4]posix.iovec_const align(64),
@@ -104,8 +106,9 @@ pub fn TLSWorker(comptime Handler: type) type {
             errdefer self.reader.deinit();
             self.tls_cert = try cert.readCertificateFile(allocator, cfg.cert_filename);
             errdefer allocator.free(self.tls_cert);
-            self.tls_key = try cert.readPrivateKeyFile(allocator, cfg.key_filename);
-            errdefer allocator.free(self.tls_key);
+            const priv_key = try cert.readPrivateKeyFile(allocator, cfg.key_filename);
+            defer allocator.free(priv_key);
+            self.tls_key = try cert.derToKeyPair(priv_key);
             self.connections = try allocator.alignedAlloc(Connection, 64, std.math.maxInt(i16));
             errdefer allocator.free(self.connections);
             self.ws = cfg.ws;
@@ -126,7 +129,6 @@ pub fn TLSWorker(comptime Handler: type) type {
             self.req.deinit();
             self.resp.deinit();
             self.allocator.free(self.tls_cert);
-            self.allocator.free(self.tls_key);
             for (self.connections) |*c| {
                 c.deinit();
             }
@@ -169,8 +171,11 @@ pub fn TLSWorker(comptime Handler: type) type {
                     try conn.deriveKeys();
                     try self.writeEncryptedExtensions(conn, fd);
                     try self.writeCertificate(conn, fd);
-                    //try self.writeCertificateVerify(conn, fd);
-                    //try self.writeFinished(conn, fd);
+                    try self.writeCertificateVerify(conn, fd);
+                    switch (conn.hash) {
+                        .SHA256 => try self.writeFinished(32, conn, fd),
+                        .SHA384 => try self.writeFinished(48, conn, fd),
+                    }
                     conn.state = .@"02_WaitClientFinished";
                     std.debug.print("fd {} now in state {}\n", .{ fd, conn.state });
                 },
@@ -225,59 +230,142 @@ pub fn TLSWorker(comptime Handler: type) type {
                 0x00, 0x00, 0x02, // length (2 bytes)
                 0x00, 0x00, // empty extensions list
             };
-            switch (conn.hash) {
-                .SHA256 => try self.writeEncrypted(32, conn, fd, &msg),
-                .SHA384 => try self.writeEncrypted(48, conn, fd, &msg),
-            }
+            try self.writeEncrypted(conn, fd, &msg);
         }
 
         fn writeCertificate(self: *Self, conn: *Connection, fd: i32) !void {
             var buffer = std.ArrayList(u8).init(self.allocator);
             defer buffer.deinit();
-
-            // Certificate message header
             try buffer.append(@intFromEnum(parser.HandshakeType.certificate));
             try buffer.appendSlice(&[_]u8{ 0x00, 0x00, 0x00 }); // length placeholder
-
-            // Certificate request context (empty for server)
             try buffer.append(0x00);
-
-            // Certificate list length (placeholder)
             try buffer.appendSlice(&[_]u8{ 0x00, 0x00, 0x00 });
-
-            // Add certificate
             const cert_len = self.tls_cert.len;
             try buffer.append(@intCast((cert_len >> 16) & 0xFF));
             try buffer.append(@intCast((cert_len >> 8) & 0xFF));
             try buffer.append(@intCast(cert_len & 0xFF));
             try buffer.appendSlice(self.tls_cert);
-
-            // Certificate extensions length (0 for now)
             try buffer.appendSlice(&[_]u8{ 0x00, 0x00 });
-
-            // Update message length
             const msg_len = buffer.items.len - 4;
             buffer.items[1] = @intCast((msg_len >> 16) & 0xFF);
             buffer.items[2] = @intCast((msg_len >> 8) & 0xFF);
             buffer.items[3] = @intCast(msg_len & 0xFF);
-
-            // Update certificate list length
             const cert_list_len = msg_len - 1; // subtract context length
             buffer.items[5] = @intCast((cert_list_len >> 16) & 0xFF);
             buffer.items[6] = @intCast((cert_list_len >> 8) & 0xFF);
             buffer.items[7] = @intCast(cert_list_len & 0xFF);
-
-            // Write to handshake digest
             try conn.handshake_to_digest.appendSlice(buffer.items);
+            try self.writeEncrypted(conn, fd, buffer.items);
+        }
 
-            // Encrypt and send
+        fn writeCertificateVerify(self: *Self, conn: *Connection, fd: i32) !void {
+            var buffer = std.ArrayList(u8).init(self.allocator);
+            defer buffer.deinit();
+            try buffer.append(@intFromEnum(parser.HandshakeType.certificate_verify));
+            try buffer.appendSlice(&[_]u8{ 0x00, 0x00, 0x00 }); // length placeholder
+            try buffer.appendSlice(&[_]u8{
+                0x08, 0x04, // ecdsa_secp256r1_sha256 WRONG???!!!!??????????????????????????????????????????????
+            });
+            var signature_input = std.ArrayList(u8).init(self.allocator);
+            defer signature_input.deinit();
+            const context = "TLS 1.3, server CertificateVerify\x00";
+            try signature_input.appendNTimes(0x20, 64); // 64 spaces
+            try signature_input.appendSlice(context);
             switch (conn.hash) {
-                .SHA256 => try self.writeEncrypted(32, conn, fd, buffer.items),
-                .SHA384 => try self.writeEncrypted(48, conn, fd, buffer.items),
+                .SHA256 => {
+                    var h: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(conn.handshake_to_digest.items, &h, .{});
+                    try signature_input.appendSlice(&h);
+                },
+                .SHA384 => {
+                    var h: [48]u8 = undefined;
+                    std.crypto.hash.sha2.Sha384.hash(conn.handshake_to_digest.items, &h, .{});
+                    try signature_input.appendSlice(&h);
+                },
+            }
+            var signature = try self.allocator.alloc(u8, 64); // P-256 ECDSA signature is 64 bytes
+            defer self.allocator.free(signature);
+            _ = &signature;
+            try self.signWithPrivateKey(signature_input.items, signature);
+            try buffer.append(@intCast((signature.len >> 8) & 0xFF));
+            try buffer.append(@intCast(signature.len & 0xFF));
+            try buffer.appendSlice(signature);
+            const msg_len = buffer.items.len - 4;
+            buffer.items[1] = @intCast((msg_len >> 16) & 0xFF);
+            buffer.items[2] = @intCast((msg_len >> 8) & 0xFF);
+            buffer.items[3] = @intCast(msg_len & 0xFF);
+            try conn.handshake_to_digest.appendSlice(buffer.items);
+            try self.writeEncrypted(conn, fd, buffer.items);
+        }
+
+        fn signWithPrivateKey(self: *Self, data: []const u8, signature: []u8) !void {
+            // TODO: should we be adding noise to the signature?
+            var sig = try self.tls_key.sign(data, null);
+            @memcpy(signature[0..32], &sig.r);
+            @memcpy(signature[32..64], &sig.s);
+        }
+
+        fn writeFinished(self: *Self, comptime hash_len: u8, conn: *Connection, fd: i32) !void {
+            var buffer = std.ArrayList(u8).init(self.allocator);
+            defer buffer.deinit();
+            try buffer.append(@intFromEnum(parser.HandshakeType.finished));
+            try buffer.appendSlice(&[_]u8{ 0x00, 0x00, 0x00 }); // length placeholder
+            var transcript_hash: [hash_len]u8 = undefined;
+            switch (hash_len) {
+                32 => std.crypto.hash.sha2.Sha256.hash(conn.handshake_to_digest.items, &transcript_hash, .{}),
+                48 => std.crypto.hash.sha2.Sha384.hash(conn.handshake_to_digest.items, &transcript_hash, .{}),
+                else => return error.UnsupportedHashLen,
+            }
+            var finished_key: [hash_len]u8 = undefined;
+            const server_secret = switch (hash_len) {
+                32 => conn.server_hash_keys.SHA256.traffic_secret,
+                48 => conn.server_hash_keys.SHA384.traffic_secret,
+                else => return error.UnsupportedHashLen,
+            };
+            hkdf_expand.hkdfExpandLabel(
+                switch (hash_len) {
+                    32 => hkdf.HkdfSha256,
+                    48 => hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384),
+                    else => return error.UnsupportedHashLen,
+                },
+                hash_len,
+                &finished_key,
+                server_secret,
+                "finished",
+                "",
+            );
+            var verify_data: [48]u8 = undefined;
+            switch (hash_len) {
+                32 => {
+                    var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(finished_key[0..32]);
+                    hmac.update(transcript_hash[0..32]);
+                    hmac.final(verify_data[0..32]);
+                    try buffer.appendSlice(verify_data[0..32]);
+                },
+                48 => {
+                    var hmac = std.crypto.auth.hmac.sha2.HmacSha384.init(finished_key[0..48]);
+                    hmac.update(transcript_hash[0..48]);
+                    hmac.final(&verify_data);
+                    try buffer.appendSlice(verify_data[0..48]);
+                },
+                else => return error.UnsupportedHashLen,
+            }
+            const msg_len = buffer.items.len - 4;
+            buffer.items[1] = @intCast((msg_len >> 16) & 0xFF);
+            buffer.items[2] = @intCast((msg_len >> 8) & 0xFF);
+            buffer.items[3] = @intCast(msg_len & 0xFF);
+            try conn.handshake_to_digest.appendSlice(buffer.items);
+            try self.writeEncrypted(conn, fd, buffer.items);
+        }
+
+        fn writeEncrypted(self: *Self, conn: *Connection, fd: i32, msg: []const u8) !void {
+            switch (conn.hash) {
+                .SHA256 => try self._writeEncrypted(32, conn, fd, msg),
+                .SHA384 => try self._writeEncrypted(48, conn, fd, msg),
             }
         }
 
-        fn writeEncrypted(self: *Self, comptime hash_len: u8, conn: *Connection, fd: i32, msg: []const u8) !void {
+        fn _writeEncrypted(self: *Self, comptime hash_len: u8, conn: *Connection, fd: i32, msg: []const u8) !void {
             var buffer = std.ArrayList(u8).init(self.allocator);
             defer buffer.deinit();
             try buffer.appendSlice(&[_]u8{

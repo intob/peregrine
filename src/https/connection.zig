@@ -3,6 +3,7 @@ const parser = @import("./parser.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha384 = std.crypto.hash.sha2.Sha384;
 const hkdf = std.crypto.kdf.hkdf;
+const hkdf_expand = @import("./hkdf_expand.zig");
 
 pub const ConnectionState = enum {
     @"01_ClientHello",
@@ -132,14 +133,14 @@ pub const Connection = struct {
         const zeros = [_]u8{0} ** hash_len;
         const early_secret = HkdfType.extract(&[_]u8{0x00}, &zeros);
         var derived_secret: [hash_len]u8 = undefined;
-        hkdfExpandLabel(HkdfType, hash_len, &derived_secret, early_secret, "derived", &empty_hash);
+        hkdf_expand.hkdfExpandLabel(HkdfType, hash_len, &derived_secret, early_secret, "derived", &empty_hash);
         const handshake_secret = HkdfType.extract(derived_secret[0..], self.shared_secret.items);
         var server_traffic_secret: [hash_len]u8 = undefined;
-        hkdfExpandLabel(HkdfType, hash_len, &server_traffic_secret, handshake_secret, "s hs traffic", hello_digest);
+        hkdf_expand.hkdfExpandLabel(HkdfType, hash_len, &server_traffic_secret, handshake_secret, "s hs traffic", hello_digest);
         const server_keys = deriveTrafficKeys(HkdfType, hash_len, server_traffic_secret);
         self.server_handshake_iv = server_keys.iv;
         var client_traffic_secret: [hash_len]u8 = undefined;
-        hkdfExpandLabel(HkdfType, hash_len, &client_traffic_secret, handshake_secret, "c hs traffic", hello_digest);
+        hkdf_expand.hkdfExpandLabel(HkdfType, hash_len, &client_traffic_secret, handshake_secret, "c hs traffic", hello_digest);
         const client_keys = deriveTrafficKeys(HkdfType, hash_len, client_traffic_secret);
         self.client_handshake_iv = client_keys.iv;
         switch (hash_len) {
@@ -193,28 +194,7 @@ fn deriveTrafficKeys(
 ) struct { key: [hash_len]u8, iv: [12]u8 } {
     var key: [hash_len]u8 = undefined;
     var iv: [12]u8 = undefined;
-    hkdfExpandLabel(HkdfType, hash_len, &key, traffic_secret, "key", "");
-    hkdfExpandLabel(HkdfType, 12, &iv, traffic_secret, "iv", "");
+    hkdf_expand.hkdfExpandLabel(HkdfType, hash_len, &key, traffic_secret, "key", "");
+    hkdf_expand.hkdfExpandLabel(HkdfType, 12, &iv, traffic_secret, "iv", "");
     return .{ .key = key, .iv = iv };
-}
-
-fn hkdfExpandLabel(
-    comptime hkdf_t: type,
-    comptime len: u8,
-    out: *[len]u8,
-    secret: [hkdf_t.prk_length]u8,
-    label: []const u8,
-    context: []const u8,
-) void {
-    const tls13_label = "tls13 ";
-    var hkdf_label: [512]u8 = undefined;
-    hkdf_label[0] = 0;
-    hkdf_label[1] = len;
-    hkdf_label[2] = @intCast(tls13_label.len + label.len);
-    @memcpy(hkdf_label[3..][0..tls13_label.len], tls13_label);
-    @memcpy(hkdf_label[3 + tls13_label.len ..][0..label.len], label);
-    hkdf_label[3 + tls13_label.len + label.len] = @intCast(context.len);
-    @memcpy(hkdf_label[4 + tls13_label.len + label.len ..][0..context.len], context);
-    const total_len = 4 + tls13_label.len + label.len + context.len;
-    hkdf_t.expand(out, hkdf_label[0..total_len], secret);
 }

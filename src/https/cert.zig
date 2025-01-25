@@ -1,4 +1,5 @@
 const std = @import("std");
+const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
 pub fn readCertificateFile(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
     const file = try std.fs.cwd().openFile(path, .{});
@@ -19,17 +20,17 @@ pub fn readPrivateKeyFile(allocator: std.mem.Allocator, path: []const u8) ![]con
     const stat = try file.stat();
     const file_size = stat.size;
     const contents = try file.readToEndAlloc(allocator, file_size);
-    errdefer allocator.free(contents);
+    defer allocator.free(contents);
     if (!std.mem.startsWith(u8, contents, "-----BEGIN PRIVATE KEY-----") and
         !std.mem.startsWith(u8, contents, "-----BEGIN RSA PRIVATE KEY-----") and
         !std.mem.startsWith(u8, contents, "-----BEGIN EC PRIVATE KEY-----"))
     {
         return error.InvalidKeyFormat;
     }
-    return contents;
+    return try pemToDer(allocator, contents);
 }
 
-pub fn pemToDer(allocator: std.mem.Allocator, pem_data: []const u8) ![]const u8 {
+fn pemToDer(allocator: std.mem.Allocator, pem_data: []const u8) ![]const u8 {
     const begin_marker = if (std.mem.indexOf(u8, pem_data, "BEGIN")) |i| i else {
         return error.MissingBeginMarker;
     };
@@ -59,6 +60,15 @@ pub fn pemToDer(allocator: std.mem.Allocator, pem_data: []const u8) ![]const u8 
     _ = &der;
     try std.base64.standard.Decoder.decode(der, raw_content.items);
     return der;
+}
+
+pub fn derToKeyPair(der_bytes: []const u8) !EcdsaP256Sha256.KeyPair {
+    // DER format for EC private key:
+    // - 32 bytes for private scalar
+    // - Optional public key point (x,y coordinates)
+    const private_scalar = der_bytes[der_bytes.len - 32 ..][0..32].*;
+    const secret_key = try EcdsaP256Sha256.SecretKey.fromBytes(private_scalar);
+    return try EcdsaP256Sha256.KeyPair.fromSecretKey(secret_key);
 }
 
 test "pemToDer certificate" {
