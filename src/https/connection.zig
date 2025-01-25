@@ -6,7 +6,8 @@ const hkdf = std.crypto.kdf.hkdf;
 
 pub const ConnectionState = enum {
     @"01_ClientHello",
-    @"02_",
+    @"02_WaitClientFinished",
+    @"03_Connected",
 };
 
 pub const ServerKey = union(enum) {
@@ -26,12 +27,22 @@ const HashKeys = union(enum) {
     SHA256: struct {
         traffic_secret: [32]u8,
         handshake_key: [32]u8,
-        handshake_iv: [12]u8,
+
+        pub fn getAes128Key(self: @This()) [16]u8 {
+            var key: [16]u8 = undefined;
+            @memcpy(&key, self.handshake_key[0..16]);
+            return key;
+        }
     },
     SHA384: struct {
         traffic_secret: [48]u8,
         handshake_key: [48]u8,
-        handshake_iv: [12]u8,
+
+        pub fn getAes256Key(self: @This()) [32]u8 {
+            var key: [32]u8 = undefined;
+            @memcpy(&key, self.handshake_key[0..32]);
+            return key;
+        }
     },
 };
 
@@ -50,10 +61,13 @@ pub const Connection = struct {
     handshake_to_digest: std.ArrayList(u8),
     shared_secret: std.ArrayList(u8),
     client_hash_keys: HashKeys,
+    client_handshake_iv: [12]u8,
     server_hash_keys: HashKeys,
+    server_handshake_iv: [12]u8,
 
     pub fn init(self: *Connection, allocator: std.mem.Allocator) void {
         self.allocator = allocator;
+        self.state = .@"01_ClientHello";
         self.server_key = .{ .none = {} };
         self.handshake_to_digest = std.ArrayList(u8).init(allocator);
         self.shared_secret = std.ArrayList(u8).init(allocator);
@@ -68,8 +82,8 @@ pub const Connection = struct {
         self.state = .@"01_ClientHello";
         self.requests = 0;
         self.server_key = .{ .none = {} };
-        self.handshake_to_digest.clearRetainingCapacity();
-        self.shared_secret.clearRetainingCapacity();
+        self.handshake_to_digest.clearAndFree();
+        self.shared_secret.clearAndFree();
     }
 
     pub fn generateKey(self: *Connection) !void {
@@ -116,35 +130,30 @@ pub const Connection = struct {
         empty_hash: [hash_len]u8,
     ) !void {
         const zeros = [_]u8{0} ** hash_len;
-
         const early_secret = HkdfType.extract(&[_]u8{0x00}, &zeros);
         var derived_secret: [hash_len]u8 = undefined;
         hkdfExpandLabel(HkdfType, hash_len, &derived_secret, early_secret, "derived", &empty_hash);
-
         const handshake_secret = HkdfType.extract(derived_secret[0..], self.shared_secret.items);
-
         var server_traffic_secret: [hash_len]u8 = undefined;
         hkdfExpandLabel(HkdfType, hash_len, &server_traffic_secret, handshake_secret, "s hs traffic", hello_digest);
         const server_keys = deriveTrafficKeys(HkdfType, hash_len, server_traffic_secret);
-
+        self.server_handshake_iv = server_keys.iv;
         var client_traffic_secret: [hash_len]u8 = undefined;
         hkdfExpandLabel(HkdfType, hash_len, &client_traffic_secret, handshake_secret, "c hs traffic", hello_digest);
         const client_keys = deriveTrafficKeys(HkdfType, hash_len, client_traffic_secret);
-
+        self.client_handshake_iv = client_keys.iv;
         switch (hash_len) {
             32 => {
                 self.server_hash_keys = .{
                     .SHA256 = .{
                         .traffic_secret = server_traffic_secret,
                         .handshake_key = server_keys.key,
-                        .handshake_iv = server_keys.iv,
                     },
                 };
                 self.client_hash_keys = .{
                     .SHA256 = .{
                         .traffic_secret = client_traffic_secret,
                         .handshake_key = client_keys.key,
-                        .handshake_iv = client_keys.iv,
                     },
                 };
             },
@@ -153,24 +162,17 @@ pub const Connection = struct {
                     .SHA384 = .{
                         .traffic_secret = server_traffic_secret,
                         .handshake_key = server_keys.key,
-                        .handshake_iv = server_keys.iv,
                     },
                 };
                 self.client_hash_keys = .{
                     .SHA384 = .{
                         .traffic_secret = client_traffic_secret,
                         .handshake_key = client_keys.key,
-                        .handshake_iv = client_keys.iv,
                     },
                 };
             },
             else => error.UnsupportedHashLen,
         }
-
-        std.debug.print("client key: {x}\n", .{client_keys.key});
-        std.debug.print("client iv: {x}\n", .{client_keys.iv});
-        std.debug.print("server key: {x}\n", .{server_keys.key});
-        std.debug.print("server iv: {x}\n", .{server_keys.iv});
     }
 };
 

@@ -3,6 +3,7 @@ const TLSReader = @import("./reader.zig").TLSReader;
 
 pub const RecordType = enum(u8) {
     handshake = 0x16,
+    application_data = 0x17,
 };
 
 pub const HandshakeType = enum(u8) {
@@ -125,12 +126,9 @@ pub fn parseHandshakeRecord(data: []const u8) !struct { handshake_type: Handshak
 
 pub fn parseClientHello(allocator: std.mem.Allocator, data: []const u8) !*ClientHello {
     var result = try ClientHello.init(allocator);
-
     var pos: usize = 4 + 2; // Skip handshake type and length, and legacy version
-
     @memcpy(&result.random, data[pos..][0..32]);
     pos += 32;
-
     const session_id_len = data[pos];
     pos += 1;
     if (session_id_len == 0) {
@@ -141,7 +139,6 @@ pub fn parseClientHello(allocator: std.mem.Allocator, data: []const u8) !*Client
         @memcpy(result.legacy_session_id.?[0..32], data[pos..][0..32]);
         pos += session_id_len;
     }
-
     const cipher_suites_len = std.mem.readInt(u16, data[pos..][0..2], .big);
     pos += 2;
     var i: usize = 0;
@@ -150,10 +147,8 @@ pub fn parseClientHello(allocator: std.mem.Allocator, data: []const u8) !*Client
         try result.cipher_suites.append(@enumFromInt(raw));
     }
     pos += cipher_suites_len;
-
     const compression_methods_len = data[pos];
     pos += 1 + compression_methods_len;
-
     var extensions = std.ArrayList(Extension).init(allocator);
     defer extensions.deinit();
     if (pos < data.len) {
@@ -161,7 +156,6 @@ pub fn parseClientHello(allocator: std.mem.Allocator, data: []const u8) !*Client
         pos += 2;
         try parseExtensions(data[pos..][0..extensions_len], &extensions);
     }
-
     var supported_versions_found = false;
     for (extensions.items) |ext| {
         switch (ext.extension_type) {
@@ -179,7 +173,6 @@ pub fn parseClientHello(allocator: std.mem.Allocator, data: []const u8) !*Client
         }
     }
     if (!supported_versions_found) return error.MissingSupportedVersionsExtension;
-
     return result;
 }
 
@@ -204,16 +197,12 @@ fn parseExtensions(data: []const u8, extensions: *std.ArrayList(Extension)) !voi
 
 fn parseExtSupportedVersions(data: []const u8) !struct { tls_1_3: bool } {
     const TLS_1_3_VERSION = 0x0304;
-
     if (data.len < 1) return error.InvalidLength;
-
     // First byte is the length of the version list
     const list_len = data[0];
     if (data.len < 1 + list_len) return error.InvalidLength;
-
     // Each version is 2 bytes
     if (list_len % 2 != 0) return error.InvalidFormat;
-
     var has_tls13 = false;
     var i: usize = 1;
     while (i < 1 + list_len) : (i += 2) {
@@ -223,20 +212,16 @@ fn parseExtSupportedVersions(data: []const u8) !struct { tls_1_3: bool } {
             break;
         }
     }
-
     return .{ .tls_1_3 = has_tls13 };
 }
 
 fn parseExtSupportedGroups(data: []const u8, list: *std.ArrayList(CryptoGroup)) !void {
     if (data.len < 2) return error.InvalidLength;
-
     // First 2 bytes are the length of the groups list
     const list_len = (@as(u16, data[0]) << 8) | data[1];
     if (data.len < 2 + list_len) return error.InvalidLength;
-
     // Each group is 2 bytes
     if (list_len % 2 != 0) return error.InvalidFormat;
-
     var i: usize = 2;
     while (i < 2 + list_len) : (i += 2) {
         const raw = (@as(u16, data[i]) << 8) | data[i + 1];
@@ -250,14 +235,11 @@ fn parseExtSupportedGroups(data: []const u8, list: *std.ArrayList(CryptoGroup)) 
 
 fn parseExtSignatureAlgorithms(data: []const u8, list: *std.ArrayList(SignatureAlgorithm)) !void {
     if (data.len < 2) return error.InvalidLength;
-
     // First 2 bytes are the length of the signature algorithms list
     const list_len = (@as(u16, data[0]) << 8) | data[1];
     if (data.len < 2 + list_len) return error.InvalidLength;
-
     // Each signature algorithm is 2 bytes
     if (list_len % 2 != 0) return error.InvalidFormat;
-
     var i: usize = 2;
     while (i < 2 + list_len) : (i += 2) {
         const raw = (@as(u16, data[i]) << 8) | data[i + 1];
@@ -271,32 +253,24 @@ fn parseExtSignatureAlgorithms(data: []const u8, list: *std.ArrayList(SignatureA
 
 fn parseExtKeyShare(data: []const u8, list: *std.ArrayList(KeyShare)) !void {
     if (data.len < 2) return error.InvalidLength;
-
     // First 2 bytes are the length of all key share entries
     const list_len = (@as(u16, data[0]) << 8) | data[1];
     if (data.len < 2 + list_len) return error.InvalidLength;
-
     var offset: usize = 2;
     while (offset < 2 + list_len) {
         if (offset + 4 > data.len) return error.InvalidLength;
-
         // Parse group (2 bytes)
         const group_id = (@as(u16, data[offset]) << 8) | data[offset + 1];
         offset += 2;
-
         // Parse key exchange length (2 bytes)
         const key_exchange_len = (@as(u16, data[offset]) << 8) | data[offset + 1];
         offset += 2;
-
         if (offset + key_exchange_len > data.len) return error.InvalidLength;
-
         try list.append(.{
             .group = @enumFromInt(group_id),
             .key_exchange = data[offset .. offset + key_exchange_len],
         });
-
         offset += key_exchange_len;
     }
-
     if (offset != 2 + list_len) return error.InvalidFormat;
 }

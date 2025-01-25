@@ -155,8 +155,14 @@ pub fn TLSWorker(comptime Handler: type) type {
                     try conn.generateKey();
                     try self.writeServerHello(conn, fd);
                     try conn.deriveKeys();
+                    try self.writeEncryptedExtensions(conn, fd);
+                    //try self.writeCertificate(conn, fd);
+                    //try self.writeCertificateVerify(conn, fd);
+                    //try self.writeFinished(conn, fd);
+                    conn.state = .@"02_WaitClientFinished";
+                    std.debug.print("fd {} now in state {}", .{ fd, conn.state });
                 },
-                else => std.debug.print("I'm a teapot\n", .{}),
+                else => std.debug.print("I'm a teapot. State: {}\n", .{conn.state}),
             }
         }
 
@@ -200,6 +206,57 @@ pub fn TLSWorker(comptime Handler: type) type {
                 n += try posix.write(fd, response.items[n..]);
             }
             std.debug.print("responsed with {x}\n", .{response.items});
+        }
+
+        fn writeEncryptedExtensions(self: *Self, conn: *Connection, fd: i32) !void {
+            const msg = [_]u8{
+                @intFromEnum(parser.HandshakeType.encrypted_extensions),
+                0x00, 0x00, 0x02, // length (2 bytes)
+                0x00, 0x00, // empty extensions list
+            };
+            switch (conn.hash) {
+                .SHA256 => try self.writeEncrypted(32, conn, fd, &msg),
+                .SHA384 => try self.writeEncrypted(48, conn, fd, &msg),
+            }
+        }
+
+        fn writeEncrypted(self: *Self, comptime hash_len: u8, conn: *Connection, fd: i32, msg: []const u8) !void {
+            var buffer = std.ArrayList(u8).init(self.allocator);
+            defer buffer.deinit();
+            try buffer.appendSlice(&[_]u8{
+                @intFromEnum(parser.RecordType.application_data),
+                0x03, 0x03, // legacy_record_version TLS 1.2
+                0x00, 0x00, // length placeholder
+            });
+            var plaintext = try self.allocator.alloc(u8, msg.len + 1);
+            defer self.allocator.free(plaintext);
+            plaintext[0] = 0x17; // application_data
+            @memcpy(plaintext[1..][0..msg.len], msg);
+            const key = switch (hash_len) {
+                32 => conn.server_hash_keys.SHA256.getAes128Key(),
+                48 => conn.server_hash_keys.SHA384.getAes256Key(),
+                else => return error.UnsupportedHashLen,
+            };
+            var ciphertext = try self.allocator.alloc(u8, plaintext.len);
+            defer self.allocator.free(ciphertext);
+            _ = &ciphertext;
+            var tag: [16]u8 = undefined;
+            const aes = switch (key.len) {
+                32 => std.crypto.aead.aes_gcm.Aes256Gcm,
+                16 => std.crypto.aead.aes_gcm.Aes128Gcm,
+                else => return error.UnsupportedKeySize,
+            };
+            aes.encrypt(ciphertext, &tag, plaintext, &[0]u8{}, conn.server_handshake_iv, key);
+            const encrypted_len = ciphertext.len + tag.len;
+            buffer.items[3] = @intCast((encrypted_len >> 8) & 0xFF);
+            buffer.items[4] = @intCast(encrypted_len & 0xFF);
+            try buffer.appendSlice(ciphertext);
+            try buffer.appendSlice(&tag);
+            var n: usize = 0;
+            while (n < buffer.items.len) {
+                n += try posix.write(fd, buffer.items[n..]);
+            }
+            try conn.handshake_to_digest.appendSlice(msg);
         }
 
         fn respond(self: *Self, fd: posix.socket_t, keep_alive: bool) !void {
