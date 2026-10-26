@@ -1,205 +1,566 @@
-const native_os = @import("builtin").os.tag;
+//! Readiness-based (epoll/kqueue) event loop. Each worker owns its
+//! connections end to end: it accepts them (its own SO_REUSEPORT listener on
+//! Linux), reads, runs the session state machine, and writes.
 const std = @import("std");
-const posix = std.posix;
-const linux = std.os.linux;
+const sys = @import("../sys.zig");
 const Poller = @import("../poller.zig").Poller;
-const Header = @import("../header.zig").Header;
+const session = @import("./session.zig");
+const date = @import("./date.zig");
+const Session = session.Session;
+const BufferPool = session.BufferPool;
+const Out = session.Out;
 const Request = @import("../request.zig").Request;
-const RequestReader = @import("./reader.zig").RequestReader;
 const Response = @import("../response.zig").Response;
-const Status = @import("../status.zig").Status;
 const WebsocketServer = @import("../ws/server.zig").WebsocketServer;
 
-const CONNECTION_MAX_REQUESTS: u16 = 65535;
-// This is added to a response that contains no body. This is more efficient than
-// having the user provide the header to be serialised.
-const CONTENT_LENGTH_ZERO_HEADER = "content-length: 0\r\n";
-// These headers are added last, so they have an extra CRLF to terminate the headers.
-// This is simpler and more efficient than appending \r\n separately.
-const KEEP_ALIVE_HEADERS = "connection: keep-alive\r\nkeep-alive: timeout=3, max=65535\r\n\r\n";
-const CLOSE_HEADER = "connection: close\r\n\r\n";
-const UPGRADE_HEADER = "connection: upgrade\r\n\r\n";
+const LISTENER_TOKEN: u64 = std.math.maxInt(u64);
+const WAKER_TOKEN: u64 = std.math.maxInt(u64) - 1;
+const NIL: u32 = std.math.maxInt(u32);
+/// Connections accepted per listener event, to stay fair to existing ones.
+const ACCEPT_BATCH = 64;
 
-const CommonIovecs = struct {
-    const content_len_zero: posix.iovec_const align(64) = .{
-        .base = CONTENT_LENGTH_ZERO_HEADER,
-        .len = CONTENT_LENGTH_ZERO_HEADER.len,
-    };
-    const keep_alive: posix.iovec_const align(64) = .{
-        .base = KEEP_ALIVE_HEADERS,
-        .len = KEEP_ALIVE_HEADERS.len,
-    };
-    const close: posix.iovec_const align(64) = .{
-        .base = CLOSE_HEADER,
-        .len = CLOSE_HEADER.len,
-    };
-    const upgrade: posix.iovec_const align(64) = .{
-        .base = UPGRADE_HEADER,
-        .len = UPGRADE_HEADER.len,
-    };
+pub const Options = struct {
+    session: session.Options,
+    max_connections: u32,
+    read_buffer_size: usize,
+    buffer_pool_size: usize,
+    out_buffer_size: usize,
+    response_body_buffer_size: usize,
+    response_header_buffer_size: usize,
+    keep_alive_timeout_s: u32,
+    request_timeout_s: u32,
+    /// Linux: try reading right after accept (the listener uses
+    /// TCP_DEFER_ACCEPT, so data is usually already there).
+    read_on_accept: bool,
 };
 
 pub fn Worker(comptime Handler: type) type {
     return struct {
         const Self = @This();
-        const EventType = switch (native_os) {
-            .freebsd, .netbsd, .openbsd, .dragonfly, .macos => posix.Kevent,
-            .linux => linux.epoll_event,
-            else => unreachable,
-        };
-        const WorkerConfig = struct {
-            allocator: std.mem.Allocator,
-            resp_body_buffer_size: usize,
-            req_buffer_size: usize,
-            stack_size: usize,
-            handler: *Handler,
-            ws: *WebsocketServer(Handler),
-        };
-        const getFd = blk: {
-            break :blk switch (native_os) {
-                .freebsd, .netbsd, .openbsd, .dragonfly, .macos => struct {
-                    fn get(event: posix.Kevent) i32 {
-                        return @intCast(event.udata);
-                    }
-                }.get,
-                .linux => struct {
-                    fn get(event: linux.epoll_event) i32 {
-                        return event.data.fd;
-                    }
-                }.get,
-                else => unreachable,
-            };
+
+        const ListId = enum(u8) { none, idle, active };
+
+        const Conn = struct {
+            fd: sys.fd_t = -1,
+            gen: u32 = 0,
+            open: bool = false,
+            /// The kernel may have unread data (edge-triggered).
+            read_ready: bool = false,
+            peer_closed: bool = false,
+            /// Draining input after an error response (see Session.linger).
+            lingering: bool = false,
+            lingered: u32 = 0,
+            after_flush: enum(u8) { none, close, upgrade } = .none,
+            list: ListId = .none,
+            prev: u32 = NIL,
+            next: u32 = NIL,
+            deadline: u32 = 0,
+            session: Session = .{},
+            /// Unsent output after a partial write: an owned copy of the
+            /// serialised head bytes, then the body (owned or borrowed).
+            pending_head: []u8 = &.{},
+            pending_head_pos: usize = 0,
+            pending_body: []const u8 = "",
+            pending_body_owned: []u8 = &.{},
+
+            inline fn hasPending(c: *const Conn) bool {
+                return c.pending_head_pos < c.pending_head.len or c.pending_body.len > 0;
+            }
         };
 
-        shutdown: std.atomic.Value(bool) align(64),
-        connection_requests: []u16 align(64),
+        const List = struct {
+            head: u32 = NIL,
+            tail: u32 = NIL,
+            timeout: u32,
+        };
+
+        id: usize,
+        allocator: std.mem.Allocator,
         handler: *Handler,
+        ws: *WebsocketServer(Handler),
+        shutdown: *const std.atomic.Value(bool),
+        opts: Options,
         poller: Poller,
-        reader: *RequestReader,
+        listener: sys.fd_t,
+        owns_listener: bool,
+        waker: sys.Waker,
+        conns: []Conn,
+        free_slots: []u32,
+        free_len: usize,
+        pool: BufferPool,
         req: *Request,
         resp: *Response,
-        iovecs: [4]posix.iovec_const align(64),
-        ws: *WebsocketServer(Handler),
-        thread: std.Thread,
-        allocator: std.mem.Allocator,
+        out: Out,
+        out_buf: []u8,
+        date_line: [date.header_len]u8 = undefined,
+        now: u32,
+        last_realtime: i64 = 0,
+        idle: List,
+        active: List,
+        open_count: usize = 0,
+        thread: ?std.Thread = null,
 
-        pub fn init(self: *Self, cfg: WorkerConfig) !void {
+        pub const InitConfig = struct {
+            id: usize,
+            allocator: std.mem.Allocator,
+            handler: *Handler,
+            ws: *WebsocketServer(Handler),
+            shutdown: *const std.atomic.Value(bool),
+            listener: sys.fd_t,
+            owns_listener: bool,
+            opts: Options,
+        };
+
+        pub fn init(self: *Self, cfg: InitConfig) !void {
             const allocator = cfg.allocator;
-            self.allocator = allocator;
-            self.handler = cfg.handler;
-            self.poller = try Poller.init();
-            self.req = try Request.init(allocator);
-            self.resp = try Response.init(allocator, cfg.resp_body_buffer_size);
-            self.reader = try RequestReader.init(self.allocator, cfg.req_buffer_size);
-            self.connection_requests = try allocator.alignedAlloc(u16, 64, std.math.maxInt(i16));
-            self.ws = cfg.ws;
-            self.shutdown = std.atomic.Value(bool).init(false);
-            self.thread = try std.Thread.spawn(.{
-                .stack_size = cfg.stack_size,
+            const opts = cfg.opts;
+            var poller = try Poller.init();
+            errdefer poller.deinit();
+            const waker = try sys.Waker.init();
+            errdefer waker.deinit();
+            const conns = try allocator.alloc(Conn, opts.max_connections);
+            errdefer allocator.free(conns);
+            @memset(conns, .{});
+            const free_slots = try allocator.alloc(u32, opts.max_connections);
+            errdefer allocator.free(free_slots);
+            // Hand out low slots first (better cache locality).
+            for (free_slots, 0..) |*s, i| s.* = @intCast(opts.max_connections - 1 - i);
+            var pool = try BufferPool.init(allocator, opts.read_buffer_size, opts.buffer_pool_size);
+            errdefer pool.deinit();
+            const req = try Request.init(allocator);
+            errdefer req.deinit();
+            const resp = try Response.init(allocator, opts.response_body_buffer_size, opts.response_header_buffer_size);
+            errdefer resp.deinit();
+            if (opts.out_buffer_size < session.headRoom(resp)) return error.OutBufferTooSmall;
+            const out_buf = try allocator.alloc(u8, opts.out_buffer_size);
+            errdefer allocator.free(out_buf);
+            self.* = .{
+                .id = cfg.id,
                 .allocator = allocator,
-            }, workerLoop, .{self});
+                .handler = cfg.handler,
+                .ws = cfg.ws,
+                .shutdown = cfg.shutdown,
+                .opts = opts,
+                .poller = poller,
+                .listener = cfg.listener,
+                .owns_listener = cfg.owns_listener,
+                .waker = waker,
+                .conns = conns,
+                .free_slots = free_slots,
+                .free_len = free_slots.len,
+                .pool = pool,
+                .req = req,
+                .resp = resp,
+                .out_buf = out_buf,
+                .out = .{ .buf = out_buf },
+                .now = sys.monotonicSeconds(),
+                .idle = .{ .timeout = opts.keep_alive_timeout_s },
+                .active = .{ .timeout = opts.request_timeout_s },
+            };
+            self.refreshDate();
+            try self.poller.add(self.listener, LISTENER_TOKEN, .level_read);
+            try self.poller.add(self.waker.read_fd, WAKER_TOKEN, .level_read);
+        }
+
+        pub fn spawn(self: *Self, stack_size: usize, pin: bool) !void {
+            self.thread = try std.Thread.spawn(.{ .stack_size = stack_size }, run, .{ self, pin });
+        }
+
+        pub fn wake(self: *Self) void {
+            self.waker.wake();
+        }
+
+        pub fn join(self: *Self) void {
+            if (self.thread) |t| t.join();
+            self.thread = null;
         }
 
         pub fn deinit(self: *Self) void {
-            self.shutdown.store(true, .monotonic);
-            self.thread.join();
-            self.reader.deinit();
+            for (self.conns) |*c| {
+                if (c.open) self.closeConn(c);
+            }
+            if (self.owns_listener) sys.close(self.listener);
+            self.poller.deinit();
+            self.waker.deinit();
+            self.pool.deinit();
             self.req.deinit();
             self.resp.deinit();
-            self.allocator.free(self.connection_requests);
-            // server frees worker
+            self.allocator.free(self.out_buf);
+            self.allocator.free(self.conns);
+            self.allocator.free(self.free_slots);
         }
 
-        pub fn addClient(self: *Self, fd: posix.socket_t) !void {
-            try self.poller.addSocket(fd);
+        fn run(self: *Self, pin: bool) void {
+            if (pin) sys.pinToCpu(self.id);
+            var events: [512]Poller.Event = undefined;
+            while (!self.shutdown.load(.acquire)) {
+                // With no connections there are no timers to run, so block
+                // until something happens (shutdown uses the waker).
+                const timeout: i32 = if (self.open_count == 0) -1 else 1000;
+                const n = self.poller.wait(&events, timeout);
+                self.tick();
+                for (events[0..n]) |ev| {
+                    switch (Poller.token(ev)) {
+                        LISTENER_TOKEN => self.acceptConnections(),
+                        WAKER_TOKEN => self.drainWaker(),
+                        else => |token| self.onConnEvent(ev, token),
+                    }
+                }
+            }
         }
 
-        fn workerLoop(self: *Self) void {
-            var events: [1024]EventType align(64) = undefined;
-            var ready_count: usize align(64) = 0;
-            var fd: i32 align(64) = 0;
-            var fd_idx: usize align(64) = 0;
-            while (!self.shutdown.load(.unordered)) {
-                ready_count = self.poller.wait(&events) catch |err| {
-                    std.debug.print("error waiting for events: {any}\n", .{err});
+        fn drainWaker(self: *Self) void {
+            var buf: [64]u8 = undefined;
+            _ = sys.read(self.waker.read_fd, &buf) catch {};
+        }
+
+        // -- Time and timeouts -------------------------------------------
+
+        fn refreshDate(self: *Self) void {
+            const t = sys.realtimeSeconds();
+            if (t != self.last_realtime) {
+                self.last_realtime = t;
+                date.formatHeader(&self.date_line, t);
+            }
+        }
+
+        fn tick(self: *Self) void {
+            const now = sys.monotonicSeconds();
+            if (now == self.now) return;
+            self.now = now;
+            self.refreshDate();
+            self.expire(&self.idle);
+            self.expire(&self.active);
+        }
+
+        fn expire(self: *Self, list: *List) void {
+            // Lists are ordered by deadline because each has a fixed timeout
+            // and connections are appended when (re)armed.
+            while (list.head != NIL) {
+                const c = &self.conns[list.head];
+                if (@as(i32, @bitCast(c.deadline -% self.now)) > 0) break;
+                self.closeConn(c);
+            }
+        }
+
+        fn listFor(self: *Self, id: ListId) *List {
+            return switch (id) {
+                .idle => &self.idle,
+                .active => &self.active,
+                .none => unreachable,
+            };
+        }
+
+        fn unlink(self: *Self, c: *Conn) void {
+            if (c.list == .none) return;
+            const list = self.listFor(c.list);
+            if (c.prev != NIL) self.conns[c.prev].next = c.next else list.head = c.next;
+            if (c.next != NIL) self.conns[c.next].prev = c.prev else list.tail = c.prev;
+            c.prev = NIL;
+            c.next = NIL;
+            c.list = .none;
+        }
+
+        /// Append to a list with a fresh deadline.
+        fn arm(self: *Self, c: *Conn, id: ListId) void {
+            self.unlink(c);
+            const list = self.listFor(id);
+            const slot = self.slotOf(c);
+            c.list = id;
+            c.deadline = self.now +% list.timeout;
+            c.prev = list.tail;
+            c.next = NIL;
+            if (list.tail != NIL) self.conns[list.tail].next = slot else list.head = slot;
+            list.tail = slot;
+        }
+
+        /// Idle connections get the keep-alive timeout. A partially received
+        /// request or unsent response gets the request timeout, which is not
+        /// extended by further reads (slowloris), only by write progress.
+        fn updateTimer(self: *Self, c: *Conn) void {
+            if (c.session.inRequest() or c.hasPending()) {
+                if (c.list != .active) self.arm(c, .active);
+            } else {
+                self.arm(c, .idle);
+            }
+        }
+
+        inline fn slotOf(self: *Self, c: *Conn) u32 {
+            return @intCast((@intFromPtr(c) - @intFromPtr(self.conns.ptr)) / @sizeOf(Conn));
+        }
+
+        // -- Connection lifecycle ----------------------------------------
+
+        fn acceptConnections(self: *Self) void {
+            for (0..ACCEPT_BATCH) |_| {
+                const fd = sys.accept(self.listener) catch |err| switch (err) {
+                    error.WouldBlock => return,
+                    error.Aborted => continue,
+                    error.FdLimit, error.Unexpected => return,
+                };
+                if (self.free_len == 0) {
+                    // At capacity: shed load rather than queue unboundedly.
+                    sys.close(fd);
+                    continue;
+                }
+                self.free_len -= 1;
+                const slot = self.free_slots[self.free_len];
+                const c = &self.conns[slot];
+                const gen = c.gen +% 1;
+                c.* = .{ .fd = fd, .gen = gen, .open = true };
+                self.open_count += 1;
+                self.poller.add(fd, (@as(u64, gen) << 32) | slot, .connection) catch {
+                    self.closeConn(c);
                     continue;
                 };
-                for (events[0..ready_count]) |event| {
-                    fd = getFd(event);
-                    fd_idx = @intCast(fd);
-                    self.readSocket(fd, fd_idx) catch |err| {
-                        posix.close(fd);
-                        self.connection_requests[fd_idx] = 0;
-                        switch (err) {
-                            error.DoNotKeepAlive => {}, // Expected case
-                            else => std.debug.print("error reading socket: {any}\n", .{err}),
-                        }
-                        continue;
-                    };
+                self.arm(c, .active);
+                if (self.opts.read_on_accept) {
+                    c.read_ready = true;
+                    self.onReadable(c);
                 }
             }
         }
 
-        inline fn readSocket(self: *Self, fd: posix.socket_t, fd_idx: usize) !void {
-            var keep_alive: bool = undefined;
-            if (self.connection_requests[fd_idx] >= CONNECTION_MAX_REQUESTS - 1) {
-                keep_alive = false;
-            } else {
-                self.connection_requests[fd_idx] += 1;
-                keep_alive = self.req.version == .@"HTTP/1.1" or self.req.keep_alive;
-            }
-            self.req.reset();
-            self.reader.reset();
-            try self.reader.readRequest(fd, self.req);
-            self.resp.reset();
-            self.handler.handleRequest(self.req, self.resp);
-            try self.respond(fd, keep_alive);
-            if (self.resp.is_ws_upgrade) {
-                self.connection_requests[@intCast(fd)] = 0;
-                try self.poller.removeSocket(fd);
-                try self.ws.addSocket(fd);
-            }
-            if (!keep_alive and !self.resp.is_ws_upgrade) return error.DoNotKeepAlive;
+        /// Close after the final response, lingering if the session asks.
+        fn finish(self: *Self, c: *Conn) void {
+            if (!c.session.linger or c.peer_closed) return self.closeConn(c);
+            sys.shutdownWrite(c.fd);
+            c.session.deinit(&self.pool);
+            c.lingering = true;
+            self.arm(c, .active);
+            self.drainLingering(c);
         }
 
-        inline fn respond(self: *Self, fd: posix.socket_t, keep_alive: bool) !void {
-            const status_len = try self.resp.serialiseStatusAndHeaders();
-            self.iovecs[0] = .{
-                .base = @ptrCast(self.resp.status_buf[0..status_len]),
-                .len = status_len,
-            };
-            var total = status_len;
-            var iovecs_len: u8 = 1;
-            if (self.resp.body_len == 0) {
-                self.iovecs[1] = CommonIovecs.content_len_zero;
-                iovecs_len += 1;
-                total += CONTENT_LENGTH_ZERO_HEADER.len;
-            }
-            if (self.resp.is_ws_upgrade) {
-                self.iovecs[iovecs_len] = CommonIovecs.upgrade;
-                total += UPGRADE_HEADER.len;
-            } else {
-                if (keep_alive) {
-                    self.iovecs[iovecs_len] = CommonIovecs.keep_alive;
-                    total += KEEP_ALIVE_HEADERS.len;
-                } else {
-                    self.iovecs[iovecs_len] = CommonIovecs.close;
-                    total += CLOSE_HEADER.len;
-                }
-            }
-            iovecs_len += 1;
-            if (self.resp.body_len > 0) {
-                self.iovecs[iovecs_len] = .{
-                    .base = @ptrCast(self.resp.body[0..self.resp.body_len]),
-                    .len = self.resp.body_len,
+        fn drainLingering(self: *Self, c: *Conn) void {
+            var scratch: [16 * 1024]u8 = undefined;
+            while (true) {
+                const n = sys.read(c.fd, &scratch) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        c.read_ready = false;
+                        return;
+                    },
+                    else => return self.closeConn(c),
                 };
-                iovecs_len += 1;
-                total += self.resp.body_len;
+                c.lingered +|= @intCast(n);
+                if (n == 0 or c.lingered > sys.max_linger_bytes) return self.closeConn(c);
             }
-            const n = try posix.writev(fd, self.iovecs[0..iovecs_len]);
-            if (n != total) {
-                return error.PartialWrite;
+        }
+
+        fn closeConn(self: *Self, c: *Conn) void {
+            sys.close(c.fd);
+            self.releaseConn(c);
+        }
+
+        fn releaseConn(self: *Self, c: *Conn) void {
+            self.unlink(c);
+            c.session.deinit(&self.pool);
+            self.freePending(c);
+            c.open = false;
+            c.fd = -1;
+            self.free_slots[self.free_len] = self.slotOf(c);
+            self.free_len += 1;
+            self.open_count -= 1;
+        }
+
+        fn upgradeConn(self: *Self, c: *Conn) void {
+            const fd = c.fd;
+            self.poller.remove(fd);
+            self.releaseConn(c);
+            self.ws.addSocket(fd) catch sys.close(fd);
+        }
+
+        fn freePending(self: *Self, c: *Conn) void {
+            if (c.pending_head.len > 0) self.allocator.free(c.pending_head);
+            if (c.pending_body_owned.len > 0) self.allocator.free(c.pending_body_owned);
+            c.pending_head = &.{};
+            c.pending_head_pos = 0;
+            c.pending_body = "";
+            c.pending_body_owned = &.{};
+        }
+
+        // -- I/O -----------------------------------------------------------
+
+        fn onConnEvent(self: *Self, ev: Poller.Event, token: u64) void {
+            const slot: u32 = @truncate(token);
+            const gen: u32 = @intCast(token >> 32);
+            const c = &self.conns[slot];
+            // The slot may have been closed (and reused) earlier in this batch.
+            if (!c.open or c.gen != gen) return;
+            if (Poller.readable(ev)) c.read_ready = true;
+            if (c.lingering) {
+                if (c.read_ready) self.drainLingering(c);
+                return;
             }
+            if (Poller.writable(ev) and c.hasPending()) {
+                if (!self.writePending(c)) return;
+            }
+            if (c.read_ready and !c.hasPending()) self.onReadable(c);
+        }
+
+        fn onReadable(self: *Self, c: *Conn) void {
+            while (true) {
+                if (c.read_ready) {
+                    const space = c.session.readSpace(&self.pool, self.opts.session) catch {
+                        return self.closeConn(c);
+                    };
+                    if (sys.read(c.fd, space)) |n| {
+                        if (n == 0) {
+                            c.peer_closed = true;
+                            c.read_ready = false;
+                        } else {
+                            c.session.commitRead(n);
+                            // A short read drained the socket; edge triggering
+                            // reports any newer data. Saves a read() == EAGAIN.
+                            if (n < space.len) c.read_ready = false;
+                        }
+                    } else |err| switch (err) {
+                        error.WouldBlock => c.read_ready = false,
+                        else => return self.closeConn(c),
+                    }
+                }
+                switch (self.processBuffered(c)) {
+                    .ok => {},
+                    .blocked => return self.updateTimer(c),
+                    .gone => return,
+                }
+                if (c.peer_closed) return self.closeConn(c);
+                if (!c.read_ready) break;
+            }
+            c.session.releaseIfIdle(&self.pool);
+            self.updateTimer(c);
+        }
+
+        const ProcessResult = enum { ok, blocked, gone };
+
+        fn processBuffered(self: *Self, c: *Conn) ProcessResult {
+            const ctx: session.Context(Handler) = .{
+                .handler = self.handler,
+                .req = self.req,
+                .resp = self.resp,
+                .date = &self.date_line,
+                .opts = self.opts.session,
+            };
+            while (true) {
+                const action = session.process(Handler, &c.session, &ctx, &self.out);
+                if (!self.out.isEmpty()) {
+                    if (!self.writeOut(c)) return .gone;
+                    if (c.hasPending()) {
+                        c.after_flush = switch (action) {
+                            .close => .close,
+                            .upgrade => .upgrade,
+                            .flush, .need_more => .none,
+                        };
+                        return .blocked;
+                    }
+                }
+                switch (action) {
+                    .flush => continue,
+                    .need_more => return .ok,
+                    .close => {
+                        self.finish(c);
+                        return .gone;
+                    },
+                    .upgrade => {
+                        self.upgradeConn(c);
+                        return .gone;
+                    },
+                }
+            }
+        }
+
+        /// Writes the worker's Out buffer. Anything unsent is copied into
+        /// the connection (Out and the response are reused). Returns false
+        /// if the connection was closed.
+        fn writeOut(self: *Self, c: *Conn) bool {
+            var iov: [2]sys.iovec_const = undefined;
+            const total = self.out.totalLen();
+            const n = sys.writev(c.fd, self.out.iovecs(&iov)) catch |err| switch (err) {
+                error.WouldBlock => 0,
+                else => {
+                    self.out.clear();
+                    self.closeConn(c);
+                    return false;
+                },
+            };
+            if (n == total) {
+                self.out.clear();
+                return true;
+            }
+            self.savePending(c, n) catch {
+                self.out.clear();
+                self.closeConn(c);
+                return false;
+            };
+            self.out.clear();
+            return true;
+        }
+
+        fn savePending(self: *Self, c: *Conn, written: usize) !void {
+            const out = &self.out;
+            if (written < out.len) {
+                c.pending_head = try self.allocator.dupe(u8, out.buf[written..out.len]);
+                c.pending_head_pos = 0;
+            }
+            const body_written = written -| out.len;
+            const body_rest = out.body[body_written..];
+            if (body_rest.len == 0) return;
+            const resp_buf = self.resp.body_buf;
+            const in_resp_buf = @intFromPtr(body_rest.ptr) >= @intFromPtr(resp_buf.ptr) and
+                @intFromPtr(body_rest.ptr) < @intFromPtr(resp_buf.ptr) + resp_buf.len;
+            if (in_resp_buf) {
+                // The worker's response buffer is reused by the next request.
+                c.pending_body_owned = try self.allocator.dupe(u8, body_rest);
+                c.pending_body = c.pending_body_owned;
+            } else {
+                // Borrowed bodies are immutable until sent (setBodyBorrowed).
+                c.pending_body = body_rest;
+            }
+        }
+
+        /// Continues a partial write. Returns false if the connection is gone.
+        fn writePending(self: *Self, c: *Conn) bool {
+            var iov: [2]sys.iovec_const = undefined;
+            var iov_len: usize = 0;
+            const head_rest = c.pending_head[c.pending_head_pos..];
+            if (head_rest.len > 0) {
+                iov[iov_len] = .{ .base = head_rest.ptr, .len = head_rest.len };
+                iov_len += 1;
+            }
+            if (c.pending_body.len > 0) {
+                iov[iov_len] = .{ .base = c.pending_body.ptr, .len = c.pending_body.len };
+                iov_len += 1;
+            }
+            const n = sys.writev(c.fd, iov[0..iov_len]) catch |err| switch (err) {
+                error.WouldBlock => return true,
+                else => {
+                    self.closeConn(c);
+                    return false;
+                },
+            };
+            const from_head = @min(n, head_rest.len);
+            c.pending_head_pos += from_head;
+            c.pending_body = c.pending_body[n - from_head ..];
+            if (c.hasPending()) {
+                // Progress extends the deadline; a stalled reader still times out.
+                if (n > 0) self.arm(c, .active);
+                return true;
+            }
+            self.freePending(c);
+            switch (c.after_flush) {
+                .close => {
+                    self.finish(c);
+                    return false;
+                },
+                .upgrade => {
+                    self.upgradeConn(c);
+                    return false;
+                },
+                .none => {},
+            }
+            // Resume: buffered requests may be waiting even if no new data
+            // arrives.
+            self.onReadable(c);
+            return false;
         }
     };
 }
