@@ -135,13 +135,24 @@ pub const Conn = struct {
         self.in_end = len;
     }
 
-    /// Whether `readPlain` could return more data without another read.
+    /// Whether `readPlain` has work to do without another read: decrypted
+    /// data, a complete record, or a header that is already invalid.
     pub fn hasBufferedInput(self: *const Self) bool {
         if (self.plain.len > 0) return true;
         const avail = self.in_end - self.in_start;
         if (avail < record.header_len or self.failed or self.peer_closed) return false;
-        const len = std.mem.readInt(u16, self.in_buf[self.in_start + 3 ..][0..2], .big);
-        return avail >= record.header_len + len;
+        const header = self.in_buf[self.in_start..][0..record.header_len];
+        const len = std.mem.readInt(u16, header[3..5], .big);
+        return avail >= record.header_len + len or !headerValid(header);
+    }
+
+    fn headerValid(header: *const [record.header_len]u8) bool {
+        const len = std.mem.readInt(u16, header[3..5], .big);
+        return switch (@as(ContentType, @fromBackingInt(header[0]))) {
+            .application_data => len <= record.max_ciphertext,
+            .change_cipher_spec, .alert, .handshake => len <= record.max_plaintext,
+            else => false,
+        };
     }
 
     /// Copies decrypted application data into `out`, processing records
@@ -190,9 +201,12 @@ pub const Conn = struct {
         const header = self.in_buf[self.in_start..][0..record.header_len];
         const content_type: ContentType = @fromBackingInt(header[0]);
         const len = std.mem.readInt(u16, header[3..5], .big);
-        const encrypted = content_type == .application_data;
-        const max: usize = if (encrypted) record.max_ciphertext else record.max_plaintext;
-        if (len > max) return error.RecordOverflow;
+        // Reject garbage (say, plaintext HTTP) without waiting for a
+        // "record" of whatever length its bytes happen to encode.
+        if (!headerValid(header)) return switch (content_type) {
+            .change_cipher_spec, .alert, .handshake, .application_data => error.RecordOverflow,
+            else => error.UnexpectedMessage,
+        };
         if (avail < record.header_len + len) {
             // Make room for the rest of the record.
             if (self.in_start > 0 and self.in_start + record.header_len + len > self.in_buf.len) self.compact();

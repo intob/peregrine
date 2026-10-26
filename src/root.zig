@@ -6,6 +6,7 @@ pub const Server = @import("./server.zig").Server;
 pub const Config = @import("./server.zig").Config;
 pub const ServerConfig = Config;
 pub const Backend = @import("./server.zig").Backend;
+pub const TlsOptions = @import("./server.zig").TlsOptions;
 pub const Limits = @import("./http/parser.zig").Limits;
 pub const Status = @import("./status.zig").Status;
 pub const Version = @import("./version.zig").Version;

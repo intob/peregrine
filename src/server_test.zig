@@ -724,3 +724,198 @@ test "accepted sockets inherit TCP_NODELAY and O_NONBLOCK" {
     try testing.expect(sys.isNonBlocking(fd));
     try testing.expect(try sys.getsockoptInt(fd, posix.IPPROTO.TCP, sys.TCP_NODELAY) != 0);
 }
+
+// -- TLS --------------------------------------------------------------------
+
+const tls_testdata = @import("./tls/credentials.zig").testdata;
+const StdTls = std.crypto.tls.Client;
+
+/// std's TLS client over a TCP connection to the test server.
+const TlsClient = struct {
+    fd: sys.fd_t,
+    file_reader: std.Io.File.Reader,
+    file_writer: std.Io.File.Writer,
+    in_buf: [StdTls.min_buffer_len]u8 = undefined,
+    out_buf: [StdTls.min_buffer_len]u8 = undefined,
+    read_buf: [StdTls.min_buffer_len]u8 = undefined,
+    write_buf: [StdTls.min_buffer_len]u8 = undefined,
+    client: StdTls = undefined,
+
+    fn connect(port: u16) !*TlsClient {
+        const raw = try Client.connect(port);
+        errdefer sys.close(raw.fd);
+        const self = try testing.allocator.create(TlsClient);
+        errdefer testing.allocator.destroy(self);
+        const file: std.Io.File = .{ .handle = raw.fd, .flags = .{ .nonblocking = false } };
+        self.* = .{
+            .fd = raw.fd,
+            .file_reader = undefined,
+            .file_writer = undefined,
+        };
+        self.file_reader = file.readerStreaming(testing.io, &self.in_buf);
+        self.file_writer = file.writerStreaming(testing.io, &self.out_buf);
+        var entropy: [StdTls.Options.entropy_len]u8 = undefined;
+        sys.randomBytes(&entropy);
+        self.client = try StdTls.init(&self.file_reader.interface, &self.file_writer.interface, .{
+            .host = .{ .explicit = "localhost" },
+            .ca = .self_signed,
+            .read_buffer = &self.read_buf,
+            .write_buffer = &self.write_buf,
+            .entropy = &entropy,
+            .realtime_now = .{ .nanoseconds = @as(i96, sys.realtimeSeconds()) * std.time.ns_per_s },
+        });
+        return self;
+    }
+
+    fn close(self: *TlsClient) void {
+        sys.close(self.fd);
+        testing.allocator.destroy(self);
+    }
+
+    fn send(self: *TlsClient, bytes: []const u8) !void {
+        try self.client.writer.writeAll(bytes);
+        try self.client.writer.flush();
+        try self.file_writer.interface.flush();
+    }
+
+    /// Reads one response. The body is copied into `body` if given.
+    fn readResponse(self: *TlsClient, body: ?[]u8) !struct { status: u16, body_len: usize, close: bool } {
+        const r = &self.client.reader;
+        const status_line = try r.takeDelimiterInclusive('\n');
+        const status = try std.fmt.parseInt(u16, status_line[9..12], 10);
+        var body_len: usize = 0;
+        var closing = false;
+        while (true) {
+            const line = try r.takeDelimiterInclusive('\n');
+            if (line.len == 2) break;
+            if (std.mem.startsWith(u8, line, "content-length: ")) {
+                body_len = try std.fmt.parseInt(usize, line[16 .. line.len - 2], 10);
+            } else if (std.mem.eql(u8, line, "connection: close\r\n")) {
+                closing = true;
+            }
+        }
+        if (body) |b| try r.readSliceAll(b[0..body_len]) else try r.discardAll(body_len);
+        return .{ .status = status, .body_len = body_len, .close = closing };
+    }
+
+    /// The server's close_notify ends the stream cleanly; a bare FIN would
+    /// make std's client report a truncation attack.
+    fn expectCleanClose(self: *TlsClient) !void {
+        var b: [1]u8 = undefined;
+        try testing.expectError(error.EndOfStream, self.client.reader.readSliceAll(&b));
+    }
+
+    fn wsRead(self: *TlsClient, payload: []u8) !struct { opcode: ws.Opcode, data: []u8 } {
+        const r = &self.client.reader;
+        const b0 = try r.takeByte();
+        const b1 = try r.takeByte();
+        var len: usize = b1 & 0x7f;
+        if (len == 126) len = try r.takeInt(u16, .big) else if (len == 127) len = @intCast(try r.takeInt(u64, .big));
+        try r.readSliceAll(payload[0..len]);
+        return .{ .opcode = ws.Opcode.fromByte(b0 & 0x0f).?, .data = payload[0..len] };
+    }
+};
+
+fn tlsConfig() Config {
+    return .{ .tls = .{ .cert_pem = tls_testdata.p256_cert, .key_pem = tls_testdata.p256_key } };
+}
+
+test "tls: keep-alive, pipelining, large responses and close_notify" {
+    const r = try Running.start(.epoll, tlsConfig());
+    defer r.stop();
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+
+    const c = try TlsClient.connect(r.port);
+    defer c.close();
+    var body: [64]u8 = undefined;
+    try c.send("GET /a HTTP/1.1\r\nHost: x\r\n\r\n");
+    var resp = try c.readResponse(&body);
+    try testing.expectEqual(200, resp.status);
+    try testing.expectEqualStrings("ok", body[0..resp.body_len]);
+
+    // Pipelined, with a body.
+    try c.send("GET /b HTTP/1.1\r\nHost: x\r\n\r\nPOST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhelloGET /c HTTP/1.1\r\nHost: x\r\n\r\n");
+    resp = try c.readResponse(&body);
+    try testing.expectEqualStrings("ok", body[0..resp.body_len]);
+    resp = try c.readResponse(&body);
+    try testing.expectEqualStrings("hello", body[0..resp.body_len]);
+    resp = try c.readResponse(&body);
+    try testing.expectEqualStrings("ok", body[0..resp.body_len]);
+
+    // Larger than the TLS output buffer and the socket buffer: encrypted in
+    // pieces as the socket drains.
+    const got = try testing.allocator.alloc(u8, big_body_len);
+    defer testing.allocator.free(got);
+    try c.send("GET /big HTTP/1.1\r\nHost: x\r\n\r\nGET /copy-big HTTP/1.1\r\nHost: x\r\n\r\n");
+    resp = try c.readResponse(got);
+    try testing.expectEqual(big_body_len, resp.body_len);
+    try testing.expectEqualSlices(u8, &big_body, got);
+    resp = try c.readResponse(null);
+    try testing.expect(resp.body_len > 0);
+
+    try c.send("GET /last HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    resp = try c.readResponse(&body);
+    try testing.expect(resp.close);
+    try c.expectCleanClose();
+}
+
+test "tls: websocket echo and server-initiated sends" {
+    const r = try Running.start(.epoll, tlsConfig());
+    defer r.stop();
+    const c = try TlsClient.connect(r.port);
+    defer c.close();
+    try c.send(Client.upgrade_request);
+    const head = try c.client.reader.takeDelimiterInclusive('\n');
+    try testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 101 "));
+    while ((try c.client.reader.takeDelimiterInclusive('\n')).len != 2) {}
+
+    var frame: [64 * 1024 + 16]u8 = undefined;
+    var payload: [64 * 1024]u8 = undefined;
+    try c.send(Client.wsFrame(&frame, true, .text, "hello"));
+    var f = try c.wsRead(&payload);
+    try testing.expectEqual(ws.Opcode.text, f.opcode);
+    try testing.expectEqualStrings("hello", f.data);
+
+    // Larger than one TLS record, both ways.
+    var big: [40 * 1024]u8 = undefined;
+    for (&big, 0..) |*b, i| b.* = @truncate(i);
+    try c.send(Client.wsFrame(&frame, true, .binary, &big));
+    f = try c.wsRead(&payload);
+    try testing.expectEqualSlices(u8, &big, f.data);
+
+    // A send from another thread wakes the worker, which encrypts it.
+    try c.send(Client.wsFrame(&frame, true, .text, "async"));
+    f = try c.wsRead(&payload);
+    try testing.expectEqualStrings("later", f.data);
+
+    try c.send(Client.wsFrame(&frame, true, .text, "close-me"));
+    f = try c.wsRead(&payload);
+    try testing.expectEqual(ws.Opcode.close, f.opcode);
+    try c.send(Client.wsFrame(&frame, true, .close, &.{ 0x03, 0xe8 }));
+    try c.expectCleanClose();
+}
+
+test "tls: plaintext HTTP to a TLS port gets an alert" {
+    const r = try Running.start(.epoll, tlsConfig());
+    defer r.stop();
+    var c = try Client.connect(r.port);
+    defer c.close();
+    try c.send("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    while (c.len < 7) {
+        if (try c.fill() == 0) break;
+    }
+    // 'G' is not a record type: unexpected_message, in a plaintext record.
+    try testing.expectEqualSlices(u8, &.{ 21, 3, 3, 0, 2, 2, 10 }, c.buf[0..7]);
+    try c.expectClosed();
+}
+
+test "tls: rejected with io_uring, and bad credentials fail init" {
+    var cfg = tlsConfig();
+    cfg.backend = .io_uring;
+    cfg.handle_signals = false;
+    try testing.expectError(error.TlsUnsupportedOnIoUring, Server(TestHandler).init(testing.allocator, 0, cfg));
+    cfg = tlsConfig();
+    cfg.handle_signals = false;
+    cfg.tls.?.key_pem = tls_testdata.p384_key;
+    try testing.expectError(error.KeyCertificateMismatch, Server(TestHandler).init(testing.allocator, 0, cfg));
+}

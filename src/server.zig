@@ -18,6 +18,22 @@ pub const Backend = enum {
     io_uring,
 };
 const ws = @import("./ws/conn.zig");
+const tls_conn = @import("./tls/conn.zig");
+const Credentials = @import("./tls/credentials.zig").Credentials;
+
+pub const TlsOptions = struct {
+    /// PEM certificate chain, leaf first.
+    cert_pem: []const u8,
+    /// PEM private key: PKCS#8 ("PRIVATE KEY") or SEC1 ("EC PRIVATE KEY").
+    /// ECDSA P-256/P-384 and Ed25519 keys are supported.
+    key_pem: []const u8,
+    /// ALPN protocol names offered, in preference order.
+    alpn: []const []const u8 = &.{"http/1.1"},
+    /// TLS record buffers preallocated per worker (input and output each).
+    /// Like read buffers, only connections with unprocessed or unsent
+    /// bytes hold one.
+    buffer_pool_size: usize = 64,
+};
 
 pub const Config = struct {
     /// I/O backend.
@@ -63,6 +79,9 @@ pub const Config = struct {
     websocket_max_send_queue_bytes: usize = 4 * 1024 * 1024,
     /// Install SIGINT/SIGTERM handlers that shut the server down.
     handle_signals: bool = true,
+    /// Serve TLS 1.3 on this port. The PEM data is parsed during init and
+    /// need not outlive it. Not yet supported by the io_uring backend.
+    tls: ?TlsOptions = null,
 };
 
 /// The server that a signal handler should stop.
@@ -153,6 +172,8 @@ pub fn Server(comptime Handler: type) type {
         signal_target: SignalTarget,
         cfg: Config,
         port: u16,
+        tls_credentials: ?Credentials = null,
+        tls_config: tls_conn.Config = undefined,
 
         pub fn init(allocator: std.mem.Allocator, port: u16, cfg: Config) !*Self {
             const address = try std.Io.net.IpAddress.parse(cfg.ip, port);
@@ -162,7 +183,12 @@ pub fn Server(comptime Handler: type) type {
                 try std.Thread.getCpuCount();
             const backend: Backend = switch (cfg.backend) {
                 .auto => .epoll,
-                .io_uring => if (sys.is_linux and worker_uring.available()) .io_uring else return error.IoUringUnavailable,
+                .io_uring => if (cfg.tls != null)
+                    return error.TlsUnsupportedOnIoUring
+                else if (sys.is_linux and worker_uring.available())
+                    .io_uring
+                else
+                    return error.IoUringUnavailable,
                 .epoll => .epoll,
             };
 
@@ -194,6 +220,12 @@ pub fn Server(comptime Handler: type) type {
                 allocator.free(srv.workers);
                 allocator.free(srv.wakers);
             }
+            if (cfg.tls) |t| {
+                srv.tls_credentials = try Credentials.fromPem(allocator, t.cert_pem, t.key_pem);
+                srv.tls_config = .{ .credentials = &srv.tls_credentials.?, .alpn = t.alpn };
+                srv.cfg.tls = null; // the PEM data may be freed after init
+            }
+            errdefer if (srv.tls_credentials) |*c| c.deinit();
 
             // Linux load-balances SO_REUSEPORT listeners across workers, so
             // each worker gets its own: no shared accept queue, no handoff.
@@ -239,6 +271,8 @@ pub fn Server(comptime Handler: type) type {
                         .max_message_size = cfg.websocket_max_message_size,
                         .max_send_queue_bytes = cfg.websocket_max_send_queue_bytes,
                     },
+                    .tls = if (srv.tls_credentials != null) &srv.tls_config else null,
+                    .tls_buffer_pool_size = if (cfg.tls) |t| t.buffer_pool_size else 0,
                 };
                 const result = switch (backend) {
                     .io_uring => if (sys.is_linux) blk: {
@@ -332,6 +366,7 @@ pub fn Server(comptime Handler: type) type {
                 -1;
             for (self.workers) |*w| w.deinit();
             if (shared_listener >= 0) sys.close(shared_listener);
+            if (self.tls_credentials) |*c| c.deinit();
             self.handler.deinit();
             self.allocator.free(self.workers);
             self.allocator.free(self.wakers);

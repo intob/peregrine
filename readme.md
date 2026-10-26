@@ -6,7 +6,7 @@ Priorities, in order:
 - Performance
 - Simplicity
 
-Where it is today: HTTP/1.1 and WebSockets are done. TLS 1.3 is in progress, then HTTP/2, then HTTP/3 over QUIC. See [PLAN.md](PLAN.md) for the roadmap and the architecture: every protocol layer is an I/O-free state machine driven by per-core event loops, so the layers stack (TCP → TLS → HTTP/1.1 or HTTP/2; UDP → QUIC → HTTP/3) and the same code runs on every backend.
+Where it is today: HTTP/1.1, WebSockets and TLS 1.3 work (TLS on the epoll/kqueue backends). Next is HTTP/2, then HTTP/3 over QUIC. See [PLAN.md](PLAN.md) for the roadmap and the architecture: every protocol layer is an I/O-free state machine driven by per-core event loops, so the layers stack (TCP → TLS → HTTP/1.1 or HTTP/2; UDP → QUIC → HTTP/3) and the same code runs on every backend.
 
 Currently, all heap allocations are made during startup. Internally, no heap allocations are made per-request unless pre-allocated buffers overflow (for example, a request body larger than a pooled read buffer, or a response that can't be written in one go).
 
@@ -22,6 +22,11 @@ Note: This project has just started, and is not yet a complete HTTP server imple
     - Strict parsing that rejects request smuggling vectors (see `src/http/parser.zig`)
     - Request size limits, idle/request timeouts (slowloris-resistant)
 - Support for WebSockets
+- TLS 1.3, written from scratch on top of `std.crypto` (no OpenSSL)
+    - X25519MLKEM768 (post-quantum hybrid), X25519 and P-256 key exchange, HelloRetryRequest
+    - AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305
+    - ECDSA P-256/P-384 and Ed25519 certificates, ALPN, KeyUpdate
+    - HTTP and WebSockets over TLS, on the epoll/kqueue backends (io_uring not yet)
 - Cross-platform IO Multiplexing
     - Kqueue support for BSD and MacOS systems
     - Epoll support for Linux systems
@@ -118,6 +123,23 @@ docker build -t counter . -f ./example/counter/Dockerfile && \
 docker run -p 3000:3000 counter
 ```
 
+### Serve HTTPS
+```bash
+zig build run-https
+curl --cacert example/https/server.pem https://localhost:3443/
+```
+Pass the PEM certificate chain and private key in the config. They are parsed at startup and needn't outlive `init`:
+```zig
+const srv = try per.Server(Handler).init(gpa, 443, .{
+    .tls = .{
+        .cert_pem = cert_pem, // leaf first, then intermediates
+        .key_pem = key_pem, // PKCS#8 or SEC1; ECDSA P-256/P-384 or Ed25519
+        .alpn = &.{"http/1.1"}, // the default
+    },
+});
+```
+RSA certificates aren't supported yet. Session resumption and 0-RTT aren't either: every connection does a full handshake.
+
 ### Implement a server
 ```zig
 const std = @import("std");
@@ -187,6 +209,8 @@ Workers:    Read buffer pool:   256 x 16KB = 4MB
             Total:              ~8MB
 ```
 Read buffers are only held while a connection has unprocessed bytes, so many idle keep-alive connections don't need many buffers. If the pool runs out, buffers overflow to the heap and are freed afterwards.
+
+With TLS, each worker also preallocates `tls.buffer_pool_size` (default 64) record input buffers of 17KB and output buffers of 64KB, held on the same terms; an established connection keeps only its keys (about 300 bytes).
 
 ### Response headers
 `Content-Length`, `Date` and `Connection` are set by the server (no `Content-Length` on 1xx/204 responses; `HEAD` responses keep the length but omit the body). Adding any of them, or `Transfer-Encoding`, with `addNewHeader` is a compile error, so they can't be duplicated by accident. Set `resp.close = true` to close the connection after the response.
@@ -260,7 +284,7 @@ Until these things are done, I don't think that this project can possibly be con
 
 See [PLAN.md](PLAN.md) for the full checklist. In order:
 
-1. TLS 1.3 (in progress): X25519, P-256 and X25519MLKEM768 key exchange, AES-GCM and ChaCha20-Poly1305, ECDSA and Ed25519 certificates, ALPN. Later: resumption, kTLS on Linux
+1. TLS 1.3 follow-ups: io_uring support, fuzzing, faster handshakes, RSA certificates, resumption, kTLS on Linux
 2. HTTP/2: HPACK, flow control, RFC 9218 priorities, WebSockets over h2 (RFC 8441), with a handler API that supports streaming responses
 3. HTTP/3 over QUIC: QUIC transport, loss recovery and congestion control, QPACK, GSO/GRO, WebSockets over h3 (RFC 9220)
 4. Throughout: `sendfile`, tuning io_uring until it beats epoll, WebSocket `permessage-deflate`, and verification with Autobahn, h2spec, quic-interop-runner, soak, adversarial and differential (HTTP Garden) testing

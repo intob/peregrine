@@ -54,7 +54,7 @@ Design rules that apply to every layer:
 | M1. HTTP/1.1 core | ✅ done (streaming responses deferred to the API redesign in M5) |
 | M2. Throughput architecture | 🟡 io_uring works (opt-in, not yet faster than epoll); sendfile, NUMA open |
 | M3. WebSockets over HTTP/1.1 | ✅ reworked; permessage-deflate, Autobahn, benchmarks open |
-| M4. TLS 1.3 | 🟡 **in progress**: I/O-free handshake and record layer, integrated into the epoll/kqueue worker |
+| M4. TLS 1.3 | 🟡 **working on epoll/kqueue** (HTTP and WebSockets, interop-tested); io_uring, fuzzing and handshake speed open |
 | M5. HTTP/2 | ⬜ next after TLS |
 | M6. HTTP/3 and QUIC | ⬜ |
 | M7. Verification and benchmarking | 🟡 ongoing for each milestone |
@@ -73,12 +73,9 @@ Source layout:
 | `src/ws/protocol.zig` | I/O-free WebSocket frame decoder and message assembler |
 | `src/ws/conn.zig` | Per-connection WebSocket state: send queue, close handshake, cross-thread mailbox |
 | `src/ws/upgrader.zig` | The HTTP upgrade response |
-| `src/tls/` | TLS 1.3 server (M4): see below |
+| `src/tls/` | I/O-free TLS 1.3 server (M4): see below |
 | `src/server_test.zig` | End-to-end tests over real sockets, run once per available backend |
 | `bench/` | `zig build bench` (parser micro-benchmarks), `zig build bench-server` (load-test target) |
-
-`src/https/` is the old blocking TLS prototype. It is not compiled and will be deleted
-once `src/tls/` covers it.
 
 Tests run with `zig build test` on macOS (kqueue), Linux with Docker's default seccomp
 (epoll; io_uring is blocked there, so `.auto` falls back), and Linux with io_uring
@@ -194,7 +191,7 @@ Still open:
 
 ---
 
-## M4. TLS 1.3 🟡 (in progress)
+## M4. TLS 1.3 🟡
 
 std 0.17 ships only a TLS client (`std.crypto.tls.Client`), so the server side is
 ours. We reuse std for primitives: AEADs, HKDF, X25519, P-256/P-384, ML-KEM, ECDSA,
@@ -238,27 +235,53 @@ ciphertext too: unsent ciphertext counts as pending output, and plaintext not ye
 encrypted is kept like an unsent response.
 
 Checklist:
-- [x] Decide: rewrite as I/O-free layers in `src/tls/` instead of fixing `src/https/`
-      (it was blocking, had no bounds checks, used an empty AAD and no sequence-number
-      nonce, and assumed one read per record)
-- [ ] `key_schedule.zig` + RFC 8448 test vectors
-- [ ] `record.zig` + tests (round trip, tampering, padding, limits)
-- [ ] `handshake.zig`: ClientHello parsing (strict, bounds-checked), negotiation,
-      HRR, server flight, client Finished
-- [ ] `credentials.zig`: PEM chain, PKCS#8/SEC1 keys
-- [ ] `conn.zig`: records ↔ handshake ↔ application data, alerts, close_notify,
-      KeyUpdate
-- [ ] Handshake test against `std.crypto.tls.Client` (in-process, over a socketpair)
-- [ ] `Config.tls`, worker integration for HTTP and WebSockets, end-to-end tests
-- [ ] Interop check with curl and `openssl s_client`
-- [ ] io_uring backend integration
-- [ ] Random-split property test and fuzz target over `tls.Conn`
-- [ ] Remove `src/https/`
+- [x] Decide: rewrite as I/O-free layers in `src/tls/` instead of fixing the old
+      `src/https/` prototype (it was blocking, had no bounds checks, used an empty AAD
+      and no sequence-number nonce, and assumed one read per record). Prototype deleted
+- [x] `key_schedule.zig`: every secret, key and IV of the RFC 8448 1-RTT trace
+- [x] `record.zig`: seal/open reproduce RFC 8448's encrypted records byte for byte;
+      round trips for every suite, KeyUpdate, tampering, replay, padding-only records
+- [x] `handshake.zig`: strict ClientHello parsing (duplicate extensions, PSK not last,
+      share/group mismatches, bad lengths, low-order points), negotiation, HRR, server
+      flight, client Finished. The ServerHello for RFC 8448's ClientHello matches the
+      RFC byte for byte; every group × suite is checked against an independent
+      client-side computation
+- [x] `credentials.zig`: PEM chains, PKCS#8 and SEC1 keys, checked against the leaf
+- [x] `conn.zig`: records ↔ handshake ↔ application data, alerts (plaintext before
+      keys exist), close_notify, KeyUpdate both ways, rejected 0-RTT skipped, garbage
+      (say, plaintext HTTP) rejected from the first header
+- [x] Handshake + 40 KB echo against `std.crypto.tls.Client` over a socketpair, for
+      every suite × group with P-256 and P-384 certificates (with the client in
+      middlebox compatibility mode, so the CCS path runs)
+- [x] Random-split property test: a recorded session replayed byte by byte and in 99
+      random splits gives identical handshake bytes and plaintext
+- [x] `Config.tls` (PEM in memory, ALPN list), worker integration for HTTP and
+      WebSockets on epoll/kqueue. End-to-end tests with std's client: keep-alive,
+      pipelining, 8 MB and 1 MB responses through partial writes, close_notify on
+      `Connection: close`, WebSocket echo (40 KB frames, cross-thread sends, close
+      handshake), plaintext HTTP to a TLS port. Linux (epoll) and macOS (kqueue)
+- [x] Interop with OpenSSL 4.0 `s_client`: all 9 suite × group combinations with
+      certificate verification, HelloRetryRequest (client shares X448 only), KeyUpdate
+      in both directions, Ed25519 certificates (std's client can't check those: its
+      CertificateVerify scheme check has no Ed25519 case). curl 8.7 (LibreSSL) with ALPN
+- [x] `example/https` (`zig build run-https`)
+- [ ] io_uring backend integration (`.io_uring` + TLS is rejected at init for now;
+      `.auto` picks epoll)
+- [ ] Fuzz target over `tls.Conn` (ClientHello mutations and record splits)
+
+First numbers (macOS, M2 Pro, all cores, `wrk -t4 -c64`, so wrk-bound and only
+relative): keep-alive "Hello" over TLS 136k req/s vs. 146k plaintext; full handshakes
+(new connection per request, X25519MLKEM768 + ECDSA P-256) about 6.2k/s. Handshake
+cost is mostly std's P-256 signing and ML-KEM, which have no assembly fast paths:
+profile before deciding what to optimise.
 
 Later in M4:
 - [ ] Faster record crypto: keep expanded AES key schedules per connection instead of
       re-expanding per record (std's AEAD API takes raw keys), and decrypt straight
       into the session buffer
+- [ ] Faster handshakes: measure on Linux; candidates are P-256 signing, ML-KEM
+      encapsulation, and the per-handshake allocations (handshake state, flight buffer)
+- [ ] Send KeyUpdate before the AES-GCM record limit (about 2^24.5 records per key)
 - [ ] RSA certificates (RSA-PSS signing: std has only verification)
 - [ ] Session tickets and resumption (PSK-DHE); 0-RTT only with replay protection
 - [ ] Several certificates selected by SNI; OCSP stapling

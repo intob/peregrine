@@ -13,6 +13,8 @@ const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
 const ws = @import("../ws/conn.zig");
 const WsConn = ws.Conn;
+const tls = @import("../tls/conn.zig");
+const TlsConn = tls.Conn;
 
 const LISTENER_TOKEN: u64 = std.math.maxInt(u64);
 const WAKER_TOKEN: u64 = std.math.maxInt(u64) - 1;
@@ -34,6 +36,10 @@ pub const Options = struct {
     /// TCP_DEFER_ACCEPT, so data is usually already there).
     read_on_accept: bool,
     websocket: ws.Options,
+    /// TLS for every connection, if set.
+    tls: ?*const tls.Config = null,
+    /// TLS record buffers preallocated per worker (input and output each).
+    tls_buffer_pool_size: usize = 0,
 };
 
 pub fn Worker(comptime Handler: type) type {
@@ -60,6 +66,9 @@ pub fn Worker(comptime Handler: type) type {
             session: Session = .{},
             /// Set after a WebSocket upgrade; the session is then unused.
             ws: ?*WsConn = null,
+            /// Set on TLS listeners: sits between the socket and the
+            /// session (or the WebSocket decoder).
+            tls: ?*TlsConn = null,
             /// Unsent output after a partial write: an owned copy of the
             /// serialised head bytes, then the body (owned or borrowed).
             pending_head: []u8 = &.{},
@@ -67,7 +76,13 @@ pub fn Worker(comptime Handler: type) type {
             pending_body: []const u8 = "",
             pending_body_owned: []u8 = &.{},
 
+            /// Output not yet written: plaintext waiting to be written (or
+            /// encrypted), or TLS records waiting to be written.
             inline fn hasPending(c: *const Conn) bool {
+                return c.hasPendingPlain() or (c.tls != null and c.tls.?.hasWire());
+            }
+
+            inline fn hasPendingPlain(c: *const Conn) bool {
                 return c.pending_head_pos < c.pending_head.len or c.pending_body.len > 0;
             }
         };
@@ -104,6 +119,9 @@ pub fn Worker(comptime Handler: type) type {
         active: List,
         open_count: usize = 0,
         thread: ?std.Thread = null,
+        tls_pools: ?tls.Pools = null,
+        /// Handshake randomness, seeded from the OS once per worker.
+        rng: std.Random.ChaCha,
 
         pub const InitConfig = struct {
             id: usize,
@@ -140,6 +158,11 @@ pub fn Worker(comptime Handler: type) type {
             if (opts.out_buffer_size < session.headRoom(resp)) return error.OutBufferTooSmall;
             const out_buf = try allocator.alloc(u8, opts.out_buffer_size);
             errdefer allocator.free(out_buf);
+            var tls_pools: ?tls.Pools = if (opts.tls != null) try tls.Pools.init(allocator, opts.tls_buffer_pool_size) else null;
+            errdefer if (tls_pools) |*p| p.deinit();
+            var seed: [std.Random.ChaCha.secret_seed_length]u8 = undefined;
+            sys.randomBytes(&seed);
+            defer std.crypto.secureZero(u8, &seed);
             self.* = .{
                 .id = cfg.id,
                 .allocator = allocator,
@@ -162,6 +185,8 @@ pub fn Worker(comptime Handler: type) type {
                 .now = sys.monotonicSeconds(),
                 .idle = .{ .timeout = opts.keep_alive_timeout_s },
                 .active = .{ .timeout = opts.request_timeout_s },
+                .tls_pools = tls_pools,
+                .rng = .init(seed),
             };
             self.refreshDate();
             try self.poller.add(self.listener, LISTENER_TOKEN, .level_read);
@@ -195,6 +220,7 @@ pub fn Worker(comptime Handler: type) type {
             self.allocator.free(self.out_buf);
             self.allocator.free(self.conns);
             self.allocator.free(self.free_slots);
+            if (self.tls_pools) |*p| p.deinit();
         }
 
         fn run(self: *Self, pin: bool) void {
@@ -289,7 +315,8 @@ pub fn Worker(comptime Handler: type) type {
         /// request or unsent response gets the request timeout, which is not
         /// extended by further reads (slowloris), only by write progress.
         fn updateTimer(self: *Self, c: *Conn) void {
-            if (c.session.inRequest() or c.hasPending()) {
+            const handshaking = c.tls != null and c.tls.?.isHandshaking();
+            if (c.session.inRequest() or c.hasPending() or handshaking) {
                 if (c.list != .active) self.arm(c, .active);
             } else {
                 self.arm(c, .idle);
@@ -320,6 +347,12 @@ pub fn Worker(comptime Handler: type) type {
                 const gen = c.gen +% 1;
                 c.* = .{ .fd = fd, .gen = gen, .open = true };
                 self.open_count += 1;
+                if (self.opts.tls) |cfg| {
+                    self.attachTls(c, cfg) catch {
+                        self.closeConn(c);
+                        continue;
+                    };
+                }
                 self.poller.add(fd, (@as(u64, gen) << 32) | slot, .connection) catch {
                     self.closeConn(c);
                     continue;
@@ -332,8 +365,22 @@ pub fn Worker(comptime Handler: type) type {
             }
         }
 
+        fn attachTls(self: *Self, c: *Conn, cfg: *const tls.Config) !void {
+            var entropy: [tls.entropy_len]u8 = undefined;
+            self.rng.fill(&entropy);
+            defer std.crypto.secureZero(u8, &entropy);
+            const t = try self.allocator.create(TlsConn);
+            errdefer self.allocator.destroy(t);
+            t.* = try TlsConn.init(self.allocator, &self.tls_pools.?, cfg, &entropy);
+            c.tls = t;
+        }
+
         /// Close after the final response, lingering if the session asks.
         fn finish(self: *Self, c: *Conn) void {
+            if (c.tls) |t| {
+                t.close();
+                self.tlsWriteOnce(c, t);
+            }
             if (!c.session.linger or c.peer_closed) return self.closeConn(c);
             sys.shutdownWrite(c.fd);
             c.session.deinit(&self.pool);
@@ -358,6 +405,13 @@ pub fn Worker(comptime Handler: type) type {
         }
 
         fn closeConn(self: *Self, c: *Conn) void {
+            if (c.tls) |t| {
+                // close_notify, unless an alert went out or output is stuck.
+                if (t.isEstablished() and !t.hasWire()) {
+                    t.close();
+                    self.tlsWriteOnce(c, t);
+                }
+            }
             sys.close(c.fd);
             self.releaseConn(c);
         }
@@ -370,6 +424,11 @@ pub fn Worker(comptime Handler: type) type {
                 if (@hasDecl(Handler, "handleWSDisconn")) self.handler.handleWSDisconn(w);
                 w.destroy(&self.pool);
                 c.ws = null;
+            }
+            if (c.tls) |t| {
+                t.deinit();
+                self.allocator.destroy(t);
+                c.tls = null;
             }
             c.open = false;
             c.fd = -1;
@@ -392,7 +451,7 @@ pub fn Worker(comptime Handler: type) type {
             self.unlink(c);
             if (@hasDecl(Handler, "handleWSConn")) self.handler.handleWSConn(w);
             if (!self.wsProcess(c)) return;
-            if (c.read_ready) self.wsReadable(c);
+            if (c.read_ready or (c.tls != null and c.tls.?.hasBufferedInput())) self.wsReadable(c);
         }
 
         fn freePending(self: *Self, c: *Conn) void {
@@ -426,24 +485,9 @@ pub fn Worker(comptime Handler: type) type {
 
         fn onReadable(self: *Self, c: *Conn) void {
             while (true) {
-                if (c.read_ready) {
-                    const space = c.session.readSpace(&self.pool, self.opts.session) catch {
-                        return self.closeConn(c);
-                    };
-                    if (sys.read(c.fd, space)) |n| {
-                        if (n == 0) {
-                            c.peer_closed = true;
-                            c.read_ready = false;
-                        } else {
-                            c.session.commitRead(n);
-                            // A short read drained the socket; edge triggering
-                            // reports any newer data. Saves a read() == EAGAIN.
-                            if (n < space.len) c.read_ready = false;
-                        }
-                    } else |err| switch (err) {
-                        error.WouldBlock => c.read_ready = false,
-                        else => return self.closeConn(c),
-                    }
+                if (c.read_ready and !self.readSocket(c)) return;
+                if (c.tls) |t| {
+                    if (!self.tlsDecrypt(c, t)) return;
                 }
                 switch (self.processBuffered(c)) {
                     .ok => {},
@@ -451,10 +495,50 @@ pub fn Worker(comptime Handler: type) type {
                     .gone => return,
                 }
                 if (c.peer_closed) return self.closeConn(c);
-                if (!c.read_ready) break;
+                if (!c.read_ready and !(c.tls != null and c.tls.?.hasBufferedInput())) break;
             }
             c.session.releaseIfIdle(&self.pool);
+            if (c.tls) |t| t.releaseIfIdle();
             self.updateTimer(c);
+        }
+
+        /// Reads into the TLS connection, else the WebSocket decoder, else
+        /// the session. Returns false if the connection was closed.
+        fn readSocket(self: *Self, c: *Conn) bool {
+            const space = blk: {
+                if (c.tls) |t| break :blk t.readSpace();
+                if (c.ws) |w| break :blk w.decoder.readSpace(&self.pool);
+                break :blk c.session.readSpace(&self.pool, self.opts.session);
+            } catch {
+                self.closeConn(c);
+                return false;
+            };
+            // TLS: decrypted data not yet taken fills the buffer.
+            if (space.len == 0) return true;
+            if (sys.read(c.fd, space)) |n| {
+                if (n == 0) {
+                    c.peer_closed = true;
+                    c.read_ready = false;
+                    return true;
+                }
+                if (c.tls) |t| {
+                    t.commitRead(n);
+                } else if (c.ws) |w| {
+                    w.decoder.commitRead(n);
+                } else {
+                    c.session.commitRead(n);
+                }
+                // A short read drained the socket; edge triggering reports
+                // any newer data. Saves a read() == EAGAIN.
+                if (n < space.len) c.read_ready = false;
+            } else |err| switch (err) {
+                error.WouldBlock => c.read_ready = false,
+                else => {
+                    self.closeConn(c);
+                    return false;
+                },
+            }
+            return true;
         }
 
         const ProcessResult = enum { ok, blocked, gone };
@@ -499,6 +583,7 @@ pub fn Worker(comptime Handler: type) type {
         /// the connection (Out and the response are reused). Returns false
         /// if the connection was closed.
         fn writeOut(self: *Self, c: *Conn) bool {
+            if (c.tls) |t| return self.tlsWriteOut(c, t);
             var iov: [2]sys.iovec_const = undefined;
             const total = self.out.totalLen();
             const n = sys.writev(c.fd, self.out.iovecs(&iov)) catch |err| switch (err) {
@@ -546,30 +631,11 @@ pub fn Worker(comptime Handler: type) type {
 
         /// Continues a partial write. Returns false if the connection is gone.
         fn writePending(self: *Self, c: *Conn) bool {
-            var iov: [2]sys.iovec_const = undefined;
-            var iov_len: usize = 0;
-            const head_rest = c.pending_head[c.pending_head_pos..];
-            if (head_rest.len > 0) {
-                iov[iov_len] = .{ .base = head_rest.ptr, .len = head_rest.len };
-                iov_len += 1;
-            }
-            if (c.pending_body.len > 0) {
-                iov[iov_len] = .{ .base = c.pending_body.ptr, .len = c.pending_body.len };
-                iov_len += 1;
-            }
-            const n = sys.writev(c.fd, iov[0..iov_len]) catch |err| switch (err) {
-                error.WouldBlock => return true,
-                else => {
-                    self.closeConn(c);
-                    return false;
-                },
-            };
-            const from_head = @min(n, head_rest.len);
-            c.pending_head_pos += from_head;
-            c.pending_body = c.pending_body[n - from_head ..];
+            const progressed = (if (c.tls) |t| self.tlsWritePending(c, t) else self.writePendingPlain(c)) orelse
+                return false;
             if (c.hasPending()) {
                 // Progress extends the deadline; a stalled reader still times out.
-                if (n > 0) self.arm(c, .active);
+                if (progressed) self.arm(c, .active);
                 return true;
             }
             self.freePending(c);
@@ -590,32 +656,157 @@ pub fn Worker(comptime Handler: type) type {
             return false;
         }
 
+        /// Writes pending plaintext. Returns whether bytes were written, or
+        /// null if the connection was closed.
+        fn writePendingPlain(self: *Self, c: *Conn) ?bool {
+            var iov: [2]sys.iovec_const = undefined;
+            var iov_len: usize = 0;
+            const head_rest = c.pending_head[c.pending_head_pos..];
+            if (head_rest.len > 0) {
+                iov[iov_len] = .{ .base = head_rest.ptr, .len = head_rest.len };
+                iov_len += 1;
+            }
+            if (c.pending_body.len > 0) {
+                iov[iov_len] = .{ .base = c.pending_body.ptr, .len = c.pending_body.len };
+                iov_len += 1;
+            }
+            const n = sys.writev(c.fd, iov[0..iov_len]) catch |err| switch (err) {
+                error.WouldBlock => return false,
+                else => {
+                    self.closeConn(c);
+                    return null;
+                },
+            };
+            advancePending(c, n);
+            return n > 0;
+        }
+
+        fn advancePending(c: *Conn, n: usize) void {
+            const from_head = @min(n, c.pending_head.len - c.pending_head_pos);
+            c.pending_head_pos += from_head;
+            c.pending_body = c.pending_body[n - from_head ..];
+        }
+
+        // -- TLS I/O --------------------------------------------------------
+
+        /// Moves decrypted application data into the session (or the
+        /// WebSocket decoder), at most one buffer's worth: the caller
+        /// processes it and calls again while `hasBufferedInput`. Also
+        /// writes TLS output such as the handshake. Returns false if the
+        /// connection was closed.
+        fn tlsDecrypt(self: *Self, c: *Conn, t: *TlsConn) bool {
+            if (t.hasBufferedInput()) {
+                const space = blk: {
+                    if (c.ws) |w| break :blk w.decoder.readSpace(&self.pool);
+                    break :blk c.session.readSpace(&self.pool, self.opts.session);
+                } catch {
+                    self.closeConn(c);
+                    return false;
+                };
+                const n = t.readPlain(space);
+                if (c.ws) |w| w.decoder.commitRead(n) else c.session.commitRead(n);
+            }
+            if (t.failed) {
+                // Send the alert, then give up on the connection.
+                self.tlsWriteOnce(c, t);
+                self.closeConn(c);
+                return false;
+            }
+            if (t.peer_closed) c.peer_closed = true;
+            return self.tlsFlush(c, t) != null;
+        }
+
+        /// Writes TLS records until done or the socket is full. Returns
+        /// whether bytes were written, or null if the connection was closed.
+        fn tlsFlush(self: *Self, c: *Conn, t: *TlsConn) ?bool {
+            var progressed = false;
+            while (t.hasWire()) {
+                const n = sys.write(c.fd, t.wireBytes()) catch |err| switch (err) {
+                    error.WouldBlock => return progressed,
+                    else => {
+                        self.closeConn(c);
+                        return null;
+                    },
+                };
+                t.advance(n);
+                progressed = true;
+            }
+            return progressed;
+        }
+
+        /// Best effort before closing (alerts, close_notify): one write.
+        fn tlsWriteOnce(_: *Self, c: *Conn, t: *TlsConn) void {
+            if (!t.hasWire()) return;
+            const n = sys.write(c.fd, t.wireBytes()) catch return;
+            t.advance(n);
+        }
+
+        /// Encrypts the worker's Out buffer and writes it. Plaintext that
+        /// didn't fit in the TLS output buffer is kept like an unsent
+        /// response. Returns false if the connection was closed.
+        fn tlsWriteOut(self: *Self, c: *Conn, t: *TlsConn) bool {
+            const out = &self.out;
+            defer out.clear();
+            const total = out.totalLen();
+            var consumed: usize = 0;
+            // Encrypt and write until done or the socket is full. Stopping
+            // with the wire drained but plaintext left would wait for a
+            // writability edge that never comes.
+            while (true) {
+                const head = out.buf[@min(consumed, out.len)..out.len];
+                const body = out.body[consumed -| out.len..];
+                consumed += t.encrypt(&.{ head, body }) catch {
+                    self.closeConn(c);
+                    return false;
+                };
+                if (self.tlsFlush(c, t) == null) return false;
+                if (consumed == total or t.hasWire()) break;
+            }
+            if (consumed < total) {
+                self.savePending(c, consumed) catch {
+                    self.closeConn(c);
+                    return false;
+                };
+            }
+            return true;
+        }
+
+        /// Writes TLS records, encrypting pending plaintext as they drain.
+        fn tlsWritePending(self: *Self, c: *Conn, t: *TlsConn) ?bool {
+            var progressed = false;
+            while (true) {
+                progressed = (self.tlsFlush(c, t) orelse return null) or progressed;
+                if (t.hasWire() or !c.hasPendingPlain()) return progressed;
+                const consumed = t.encrypt(&.{ c.pending_head[c.pending_head_pos..], c.pending_body }) catch {
+                    self.closeConn(c);
+                    return null;
+                };
+                advancePending(c, consumed);
+            }
+        }
+
         // -- WebSocket I/O ------------------------------------------------
 
+        /// A stalled write: WebSocket bytes, or TLS records, not yet written.
+        fn wsHasWire(c: *const Conn) bool {
+            return c.ws.?.hasWire() or (c.tls != null and c.tls.?.hasWire());
+        }
+
         fn onWsEvent(self: *Self, c: *Conn, ev: Poller.Event) void {
-            const w = c.ws.?;
-            if (Poller.writable(ev) and w.hasWire()) {
+            if (Poller.writable(ev) and wsHasWire(c)) {
                 if (!self.wsFlush(c)) return;
             }
             // Reading pauses while output is stalled (backpressure).
-            if (c.read_ready and !w.hasWire()) self.wsReadable(c);
+            if (c.read_ready and !wsHasWire(c)) self.wsReadable(c);
         }
 
         fn wsReadable(self: *Self, c: *Conn) void {
-            const w = c.ws.?;
-            while (c.read_ready and !w.hasWire()) {
-                const space = w.decoder.readSpace(&self.pool) catch return self.closeConn(c);
-                if (sys.read(c.fd, space)) |n| {
-                    if (n == 0) {
-                        c.peer_closed = true;
-                        c.read_ready = false;
-                    } else {
-                        w.decoder.commitRead(n);
-                        if (n < space.len) c.read_ready = false;
-                    }
-                } else |err| switch (err) {
-                    error.WouldBlock => c.read_ready = false,
-                    else => return self.closeConn(c),
+            while (!wsHasWire(c)) {
+                const tls_buffered = c.tls != null and c.tls.?.hasBufferedInput();
+                if (!c.read_ready and !tls_buffered) break;
+                if (c.read_ready and !self.readSocket(c)) return;
+                if (c.tls) |t| {
+                    if (!self.tlsDecrypt(c, t)) return;
                 }
                 if (!self.wsProcess(c)) return;
                 if (c.peer_closed) return self.closeConn(c);
@@ -638,6 +829,22 @@ pub fn Worker(comptime Handler: type) type {
         fn wsFlush(self: *Self, c: *Conn) bool {
             const w = c.ws.?;
             while (true) {
+                if (c.tls) |t| {
+                    // TLS records first, then encrypt more WebSocket output.
+                    const progressed = self.tlsFlush(c, t) orelse return false;
+                    if (t.hasWire()) {
+                        self.wsTimer(c, progressed);
+                        return true;
+                    }
+                    const bytes = w.wireBytes();
+                    if (bytes.len == 0) break;
+                    const n = t.encrypt(&.{bytes}) catch {
+                        self.closeConn(c);
+                        return false;
+                    };
+                    w.advance(n);
+                    continue;
+                }
                 const bytes = w.wireBytes();
                 if (bytes.len == 0) break;
                 const n = sys.write(c.fd, bytes) catch |err| switch (err) {
@@ -669,7 +876,7 @@ pub fn Worker(comptime Handler: type) type {
         /// timeout; otherwise WebSocket connections have no timeout.
         fn wsTimer(self: *Self, c: *Conn, progress: bool) void {
             const w = c.ws.?;
-            if (w.hasWire()) {
+            if (wsHasWire(c)) {
                 if (progress or c.list != .active) self.arm(c, .active);
             } else if (w.closeSent()) {
                 if (c.list != .active) self.arm(c, .active);
@@ -697,7 +904,7 @@ pub fn Worker(comptime Handler: type) type {
             w.clearPosted();
             if (!self.wsFlush(c)) return;
             // Output may have been stalled; reading resumes once it drains.
-            if (c.read_ready and !w.hasWire()) self.wsReadable(c);
+            if (c.read_ready and !wsHasWire(c)) self.wsReadable(c);
         }
     };
 }

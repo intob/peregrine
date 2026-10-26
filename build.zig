@@ -22,6 +22,7 @@ pub fn build(b: *std.Build) !void {
         .{ .name = "fileserver", .src = "example/fileserver/fileserver.zig" },
         .{ .name = "dirserver", .src = "example/dirserver/dirserver.zig" },
         .{ .name = "websocket", .src = "example/websocket/websocket.zig" },
+        .{ .name = "https", .src = "example/https/https.zig" },
     };
     for (examples) |excfg| {
         const exe = b.addExecutable(.{
