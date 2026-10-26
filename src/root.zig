@@ -38,6 +38,7 @@ test {
     _ = @import("./tls/credentials.zig");
     _ = @import("./tls/handshake.zig");
     _ = @import("./tls/conn.zig");
+    _ = @import("./tls/fuzz.zig");
     _ = @import("./server_test.zig");
     @import("std").testing.refAllDecls(@This());
 }

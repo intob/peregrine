@@ -9,9 +9,12 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
     });
+    // e.g. -Dtest-filter="fuzz: tls" to fuzz one target.
+    const test_filters = b.option([]const []const u8, "test-filter", "Only build tests whose names contain this") orelse &.{};
     const lib_test = b.addTest(.{
         .name = "tests",
         .root_module = lib,
+        .filters = test_filters,
     });
     const lib_test_step = b.step("test", "Run library tests");
     lib_test_step.dependOn(&b.addRunArtifact(lib_test).step);
