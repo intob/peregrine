@@ -357,6 +357,18 @@ const Mutation = enum(u8) {
     legacy_version,
 };
 
+/// Rules on the extension list as a whole, whichever mutations led there:
+/// no duplicates (§4.2), pre_shared_key last (§4.2.11) and only with
+/// psk_key_exchange_modes (§4.2.9).
+fn wellFormedExtensions(h: *const Hello) bool {
+    const exts = h.exts.items;
+    for (exts, 0..) |e, i| {
+        for (exts[i + 1 ..]) |f| if (e.type == f.type) return false;
+        if (e.type == ext_pre_shared_key and (i != exts.len - 1 or h.find(ext_psk_modes) == null)) return false;
+    }
+    return true;
+}
+
 const MutationResult = struct {
     /// Every mutation left a valid ClientHello.
     benign: bool = true,
@@ -392,6 +404,9 @@ fn pickGroup(smith: *Smith) u16 {
 }
 
 fn mutateHello(a: Allocator, smith: *Smith, fx: *const Fixtures, h: *Hello, res: *MutationResult, count: u8) !void {
+    defer if (!wellFormedExtensions(h)) {
+        res.benign = false;
+    };
     for (0..count) |_| {
         const m = smith.valueRangeAtMost(u8, 0, @typeInfo(Mutation).@"enum".field_names.len - 1);
         if (trace) std.debug.print("mutation {s}\n", .{@tagName(@as(Mutation, @fromBackingInt(m)))});
@@ -1617,6 +1632,8 @@ const corpus = [_][]const u8{
     @embedFile("testdata/fuzz/hrr-1.bin"),
     // Harness: a ClientHello2 mutation changed the session ID.
     @embedFile("testdata/fuzz/hello-2.bin"),
+    // Harness: two pre_shared_key extensions counted as valid.
+    @embedFile("testdata/fuzz/hello-3.bin"),
 };
 
 test "fuzz: tls.Conn handshake and record mutations" {
