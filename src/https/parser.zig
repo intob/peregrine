@@ -2,6 +2,7 @@ const std = @import("std");
 const TLSReader = @import("./reader.zig").TLSReader;
 
 pub const RecordType = enum(u8) {
+    //alert = 0x15,
     handshake = 0x16,
     application_data = 0x17,
 };

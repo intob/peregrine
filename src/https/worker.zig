@@ -171,13 +171,20 @@ pub fn TLSWorker(comptime Handler: type) type {
                     try conn.deriveKeys();
                     try self.writeEncryptedExtensions(conn, fd);
                     try self.writeCertificate(conn, fd);
-                    try self.writeCertificateVerify(conn, fd);
-                    switch (conn.hash) {
-                        .SHA256 => try self.writeFinished(32, conn, fd),
-                        .SHA384 => try self.writeFinished(48, conn, fd),
-                    }
+                    //try self.writeCertificateVerify(conn, fd);
+                    //switch (conn.hash) {
+                    //    .SHA256 => try self.writeFinished(32, conn, fd),
+                    //    .SHA384 => try self.writeFinished(48, conn, fd),
+                    //}
                     conn.state = .@"02_WaitClientFinished";
                     std.debug.print("fd {} now in state {}\n", .{ fd, conn.state });
+                },
+                .@"02_WaitClientFinished" => {
+                    switch (conn.hash) {
+                        .SHA256 => try self.readHandshakeFinished(32, conn, fd),
+                        .SHA384 => try self.readHandshakeFinished(48, conn, fd),
+                    }
+                    conn.state = .@"03_Connected";
                 },
                 else => std.debug.print("I'm a teapot. State: {}\n", .{conn.state}),
             }
@@ -356,6 +363,122 @@ pub fn TLSWorker(comptime Handler: type) type {
             buffer.items[3] = @intCast(msg_len & 0xFF);
             try conn.handshake_to_digest.appendSlice(buffer.items);
             try self.writeEncrypted(conn, fd, buffer.items);
+        }
+
+        fn readHandshakeFinished(self: *Self, comptime hash_len: u8, conn: *Connection, fd: i32) !void {
+            // Read encrypted Finished message
+            var record_header: [5]u8 = undefined;
+            _ = try posix.read(fd, &record_header);
+
+            if (record_header[0] != @intFromEnum(parser.RecordType.application_data)) {
+                std.debug.print("unexpected record type {x}\n", .{record_header[0]});
+                const record_len = @as(usize, record_header[3]) << 8 | record_header[4];
+                const alert = try self.allocator.alloc(u8, record_len);
+                defer self.allocator.free(alert);
+                _ = try posix.read(fd, alert);
+                std.debug.print("alert: {x}\n", .{alert});
+                return error.Alert;
+            }
+
+            const record_len = @as(usize, record_header[3]) << 8 | record_header[4];
+            var encrypted = try self.allocator.alloc(u8, record_len);
+            defer self.allocator.free(encrypted);
+            _ = try posix.read(fd, encrypted);
+
+            var plaintext = try self.allocator.alloc(u8, encrypted.len - 16); // subtract auth tag
+            defer self.allocator.free(plaintext);
+
+            var tag: [16]u8 = undefined;
+            @memcpy(&tag, encrypted[encrypted.len - 16 ..]);
+
+            const client_key = switch (hash_len) {
+                32 => conn.client_hash_keys.SHA256.getAes128Key(),
+                48 => conn.client_hash_keys.SHA384.getAes256Key(),
+                else => return error.UnsupportedHashLen,
+            };
+
+            const aes = switch (client_key.len) {
+                16 => std.crypto.aead.aes_gcm.Aes128Gcm,
+                32 => std.crypto.aead.aes_gcm.Aes256Gcm,
+                else => return error.UnsupportedKeySize,
+            };
+
+            try aes.decrypt(
+                plaintext,
+                encrypted[0 .. encrypted.len - 16],
+                tag,
+                &[0]u8{}, // no additional data
+                conn.client_handshake_iv,
+                client_key,
+            );
+
+            // Verify the message type and length
+            if (plaintext[0] != 0x14) { // Finished message type
+                return error.UnexpectedMessageType;
+            }
+
+            const msg_len = @as(usize, plaintext[1]) << 16 | @as(usize, plaintext[2]) << 8 | plaintext[3];
+            if (msg_len != hash_len) {
+                return error.InvalidFinishedLength;
+            }
+
+            // Calculate expected verify_data
+            var transcript_hash: [hash_len]u8 = undefined;
+            switch (hash_len) {
+                32 => {
+                    std.crypto.hash.sha2.Sha256.hash(conn.handshake_to_digest.items, &transcript_hash, .{});
+                },
+                48 => {
+                    std.crypto.hash.sha2.Sha384.hash(conn.handshake_to_digest.items, &transcript_hash, .{});
+                },
+                else => return error.UnsupportedHashLen,
+            }
+
+            var finished_key: [hash_len]u8 = undefined;
+            const client_secret = switch (hash_len) {
+                32 => conn.client_hash_keys.SHA256.traffic_secret,
+                48 => conn.client_hash_keys.SHA384.traffic_secret,
+                else => return error.UnsupportedHashLen,
+            };
+
+            // HKDF-Expand-Label(traffic_secret, "finished", "", Hash.length)
+            hkdf_expand.hkdfExpandLabel(
+                switch (hash_len) {
+                    32 => hkdf.HkdfSha256,
+                    48 => hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384),
+                    else => return error.UnsupportedHashLen,
+                },
+                hash_len,
+                &finished_key,
+                client_secret,
+                "finished",
+                "",
+            );
+
+            // Calculate expected verify_data using HMAC
+            var expected_verify: [hash_len]u8 = undefined;
+            switch (hash_len) {
+                32 => {
+                    var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&finished_key);
+                    hmac.update(&transcript_hash);
+                    hmac.final(&expected_verify);
+                },
+                48 => {
+                    var hmac = std.crypto.auth.hmac.sha2.HmacSha384.init(&finished_key);
+                    hmac.update(&transcript_hash);
+                    hmac.final(&expected_verify);
+                },
+                else => return error.UnsupportedHashLen,
+            }
+
+            // Compare received verify_data with expected
+            const verify_data = plaintext[4..][0..hash_len];
+            if (!std.mem.eql(u8, verify_data, expected_verify[0..hash_len])) {
+                return error.VerifyDataMismatch;
+            }
+
+            // Add to handshake transcript
+            try conn.handshake_to_digest.appendSlice(plaintext);
         }
 
         fn writeEncrypted(self: *Self, conn: *Connection, fd: i32, msg: []const u8) !void {
