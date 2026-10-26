@@ -1377,7 +1377,9 @@ fn runScript(
         }
         if (retry_fault) |d| {
             mres.benign = false;
-            exp.fail(@src().line, d);
+            // With bytes left over after ClientHello1, ClientHello2 parses
+            // as garbage first: some other alert.
+            exp.fail(@src().line, if (mres.framed) d else null);
         }
         const ch2 = try h2.encode(a);
         try view.sentHello(ch2);
@@ -1641,6 +1643,8 @@ const corpus = [_][]const u8{
     // Harness: a ClientHello length that lies covered the trailing bytes,
     // so the server's transcript was shorter than the view's.
     @embedFile("testdata/fuzz/keys-4.bin"),
+    // Harness: bytes after a short-framed ClientHello1 garbled ClientHello2.
+    @embedFile("testdata/fuzz/retry-5.bin"),
 };
 
 test "fuzz: tls.Conn handshake and record mutations" {
