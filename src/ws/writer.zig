@@ -1,7 +1,7 @@
 const std = @import("std");
-const posix = std.posix;
+const sys = @import("../sys.zig");
 
-pub fn writeMessage(fd: posix.socket_t, data: []const u8, is_binary: bool) !void {
+pub fn writeMessage(fd: sys.fd_t, data: []const u8, is_binary: bool) !void {
     // Create header bytes
     var header: [14]u8 = undefined;
     var header_len: usize = 2; // minimum header size
@@ -33,7 +33,7 @@ pub fn writeMessage(fd: posix.socket_t, data: []const u8, is_binary: bool) !void
     // Write header
     var pos: usize = 0;
     while (pos < header_len) {
-        const written = try posix.write(fd, header[pos..header_len]);
+        const written = try sys.write(fd, header[pos..header_len]);
         if (written == 0) return error.ConnectionClosed;
         pos += written;
     }
@@ -41,7 +41,7 @@ pub fn writeMessage(fd: posix.socket_t, data: []const u8, is_binary: bool) !void
     // Write payload
     pos = 0;
     while (pos < data.len) {
-        const written = try posix.write(fd, data[pos..]);
+        const written = try sys.write(fd, data[pos..]);
         if (written == 0) return error.ConnectionClosed;
         pos += written;
     }

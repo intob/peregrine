@@ -10,7 +10,11 @@ pub const Opcode = enum(u4) {
     _,
 
     pub fn fromByte(byte: u8) ?Opcode {
-        return std.meta.intToEnum(Opcode, @as(u4, @truncate(byte))) catch null;
+        const op: Opcode = @enumFromInt(@as(u4, @truncate(byte)));
+        return switch (op) {
+            .continuation, .text, .binary, .close, .ping, .pong => op,
+            _ => null,
+        };
     }
 
     pub fn toString(self: Opcode) []const u8 {
@@ -41,7 +45,7 @@ pub const Frame = struct {
         const self = try allocator.create(Self);
         const aligned_payload_size = std.mem.alignForward(usize, payload_size, 16);
         self.allocator = allocator;
-        self.payload = try allocator.alignedAlloc(u8, 16, aligned_payload_size);
+        self.payload = try allocator.alignedAlloc(u8, .@"16", aligned_payload_size);
         return self;
     }
 

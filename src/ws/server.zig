@@ -1,10 +1,10 @@
-const native_os = @import("builtin").os.tag;
 const std = @import("std");
-const posix = std.posix;
-const linux = std.os.linux;
+const sys = @import("../sys.zig");
 const Poller = @import("../poller.zig").Poller;
 const WebsocketReader = @import("./reader.zig").WebsocketReader;
 const Frame = @import("./frame.zig").Frame;
+
+const WAKER_TOKEN: u64 = std.math.maxInt(u64);
 
 pub fn WebsocketServer(comptime Handler: type) type {
     return struct {
@@ -13,87 +13,82 @@ pub fn WebsocketServer(comptime Handler: type) type {
         allocator: std.mem.Allocator,
         handler: *Handler,
         poller: Poller,
-        thread: std.Thread,
+        waker: sys.Waker,
+        thread: ?std.Thread,
         reader: *WebsocketReader,
         frame: *Frame,
         shutdown: std.atomic.Value(bool),
 
         pub fn init(allocator: std.mem.Allocator, handler: *Handler, buffer_size: usize) !*Self {
             const self = try allocator.create(Self);
+            errdefer allocator.destroy(self);
+            const reader = try WebsocketReader.init(allocator, buffer_size);
+            errdefer reader.deinit();
+            const frame = try Frame.init(allocator, buffer_size);
+            errdefer frame.deinit();
+            var poller = try Poller.init();
+            errdefer poller.deinit();
+            const waker = try sys.Waker.init();
+            errdefer waker.deinit();
             self.* = .{
                 .allocator = allocator,
                 .handler = handler,
-                .poller = try Poller.init(),
-                .thread = try std.Thread.spawn(.{}, loop, .{self}),
-                .reader = try WebsocketReader.init(allocator, buffer_size),
-                .frame = try Frame.init(allocator, buffer_size),
+                .poller = poller,
+                .waker = waker,
+                .thread = null,
+                .reader = reader,
+                .frame = frame,
                 .shutdown = std.atomic.Value(bool).init(false),
             };
+            try self.poller.add(waker.read_fd, WAKER_TOKEN, .level_read);
+            // Spawn last: the thread reads every field above.
+            if (@hasDecl(Handler, "handleWSFrame")) {
+                self.thread = try std.Thread.spawn(.{}, loop, .{self});
+            }
             return self;
         }
 
         pub fn deinit(self: *Self) void {
-            self.shutdown.store(true, .monotonic);
-            self.thread.join();
-            std.debug.print("websocket server shutdown\n", .{});
+            self.shutdown.store(true, .release);
+            self.waker.wake();
+            if (self.thread) |t| t.join();
             self.reader.deinit();
             self.frame.deinit();
+            self.poller.deinit();
+            self.waker.deinit();
             self.allocator.destroy(self);
         }
 
-        pub fn addSocket(self: *Self, fd: posix.socket_t) !void {
-            try self.poller.addSocket(fd);
-            if (@hasDecl(Handler, "handleWSConn")) {
-                self.handler.handleWSConn(fd);
-            } else {
-                return error.HandlerDoesNotImplement_handleWSConn;
-            }
+        /// Called by HTTP workers after a successful upgrade.
+        pub fn addSocket(self: *Self, fd: sys.fd_t) !void {
+            if (!@hasDecl(Handler, "handleWSFrame")) return error.HandlerDoesNotImplement_handleWSFrame;
+            if (@hasDecl(Handler, "handleWSConn")) self.handler.handleWSConn(fd);
+            // Level-triggered: the reader handles one frame per event.
+            try self.poller.add(fd, @intCast(fd), .level_read);
         }
 
         fn loop(self: *Self) void {
-            if (!@hasDecl(Handler, "handleWSFrame")) {
-                std.debug.print("websocket loop joined (handler not implemented)\n", .{});
-                return;
-            }
-            const EventType = switch (native_os) {
-                .freebsd, .netbsd, .openbsd, .dragonfly, .macos => posix.Kevent,
-                .linux => linux.epoll_event,
-                else => unreachable,
-            };
-            var events: [256]EventType = undefined;
-            while (!self.shutdown.load(.unordered)) {
-                const ready_count = self.poller.wait(&events) catch |err| {
-                    std.debug.print("error waiting for events: {any}\n", .{err});
-                    continue;
-                };
+            var events: [256]Poller.Event = undefined;
+            while (!self.shutdown.load(.acquire)) {
+                const ready_count = self.poller.wait(&events, -1);
                 for (events[0..ready_count]) |event| {
-                    const socket: i32 = switch (native_os) {
-                        .freebsd, .netbsd, .openbsd, .dragonfly, .macos => @intCast(event.udata),
-                        .linux => event.data.fd,
-                        else => unreachable,
-                    };
-                    self.handleEvent(socket) catch |err| {
-                        std.debug.print("error handling ws event: {any}\n", .{err});
-                        self.poller.removeSocket(socket) catch |remove_err| {
-                            std.debug.print("error removing socket: {any}\n", .{remove_err});
-                        };
+                    const token = Poller.token(event);
+                    if (token == WAKER_TOKEN) continue;
+                    const socket: sys.fd_t = @intCast(token);
+                    self.handleEvent(socket) catch {
+                        self.poller.remove(socket);
                         if (@hasDecl(Handler, "handleWSDisconn")) {
                             self.handler.handleWSDisconn(socket);
-                        } else {
-                            std.debug.print("handler does not implement handleWSDisconn\n", .{});
                         }
+                        sys.close(socket);
                     };
                 }
             }
         }
 
-        fn handleEvent(self: *Self, fd: posix.socket_t) !void {
+        fn handleEvent(self: *Self, fd: sys.fd_t) !void {
             try self.reader.readFrame(fd, self.frame);
-            if (@hasDecl(Handler, "handleWSFrame")) {
-                self.handler.handleWSFrame(fd, self.frame);
-            } else {
-                return error.HandlerDoesNotImplement_handleWSFrame;
-            }
+            self.handler.handleWSFrame(fd, self.frame);
         }
     };
 }

@@ -28,15 +28,12 @@ pub fn handleUpgrade(allocator: std.mem.Allocator, req: *Request, resp: *Respons
     hash.update(key);
     hash.update(MAGIC_KEY);
     const result = hash.finalResult();
-    const encoded_size = std.base64.standard.Encoder.calcSize(result.len);
-    // TODO: consider using a fixed size buffer on the stack so we don't need
-    // to provide an allocator. It's less than 30B.
-    var encoded_buf = try allocator.alloc(u8, encoded_size);
-    defer allocator.free(encoded_buf);
-    _ = &encoded_buf;
-    _ = std.base64.standard.Encoder.encode(encoded_buf, result[0..]);
-    try resp.addNewHeader("sec-websocket-accept", encoded_buf);
+    _ = allocator;
+    var encoded_buf: [std.base64.standard.Encoder.calcSize(20)]u8 = undefined;
+    const encoded = std.base64.standard.Encoder.encode(&encoded_buf, result[0..]);
+    // Headers are copied when added, so a stack buffer is fine.
+    try resp.addNewHeader("sec-websocket-accept", encoded);
     try resp.addNewHeader("upgrade", "websocket");
-    resp.is_ws_upgrade = true; // worker will set header "connection: upgrade"
+    resp.is_ws_upgrade = true; // the server sets "connection: upgrade"
     resp.status = .switching_protocols;
 }
