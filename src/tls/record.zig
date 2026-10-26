@@ -140,7 +140,7 @@ pub const Protection = struct {
     pub fn open(self: *Self, record: []u8) errors.Error!Opened {
         const body = record[header_len..];
         if (body.len > max_ciphertext) return error.RecordOverflow;
-        if (body.len < tag_len + 1) return error.BadRecordMac;
+        if (body.len < tag_len) return error.BadRecordMac;
         const ct = body[0 .. body.len - tag_len];
         const tag = body[body.len - tag_len ..][0..tag_len].*;
         const n = self.nonce();
@@ -152,12 +152,15 @@ pub const Protection = struct {
             },
         }
         self.seq += 1;
+        // The inner plaintext, padding included, is at most 2^14 + 1 bytes
+        // (§5.4). Checked after decryption so rejected 0-RTT data still
+        // fails as bad_record_mac and is skipped.
+        if (ct.len > max_plaintext + 1) return error.RecordOverflow;
         // Strip padding: the content type is the last non-zero byte.
         var end = ct.len;
         while (end > 0 and ct[end - 1] == 0) end -= 1;
         if (end == 0) return error.UnexpectedMessage;
         const inner_len = end - 1;
-        if (inner_len > max_plaintext) return error.RecordOverflow;
         return .{ .content_type = @fromBackingInt(ct[inner_len]), .data = ct[0..inner_len] };
     }
 };
@@ -308,4 +311,55 @@ test "open rejects tampering, replays and empty inner plaintext" {
     var zeros: [4]u8 = @splat(0);
     n = tx2.seal(&buf, .invalid, &zeros);
     try std.testing.expectError(error.UnexpectedMessage, rx2.open(buf[0..n]));
+}
+
+/// Seals an arbitrary inner plaintext (content, type and padding), which
+/// `seal` can't produce when it is malformed.
+fn sealInner(p: *Protection, out: []u8, inner: []const u8) []u8 {
+    const rec = out[0 .. header_len + inner.len + tag_len];
+    rec[0..5].* = .{ 23, 3, 3, 0, 0 };
+    std.mem.writeInt(u16, rec[3..5], @intCast(inner.len + tag_len), .big);
+    @memcpy(rec[header_len..][0..inner.len], inner);
+    const A = Suite.aes_128_gcm_sha256.Aead();
+    A.encrypt(rec[header_len..][0..inner.len], rec[header_len + inner.len ..][0..tag_len], rec[header_len..][0..inner.len], rec[0..header_len], p.nonce(), p.key[0..A.key_length].*);
+    p.seq += 1;
+    return rec;
+}
+
+test "open: a record holding only the tag has no content type" {
+    // Found by the tls.Conn fuzz harness: an empty inner plaintext
+    // authenticates, so it is unexpected_message (§5.4), not bad_record_mac.
+    const secret: [32]u8 = @splat(3);
+    var tx = Protection.init(.aes_128_gcm_sha256, &secret);
+    var rx = Protection.init(.aes_128_gcm_sha256, &secret);
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(error.UnexpectedMessage, rx.open(sealInner(&tx, &buf, "")));
+    // Shorter than a tag can't have come from the AEAD at all.
+    var short: [header_len + tag_len - 1]u8 = .{ 23, 3, 3, 0, tag_len - 1 } ++ @as([tag_len - 1]u8, @splat(0));
+    try std.testing.expectError(error.BadRecordMac, rx.open(&short));
+}
+
+test "open: inner plaintext over 2^14 + 1 bytes is record_overflow, padding included" {
+    // Found by the tls.Conn fuzz harness: padding could take the inner
+    // plaintext past 2^14 + 1 bytes (§5.4) as long as the content itself
+    // stayed within 2^14.
+    const secret: [32]u8 = @splat(4);
+    var tx = Protection.init(.aes_128_gcm_sha256, &secret);
+    var rx = Protection.init(.aes_128_gcm_sha256, &secret);
+    var buf: [max_record]u8 = undefined;
+    var inner: [max_plaintext + 2]u8 = @splat(0);
+    // The limit itself: 2^14 bytes of content and the type.
+    @memset(inner[0..max_plaintext], 'a');
+    inner[max_plaintext] = @backingInt(ContentType.application_data);
+    const ok = try rx.open(sealInner(&tx, &buf, inner[0 .. max_plaintext + 1]));
+    try std.testing.expectEqual(max_plaintext, ok.data.len);
+    // One byte of padding over it.
+    try std.testing.expectError(error.RecordOverflow, rx.open(sealInner(&tx, &buf, &inner)));
+    // A short content with padding over it.
+    var tx2 = Protection.init(.aes_128_gcm_sha256, &secret);
+    var rx2 = Protection.init(.aes_128_gcm_sha256, &secret);
+    @memset(&inner, 0);
+    inner[0] = 'b';
+    inner[1] = @backingInt(ContentType.application_data);
+    try std.testing.expectError(error.RecordOverflow, rx2.open(sealInner(&tx2, &buf, &inner)));
 }
