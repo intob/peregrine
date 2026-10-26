@@ -59,6 +59,18 @@ pub fn build(b: *std.Build) !void {
     const bench_step = b.step("bench", "Run parser micro-benchmarks");
     bench_step.dependOn(&b.addRunArtifact(bench).step);
 
+    const bench_tls = b.addExecutable(.{
+        .name = "bench-tls",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/tls.zig"),
+            .target = target,
+            .optimize = .fast,
+            .imports = &.{.{ .name = "peregrine", .module = lib }},
+        }),
+    });
+    const bench_tls_step = b.step("bench-tls", "Run TLS record micro-benchmarks");
+    bench_tls_step.dependOn(&b.addRunArtifact(bench_tls).step);
+
     // Load-test target: zig build bench-server [-Dtarget=...]
     const bench_server = b.addExecutable(.{
         .name = "bench-server",

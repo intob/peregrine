@@ -20,6 +20,7 @@ pub const internal = struct {
     pub const session = @import("./http/session.zig");
     pub const date = @import("./http/date.zig");
     pub const sys = @import("./sys.zig");
+    pub const tls_record = @import("./tls/record.zig");
 };
 
 /// Websocket helpers

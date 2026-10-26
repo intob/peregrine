@@ -47,6 +47,74 @@ pub const Suite = enum(u16) {
 pub const max_hash_len = 48;
 const max_key_len = 32;
 
+/// AES-GCM with the AES key schedule, H and GHASH's powers of H computed
+/// once per key instead of once per record (std's AEAD API takes a raw
+/// key). Output is identical to std.crypto.aead.aes_gcm (see the tests).
+fn AesGcmKey(comptime Aes: type) type {
+    return struct {
+        const Self = @This();
+        const Ghash = std.crypto.onetimeauth.Ghash;
+
+        aes: std.crypto.core.aes.AesEncryptCtx(Aes),
+        /// A fresh GHASH state keyed with H; copied for each record.
+        ghash: Ghash,
+
+        fn init(key: [Aes.key_bits / 8]u8) Self {
+            const aes = Aes.initEnc(key);
+            var h: [16]u8 = undefined;
+            aes.encrypt(&h, &@splat(0));
+            defer std.crypto.secureZero(u8, &h);
+            return .{ .aes = aes, .ghash = .init(&h) };
+        }
+
+        /// The tag over `ad` and ciphertext `c`, for counter block `j`.
+        fn tag(self: *const Self, ad: []const u8, c: []const u8, j: [16]u8) [tag_len]u8 {
+            var mac = self.ghash;
+            mac.update(ad);
+            mac.pad();
+            mac.update(c);
+            mac.pad();
+            var lengths: [16]u8 = undefined;
+            std.mem.writeInt(u64, lengths[0..8], @as(u64, ad.len) * 8, .big);
+            std.mem.writeInt(u64, lengths[8..16], @as(u64, c.len) * 8, .big);
+            mac.update(&lengths);
+            var out: [tag_len]u8 = undefined;
+            mac.final(&out);
+            var t: [16]u8 = undefined;
+            self.aes.encrypt(&t, &j);
+            for (&out, t) |*o, x| o.* ^= x;
+            return out;
+        }
+
+        fn counter(npub: [12]u8, n: u32) [16]u8 {
+            var j: [16]u8 = undefined;
+            j[0..12].* = npub;
+            std.mem.writeInt(u32, j[12..16], n, .big);
+            return j;
+        }
+
+        fn encrypt(self: *const Self, c: []u8, tag_out: *[tag_len]u8, m: []const u8, ad: []const u8, npub: [12]u8) void {
+            std.debug.assert(c.len == m.len);
+            std.crypto.core.modes.ctr(@TypeOf(self.aes), self.aes, c, m, counter(npub, 2), .big);
+            tag_out.* = self.tag(ad, c, counter(npub, 1));
+        }
+
+        /// Verifies before decrypting, so `m` never holds unauthenticated
+        /// plaintext. `m` may alias `c`.
+        fn decrypt(self: *const Self, m: []u8, c: []const u8, tag_in: [tag_len]u8, ad: []const u8, npub: [12]u8) error{AuthenticationFailed}!void {
+            std.debug.assert(c.len == m.len);
+            var computed = self.tag(ad, c, counter(npub, 1));
+            defer std.crypto.secureZero(u8, &computed);
+            if (!std.crypto.timing_safe.eql([tag_len]u8, computed, tag_in)) return error.AuthenticationFailed;
+            std.crypto.core.modes.ctr(@TypeOf(self.aes), self.aes, m, c, counter(npub, 2), .big);
+        }
+    };
+}
+
+const Aes128GcmKey = AesGcmKey(std.crypto.core.aes.Aes128);
+const Aes256GcmKey = AesGcmKey(std.crypto.core.aes.Aes256);
+const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+
 pub const Opened = struct {
     content_type: ContentType,
     data: []u8,
@@ -62,6 +130,8 @@ pub const Protection = struct {
     seq: u64 = 0,
     /// The traffic secret the key came from, kept for KeyUpdate.
     secret: [max_hash_len]u8,
+    /// The expanded key for AES-GCM suites (ChaCha20 has no key schedule).
+    expanded: union { aes128: Aes128GcmKey, aes256: Aes256GcmKey, none: void } = .{ .none = {} },
 
     pub fn init(suite: Suite, secret: []const u8) Self {
         var self: Self = .{ .suite = suite, .key = undefined, .iv = undefined, .secret = @splat(0) };
@@ -81,6 +151,11 @@ pub const Protection = struct {
                 self.iv = ks.trafficIv(secret);
             },
         }
+        self.expanded = switch (self.suite) {
+            .aes_128_gcm_sha256 => .{ .aes128 = .init(self.key[0..16].*) },
+            .aes_256_gcm_sha384 => .{ .aes256 = .init(self.key) },
+            .chacha20_poly1305_sha256 => .{ .none = {} },
+        };
         self.seq = 0;
     }
 
@@ -98,6 +173,25 @@ pub const Protection = struct {
     pub fn wipe(self: *Self) void {
         std.crypto.secureZero(u8, &self.key);
         std.crypto.secureZero(u8, &self.secret);
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.expanded));
+    }
+
+    fn encrypt(self: *const Self, c: []u8, tag: *[tag_len]u8, m: []const u8, ad: []const u8) void {
+        const n = self.nonce();
+        switch (self.suite) {
+            .aes_128_gcm_sha256 => self.expanded.aes128.encrypt(c, tag, m, ad, n),
+            .aes_256_gcm_sha384 => self.expanded.aes256.encrypt(c, tag, m, ad, n),
+            .chacha20_poly1305_sha256 => ChaCha20Poly1305.encrypt(c, tag, m, ad, n, self.key),
+        }
+    }
+
+    fn decrypt(self: *const Self, m: []u8, c: []const u8, tag: [tag_len]u8, ad: []const u8) error{AuthenticationFailed}!void {
+        const n = self.nonce();
+        return switch (self.suite) {
+            .aes_128_gcm_sha256 => self.expanded.aes128.decrypt(m, c, tag, ad, n),
+            .aes_256_gcm_sha384 => self.expanded.aes256.decrypt(m, c, tag, ad, n),
+            .chacha20_poly1305_sha256 => ChaCha20Poly1305.decrypt(m, c, tag, ad, n, self.key),
+        };
     }
 
     fn nonce(self: *const Self) [12]u8 {
@@ -124,13 +218,7 @@ pub const Protection = struct {
         const inner = out[header_len..][0..inner_len];
         if (data.len > 0 and inner.ptr != data.ptr) @memcpy(inner[0..data.len], data);
         inner[data.len] = @backingInt(content_type);
-        const n = self.nonce();
-        switch (self.suite) {
-            inline else => |s| {
-                const A = s.Aead();
-                A.encrypt(inner, out[header_len + inner_len ..][0..tag_len], inner, out[0..header_len], n, self.key[0..A.key_length].*);
-            },
-        }
+        self.encrypt(inner, out[header_len + inner_len ..][0..tag_len], inner, out[0..header_len]);
         self.seq += 1;
         return header_len + body_len;
     }
@@ -138,20 +226,40 @@ pub const Protection = struct {
     /// Decrypts a complete record (header included) in place. The returned
     /// data points into `record`.
     pub fn open(self: *Self, record: []u8) errors.Error!Opened {
+        const len = (try ciphertext(record)).len;
+        return self.openTo(record, record[header_len..][0..len]);
+    }
+
+    /// The size of a record's inner plaintext (content, type, padding):
+    /// what `openInto` needs. Records too short or too long fail anyway.
+    pub fn innerLen(record: []const u8) usize {
+        return record.len -| (header_len + tag_len);
+    }
+
+    /// Decrypts a complete record into `out`, which needs `innerLen(record)`
+    /// bytes, leaving the record as it is. The returned data points into
+    /// `out`.
+    pub fn openInto(self: *Self, record: []const u8, out: []u8) errors.Error!Opened {
+        const ct = try ciphertext(record);
+        return self.openTo(record, out[0..ct.len]);
+    }
+
+    fn ciphertext(record: []const u8) errors.Error![]const u8 {
         const body = record[header_len..];
         if (body.len > max_ciphertext) return error.RecordOverflow;
         if (body.len < tag_len) return error.BadRecordMac;
-        const ct = body[0 .. body.len - tag_len];
-        const tag = body[body.len - tag_len ..][0..tag_len].*;
-        const n = self.nonce();
-        switch (self.suite) {
-            inline else => |s| {
-                const A = s.Aead();
-                A.decrypt(ct, ct, tag, record[0..header_len], n, self.key[0..A.key_length].*) catch
-                    return error.BadRecordMac;
-            },
-        }
+        return body[0 .. body.len - tag_len];
+    }
+
+    fn openTo(self: *Self, record: []const u8, out: []u8) errors.Error!Opened {
+        const ct = record[header_len..][0..out.len];
+        const tag = record[header_len + ct.len ..][0..tag_len].*;
+        self.decrypt(out, ct, tag, record[0..header_len]) catch return error.BadRecordMac;
         self.seq += 1;
+        return unpad(out);
+    }
+
+    fn unpad(ct: []u8) errors.Error!Opened {
         // The inner plaintext, padding included, is at most 2^14 + 1 bytes
         // (§5.4). Checked after decryption so rejected 0-RTT data still
         // fails as bad_record_mac and is skipped.
@@ -311,6 +419,59 @@ test "open rejects tampering, replays and empty inner plaintext" {
     var zeros: [4]u8 = @splat(0);
     n = tx2.seal(&buf, .invalid, &zeros);
     try std.testing.expectError(error.UnexpectedMessage, rx2.open(buf[0..n]));
+}
+
+test "expanded AES-GCM matches std's AEAD" {
+    var prng = std.Random.DefaultPrng.init(0xae5);
+    const random = prng.random();
+    var m: [3 * max_plaintext]u8 = undefined;
+    var c1: [m.len]u8 = undefined;
+    var c2: [m.len]u8 = undefined;
+    var back: [m.len]u8 = undefined;
+    // Lengths around block and GHASH aggregation boundaries, and records.
+    const lens = [_]usize{ 0, 1, 15, 16, 17, 63, 64, 65, 351, 352, 1343, 1344, 5247, 5248, max_plaintext + 1, m.len };
+    inline for (.{ std.crypto.aead.aes_gcm.Aes128Gcm, std.crypto.aead.aes_gcm.Aes256Gcm }, .{ Aes128GcmKey, Aes256GcmKey }) |Std, Ours| {
+        for (0..8) |round| for (lens) |len| {
+            var key: [Std.key_length]u8 = undefined;
+            var npub: [12]u8 = undefined;
+            var ad: [5]u8 = undefined;
+            random.bytes(&key);
+            random.bytes(&npub);
+            random.bytes(&ad);
+            random.bytes(m[0..len]);
+            const ours = Ours.init(key);
+            var t1: [tag_len]u8 = undefined;
+            var t2: [tag_len]u8 = undefined;
+            Std.encrypt(c1[0..len], &t1, m[0..len], &ad, npub, key);
+            ours.encrypt(c2[0..len], &t2, m[0..len], &ad, npub);
+            try std.testing.expectEqualSlices(u8, c1[0..len], c2[0..len]);
+            try std.testing.expectEqualSlices(u8, &t1, &t2);
+            try ours.decrypt(back[0..len], c1[0..len], t1, &ad, npub);
+            try std.testing.expectEqualSlices(u8, m[0..len], back[0..len]);
+            // In place, and a tampered tag.
+            try ours.decrypt(c2[0..len], c2[0..len], t2, &ad, npub);
+            try std.testing.expectEqualSlices(u8, m[0..len], c2[0..len]);
+            t1[round % tag_len] ^= 1;
+            try std.testing.expectError(error.AuthenticationFailed, ours.decrypt(back[0..len], c1[0..len], t1, &ad, npub));
+        };
+    }
+}
+
+test "openInto decrypts into another buffer and leaves the record" {
+    inline for (.{ Suite.aes_128_gcm_sha256, Suite.aes_256_gcm_sha384, Suite.chacha20_poly1305_sha256 }) |suite| {
+        const secret: [48]u8 = @splat(9);
+        var tx = Protection.init(suite, secret[0..suite.hashLen()]);
+        var rx = Protection.init(suite, secret[0..suite.hashLen()]);
+        var buf: [256]u8 = undefined;
+        const n = tx.seal(&buf, .application_data, "direct");
+        const sealed = buf;
+        var out: [64]u8 = undefined;
+        try std.testing.expectEqual(7, Protection.innerLen(buf[0..n]));
+        const opened = try rx.openInto(buf[0..n], &out);
+        try std.testing.expectEqualStrings("direct", opened.data);
+        try std.testing.expect(opened.data.ptr == &out);
+        try std.testing.expectEqualSlices(u8, sealed[0..n], buf[0..n]);
+    }
 }
 
 /// Seals an arbitrary inner plaintext (content, type and padding), which

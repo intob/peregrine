@@ -155,9 +155,11 @@ pub const Conn = struct {
         };
     }
 
-    /// Copies decrypted application data into `out`, processing records
-    /// (handshake, alerts, KeyUpdate) as needed. Returns 0 when more input
-    /// is needed, or when `failed` or `peer_closed` is set.
+    /// Moves decrypted application data into `out`, processing records
+    /// (handshake, alerts, KeyUpdate) as needed. A record whose plaintext
+    /// fits is decrypted straight into `out`; others are decrypted in place
+    /// and copied. Returns 0 when more input is needed, or when `failed` or
+    /// `peer_closed` is set.
     pub fn readPlain(self: *Self, out: []u8) usize {
         var n: usize = 0;
         while (n < out.len) {
@@ -168,11 +170,10 @@ pub const Conn = struct {
                 n += k;
                 continue;
             }
-            const progressed = self.nextRecord() catch |err| {
+            n += (self.nextRecord(out[n..]) catch |err| {
                 self.fail(err);
                 break;
-            };
-            if (!progressed) break;
+            }) orelse break;
         }
         return n;
     }
@@ -193,11 +194,13 @@ pub const Conn = struct {
         }
     }
 
-    /// Processes one record. Returns false if none is complete.
-    fn nextRecord(self: *Self) (errors.Error || error{OutOfMemory})!bool {
-        if (self.failed or self.peer_closed) return false;
+    /// Processes one record. Returns null if none is complete, else the
+    /// number of application data bytes decrypted into `dst` (which may be
+    /// clobbered beyond them).
+    fn nextRecord(self: *Self, dst: []u8) (errors.Error || error{OutOfMemory})!?usize {
+        if (self.failed or self.peer_closed) return null;
         const avail = self.in_end - self.in_start;
-        if (avail < record.header_len) return false;
+        if (avail < record.header_len) return null;
         const header = self.in_buf[self.in_start..][0..record.header_len];
         const content_type: ContentType = @fromBackingInt(header[0]);
         const len = std.mem.readInt(u16, header[3..5], .big);
@@ -210,7 +213,7 @@ pub const Conn = struct {
         if (avail < record.header_len + len) {
             // Make room for the rest of the record.
             if (self.in_start > 0 and self.in_start + record.header_len + len > self.in_buf.len) self.compact();
-            return false;
+            return null;
         }
         const rec = self.in_buf[self.in_start..][0 .. record.header_len + len];
         self.in_start += rec.len;
@@ -237,16 +240,17 @@ pub const Conn = struct {
                     // HelloRetryRequest: no keys at all yet.
                     if (self.early_data_left >= len) {
                         self.early_data_left -= len;
-                        return true;
+                        return 0;
                     }
                     return error.UnexpectedMessage;
                 });
-                const opened = p.open(rec) catch |err| {
+                const direct = dst.len >= Protection.innerLen(rec);
+                const opened = (if (direct) p.openInto(rec, dst) else p.open(rec)) catch |err| {
                     // Rejected 0-RTT data is encrypted under keys we never
                     // derived: skip it (RFC 8446 §4.2.10).
                     if (err == error.BadRecordMac and self.early_data_left >= len) {
                         self.early_data_left -= len;
-                        return true;
+                        return 0;
                     }
                     return err;
                 };
@@ -254,6 +258,7 @@ pub const Conn = struct {
                 switch (opened.content_type) {
                     .application_data => {
                         if (self.hs != null) return error.UnexpectedMessage;
+                        if (direct) return opened.data.len;
                         self.plain = opened.data;
                     },
                     .handshake => {
@@ -270,7 +275,7 @@ pub const Conn = struct {
             },
             else => return error.UnexpectedMessage,
         }
-        return true;
+        return 0;
     }
 
     fn feedHandshake(self: *Self, level: Level, data: []const u8) !void {
