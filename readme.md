@@ -1,12 +1,12 @@
 # Peregrine - a simple high-performance HTTP server
-This is an event-driven HTTP server. Written in pure Zig, with no dependencies other than Zig's standard library. Supports Linux (epoll) and BSD/MacOS (kqueue) systems.
+This is an event-driven HTTP server. Written in pure Zig, with no dependencies other than Zig's standard library. Supports Linux (epoll, optionally io_uring) and BSD/MacOS (kqueue) systems. Requires Zig 0.17.
 
 The main goal of this project is to provide a HTTP server with the following priorities (in order of prevalence):
 - Reliability
 - Performance
 - Simplicity
 
-Currently, all heap allocations are made during startup. Internally, no heap allocations are made per-request unless pre-allocated buffers overflow.
+Currently, all heap allocations are made during startup. Internally, no heap allocations are made per-request unless pre-allocated buffers overflow (for example, a request body larger than a pooled read buffer, or a response that can't be written in one go).
 
 Note: This project has just started, and is not yet a complete HTTP server implementation. See [To do section](#to-do). The API is likely to change. It is currently NOT FIT FOR PRODUCTION use.
 
@@ -14,18 +14,33 @@ Note: This project has just started, and is not yet a complete HTTP server imple
 
 - Simple API
 - Support for HTTP/1.0 and HTTP/1.1
+    - Keep-alive and pipelining (pipelined responses are batched into one write)
+    - Request bodies: `Content-Length` and `Transfer-Encoding: chunked`
+    - `Expect: 100-continue`, `HEAD`, automatic `Content-Length` and `Date`
+    - Strict parsing that rejects request smuggling vectors (see `src/http/parser.zig`)
+    - Request size limits, idle/request timeouts (slowloris-resistant)
 - Support for WebSockets
 - Cross-platform IO Multiplexing
     - Kqueue support for BSD and MacOS systems
     - Epoll support for Linux systems
+    - io_uring support for Linux (opt-in, `.backend = .io_uring`)
 - Multi-Worker Architecture
     - Automatic worker scaling based on CPU core count
     - Configurable worker-thread count
-    - Configurable accept-thread count
+    - Each worker accepts its own connections (`SO_REUSEPORT` on Linux), pinned to a core
     - Thread-safe request handling
 
 ## Benchmarks
-Run using wrk on an M2 Pro with 1000 connections.
+Plaintext "Hello, World!" on Linux (Docker on an M2 Pro: kernel 6.12, aarch64). Server on 6 cores (6 workers), `wrk -t6 -c256 -d10s` on the other 6, over loopback. Two runs each; numbers vary by about 10% between runs, so treat epoll and io_uring as equal here. Same machine for client and server, so these are relative, not absolute.
+
+| Requests/sec | NGINX | Peregrine (epoll) | Peregrine (io_uring) |
+|--------|-------|-----|-----|
+| Keep-alive | 767k–944k | 956k–1.09M | 995k–1.07M |
+| Pipelined ×16 | 1.24M–1.47M | 8.2M–9.4M | 8.5M–8.8M |
+
+Reproduce: `zig build bench-server -Dtarget=aarch64-linux` (the server takes `[workers] [auto|epoll|io_uring] [port]`), and `zig build bench` for parser micro-benchmarks (about 190 ns to parse a 437-byte browser request with 8 headers).
+
+The previous version, run using wrk on an M2 Pro (macOS) with 1000 connections:
 
 | Metric | NGINX | h2o | Zap (Facil.io) | Peregrine |
 |--------|-------|-----|----------------|-----------|
@@ -36,20 +51,24 @@ Run using wrk on an M2 Pro with 1000 connections.
 
 Facil.io is still superior to this library as it is battle-tested, production-ready and supports TLS. While working on this library, I've seen just how well-implemented and stable Facil.io is...
 
-Note that this benchmark simply measured serving static GET requests, and they do not indicate real-world performance unless you're only serving static files. For these tests, the response length was 6150 bytes.
+Note that these benchmarks simply measure serving static GET requests, and they do not indicate real-world performance unless you're only serving static files. For the previous-version tests, the response length was 6150 bytes.
 
 ## Performance optimisations
 
-- Non-blocking socket operations
-- Event-driven architecture
-- Aligned buffer allocation
-- SIMD operations
-- Vectored IO writes the response with a single syscall
+- Raw syscalls (no libc on Linux), non-blocking sockets, edge-triggered events
+- Event-driven architecture, one event loop per core, no cross-thread handoff
+- SIMD scanning for the end of the head, request-target and header values
+- Zero-copy request parsing: headers, path and body are slices into the read buffer
+- Vectored IO: pipelined responses go out in a single `writev`
 - Zero heap allocations per-request
+- Read buffers are pooled and only held while a connection has unprocessed bytes, so idle keep-alive connections use no buffer memory
+- Zero-copy response bodies with `setBodyBorrowed`
+- `Date` header formatted once per second, not per request
+- Timeouts without a syscall per connection (deadline-ordered intrusive lists)
+- Linux: `TCP_DEFER_ACCEPT` plus reading straight after accept
 - Header case-insensitivity handled when searching, not parsing (unused headers are not transformed)
 - Query only parsed on demand
 - Optimised header, method and version parsing
-- Fixed sized array for headers (faster than std.ArrayList)
 
 ## Architecture
 
@@ -60,15 +79,10 @@ Note that this benchmark simply measured serving static GET requests, and they d
 - Platform-specific I/O handlers
 
 ### Worker threads
-- Manage connections
-- Parse and handle requess
-- Serialise and write responses
-
-### Accept threads
-- Accept connections
-- Set client socket options
-- Assign each client to the next worker
-- Monotonically increment the next_worker counter
+- Accept connections (own `SO_REUSEPORT` listener on Linux; a shared listener elsewhere)
+- Manage connections, timeouts and backpressure
+- Feed bytes to the per-connection state machine (`src/http/session.zig`), which parses and handles requests and serialises responses without doing any I/O itself
+- Write responses
 
 ### WebSocket threads
 - Join immediately if there are no WS handlers
@@ -92,13 +106,13 @@ zig build run-counter
 #### x86_64
 ```bash
 zig build -Dtarget=x86_64-linux-musl && \
-docker build -t counter . -f ./example/counter.Dockerfile && \
+docker build -t counter . -f ./example/counter/Dockerfile && \
 docker run -p 3000:3000 counter
 ```
 #### aarch64 (ARM)
 ```bash
 zig build -Dtarget=aarch64-linux-musl && \
-docker build -t counter . -f ./example/counter.Dockerfile && \
+docker build -t counter . -f ./example/counter/Dockerfile && \
 docker run -p 3000:3000 counter
 ```
 
@@ -123,17 +137,15 @@ const Handler = struct {
     }
 
     pub fn handleRequest(_: *Self, _: *per.Request, resp: *per.Response) void {
-        _ = resp.setBody("Kawww\n") catch {};
-        resp.addNewHeader("Content-Length", "6") catch {};
+        resp.addNewHeader("content-type", "text/plain") catch {};
+        resp.setBodyBorrowed("Kawww\n"); // static data: no copy
     }
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const srv = try per.Server(Handler).init(gpa.allocator(), 3000, .{});
+pub fn main(init: std.process.Init) !void {
+    const srv = try per.Server(Handler).init(init.gpa, 3000, .{});
     std.debug.print("listening on 0.0.0.0:3000\n", .{});
-    try srv.start(); // Blocks if there is no error
+    try srv.start(); // Blocks until shutdown
 }
 
 ```
@@ -147,7 +159,12 @@ The server will shutdown gracefully if an interrupt signal is received. Alternat
 ## Memory management model
 
 ### Request lifecycle
-The server manages request and response buffers internally, reusing them across requests to avoid allocations. When a handler processes a request, it must copy any data it needs to retain, as the underlying buffers will be reused for subsequent requests.
+The server manages request and response buffers internally, reusing them across requests to avoid allocations. `Request` fields (path, headers, body) are slices into the connection's read buffer and are only valid until `handleRequest` returns. When a handler processes a request, it must copy any data it needs to retain, as the underlying buffers will be reused for subsequent requests.
+
+Response headers are copied as they are added, so their values can be freed straight away. For the body:
+- `setBody(buf)` copies into the worker's response buffer (`response_body_buffer_size`).
+- `bodyWriteBuffer()` + `commitBody(len)` let you format straight into that buffer.
+- `setBodyBorrowed(buf)` sends `buf` without copying. It must stay valid and unchanged until the response is sent, so use it for static or cached content.
 
 ### Handler responsibilities
 - Handlers own and manage their internal memory
@@ -157,31 +174,22 @@ The server manages request and response buffers internally, reusing them across 
 ## Need to know
 
 ### Memory usage
-Each worker thread gets it's own resources (obviously). By default, the number of worker threads is equal to the number of CPU cores. Therefore, the memory usage will depend on allocated buffer sizes, stack sizes, and the number of worker threads. You can adjust these parameters in the configuration struct. Example memory usage:
+Each worker thread gets it's own resources (obviously). By default, the number of worker threads is equal to the number of CPU cores. Therefore, the memory usage will depend on allocated buffer sizes, stack sizes, and the number of worker threads. You can adjust these parameters in the configuration struct. Default memory usage per worker (epoll backend):
 ```
-Workers:    Response buffer:    10MB
-            Request buffer:     1MB
+Workers:    Read buffer pool:   256 x 16KB = 4MB
+            Response buffer:    1MB
+            Output buffer:      64KB
+            Connection slab:    16384 connections, ~2MB
             Stack size:         1MB
-            Overhead:           ~70KB
 
-            Total:              12.07MB
-_______________________________________________________________________
-            Worker count:       12
-            Main thread stack:  ~1MB (currently dependent on the OS)
-            Total:              12.07 * 12 + 0.1 + 0.2 = 145.14MB
+            Total:              ~8MB
 ```
-Thanks to the zero-allocation design, even under high load, these numbers won't change beyond what your handler allocates.
+Read buffers are only held while a connection has unprocessed bytes, so many idle keep-alive connections don't need many buffers. If the pool runs out, buffers overflow to the heap and are freed afterwards.
 
 ### Response headers
-If the body is not zero-length, you must set the Content-Length header yourself. I will write a helper for this soon.
+`Content-Length`, `Date` and `Connection` are set by the server (no `Content-Length` on 1xx/204 responses; `HEAD` responses keep the length but omit the body). Adding any of them, or `Transfer-Encoding`, with `addNewHeader` is a compile error, so they can't be duplicated by accident. Set `resp.close = true` to close the connection after the response.
 
-Regardless of whether it's an ArrayList or a HashMap, checking if it was set already by the user would incur a cost (albeit small).
-
-If you do not give a response body, the "content-length: 0" header will be added automatically. This is because it's faster to add a hard-coded iovec than to serialise an extra header.
-
-Again, this library is designed to be reliable, performant, and simple. Occasionally simplicity is sacrificed for performance.
-
-Connection and keep-alive headers are set by the Worker. This is because there is internal logic to handle connection persistence, and it would hurt developer experience to not set these headers appropriately.
+Header keys and values containing CR or LF are rejected (`error.InvalidHeader`), which prevents response splitting.
 
 ### Query params
 `req.parseQuery()` returns `!?std.StringHashMap([]const u8)` - an error union containing an optional hash map. The semantics are:
@@ -215,15 +223,15 @@ pub fn handleRequest(self: *Self, req: *per.Request, resp: *per.Response) void {
     self.dirServer.serve(req, resp) catch {};
 }
 
-pub fn handleWSConn(_: *Self, fd: posix.socket_t) void {
+pub fn handleWSConn(_: *Self, fd: std.posix.fd_t) void {
     std.debug.print("handle ws conn... {d}\n", .{fd});
 }
 
-pub fn handleWSDisconn(_: *Self, fd: posix.socket_t) void {
+pub fn handleWSDisconn(_: *Self, fd: std.posix.fd_t) void {
     std.debug.print("handle ws disconn... {d}\n", .{fd});
 }
 
-pub fn handleWSFrame(_: *Self, fd: posix.socket_t, frame: *per.ws.Frame) void {
+pub fn handleWSFrame(_: *Self, fd: std.posix.fd_t, frame: *per.ws.Frame) void {
     // Reply to the client
     per.ws.writer.writeMessage(fd, "Hello client!", false) catch |err| {
         std.debug.print("error writing websocket: {any}\n", .{err});
@@ -242,14 +250,15 @@ If you want a more substantial HTTP library, I suggest that you look at [Zap](ht
 ## To do
 Until these things are done, I don't think that this project can possibly be considered production-ready.
 
+See [PLAN.md](PLAN.md) for the full checklist. The main open items:
+
 - TLS 1.3 support
-- Handle request body
-- Implement better worker selection than round-robin
-- Set Worker thread CPU affinity
-- Make WebSocket component multi-threaded
-- Benchmark connection-pooling (will it improve response times under load?)
+- Streaming (chunked) responses
+- `sendfile` for file bodies
+- Make WebSocket component multi-threaded (and give its reader per-connection state)
+- Tune the io_uring backend until it beats epoll
+- Soak, adversarial and differential (HTTP Garden) testing
 - API reference
-- Add a response helper to set content-length header from an integer. Maybe use a pre-allocated buffer that can be reused.
 
 ## Nice to have
 - HTTP/2 support
