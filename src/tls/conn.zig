@@ -232,7 +232,15 @@ pub const Conn = struct {
                 try self.feedHandshake(.initial, body);
             },
             .application_data => {
-                var p = &(self.read orelse return error.UnexpectedMessage);
+                var p = &(self.read orelse {
+                    // 0-RTT data sent with ClientHello1, arriving after our
+                    // HelloRetryRequest: no keys at all yet.
+                    if (self.early_data_left >= len) {
+                        self.early_data_left -= len;
+                        return true;
+                    }
+                    return error.UnexpectedMessage;
+                });
                 const opened = p.open(rec) catch |err| {
                     // Rejected 0-RTT data is encrypted under keys we never
                     // derived: skip it (RFC 8446 §4.2.10).
@@ -267,14 +275,17 @@ pub const Conn = struct {
 
     fn feedHandshake(self: *Self, level: Level, data: []const u8) !void {
         const hs = self.hs.?;
+        const retrying = hs.isRetrying();
         var sink: Sink = .{ .conn = self };
         hs.feed(level, data, &sink) catch |err| switch (err) {
             error.OutOfMemory => return error.InternalError,
             else => |e| return e,
         };
-        if (hs.early_data_offered and self.read_level == .handshake and !hs.isDone()) {
-            // Only until the first record that decrypts.
-            if (self.early_data_left == 0 and self.read.?.seq == 0) self.early_data_left = max_skipped_early_data;
+        if (level == .initial) {
+            // Rejected 0-RTT data is skipped (§4.2.10) from ClientHello1
+            // until the first record that decrypts, or, after a
+            // HelloRetryRequest, until ClientHello2 starts.
+            self.early_data_left = if (hs.early_data_offered and !retrying) max_skipped_early_data else 0;
         }
         if (hs.isDone()) {
             self.alpn = hs.alpn;
@@ -469,24 +480,24 @@ const sys = @import("../sys.zig");
 const credentials = @import("./credentials.zig");
 const testing = std.testing;
 
-const TestServer = struct {
+pub const TestServer = struct {
     creds: credentials.Credentials,
     config: Config,
     pools: Pools,
 
-    fn init(self: *TestServer, cert: []const u8, key: []const u8) !void {
+    pub fn init(self: *TestServer, cert: []const u8, key: []const u8) !void {
         self.creds = try .fromPem(testing.allocator, cert, key);
         self.config = .{ .credentials = &self.creds, .alpn = &.{"http/1.1"} };
         self.pools = try .init(testing.allocator, 4);
     }
 
-    fn deinit(self: *TestServer) void {
+    pub fn deinit(self: *TestServer) void {
         self.pools.deinit();
         self.creds.deinit();
     }
 };
 
-fn testEntropy(seed: u8) [entropy_len]u8 {
+pub fn testEntropy(seed: u8) [entropy_len]u8 {
     var e: [entropy_len]u8 = undefined;
     for (&e, 0..) |*b, i| b.* = @truncate(i *% 13 +% seed);
     return e;
@@ -573,7 +584,7 @@ fn flushBlocking(conn: *Conn, fd: sys.fd_t) !void {
     while (conn.hasWire()) conn.advance(try sys.write(fd, conn.wireBytes()));
 }
 
-fn runAgainstStdClient(server: *TestServer, msg: []const u8, transcript: ?*std.ArrayList(u8)) !void {
+pub fn runAgainstStdClient(server: *TestServer, msg: []const u8, transcript: ?*std.ArrayList(u8)) !void {
     const fds = try sys.socketPair();
     defer sys.close(fds[0]);
     var client_err: ?anyerror = null;
@@ -781,6 +792,62 @@ test "KeyUpdate in both directions" {
     n = client_tx.seal(space2, .handshake, &.{ 24, 0, 0, 1, 7 });
     conn.commitRead(n);
     try testing.expectEqual(0, conn.readPlain(&buf));
+    try testing.expect(conn.failed);
+}
+
+/// Appends a plaintext handshake record holding `msg`.
+fn plainRecord(out: []u8, msg: []const u8) []u8 {
+    out[0..5].* = .{ 22, 3, 1, 0, 0 };
+    std.mem.writeInt(u16, out[3..5], @intCast(msg.len), .big);
+    @memcpy(out[5..][0..msg.len], msg);
+    return out[0 .. 5 + msg.len];
+}
+
+fn feedConn(conn: *Conn, bytes: []const u8) !void {
+    const space = try conn.readSpace();
+    @memcpy(space[0..bytes.len], bytes);
+    conn.commitRead(bytes.len);
+    var buf: [64]u8 = undefined;
+    try testing.expectEqual(0, conn.readPlain(&buf));
+}
+
+test "0-RTT data after a HelloRetryRequest is skipped until ClientHello2" {
+    // Found by the tls.Conn fuzz harness: a client offering 0-RTT sends
+    // early data right after ClientHello1. If the server answers with a
+    // HelloRetryRequest, that data arrives before ClientHello2, with no
+    // keys yet, and must be skipped (RFC 8446 §4.2.10), not rejected.
+    const td = credentials.testdata;
+    var server: TestServer = undefined;
+    try server.init(td.p256_cert, td.p256_key);
+    defer server.deinit();
+    server.config.groups = &.{.x25519};
+    var conn = try Conn.init(testing.allocator, &server.pools, &server.config, &testEntropy(5));
+    defer conn.deinit();
+
+    var hello_buf: [2048]u8 = undefined;
+    var rec: [2048]u8 = undefined;
+    const early_data_ext = "\x00\x2a\x00\x00";
+    // No key share: HelloRetryRequest.
+    const ch1 = handshake.buildClientHello(&hello_buf, .{ .groups = &.{.x25519}, .extra = early_data_ext });
+    try feedConn(&conn, plainRecord(&rec, ch1));
+    try testing.expect(!conn.failed and conn.hasWire());
+    conn.advance(conn.wireBytes().len);
+
+    // 0-RTT records under keys the server never derived.
+    var early: [5 + 40]u8 = @splat(0xa5);
+    early[0..5].* = .{ 23, 3, 3, 0, 40 };
+    try feedConn(&conn, &early);
+    try feedConn(&conn, &early);
+    try testing.expect(!conn.failed);
+
+    const x = std.crypto.dh.X25519.recoverPublicKey(@splat(5));
+    const ch2 = handshake.buildClientHello(&hello_buf, .{ .groups = &.{.x25519}, .shares = &.{.{ .group = .x25519, .key_exchange = &x }} });
+    try feedConn(&conn, plainRecord(&rec, ch2));
+    try testing.expect(!conn.failed and conn.hasWire());
+    conn.advance(conn.wireBytes().len);
+
+    // Early data ends with ClientHello2: an undecryptable record now fails.
+    try feedConn(&conn, &early);
     try testing.expect(conn.failed);
 }
 

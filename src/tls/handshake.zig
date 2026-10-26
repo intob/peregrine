@@ -139,6 +139,11 @@ pub const Handshake = struct {
         return self.state == .done;
     }
 
+    /// A HelloRetryRequest was sent; ClientHello2 hasn't been handled yet.
+    pub fn isRetrying(self: *const Self) bool {
+        return self.state == .client_hello_retry;
+    }
+
     /// Handles handshake bytes received at `level`.
     pub fn feed(self: *Self, level: Level, data: []const u8, sink: anytype) (Error || SinkError(@TypeOf(sink)))!void {
         var rest = data;
@@ -574,7 +579,7 @@ const KeyExchange = struct {
 
 // -- ClientHello parsing ------------------------------------------------------
 
-const KeyShare = struct {
+pub const KeyShare = struct {
     group: NamedGroup,
     key_exchange: []const u8,
 };
@@ -851,7 +856,7 @@ test "ServerHello and handshake secrets match RFC 8448" {
 }
 
 /// Builds a ClientHello with the given suites, groups and key shares.
-fn buildClientHello(buf: []u8, opts: struct {
+pub fn buildClientHello(buf: []u8, opts: struct {
     suites: []const u16 = &.{0x1301},
     groups: []const NamedGroup = &.{.x25519},
     shares: []const KeyShare = &.{},
