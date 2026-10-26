@@ -1,14 +1,16 @@
-# Peregrine - a simple high-performance HTTP server
-This is an event-driven HTTP server. Written in pure Zig, with no dependencies other than Zig's standard library. Supports Linux (epoll, optionally io_uring) and BSD/MacOS (kqueue) systems. Requires Zig 0.17.
+# Peregrine - a high-performance HTTP server in pure Zig
+The goal: the fastest HTTP/1.1, HTTP/2 and HTTP/3 server, with TLS 1.3 and WebSockets, written in pure Zig. The only dependency is Zig's standard library: no libc on Linux, no OpenSSL. Supports Linux (epoll, optionally io_uring) and BSD/MacOS (kqueue) systems. Requires Zig 0.17.
 
-The main goal of this project is to provide a HTTP server with the following priorities (in order of prevalence):
+Priorities, in order:
 - Reliability
 - Performance
 - Simplicity
 
+Where it is today: HTTP/1.1 and WebSockets are done. TLS 1.3 is in progress, then HTTP/2, then HTTP/3 over QUIC. See [PLAN.md](PLAN.md) for the roadmap and the architecture: every protocol layer is an I/O-free state machine driven by per-core event loops, so the layers stack (TCP → TLS → HTTP/1.1 or HTTP/2; UDP → QUIC → HTTP/3) and the same code runs on every backend.
+
 Currently, all heap allocations are made during startup. Internally, no heap allocations are made per-request unless pre-allocated buffers overflow (for example, a request body larger than a pooled read buffer, or a response that can't be written in one go).
 
-Note: This project has just started, and is not yet a complete HTTP server implementation. See [To do section](#to-do). The API is likely to change. It is currently NOT FIT FOR PRODUCTION use.
+Note: This project has just started, and is not yet a complete HTTP server implementation. See the [Roadmap](#roadmap). The API is likely to change. It is currently NOT FIT FOR PRODUCTION use.
 
 ## Features
 
@@ -253,22 +255,18 @@ This is not a framework for building web applications. This is purely a HTTP ser
 
 If you want a more substantial HTTP library, I suggest that you look at [Zap](https://github.com/zigzap/zap), built on [Facil.io](http://facil.io). Facil.io is an excellent battle-tested library written in C.
 
-## To do
+## Roadmap
 Until these things are done, I don't think that this project can possibly be considered production-ready.
 
-See [PLAN.md](PLAN.md) for the full checklist. The main open items:
+See [PLAN.md](PLAN.md) for the full checklist. In order:
 
-- TLS 1.3 support
-- Streaming (chunked) responses
-- `sendfile` for file bodies
-- WebSocket extras: `permessage-deflate`, an idle timeout, the Autobahn test suite
-- Tune the io_uring backend until it beats epoll
-- Soak, adversarial and differential (HTTP Garden) testing
-- API reference
+1. TLS 1.3 (in progress): X25519, P-256 and X25519MLKEM768 key exchange, AES-GCM and ChaCha20-Poly1305, ECDSA and Ed25519 certificates, ALPN. Later: resumption, kTLS on Linux
+2. HTTP/2: HPACK, flow control, RFC 9218 priorities, WebSockets over h2 (RFC 8441), with a handler API that supports streaming responses
+3. HTTP/3 over QUIC: QUIC transport, loss recovery and congestion control, QPACK, GSO/GRO, WebSockets over h3 (RFC 9220)
+4. Throughout: `sendfile`, tuning io_uring until it beats epoll, WebSocket `permessage-deflate`, and verification with Autobahn, h2spec, quic-interop-runner, soak, adversarial and differential (HTTP Garden) testing
+5. API reference
 
 ## Nice to have
-- HTTP/2 support
-- HTTP/3 support
 - Windows support
 - Templating util (possibly adapt util.DirServer to be composable)
 
