@@ -10,12 +10,7 @@ const Handler = struct {
     fileServer: *per.util.FileServer,
 
     pub fn init(allocator: std.mem.Allocator) !*Self {
-        const cwd_path = try std.fs.cwd().realpathAlloc(allocator, ".");
-        defer allocator.free(cwd_path);
-        std.debug.print("cwd: {s}\n", .{cwd_path});
-        const abs_file_path = try std.fs.path.join(allocator, &.{ cwd_path, FILE });
-        defer allocator.free(abs_file_path);
-        const fileServer = try per.util.FileServer.init(allocator, abs_file_path, .{});
+        const fileServer = try per.util.FileServer.init(allocator, FILE, .{});
         const handler = try allocator.create(Self);
         handler.* = .{
             .allocator = allocator,
@@ -40,10 +35,8 @@ const Handler = struct {
     }
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const srv = try per.Server(Handler).init(gpa.allocator(), 3000, .{});
+pub fn main(init: std.process.Init) !void {
+    const srv = try per.Server(Handler).init(init.gpa, 3000, .{});
     std.debug.print("listening on 0.0.0.0:3000\n", .{});
     try srv.start(); // Blocks if there is no error
 }

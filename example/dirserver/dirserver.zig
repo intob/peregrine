@@ -10,10 +10,7 @@ const Handler = struct {
     dirServer: *per.util.DirServer,
 
     pub fn init(allocator: std.mem.Allocator) !*Self {
-        const cwd_path = try std.fs.cwd().realpathAlloc(allocator, ".");
-        defer allocator.free(cwd_path);
-        std.debug.print("cwd: {s}\n", .{cwd_path});
-        const abs_path = try std.fs.path.join(allocator, &.{ cwd_path, DIR });
+        const abs_path = try absolutePath(allocator, DIR);
         defer allocator.free(abs_path);
         const dirServer = try per.util.DirServer.init(allocator, abs_path, .{});
         const handler = try allocator.create(Self);
@@ -33,13 +30,14 @@ const Handler = struct {
     }
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const srv = try per.Server(Handler).init(gpa.allocator(), 3000, .{
-        .accept_thread_count = 2,
-        .worker_thread_count = 6,
-    });
+pub fn main(init: std.process.Init) !void {
+    const srv = try per.Server(Handler).init(init.gpa, 3000, .{});
     std.debug.print("listening on 0.0.0.0:3000\n", .{});
     try srv.start(); // Blocks if there is no error
+}
+
+fn absolutePath(allocator: std.mem.Allocator, rel: []const u8) ![:0]u8 {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    return try std.Io.Dir.cwd().realPathFileAlloc(threaded.io(), rel, allocator);
 }

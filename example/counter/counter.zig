@@ -31,20 +31,14 @@ const Handler = struct {
 
     fn handleWithError(self: *Self, _: *per.Request, resp: *per.Response) !void {
         const count = self.counter.fetchAdd(1, .monotonic);
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const allocator = arena.allocator();
-        const buf = try std.fmt.allocPrint(allocator, "counter={d}\n", .{count});
-        _ = try resp.setBody(buf);
-        const len_buf = try std.fmt.allocPrint(allocator, "{d}", .{buf.len});
-        try resp.addNewHeader("content-length", len_buf);
+        // Format straight into the response buffer: no allocation, no copy.
+        const body = try std.fmt.bufPrint(resp.bodyWriteBuffer(), "counter={d}\n", .{count});
+        resp.commitBody(body.len);
     }
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const srv = try per.Server(Handler).init(gpa.allocator(), 3000, .{});
+pub fn main(init: std.process.Init) !void {
+    const srv = try per.Server(Handler).init(init.gpa, 3000, .{});
     std.debug.print("listening on 0.0.0.0:3000\n", .{});
     try srv.start(); // Blocks if there is no error
 }
