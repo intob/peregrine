@@ -364,6 +364,9 @@ const MutationResult = struct {
     /// inside it must not matter).
     framed: bool = true,
     early_data: bool = false,
+    /// Only padding was added (all ClientHello2 may change besides its
+    /// key shares, §4.1.2).
+    padding_only: bool = true,
 };
 
 /// Byte content comes from a PRNG seeded by one value, so every Smith
@@ -393,7 +396,9 @@ fn mutateHello(a: Allocator, smith: *Smith, fx: *const Fixtures, h: *Hello, res:
         const m = smith.valueRangeAtMost(u8, 0, @typeInfo(Mutation).@"enum".field_names.len - 1);
         if (trace) std.debug.print("mutation {s}\n", .{@tagName(@as(Mutation, @fromBackingInt(m)))});
         const exts = h.exts.items;
-        switch (@as(Mutation, @fromBackingInt(m))) {
+        const mutation: Mutation = @fromBackingInt(m);
+        if (mutation != .add_padding) res.padding_only = false;
+        switch (mutation) {
             .flip_byte => {
                 if (exts.len == 0) continue;
                 const i = smith.index(exts.len);
@@ -1347,7 +1352,7 @@ fn runScript(
                 var list: [2]KeyShare = undefined;
                 const n = h2.shares(&list);
                 const requested = n == 1 and list[0].group == g and std.mem.eql(u8, list[0].kx, fx.share(g).?);
-                if (!r2.benign or r2.early_data or !requested) mres.benign = false;
+                if (!r2.benign or !r2.padding_only or !requested) mres.benign = false;
                 if (!r2.framed) mres.framed = false;
             },
         }
@@ -1610,6 +1615,8 @@ var trace = false;
 const corpus = [_][]const u8{
     // Harness: a ClientHello2 mutation dropped the requested key share.
     @embedFile("testdata/fuzz/hrr-1.bin"),
+    // Harness: a ClientHello2 mutation changed the session ID.
+    @embedFile("testdata/fuzz/hello-2.bin"),
 };
 
 test "fuzz: tls.Conn handshake and record mutations" {
