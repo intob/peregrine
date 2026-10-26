@@ -1,0 +1,798 @@
+//! TLS 1.3 over TCP for one connection, independent of the I/O model.
+//!
+//! The event loop reads ciphertext into `readSpace`, then takes decrypted
+//! application data with `readPlain`; it hands application output to
+//! `encrypt` and writes `wireBytes`. Handshake messages, alerts and
+//! KeyUpdate responses also end up in the wire buffer. Like `Session`, the
+//! connection holds a pooled input buffer only while it has unprocessed
+//! bytes, and a pooled output buffer only while it has unsent bytes.
+const std = @import("std");
+const tls = std.crypto.tls;
+const record = @import("./record.zig");
+const handshake = @import("./handshake.zig");
+const errors = @import("./errors.zig");
+const BufferPool = @import("../http/session.zig").BufferPool;
+const Protection = record.Protection;
+const ContentType = record.ContentType;
+const Level = handshake.Level;
+const Suite = record.Suite;
+
+pub const Config = handshake.Config;
+pub const entropy_len = handshake.entropy_len;
+
+/// Input buffers hold one maximum-size record.
+pub const in_buffer_size = 17 * 1024;
+/// Output buffers hold several records, so a large body goes out in fewer
+/// writes.
+pub const out_buffer_size = 4 * (record.max_plaintext + record.overhead);
+
+comptime {
+    std.debug.assert(in_buffer_size >= record.max_record);
+}
+
+/// Per-worker buffer pools shared by its TLS connections.
+pub const Pools = struct {
+    in: BufferPool,
+    out: BufferPool,
+
+    pub fn init(allocator: std.mem.Allocator, count: usize) !Pools {
+        var in = try BufferPool.init(allocator, in_buffer_size, count);
+        errdefer in.deinit();
+        return .{ .in = in, .out = try BufferPool.init(allocator, out_buffer_size, count) };
+    }
+
+    pub fn deinit(self: *Pools) void {
+        self.in.deinit();
+        self.out.deinit();
+    }
+};
+
+/// 0-RTT data the server rejects is skipped, up to this many bytes.
+const max_skipped_early_data = 64 * 1024;
+
+pub const Conn = struct {
+    const Self = @This();
+
+    pools: *Pools,
+    hs: ?*handshake.Handshake,
+    read: ?Protection = null,
+    write: ?Protection = null,
+    read_level: Level = .initial,
+
+    in_buf: []u8 = &.{},
+    in_start: usize = 0,
+    in_end: usize = 0,
+    /// Decrypted application data not yet taken (points into in_buf).
+    plain: []u8 = &.{},
+
+    wire_buf: []u8 = &.{},
+    wire_start: usize = 0,
+    wire_end: usize = 0,
+
+    early_data_left: usize = 0,
+    /// Negotiated ALPN protocol (points into the config), once established.
+    alpn: ?[]const u8 = null,
+    /// A fatal alert was queued: flush the wire, then close.
+    failed: bool = false,
+    /// The peer sent close_notify or an alert: no more input will come.
+    peer_closed: bool = false,
+    close_sent: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator, pools: *Pools, config: *const Config, entropy: *const [entropy_len]u8) !Self {
+        const hs = try allocator.create(handshake.Handshake);
+        hs.* = .init(allocator, config, entropy);
+        return .{ .pools = pools, .hs = hs };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.freeHandshake();
+        if (self.read) |*p| p.wipe();
+        if (self.write) |*p| p.wipe();
+        if (self.in_buf.len > 0) self.pools.in.release(self.in_buf);
+        if (self.wire_buf.len > 0) self.pools.out.release(self.wire_buf);
+        self.* = undefined;
+    }
+
+    fn freeHandshake(self: *Self) void {
+        if (self.hs) |hs| {
+            const allocator = hs.allocator;
+            hs.deinit();
+            allocator.destroy(hs);
+            self.hs = null;
+        }
+    }
+
+    pub fn isEstablished(self: *const Self) bool {
+        return self.hs == null and !self.failed;
+    }
+
+    pub fn isHandshaking(self: *const Self) bool {
+        return self.hs != null;
+    }
+
+    // -- Input --------------------------------------------------------------
+
+    /// Space to read ciphertext into. Empty while the buffer is full of
+    /// decrypted data not yet taken with `readPlain`.
+    pub fn readSpace(self: *Self) ![]u8 {
+        if (self.in_buf.len == 0) {
+            self.in_buf = try self.pools.in.acquire();
+            self.in_start = 0;
+            self.in_end = 0;
+        }
+        if (self.in_end == self.in_buf.len and self.plain.len == 0) self.compact();
+        return self.in_buf[self.in_end..];
+    }
+
+    pub fn commitRead(self: *Self, n: usize) void {
+        self.in_end += n;
+    }
+
+    fn compact(self: *Self) void {
+        const len = self.in_end - self.in_start;
+        std.mem.copyForwards(u8, self.in_buf[0..len], self.in_buf[self.in_start..self.in_end]);
+        self.in_start = 0;
+        self.in_end = len;
+    }
+
+    /// Whether `readPlain` could return more data without another read.
+    pub fn hasBufferedInput(self: *const Self) bool {
+        if (self.plain.len > 0) return true;
+        const avail = self.in_end - self.in_start;
+        if (avail < record.header_len or self.failed or self.peer_closed) return false;
+        const len = std.mem.readInt(u16, self.in_buf[self.in_start + 3 ..][0..2], .big);
+        return avail >= record.header_len + len;
+    }
+
+    /// Copies decrypted application data into `out`, processing records
+    /// (handshake, alerts, KeyUpdate) as needed. Returns 0 when more input
+    /// is needed, or when `failed` or `peer_closed` is set.
+    pub fn readPlain(self: *Self, out: []u8) usize {
+        var n: usize = 0;
+        while (n < out.len) {
+            if (self.plain.len > 0) {
+                const k = @min(self.plain.len, out.len - n);
+                @memcpy(out[n..][0..k], self.plain[0..k]);
+                self.plain = self.plain[k..];
+                n += k;
+                continue;
+            }
+            const progressed = self.nextRecord() catch |err| {
+                self.fail(err);
+                break;
+            };
+            if (!progressed) break;
+        }
+        return n;
+    }
+
+    /// Return the input buffer to the pool when nothing is buffered.
+    pub fn releaseIfIdle(self: *Self) void {
+        if (self.in_buf.len > 0 and self.in_start == self.in_end and self.plain.len == 0) {
+            self.pools.in.release(self.in_buf);
+            self.in_buf = &.{};
+            self.in_start = 0;
+            self.in_end = 0;
+        }
+        if (self.wire_buf.len > 0 and self.wire_start == self.wire_end) {
+            self.pools.out.release(self.wire_buf);
+            self.wire_buf = &.{};
+            self.wire_start = 0;
+            self.wire_end = 0;
+        }
+    }
+
+    /// Processes one record. Returns false if none is complete.
+    fn nextRecord(self: *Self) (errors.Error || error{OutOfMemory})!bool {
+        if (self.failed or self.peer_closed) return false;
+        const avail = self.in_end - self.in_start;
+        if (avail < record.header_len) return false;
+        const header = self.in_buf[self.in_start..][0..record.header_len];
+        const content_type: ContentType = @fromBackingInt(header[0]);
+        const len = std.mem.readInt(u16, header[3..5], .big);
+        const encrypted = content_type == .application_data;
+        const max: usize = if (encrypted) record.max_ciphertext else record.max_plaintext;
+        if (len > max) return error.RecordOverflow;
+        if (avail < record.header_len + len) {
+            // Make room for the rest of the record.
+            if (self.in_start > 0 and self.in_start + record.header_len + len > self.in_buf.len) self.compact();
+            return false;
+        }
+        const rec = self.in_buf[self.in_start..][0 .. record.header_len + len];
+        self.in_start += rec.len;
+        const body = rec[record.header_len..];
+
+        switch (content_type) {
+            .change_cipher_spec => {
+                // Compatibility mode: one byte, 0x01, dropped while handshaking.
+                if (self.hs == null or len != 1 or body[0] != 1) return error.UnexpectedMessage;
+            },
+            .alert => {
+                // Plaintext alerts only make sense before keys exist, but a
+                // client that failed to process the ServerHello sends one.
+                if (self.hs == null) return error.UnexpectedMessage;
+                try self.handleAlert(body);
+            },
+            .handshake => {
+                if (self.read != null or len == 0) return error.UnexpectedMessage;
+                try self.feedHandshake(.initial, body);
+            },
+            .application_data => {
+                var p = &(self.read orelse return error.UnexpectedMessage);
+                const opened = p.open(rec) catch |err| {
+                    // Rejected 0-RTT data is encrypted under keys we never
+                    // derived: skip it (RFC 8446 §4.2.10).
+                    if (err == error.BadRecordMac and self.early_data_left >= len) {
+                        self.early_data_left -= len;
+                        return true;
+                    }
+                    return err;
+                };
+                self.early_data_left = 0;
+                switch (opened.content_type) {
+                    .application_data => {
+                        if (self.hs != null) return error.UnexpectedMessage;
+                        self.plain = opened.data;
+                    },
+                    .handshake => {
+                        if (opened.data.len == 0) return error.UnexpectedMessage;
+                        if (self.hs != null) {
+                            try self.feedHandshake(self.read_level, opened.data);
+                        } else {
+                            try self.handlePostHandshake(opened.data);
+                        }
+                    },
+                    .alert => try self.handleAlert(opened.data),
+                    else => return error.UnexpectedMessage,
+                }
+            },
+            else => return error.UnexpectedMessage,
+        }
+        return true;
+    }
+
+    fn feedHandshake(self: *Self, level: Level, data: []const u8) !void {
+        const hs = self.hs.?;
+        var sink: Sink = .{ .conn = self };
+        hs.feed(level, data, &sink) catch |err| switch (err) {
+            error.OutOfMemory => return error.InternalError,
+            else => |e| return e,
+        };
+        if (hs.early_data_offered and self.read_level == .handshake and !hs.isDone()) {
+            // Only until the first record that decrypts.
+            if (self.early_data_left == 0 and self.read.?.seq == 0) self.early_data_left = max_skipped_early_data;
+        }
+        if (hs.isDone()) {
+            self.alpn = hs.alpn;
+            self.freeHandshake();
+        }
+    }
+
+    fn handleAlert(self: *Self, body: []const u8) !void {
+        if (body.len != 2) return error.DecodeError;
+        const description: tls.Alert.Description = @fromBackingInt(body[1]);
+        switch (description) {
+            // Followed by close_notify; nothing to do.
+            .user_canceled => {},
+            // close_notify, or a fatal alert: either way no more input.
+            else => self.peer_closed = true,
+        }
+    }
+
+    /// After the handshake the client may only send KeyUpdate.
+    fn handlePostHandshake(self: *Self, data: []const u8) !void {
+        // KeyUpdate precedes a key change, so it must end its record and
+        // can't be split across records.
+        if (data.len != 5 or data[0] != @backingInt(tls.HandshakeType.key_update)) return error.UnexpectedMessage;
+        if (std.mem.readInt(u24, data[1..4], .big) != 1) return error.DecodeError;
+        const request: tls.KeyUpdateRequest = @fromBackingInt(data[4]);
+        switch (request) {
+            .update_not_requested => {},
+            .update_requested => {
+                // Answer under the current key, then switch (§4.6.3).
+                try self.sendRecords(.handshake, &.{ @backingInt(tls.HandshakeType.key_update), 0, 0, 1, 0 });
+                self.write.?.update();
+            },
+            _ => return error.IllegalParameter,
+        }
+        self.read.?.update();
+    }
+
+    fn fail(self: *Self, err: (errors.Error || error{OutOfMemory})) void {
+        const e: errors.Error = switch (err) {
+            error.OutOfMemory => error.InternalError,
+            else => |e| e,
+        };
+        self.failed = true;
+        self.sendAlert(.fatal, errors.alertFor(e));
+        self.freeHandshake();
+    }
+
+    fn sendAlert(self: *Self, level: tls.Alert.Level, description: tls.Alert.Description) void {
+        if (self.close_sent) return;
+        self.close_sent = true;
+        // Best effort: if there is no memory for the alert, just close.
+        self.sendRecords(.alert, &.{ @backingInt(level), @backingInt(description) }) catch {};
+    }
+
+    /// Queues close_notify: no more output after this.
+    pub fn close(self: *Self) void {
+        if (self.hs != null) return;
+        self.sendAlert(.warning, .close_notify);
+    }
+
+    // -- Output -------------------------------------------------------------
+
+    pub fn wireBytes(self: *const Self) []const u8 {
+        return self.wire_buf[self.wire_start..self.wire_end];
+    }
+
+    pub fn hasWire(self: *const Self) bool {
+        return self.wire_end > self.wire_start;
+    }
+
+    pub fn advance(self: *Self, n: usize) void {
+        self.wire_start += n;
+        if (self.wire_start == self.wire_end) {
+            self.wire_start = 0;
+            self.wire_end = 0;
+        }
+    }
+
+    /// Free space at the end of the wire buffer, at least `min` bytes.
+    fn reserve(self: *Self, min: usize) ![]u8 {
+        if (self.wire_buf.len == 0) {
+            self.wire_buf = try self.pools.out.acquire();
+            self.wire_start = 0;
+            self.wire_end = 0;
+        }
+        if (self.wire_buf.len - self.wire_end >= min) return self.wire_buf[self.wire_end..];
+        const len = self.wire_end - self.wire_start;
+        if (self.wire_buf.len - len >= min) {
+            std.mem.copyForwards(u8, self.wire_buf[0..len], self.wire_buf[self.wire_start..self.wire_end]);
+        } else {
+            // Rare: a handshake flight larger than the buffer (a long
+            // certificate chain).
+            const new_buf = try self.pools.out.allocator.alloc(u8, len + min);
+            @memcpy(new_buf[0..len], self.wire_buf[self.wire_start..self.wire_end]);
+            self.pools.out.release(self.wire_buf);
+            self.wire_buf = new_buf;
+        }
+        self.wire_start = 0;
+        self.wire_end = len;
+        return self.wire_buf[self.wire_end..];
+    }
+
+    /// Writes `data` as records of the given type, encrypted once keys
+    /// exist.
+    fn sendRecords(self: *Self, content_type: ContentType, data: []const u8) !void {
+        var rest = data;
+        while (true) {
+            const chunk = rest[0..@min(rest.len, record.max_plaintext)];
+            const out = try self.reserve(chunk.len + record.overhead);
+            if (self.write) |*p| {
+                self.wire_end += p.seal(out, content_type, chunk);
+            } else {
+                out[0] = @backingInt(content_type);
+                out[1..3].* = .{ 3, 3 };
+                std.mem.writeInt(u16, out[3..5], @intCast(chunk.len), .big);
+                @memcpy(out[record.header_len..][0..chunk.len], chunk);
+                self.wire_end += record.header_len + chunk.len;
+            }
+            rest = rest[chunk.len..];
+            if (rest.len == 0) break;
+        }
+    }
+
+    /// Encrypts as much of `parts` (taken in order, as one stream) as fits
+    /// in the wire buffer. Returns the number of plaintext bytes consumed.
+    pub fn encrypt(self: *Self, parts: []const []const u8) !usize {
+        std.debug.assert(self.isEstablished());
+        var total: usize = 0;
+        for (parts) |p| total += p.len;
+        var consumed: usize = 0;
+        var part: usize = 0;
+        var part_off: usize = 0;
+        while (consumed < total) {
+            const out = self.reserve(record.overhead + 1) catch |err| {
+                if (consumed > 0) break;
+                return err;
+            };
+            if (out.len < record.overhead + 1) break;
+            const n = @min(total - consumed, record.max_plaintext, out.len - record.overhead);
+            // Gather the plaintext where seal expects it, then seal in place.
+            const dst = out[record.header_len..][0..n];
+            var filled: usize = 0;
+            while (filled < n) {
+                const src = parts[part][part_off..];
+                const k = @min(src.len, n - filled);
+                @memcpy(dst[filled..][0..k], src[0..k]);
+                filled += k;
+                part_off += k;
+                if (part_off == parts[part].len) {
+                    part += 1;
+                    part_off = 0;
+                }
+            }
+            self.wire_end += self.write.?.seal(out, .application_data, dst);
+            consumed += n;
+            // Fill the buffer, but don't grow it for application data.
+            if (self.wire_buf.len - self.wire_end < record.overhead + 1) break;
+        }
+        return consumed;
+    }
+
+    const Sink = struct {
+        conn: *Self,
+        pub const Error = error{OutOfMemory};
+
+        pub fn handshakeData(self: *Sink, _: Level, bytes: []const u8) Error!void {
+            try self.conn.sendRecords(.handshake, bytes);
+        }
+
+        pub fn changeCipherSpec(self: *Sink) Error!void {
+            const out = try self.conn.reserve(6);
+            out[0..6].* = .{ @backingInt(ContentType.change_cipher_spec), 3, 3, 0, 1, 1 };
+            self.conn.wire_end += 6;
+        }
+
+        pub fn writeSecret(self: *Sink, _: Level, suite: Suite, secret: []const u8) Error!void {
+            if (self.conn.write) |*p| p.wipe();
+            self.conn.write = Protection.init(suite, secret);
+        }
+
+        pub fn readSecret(self: *Sink, level: Level, suite: Suite, secret: []const u8) Error!void {
+            if (self.conn.read) |*p| p.wipe();
+            self.conn.read = Protection.init(suite, secret);
+            self.conn.read_level = level;
+        }
+    };
+};
+
+// -- Tests ----------------------------------------------------------------
+
+const sys = @import("../sys.zig");
+const credentials = @import("./credentials.zig");
+const testing = std.testing;
+
+const TestServer = struct {
+    creds: credentials.Credentials,
+    config: Config,
+    pools: Pools,
+
+    fn init(self: *TestServer, cert: []const u8, key: []const u8) !void {
+        self.creds = try .fromPem(testing.allocator, cert, key);
+        self.config = .{ .credentials = &self.creds, .alpn = &.{"http/1.1"} };
+        self.pools = try .init(testing.allocator, 4);
+    }
+
+    fn deinit(self: *TestServer) void {
+        self.pools.deinit();
+        self.creds.deinit();
+    }
+};
+
+fn testEntropy(seed: u8) [entropy_len]u8 {
+    var e: [entropy_len]u8 = undefined;
+    for (&e, 0..) |*b, i| b.* = @truncate(i *% 13 +% seed);
+    return e;
+}
+
+/// std's TLS client: handshake, send `msg`, expect it echoed, close_notify.
+fn stdClient(fd: sys.fd_t, msg: []const u8, seed: u8, result: *?anyerror) void {
+    stdClientInner(fd, msg, seed) catch |err| {
+        result.* = err;
+    };
+    sys.shutdownWrite(fd);
+}
+
+fn stdClientInner(fd: sys.fd_t, msg: []const u8, seed: u8) !void {
+    const io = testing.io;
+    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    var in_buf: [tls.Client.min_buffer_len]u8 = undefined;
+    var out_buf: [tls.Client.min_buffer_len]u8 = undefined;
+    var reader = file.readerStreaming(io, &in_buf);
+    var writer = file.writerStreaming(io, &out_buf);
+    var read_buf: [tls.Client.min_buffer_len]u8 = undefined;
+    var write_buf: [tls.Client.min_buffer_len]u8 = undefined;
+    var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+    for (&entropy, 0..) |*b, i| b.* = @truncate(i *% 7 +% seed);
+    var client = try tls.Client.init(&reader.interface, &writer.interface, .{
+        .host = .{ .explicit = "localhost" },
+        .ca = .self_signed,
+        .read_buffer = &read_buf,
+        .write_buffer = &write_buf,
+        .entropy = &entropy,
+        .realtime_now = .{ .nanoseconds = @as(i96, sys.realtimeSeconds()) * std.time.ns_per_s },
+    });
+    try client.writer.writeAll(msg);
+    try client.writer.flush();
+    try writer.interface.flush();
+    const echo = try testing.allocator.alloc(u8, msg.len);
+    defer testing.allocator.free(echo);
+    try client.reader.readSliceAll(echo);
+    if (!std.mem.eql(u8, echo, msg)) return error.EchoMismatch;
+    try client.end();
+    try writer.interface.flush();
+}
+
+/// Serves one connection on a blocking socket: once `expect_len` bytes of
+/// application data have arrived, sends them back (not before, or both
+/// sides could block writing), then waits for close_notify.
+fn echoServer(conn: *Conn, fd: sys.fd_t, expect_len: usize, transcript: ?*std.ArrayList(u8)) !void {
+    var received: std.ArrayList(u8) = .empty;
+    defer received.deinit(testing.allocator);
+    var plain: [8192]u8 = undefined;
+    var echoed = false;
+    while (true) {
+        const space = try conn.readSpace();
+        const n = try sys.read(fd, space);
+        if (n == 0) return error.UnexpectedEof;
+        if (transcript) |t| try t.appendSlice(testing.allocator, space[0..n]);
+        conn.commitRead(n);
+        while (true) {
+            const k = conn.readPlain(&plain);
+            if (k == 0) break;
+            try received.appendSlice(testing.allocator, plain[0..k]);
+        }
+        try flushBlocking(conn, fd);
+        if (conn.failed) return error.TlsFailed;
+        if (!echoed and received.items.len == expect_len) {
+            echoed = true;
+            var sent: usize = 0;
+            while (sent < received.items.len) {
+                sent += try conn.encrypt(&.{received.items[sent..]});
+                try flushBlocking(conn, fd);
+            }
+        }
+        if (conn.peer_closed) {
+            if (!echoed) return error.ShortMessage;
+            conn.close();
+            try flushBlocking(conn, fd);
+            return;
+        }
+        conn.releaseIfIdle();
+    }
+}
+
+fn flushBlocking(conn: *Conn, fd: sys.fd_t) !void {
+    while (conn.hasWire()) conn.advance(try sys.write(fd, conn.wireBytes()));
+}
+
+fn runAgainstStdClient(server: *TestServer, msg: []const u8, transcript: ?*std.ArrayList(u8)) !void {
+    const fds = try sys.socketPair();
+    defer sys.close(fds[0]);
+    var client_err: ?anyerror = null;
+    const t = try std.Thread.spawn(.{}, stdClient, .{ fds[1], msg, 1, &client_err });
+    var conn = try Conn.init(testing.allocator, &server.pools, &server.config, &testEntropy(5));
+    defer conn.deinit();
+    const result = echoServer(&conn, fds[0], msg.len, transcript);
+    // Unblock the client if the server gave up.
+    sys.shutdownWrite(fds[0]);
+    t.join();
+    sys.close(fds[1]);
+    if (client_err) |err| return err;
+    try result;
+    try testing.expectEqualStrings("http/1.1", conn.alpn orelse "http/1.1");
+}
+
+test "handshake and echo with std's TLS client, every suite, group and key type" {
+    const td = credentials.testdata;
+    // std's client can't verify an Ed25519 CertificateVerify (its scheme
+    // check has no Ed25519 case), so Ed25519 is checked with OpenSSL.
+    const keys = [_][2][]const u8{
+        .{ td.p256_cert, td.p256_key },
+        .{ td.p384_cert, td.p384_key },
+    };
+    const suites = [_]Suite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 };
+    const groups = [_]tls.NamedGroup{ .x25519_ml_kem768, .x25519, .secp256r1 };
+    // A message larger than a record, so the echo spans several.
+    var big: [40_000]u8 = undefined;
+    for (&big, 0..) |*b, i| b.* = @truncate(i);
+    for (keys) |kc| for (suites) |suite| for (groups) |group| {
+        var server: TestServer = undefined;
+        try server.init(kc[0], kc[1]);
+        defer server.deinit();
+        server.config.suites = &.{suite};
+        server.config.groups = &.{group};
+        runAgainstStdClient(&server, &big, null) catch |err| {
+            std.debug.print("suite {s} group {s}: {s}\n", .{ @tagName(suite), @tagName(group), @errorName(err) });
+            return err;
+        };
+    };
+}
+
+test "split invariance: any split of the client's bytes gives identical output" {
+    const td = credentials.testdata;
+    var server: TestServer = undefined;
+    try server.init(td.p256_cert, td.p256_key);
+    defer server.deinit();
+
+    // Record a real session (client entropy and server entropy are fixed,
+    // so it is deterministic), then replay the client's bytes in pieces.
+    var transcript: std.ArrayList(u8) = .empty;
+    defer transcript.deinit(testing.allocator);
+    try runAgainstStdClient(&server, "GET / HTTP/1.1\r\nHost: x\r\n\r\n", &transcript);
+    const input = transcript.items;
+
+    const Replay = struct {
+        fn run(srv: *TestServer, bytes: []const u8, splits: []const usize, wire: *std.ArrayList(u8), plain_out: *std.ArrayList(u8)) !void {
+            var conn = try Conn.init(testing.allocator, &srv.pools, &srv.config, &testEntropy(5));
+            defer conn.deinit();
+            var pos: usize = 0;
+            var si: usize = 0;
+            var buf: [100]u8 = undefined;
+            while (pos < bytes.len) {
+                const want = if (si < splits.len) splits[si] else bytes.len - pos;
+                si += 1;
+                var chunk = bytes[pos..@min(bytes.len, pos + want)];
+                pos += chunk.len;
+                while (chunk.len > 0) {
+                    const space = try conn.readSpace();
+                    const k = @min(space.len, chunk.len);
+                    @memcpy(space[0..k], chunk[0..k]);
+                    conn.commitRead(k);
+                    chunk = chunk[k..];
+                    while (true) {
+                        const n = conn.readPlain(&buf);
+                        if (n == 0) break;
+                        try plain_out.appendSlice(testing.allocator, buf[0..n]);
+                        var sent: usize = 0;
+                        while (sent < n) sent += try conn.encrypt(&.{buf[sent..n]});
+                    }
+                    try wire.appendSlice(testing.allocator, conn.wireBytes());
+                    conn.advance(conn.wireBytes().len);
+                    try testing.expect(!conn.failed);
+                }
+            }
+            try testing.expect(conn.peer_closed);
+        }
+    };
+
+    var ref_wire: std.ArrayList(u8) = .empty;
+    defer ref_wire.deinit(testing.allocator);
+    var ref_plain: std.ArrayList(u8) = .empty;
+    defer ref_plain.deinit(testing.allocator);
+    try Replay.run(&server, input, &.{}, &ref_wire, &ref_plain);
+    try testing.expectEqualStrings("GET / HTTP/1.1\r\nHost: x\r\n\r\n", ref_plain.items);
+
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+    var splits: [4096]usize = undefined;
+    for (0..100) |round| {
+        var n: usize = 0;
+        var covered: usize = 0;
+        while (covered < input.len and n < splits.len) : (n += 1) {
+            splits[n] = if (round == 0) 1 else random.intRangeAtMost(usize, 1, 300);
+            covered += splits[n];
+        }
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(testing.allocator);
+        var plain: std.ArrayList(u8) = .empty;
+        defer plain.deinit(testing.allocator);
+        try Replay.run(&server, input, splits[0..n], &wire, &plain);
+        // Record boundaries in the output may differ (application data is
+        // encrypted as it arrives), so compare the decrypted streams.
+        try testing.expectEqualSlices(u8, ref_plain.items, plain.items);
+        try testing.expectEqualSlices(u8, ref_wire.items[0..handshakeLen(ref_wire.items)], wire.items[0..handshakeLen(wire.items)]);
+    }
+}
+
+/// Length of the server's handshake flight: everything before the first
+/// record sealed under application keys. Records up to and including the
+/// last handshake-key record are identical across splits.
+fn handshakeLen(wire: []const u8) usize {
+    // ServerHello, CCS, then one encrypted record holding the flight.
+    var pos: usize = 0;
+    for (0..3) |_| pos += record.header_len + std.mem.readInt(u16, wire[pos + 3 ..][0..2], .big);
+    return pos;
+}
+
+fn expectAlert(input: []const u8, description: tls.Alert.Description) !void {
+    const td = credentials.testdata;
+    var server: TestServer = undefined;
+    try server.init(td.p256_cert, td.p256_key);
+    defer server.deinit();
+    var conn = try Conn.init(testing.allocator, &server.pools, &server.config, &testEntropy(5));
+    defer conn.deinit();
+    const space = try conn.readSpace();
+    @memcpy(space[0..input.len], input);
+    conn.commitRead(input.len);
+    var buf: [64]u8 = undefined;
+    try testing.expectEqual(0, conn.readPlain(&buf));
+    try testing.expect(conn.failed);
+    const wire = conn.wireBytes();
+    // Before any keys exist the alert is in plaintext.
+    try testing.expectEqualSlices(u8, &.{ 21, 3, 3, 0, 2, 2, @backingInt(description) }, wire);
+}
+
+test "malformed records get the right alert" {
+    // Oversized plaintext record.
+    try expectAlert(&.{ 22, 3, 1, 0x40, 0x01 }, .record_overflow);
+    // Unknown content type.
+    try expectAlert(&.{ 99, 3, 3, 0, 1, 0 }, .unexpected_message);
+    // Application data before keys.
+    try expectAlert(&.{ 23, 3, 3, 0, 1, 0 }, .unexpected_message);
+    // Empty handshake record.
+    try expectAlert(&.{ 22, 3, 1, 0, 0 }, .unexpected_message);
+    // change_cipher_spec with the wrong value.
+    try expectAlert(&.{ 20, 3, 3, 0, 1, 2 }, .unexpected_message);
+    // A message other than ClientHello first.
+    try expectAlert(&.{ 22, 3, 1, 0, 4, 20, 0, 0, 0 }, .unexpected_message);
+    // A ClientHello claiming more than the limit.
+    try expectAlert(&.{ 22, 3, 1, 0, 4, 1, 0xff, 0xff, 0xff }, .decode_error);
+}
+
+test "KeyUpdate in both directions" {
+    const td = credentials.testdata;
+    var server: TestServer = undefined;
+    try server.init(td.p256_cert, td.p256_key);
+    defer server.deinit();
+    var conn = try Conn.init(testing.allocator, &server.pools, &server.config, &testEntropy(5));
+    defer conn.deinit();
+    // Pretend the handshake finished with known secrets.
+    conn.freeHandshake();
+    const c_secret: [32]u8 = @splat(1);
+    const s_secret: [32]u8 = @splat(2);
+    conn.read = .init(.aes_128_gcm_sha256, &c_secret);
+    conn.write = .init(.aes_128_gcm_sha256, &s_secret);
+    var client_tx: Protection = .init(.aes_128_gcm_sha256, &c_secret);
+    var client_rx: Protection = .init(.aes_128_gcm_sha256, &s_secret);
+
+    // KeyUpdate(update_requested), then data under the next key.
+    const space = try conn.readSpace();
+    var n = client_tx.seal(space, .handshake, &.{ 24, 0, 0, 1, 1 });
+    client_tx.update();
+    n += client_tx.seal(space[n..], .application_data, "after");
+    conn.commitRead(n);
+    var buf: [16]u8 = undefined;
+    try testing.expectEqual(5, conn.readPlain(&buf));
+    try testing.expectEqualStrings("after", buf[0..5]);
+
+    // The server answered under its old key, then switched.
+    try testing.expectEqual(5, try conn.encrypt(&.{"reply"}));
+    var wire: [256]u8 = undefined;
+    const w = conn.wireBytes();
+    @memcpy(wire[0..w.len], w);
+    const first_len = record.header_len + std.mem.readInt(u16, wire[3..5], .big);
+    const ku = try client_rx.open(wire[0..first_len]);
+    try testing.expectEqual(ContentType.handshake, ku.content_type);
+    try testing.expectEqualSlices(u8, &.{ 24, 0, 0, 1, 0 }, ku.data);
+    client_rx.update();
+    const reply = try client_rx.open(wire[first_len..w.len]);
+    try testing.expectEqualStrings("reply", reply.data);
+
+    // A KeyUpdate with an invalid request value is fatal.
+    const space2 = try conn.readSpace();
+    n = client_tx.seal(space2, .handshake, &.{ 24, 0, 0, 1, 7 });
+    conn.commitRead(n);
+    try testing.expectEqual(0, conn.readPlain(&buf));
+    try testing.expect(conn.failed);
+}
+
+test "close_notify from the peer ends input" {
+    const td = credentials.testdata;
+    var server: TestServer = undefined;
+    try server.init(td.p256_cert, td.p256_key);
+    defer server.deinit();
+    var conn = try Conn.init(testing.allocator, &server.pools, &server.config, &testEntropy(5));
+    defer conn.deinit();
+    conn.freeHandshake();
+    const secret: [32]u8 = @splat(1);
+    conn.read = .init(.aes_128_gcm_sha256, &secret);
+    conn.write = .init(.aes_128_gcm_sha256, &secret);
+    var client_tx: Protection = .init(.aes_128_gcm_sha256, &secret);
+    const space = try conn.readSpace();
+    var n = client_tx.seal(space, .application_data, "last");
+    n += client_tx.seal(space[n..], .alert, &.{ 1, 0 });
+    // Anything after close_notify is ignored.
+    n += client_tx.seal(space[n..], .application_data, "ignored");
+    conn.commitRead(n);
+    var buf: [16]u8 = undefined;
+    try testing.expectEqual(4, conn.readPlain(&buf));
+    try testing.expectEqual(0, conn.readPlain(&buf));
+    try testing.expect(conn.peer_closed);
+    try testing.expect(!conn.failed);
+    conn.close();
+    try testing.expect(conn.hasWire());
+}

@@ -32,6 +32,11 @@ test {
     _ = @import("./sys.zig");
     _ = @import("./ws/protocol.zig");
     _ = @import("./ws/conn.zig");
+    _ = @import("./tls/key_schedule.zig");
+    _ = @import("./tls/record.zig");
+    _ = @import("./tls/credentials.zig");
+    _ = @import("./tls/handshake.zig");
+    _ = @import("./tls/conn.zig");
     _ = @import("./server_test.zig");
     @import("std").testing.refAllDecls(@This());
 }

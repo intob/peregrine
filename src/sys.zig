@@ -239,6 +239,33 @@ pub fn nanoTimestamp() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
+/// Fills `buf` with cryptographically secure random bytes from the OS.
+pub fn randomBytes(buf: []u8) void {
+    if (is_linux) {
+        var filled: usize = 0;
+        while (filled < buf.len) {
+            const rc = linux.getrandom(buf[filled..].ptr, buf.len - filled, 0);
+            switch (posix.errno(rc)) {
+                .SUCCESS => filled += rc,
+                .INTR => continue,
+                // getrandom only fails on bad arguments or before the pool
+                // is seeded (not with flags = 0); there is no safe fallback.
+                else => @panic("getrandom failed"),
+            }
+        }
+    } else {
+        std.c.arc4random_buf(buf.ptr, buf.len);
+    }
+}
+
+/// A connected pair of blocking stream sockets (for tests).
+pub fn socketPair() ![2]fd_t {
+    var fds: [2]fd_t = undefined;
+    const rc = system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+    if (posix.errno(rc) != .SUCCESS) return error.Unexpected;
+    return fds;
+}
+
 /// A pipe (BSD) or eventfd (Linux) that wakes a poller from another thread
 /// or a signal handler. Writing uses write(2), which is async-signal-safe.
 pub const Waker = struct {
