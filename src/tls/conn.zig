@@ -50,6 +50,15 @@ pub const Pools = struct {
 /// 0-RTT data the server rejects is skipped, up to this many bytes.
 const max_skipped_early_data = 64 * 1024;
 
+/// Records we seal under one key before sending KeyUpdate and switching.
+/// RFC 8446 §5.5 allows AES-GCM about 2^24.5 full-size records per key;
+/// this stays a power of two below. ChaCha20-Poly1305 has no such limit
+/// (its sequence number would wrap first), but one rule for every suite is
+/// simpler and costs one small record per 2^24.
+pub const key_update_after = 1 << 24;
+
+const key_update_not_requested = [_]u8{ @backingInt(tls.HandshakeType.key_update), 0, 0, 1, 0 };
+
 pub const Conn = struct {
     const Self = @This();
 
@@ -77,6 +86,8 @@ pub const Conn = struct {
     /// The peer sent close_notify or an alert: no more input will come.
     peer_closed: bool = false,
     close_sent: bool = false,
+    /// See `key_update_after`; lowered by tests.
+    key_update_limit: u64 = key_update_after,
 
     pub fn init(allocator: std.mem.Allocator, pools: *Pools, config: *const Config, entropy: *const [entropy_len]u8) !Self {
         const hs = try allocator.create(handshake.Handshake);
@@ -320,7 +331,7 @@ pub const Conn = struct {
             .update_not_requested => {},
             .update_requested => {
                 // Answer under the current key, then switch (§4.6.3).
-                try self.sendRecords(.handshake, &.{ @backingInt(tls.HandshakeType.key_update), 0, 0, 1, 0 });
+                try self.sendRecords(.handshake, &key_update_not_requested);
                 self.write.?.update();
             },
             _ => return error.IllegalParameter,
@@ -424,6 +435,17 @@ pub const Conn = struct {
         var part: usize = 0;
         var part_off: usize = 0;
         while (consumed < total) {
+            if (self.write.?.seq >= self.key_update_limit) {
+                // Only with room for it and some data after it: never grow
+                // the buffer for this, the next call will do.
+                const room = if (self.wire_buf.len == 0) out_buffer_size else self.wire_buf.len - (self.wire_end - self.wire_start);
+                if (room < 2 * record.overhead + key_update_not_requested.len + 1) break;
+                self.sendRecords(.handshake, &key_update_not_requested) catch |err| {
+                    if (consumed > 0) break;
+                    return err;
+                };
+                self.write.?.update();
+            }
             const out = self.reserve(record.overhead + 1) catch |err| {
                 if (consumed > 0) break;
                 return err;
@@ -489,8 +511,13 @@ pub const TestServer = struct {
     creds: credentials.Credentials,
     config: Config,
     pools: Pools,
+    key_update_limit: u64 = key_update_after,
+    /// Records sealed under the server's last key in the last session.
+    last_write_seq: u64 = 0,
 
     pub fn init(self: *TestServer, cert: []const u8, key: []const u8) !void {
+        self.key_update_limit = key_update_after;
+        self.last_write_seq = 0;
         self.creds = try .fromPem(testing.allocator, cert, key);
         self.config = .{ .credentials = &self.creds, .alpn = &.{"http/1.1"} };
         self.pools = try .init(testing.allocator, 4);
@@ -596,6 +623,7 @@ pub fn runAgainstStdClient(server: *TestServer, msg: []const u8, transcript: ?*s
     const t = try std.Thread.spawn(.{}, stdClient, .{ fds[1], msg, 1, &client_err });
     var conn = try Conn.init(testing.allocator, &server.pools, &server.config, &testEntropy(5));
     defer conn.deinit();
+    conn.key_update_limit = server.key_update_limit;
     const result = echoServer(&conn, fds[0], msg.len, transcript);
     // Unblock the client if the server gave up.
     sys.shutdownWrite(fds[0]);
@@ -604,6 +632,7 @@ pub fn runAgainstStdClient(server: *TestServer, msg: []const u8, transcript: ?*s
     if (client_err) |err| return err;
     try result;
     try testing.expectEqualStrings("http/1.1", conn.alpn orelse "http/1.1");
+    server.last_write_seq = if (conn.write) |w| w.seq else 0;
 }
 
 test "handshake and echo with std's TLS client, every suite, group and key type" {
@@ -630,6 +659,27 @@ test "handshake and echo with std's TLS client, every suite, group and key type"
             return err;
         };
     };
+}
+
+test "std's TLS client follows our KeyUpdates" {
+    const td = credentials.testdata;
+    // 100 KB echoed as 7 records: a KeyUpdate after every 2.
+    const big = try testing.allocator.alloc(u8, 100_000);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i *% 3);
+    for ([_]Suite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 }) |suite| {
+        var server: TestServer = undefined;
+        try server.init(td.p256_cert, td.p256_key);
+        defer server.deinit();
+        server.config.suites = &.{suite};
+        server.key_update_limit = 2;
+        runAgainstStdClient(&server, big, null) catch |err| {
+            std.debug.print("suite {s}: {s}\n", .{ @tagName(suite), @errorName(err) });
+            return err;
+        };
+        // Without the KeyUpdates: 7 records and close_notify.
+        try testing.expect(server.last_write_seq <= 3);
+    }
 }
 
 test "split invariance: any split of the client's bytes gives identical output" {
@@ -854,6 +904,63 @@ test "0-RTT data after a HelloRetryRequest is skipped until ClientHello2" {
     // Early data ends with ClientHello2: an undecryptable record now fails.
     try feedConn(&conn, &early);
     try testing.expect(conn.failed);
+}
+
+test "KeyUpdate before the record limit of a key" {
+    const td = credentials.testdata;
+    var server: TestServer = undefined;
+    try server.init(td.p256_cert, td.p256_key);
+    defer server.deinit();
+    inline for (.{ Suite.aes_128_gcm_sha256, Suite.aes_256_gcm_sha384, Suite.chacha20_poly1305_sha256 }) |suite| {
+        var conn = try Conn.init(testing.allocator, &server.pools, &server.config, &testEntropy(5));
+        defer conn.deinit();
+        conn.freeHandshake();
+        const secret: [48]u8 = @splat(2);
+        conn.write = .init(suite, secret[0..suite.hashLen()]);
+        conn.read = .init(suite, secret[0..suite.hashLen()]);
+        conn.key_update_limit = 3;
+        var client_rx: Protection = .init(suite, secret[0..suite.hashLen()]);
+
+        // 20 full records' worth, written as the buffer drains.
+        const data = try testing.allocator.alloc(u8, 20 * record.max_plaintext);
+        defer testing.allocator.free(data);
+        for (data, 0..) |*b, i| b.* = @truncate(i *% 7);
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(testing.allocator);
+        var sent: usize = 0;
+        while (sent < data.len) {
+            sent += try conn.encrypt(&.{data[sent..]});
+            try wire.appendSlice(testing.allocator, conn.wireBytes());
+            conn.advance(conn.wireBytes().len);
+        }
+
+        // A KeyUpdate (not requesting one back) after every 3 records under
+        // a key; the client follows them and gets all the data.
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(testing.allocator);
+        var pos: usize = 0;
+        var since_update: usize = 0;
+        var updates: usize = 0;
+        while (pos < wire.items.len) {
+            const len = record.header_len + std.mem.readInt(u16, wire.items[pos + 3 ..][0..2], .big);
+            const opened = try client_rx.open(wire.items[pos..][0..len]);
+            pos += len;
+            since_update += 1;
+            switch (opened.content_type) {
+                .application_data => try got.appendSlice(testing.allocator, opened.data),
+                .handshake => {
+                    try testing.expectEqualSlices(u8, &key_update_not_requested, opened.data);
+                    try testing.expectEqual(4, since_update);
+                    client_rx.update();
+                    since_update = 0;
+                    updates += 1;
+                },
+                else => return error.UnexpectedRecord,
+            }
+        }
+        try testing.expectEqualSlices(u8, data, got.items);
+        try testing.expectEqual(6, updates);
+    }
 }
 
 test "close_notify from the peer ends input" {
