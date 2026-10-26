@@ -1,27 +1,27 @@
 const std = @import("std");
-const posix = std.posix;
 const Method = @import("./method.zig").Method;
 const Header = @import("./header.zig").Header;
 const Version = @import("./version.zig").Version;
 
-/// This request is reused.
-/// It is reset by the worker before each request is read.
-/// Library users do not need to call the reset method.
-/// IMPORTANT:
-/// If a field is added, it MUST be reset by the reset() method.
+pub const MAX_HEADERS = 64;
+
+/// This request is reused for every request on a worker. All slices
+/// (path, headers, body) point into the connection's read buffer and are only
+/// valid until handleRequest returns. Copy anything you need to keep.
 pub const Request = struct {
     const Self = @This();
 
-    method: Method align(64) = .GET,
-    path_and_query: []u8 align(64) = undefined,
-    // Benchmarks show this array to be significantly faster than
-    // std.ArrayList. Not sure why. Benchmark used was "benchmark
-    // read and parse headers" in reader.zig.
-    headers: [32]Header align(64) = undefined,
-    headers_len: usize align(64) = 0,
-    // TODO: make this an optional, for when unspecified.
-    keep_alive: bool align(64) = false,
-    version: Version align(64) = .@"HTTP/1.1",
+    method: Method = .GET,
+    /// The raw request target, including any query string.
+    path_and_query: []const u8 = "",
+    version: Version = .@"HTTP/1.1",
+    headers: [MAX_HEADERS]Header = undefined,
+    headers_len: usize = 0,
+    /// Fully received (and de-chunked) request body.
+    body: []const u8 = "",
+    /// Whether the connection stays open after this request, from the
+    /// version and Connection header.
+    keep_alive: bool = true,
     /// Before accessing this directly, call parseQuery()
     query: std.StringHashMap([]const u8),
     allocator: std.mem.Allocator,
@@ -40,12 +40,15 @@ pub const Request = struct {
         self.allocator.destroy(self);
     }
 
-    /// SIMD-optimised case-insensitive search. RFC 9110 Section 5.1
-    /// "Field Names" explicitly states that "Field names are case-insensitive"
-    pub fn findHeader(self: *Self, key: []const u8) ?[]const u8 {
+    pub fn getHeaders(self: *const Self) []const Header {
+        return self.headers[0..self.headers_len];
+    }
+
+    /// Case-insensitive search. RFC 9110 §5.1: "Field names are case-insensitive"
+    pub fn findHeader(self: *const Self, key: []const u8) ?[]const u8 {
         for (self.headers[0..self.headers_len]) |h| {
-            if (std.ascii.eqlIgnoreCase(h.key(), key)) {
-                return h.value();
+            if (std.ascii.eqlIgnoreCase(h.key, key)) {
+                return h.value;
             }
         }
         return null;
@@ -53,7 +56,7 @@ pub const Request = struct {
 
     /// For best performance access path_and_query directly, unless you're expecting a
     /// query. This method will search for '?', returning everything before it.
-    pub inline fn getPath(self: *Self) []const u8 {
+    pub inline fn getPath(self: *const Self) []const u8 {
         const query_start = std.mem.indexOfScalar(u8, self.path_and_query, '?') orelse
             return self.path_and_query;
         return self.path_and_query[0..query_start];
@@ -90,23 +93,18 @@ pub const Request = struct {
         return self.query;
     }
 
-    // Method, path_buf and path_len will always be overwritten by the
-    // request reader. No need to reset them here also.
-    // This method should be called BEFORE the call to RequestReader.readRequest.
-    // The query map is reset in the parseQuery method, because we don't need to clear
-    // the map unless we want to use it.
+    /// Called by the parser before each request.
     pub inline fn reset(self: *Self) void {
         self.headers_len = 0;
-        self.keep_alive = false;
+        self.body = "";
+        self.keep_alive = true;
     }
 };
 
 test "parse query" {
     var req = try Request.init(std.testing.allocator);
     defer req.deinit();
-    const raw = try std.testing.allocator.dupe(u8, "/path?key1=value1&key2=value2");
-    defer std.testing.allocator.free(raw);
-    req.path_and_query = raw;
+    req.path_and_query = "/path?key1=value1&key2=value2";
     _ = try req.parseQuery();
     try std.testing.expectEqual(2, req.query.count());
     if (req.query.get("key1")) |value1| {
@@ -120,8 +118,6 @@ test "parse query" {
 test "get path" {
     var req = try Request.init(std.testing.allocator);
     defer req.deinit();
-    const raw = try std.testing.allocator.dupe(u8, "/path?key1=value1&key2=value2");
-    defer std.testing.allocator.free(raw);
-    req.path_and_query = raw;
+    req.path_and_query = "/path?key1=value1&key2=value2";
     try std.testing.expectEqualSlices(u8, "/path", req.getPath());
 }
