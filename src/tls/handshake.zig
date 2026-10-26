@@ -611,6 +611,8 @@ const ClientHello = struct {
     alpn: ?[]const u8 = null,
     tls13: bool = false,
     early_data: bool = false,
+    psk: bool = false,
+    psk_modes: bool = false,
 
     fn parse(body: []const u8) Error!ClientHello {
         var r: Reader = .{ .data = body };
@@ -667,16 +669,23 @@ const ClientHello = struct {
                     hello.alpn = protos;
                 },
                 .early_data => hello.early_data = true,
+                .psk_key_exchange_modes => {
+                    hello.psk_modes = true;
+                    continue;
+                },
                 .pre_shared_key => {
                     // Must be last (RFC 8446 §4.2.11). Ignored: PSKs are
                     // not supported, so a full handshake follows.
                     if (exts.pos != exts_data.len) return error.IllegalParameter;
+                    hello.psk = true;
                     continue;
                 },
                 else => continue,
             }
             if (e.pos != ext.len) return error.DecodeError;
         }
+        // A PSK offer needs its key exchange modes (§4.2.9).
+        if (hello.psk and !hello.psk_modes) return error.MissingExtension;
         return hello;
     }
 };
@@ -946,6 +955,8 @@ test "ClientHello negotiation failures" {
     try expectHelloError(error.IllegalParameter, buildClientHello(&buf, .{ .shares = share, .extra = "\x00\x2b\x00\x03\x02\x03\x04" }), &config);
     // pre_shared_key not last.
     try expectHelloError(error.IllegalParameter, buildClientHello(&buf, .{ .shares = share, .extra = "\x00\x29\x00\x00\x00\x15\x00\x00" }), &config);
+    // pre_shared_key without psk_key_exchange_modes (§4.2.9).
+    try expectHelloError(error.MissingExtension, buildClientHello(&buf, .{ .shares = share, .extra = "\x00\x29\x00\x00" }), &config);
     // Truncated.
     const hello = buildClientHello(&buf, .{ .shares = share });
     var cut: [2048]u8 = undefined;
