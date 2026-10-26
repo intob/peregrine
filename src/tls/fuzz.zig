@@ -391,6 +391,7 @@ fn pickGroup(smith: *Smith) u16 {
 fn mutateHello(a: Allocator, smith: *Smith, fx: *const Fixtures, h: *Hello, res: *MutationResult, count: u8) !void {
     for (0..count) |_| {
         const m = smith.valueRangeAtMost(u8, 0, @typeInfo(Mutation).@"enum".field_names.len - 1);
+        if (trace) std.debug.print("mutation {s}\n", .{@tagName(@as(Mutation, @fromBackingInt(m)))});
         const exts = h.exts.items;
         switch (@as(Mutation, @fromBackingInt(m))) {
             .flip_byte => {
@@ -1124,6 +1125,7 @@ const Script = struct {
     view: *View,
 
     fn send(s: *Script, rec: Rec) !void {
+        if (trace) std.debug.print("send {s} ct {d} epoch {d} len {d} pad {d} -> state {s} failed {} alert {any}\n", .{ @tagName(rec.kind), rec.ct, rec.epoch, rec.data.len, rec.padding, @tagName(s.view.state), s.probe.conn.failed, s.view.alert });
         try s.recs.append(s.a, rec);
         const start = s.stream.items.len;
         try s.ser.write(s.a, &s.stream, rec, false);
@@ -1340,7 +1342,12 @@ fn runScript(
                 try h2.setExt(a, ext_key_share, try Hello.sharesBody(a, &.{.{ .group = g, .kx = fx.share(g).? }}));
                 var r2: MutationResult = .{};
                 try mutateHello(a, smith, fx, &h2, &r2, 1);
-                if (!r2.benign or r2.early_data) mres.benign = false;
+                // After a HelloRetryRequest the only valid share list is the
+                // one requested.
+                var list: [2]KeyShare = undefined;
+                const n = h2.shares(&list);
+                const requested = n == 1 and list[0].group == g and std.mem.eql(u8, list[0].kx, fx.share(g).?);
+                if (!r2.benign or r2.early_data or !requested) mres.benign = false;
                 if (!r2.framed) mres.framed = false;
             },
         }
@@ -1352,6 +1359,7 @@ fn runScript(
         try view.sentHello(ch2);
         hello.* = h2;
         try s.send(.{ .kind = .plain, .ct = ct_handshake, .data = ch2, .frags = if (mres.framed) try fragSizes(a, smith) else &.{} });
+        if (trace) std.debug.print("retry for group {x}: alert {any}\n", .{ g, view.alert });
         if (mres.benign and scheme_ok and exp.live() and view.alert != null) return error.ValidHelloRejected;
     } else if (view.state == .connected) {
         for (0..early_records) |_| try sendEarly(a, smith, s, exp, offered_early, false);
@@ -1593,8 +1601,19 @@ fn sendEarly(a: Allocator, smith: *Smith, s: *Script, exp: *Expect, skippable: b
     }
 }
 
+/// Prints the script as it runs; set it while replaying a crash input
+/// (add the file to `corpus` and run `zig build test`).
+var trace = false;
+
+/// Inputs that once failed, replayed by every `zig build test`. Saved by
+/// the fuzzer as .zig-cache/f/crash.
+const corpus = [_][]const u8{
+    // Harness: a ClientHello2 mutation dropped the requested key share.
+    @embedFile("testdata/fuzz/hrr-1.bin"),
+};
+
 test "fuzz: tls.Conn handshake and record mutations" {
-    try std.testing.fuzz({}, fuzzOne, .{});
+    try std.testing.fuzz({}, fuzzOne, .{ .corpus = &corpus });
 }
 
 test "tls fuzz harness over pseudo-random inputs" {
