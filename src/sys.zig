@@ -296,3 +296,93 @@ pub fn pinToCpu(index: usize) void {
         _ = bits;
     }
 }
+
+/// A futex-based mutex (Linux futex, Darwin __ulock; other BSDs spin and
+/// yield). std.Thread.Mutex is gone in 0.17 and std.Io.Mutex needs an Io.
+/// Uncontended lock and unlock are one atomic operation each.
+pub const Mutex = struct {
+    const State = enum(u32) { unlocked, locked, contended };
+
+    state: std.atomic.Value(State) = .init(.unlocked),
+
+    pub fn tryLock(m: *Mutex) bool {
+        return m.state.cmpxchgStrong(.unlocked, .locked, .acquire, .monotonic) == null;
+    }
+
+    pub fn lock(m: *Mutex) void {
+        if (m.state.cmpxchgWeak(.unlocked, .locked, .acquire, .monotonic) == null) return;
+        m.lockSlow();
+    }
+
+    fn lockSlow(m: *Mutex) void {
+        @branchHint(.cold);
+        // Spin briefly: critical sections here are short.
+        for (0..64) |_| {
+            if (m.state.load(.monotonic) == .unlocked and m.tryLock()) return;
+            std.atomic.spinLoopHint();
+        }
+        while (m.state.swap(.contended, .acquire) != .unlocked) {
+            futexWait(@ptrCast(&m.state.raw), @intFromEnum(State.contended));
+        }
+    }
+
+    pub fn unlock(m: *Mutex) void {
+        if (m.state.swap(.unlocked, .release) == .contended) {
+            futexWake(@ptrCast(&m.state.raw), 1);
+        }
+    }
+};
+
+fn futexWait(ptr: *const u32, expect: u32) void {
+    switch (native_os) {
+        .linux => _ = linux.futex(ptr, .{ .cmd = .WAIT, .private = true }, expect, .{ .timeout = null }, null, 0),
+        .macos, .ios, .tvos, .watchos, .visionos => {
+            const c = std.c;
+            const flags: c.UL = .{ .op = .COMPARE_AND_WAIT, .NO_ERRNO = true };
+            _ = c.__ulock_wait2(flags, ptr, expect, 0, 0);
+        },
+        else => _ = system.sched_yield(),
+    }
+}
+
+fn futexWake(ptr: *const u32, max_waiters: u32) void {
+    switch (native_os) {
+        .linux => _ = linux.futex_3arg(ptr, .{ .cmd = .WAKE, .private = true }, max_waiters),
+        .macos, .ios, .tvos, .watchos, .visionos => {
+            const c = std.c;
+            const flags: c.UL = .{ .op = .COMPARE_AND_WAIT, .NO_ERRNO = true, .WAKE_ALL = max_waiters > 1 };
+            while (true) {
+                const status = c.__ulock_wake(flags, ptr, 0);
+                if (status >= 0) return;
+                switch (@as(c.E, @enumFromInt(@as(u16, @intCast(-status))))) {
+                    .INTR => continue,
+                    else => return,
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+test "mutex serialises counters across threads" {
+    const Shared = struct {
+        mutex: Mutex = .{},
+        counter: usize = 0,
+
+        fn bump(s: *@This()) void {
+            for (0..10000) |_| {
+                s.mutex.lock();
+                s.counter += 1;
+                s.mutex.unlock();
+            }
+        }
+    };
+    var shared: Shared = .{};
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Shared.bump, .{&shared});
+    for (threads) |t| t.join();
+    try std.testing.expectEqual(@as(usize, 40000), shared.counter);
+    try std.testing.expect(shared.mutex.tryLock());
+    try std.testing.expect(!shared.mutex.tryLock());
+    shared.mutex.unlock();
+}

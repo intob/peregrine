@@ -29,6 +29,9 @@ test {
     _ = @import("./http/session.zig");
     _ = @import("./http/date.zig");
     _ = @import("./poller.zig");
+    _ = @import("./sys.zig");
+    _ = @import("./ws/protocol.zig");
+    _ = @import("./ws/conn.zig");
     _ = @import("./server_test.zig");
     @import("std").testing.refAllDecls(@This());
 }
