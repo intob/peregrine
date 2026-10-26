@@ -80,7 +80,7 @@ pub const Config = struct {
     /// Install SIGINT/SIGTERM handlers that shut the server down.
     handle_signals: bool = true,
     /// Serve TLS 1.3 on this port. The PEM data is parsed during init and
-    /// need not outlive it. Not yet supported by the io_uring backend.
+    /// need not outlive it.
     tls: ?TlsOptions = null,
 };
 
@@ -183,9 +183,7 @@ pub fn Server(comptime Handler: type) type {
                 try std.Thread.getCpuCount();
             const backend: Backend = switch (cfg.backend) {
                 .auto => .epoll,
-                .io_uring => if (cfg.tls != null)
-                    return error.TlsUnsupportedOnIoUring
-                else if (sys.is_linux and worker_uring.available())
+                .io_uring => if (sys.is_linux and worker_uring.available())
                     .io_uring
                 else
                     return error.IoUringUnavailable,

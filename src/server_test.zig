@@ -821,7 +821,11 @@ fn tlsConfig() Config {
 }
 
 test "tls: keep-alive, pipelining, large responses and close_notify" {
-    const r = try Running.start(.epoll, tlsConfig());
+    try forEachBackend(testTlsKeepAlive);
+}
+
+fn testTlsKeepAlive(backend: Backend) !void {
+    const r = try Running.start(backend, tlsConfig());
     defer r.stop();
     for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
 
@@ -860,7 +864,11 @@ test "tls: keep-alive, pipelining, large responses and close_notify" {
 }
 
 test "tls: websocket echo and server-initiated sends" {
-    const r = try Running.start(.epoll, tlsConfig());
+    try forEachBackend(testTlsWebSocket);
+}
+
+fn testTlsWebSocket(backend: Backend) !void {
+    const r = try Running.start(backend, tlsConfig());
     defer r.stop();
     const c = try TlsClient.connect(r.port);
     defer c.close();
@@ -896,7 +904,11 @@ test "tls: websocket echo and server-initiated sends" {
 }
 
 test "tls: plaintext HTTP to a TLS port gets an alert" {
-    const r = try Running.start(.epoll, tlsConfig());
+    try forEachBackend(testTlsPlaintextRejected);
+}
+
+fn testTlsPlaintextRejected(backend: Backend) !void {
+    const r = try Running.start(backend, tlsConfig());
     defer r.stop();
     var c = try Client.connect(r.port);
     defer c.close();
@@ -909,12 +921,8 @@ test "tls: plaintext HTTP to a TLS port gets an alert" {
     try c.expectClosed();
 }
 
-test "tls: rejected with io_uring, and bad credentials fail init" {
+test "tls: bad credentials fail init" {
     var cfg = tlsConfig();
-    cfg.backend = .io_uring;
-    cfg.handle_signals = false;
-    try testing.expectError(error.TlsUnsupportedOnIoUring, Server(TestHandler).init(testing.allocator, 0, cfg));
-    cfg = tlsConfig();
     cfg.handle_signals = false;
     cfg.tls.?.key_pem = tls_testdata.p384_key;
     try testing.expectError(error.KeyCertificateMismatch, Server(TestHandler).init(testing.allocator, 0, cfg));
