@@ -1,48 +1,82 @@
-const native_os = @import("builtin").os.tag;
 const std = @import("std");
 const posix = std.posix;
-const linux = std.os.linux;
+const sys = @import("./sys.zig");
+const parser = @import("./http/parser.zig");
 const Request = @import("./request.zig").Request;
 const Response = @import("./response.zig").Response;
 const http_worker = @import("./http/worker.zig");
-const https_worker = @import("./https/worker.zig");
+const worker_uring = if (sys.is_linux) @import("./http/worker_uring.zig") else struct {};
+
+pub const Backend = enum {
+    /// Currently epoll/kqueue everywhere. io_uring measured no faster for
+    /// keep-alive and pipelined plaintext (see PLAN.md), and epoll also works
+    /// under Docker's default seccomp profile, which blocks io_uring.
+    auto,
+    /// epoll on Linux, kqueue on BSD/macOS.
+    epoll,
+    /// Linux only. Fails at init if io_uring is unavailable.
+    io_uring,
+};
 const WebsocketServer = @import("./ws/server.zig").WebsocketServer;
 
-var should_shutdown: std.atomic.Value(bool) = undefined;
-
-fn handleSignal(_: c_int) callconv(.C) void {
-    should_shutdown.store(true, .release);
-}
-
-pub const Mode = enum { TLSEnabled, TLSDisabled };
-
 pub const Config = struct {
-    /// Listening IP address
+    /// I/O backend.
+    backend: Backend = .auto,
+    /// Listening IP address (IPv4 or IPv6 literal).
     ip: []const u8 = "0.0.0.0",
-    /// Number of threads processing requests.
-    /// Defaults to CPU core count.
+    /// Number of worker threads. Defaults to CPU core count.
     worker_thread_count: usize = 0,
-    /// Stack size for each worker thread. Defaults to 1MB.
+    /// Stack size for each worker thread.
     worker_stack_size: usize = 1024 * 1024,
-    /// Number of threads accepting connections. Defaults to 1.
-    accept_thread_count: usize = 1,
-    /// Disable Nagle's algorithm. Default is true (disabled).
-    tcp_nodelay: bool = true,
-    /// Defaults to 10MB. Each worker has it's own buffer.
-    /// Size is aligned internally.
-    response_body_buffer_size: usize = 1024 * 1024 * 10,
-    /// Defaults to 1MB. Each worker has it's own buffer.
-    request_buffer_size: usize = 1024 * 1024,
-    /// WebSocket reader buffer size. Defaults to 32KB.
-    /// Size is aligned internally.
+    /// Linux: pin worker N to the Nth allowed CPU.
+    pin_workers: bool = true,
+    /// Maximum open connections per worker. Further connections are
+    /// accepted and immediately closed.
+    max_connections_per_worker: u32 = 16 * 1024,
+    /// Size of each pooled read buffer. Requests larger than this (head plus
+    /// body) temporarily use a heap buffer, up to the limits below.
+    read_buffer_size: usize = 16 * 1024,
+    /// Read buffers preallocated per worker. Only connections with
+    /// unprocessed bytes hold one; idle keep-alive connections don't.
+    buffer_pool_size: usize = 256,
+    /// Per-worker buffer for Response.setBody. Bodies set with
+    /// setBodyBorrowed are not copied and have no size limit.
+    response_body_buffer_size: usize = 1024 * 1024,
+    /// Per-worker buffer for serialised response headers.
+    response_header_buffer_size: usize = 8 * 1024,
+    /// Per-worker buffer that batches responses into one write.
+    out_buffer_size: usize = 64 * 1024,
+    /// Request size limits.
+    limits: parser.Limits = .{},
+    /// Close idle keep-alive connections after this many seconds.
+    keep_alive_timeout_s: u32 = 5,
+    /// Maximum time to receive a complete request or make progress writing a
+    /// response, in seconds.
+    request_timeout_s: u32 = 10,
+    /// 0 means unlimited.
+    max_requests_per_connection: u32 = 0,
+    /// WebSocket reader buffer size.
     websocket_buffer_size: usize = 1024 * 32,
-    /// TLS certificate filename
-    tls_cert_filename: []const u8 = "",
-    /// TLS key filename
-    tls_key_filename: []const u8 = "",
+    /// Install SIGINT/SIGTERM handlers that shut the server down.
+    handle_signals: bool = true,
 };
 
-pub fn Server(comptime Handler: type, comptime mode: Mode) type {
+/// The server that a signal handler should stop.
+var signal_target: ?*const SignalTarget = null;
+
+const SignalTarget = struct {
+    shutdown: *std.atomic.Value(bool),
+    wakers: []const sys.Waker,
+};
+
+fn handleSignal(_: posix.SIG) callconv(.c) void {
+    const target = signal_target orelse return;
+    target.shutdown.store(true, .release);
+    // write(2) is async-signal-safe.
+    for (target.wakers) |w| w.wake();
+}
+
+pub fn Server(comptime Handler: type) type {
     comptime {
         if (!@hasDecl(Handler, "init")) {
             @compileError("Handler must implement init(std.mem.Allocator) !*@This()");
@@ -56,232 +90,238 @@ pub fn Server(comptime Handler: type, comptime mode: Mode) type {
     }
     return struct {
         const Self = @This();
-        const ListenerIOHandler = switch (native_os) {
-            .freebsd, .netbsd, .openbsd, .dragonfly, .macos => ListenerKqueue,
-            .linux => ListenerEpoll,
-            else => @compileError("Unsupported OS"),
-        };
-        const Worker = switch (mode) {
-            .TLSDisabled => http_worker.Worker(Handler),
-            .TLSEnabled => https_worker.TLSWorker(Handler),
+        const PollWorker = http_worker.Worker(Handler);
+        const UringWorker = if (sys.is_linux) worker_uring.Worker(Handler) else void;
+
+        const AnyWorker = union(enum) {
+            poll: PollWorker,
+            uring: UringWorker,
+
+            fn spawn(self: *AnyWorker, stack_size: usize, pin: bool) !void {
+                switch (self.*) {
+                    .poll => |*w| try w.spawn(stack_size, pin),
+                    .uring => |*w| if (sys.is_linux) try w.spawn(stack_size, pin) else unreachable,
+                }
+            }
+
+            fn wake(self: *AnyWorker) void {
+                switch (self.*) {
+                    .poll => |*w| w.wake(),
+                    .uring => |*w| if (sys.is_linux) w.wake() else unreachable,
+                }
+            }
+
+            fn join(self: *AnyWorker) void {
+                switch (self.*) {
+                    .poll => |*w| w.join(),
+                    .uring => |*w| if (sys.is_linux) w.join() else unreachable,
+                }
+            }
+
+            fn deinit(self: *AnyWorker) void {
+                switch (self.*) {
+                    .poll => |*w| w.deinit(),
+                    .uring => |*w| if (sys.is_linux) w.deinit() else unreachable,
+                }
+            }
+
+            fn waker(self: *const AnyWorker) sys.Waker {
+                return switch (self.*) {
+                    .poll => |*w| w.waker,
+                    .uring => |*w| if (sys.is_linux) w.waker else unreachable,
+                };
+            }
         };
 
+        allocator: std.mem.Allocator,
         handler: *Handler,
         ws: *WebsocketServer(Handler),
-        address: std.net.Address,
-        workers: []Worker,
-        next_worker: usize align(64) = 0,
-        listener: posix.socket_t,
-        io_handler: ListenerIOHandler,
-        accept_threads: []std.Thread,
-        allocator: std.mem.Allocator,
+        workers: []AnyWorker,
+        backend: Backend,
+        wakers: []sys.Waker,
+        shutdown_flag: std.atomic.Value(bool),
+        signal_target: SignalTarget,
+        cfg: Config,
+        port: u16,
 
         pub fn init(allocator: std.mem.Allocator, port: u16, cfg: Config) !*Self {
-            const sock_type: u32 = posix.SOCK.STREAM | posix.SOCK.NONBLOCK;
-            const address = try std.net.Address.parseIp(cfg.ip, port);
-            const listener = try posix.socket(address.any.family, sock_type, posix.IPPROTO.TCP);
-            try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-            if (@hasDecl(posix.SO, "REUSEPORT_LB")) {
-                try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEPORT_LB, &std.mem.toBytes(@as(c_int, 1)));
-            } else if (@hasDecl(posix.SO, "REUSEPORT")) {
-                try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
-            }
-            const TCP_NODELAY: u32 = 1; // posix.TCP is unavailable for macOS
-            const nodelay_opt: c_int = if (cfg.tcp_nodelay) 0 else 1; // Zero disables Nagle's algorithm
-            try posix.setsockopt(listener, posix.IPPROTO.TCP, TCP_NODELAY, &std.mem.toBytes(@as(c_int, nodelay_opt)));
-            //try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.ACCEPTFILTER, &std.mem.toBytes(@as(c_int, 1)));
-            try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.RCVBUF, &std.mem.toBytes(@as(c_int, 1 << 20)));
-            try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, 1 << 20)));
-            try posix.bind(listener, &address.any, address.getOsSockLen());
-            var sig_action = posix.Sigaction{
-                .handler = .{ .handler = handleSignal },
-                .mask = posix.empty_sigset,
-                .flags = 0,
-            };
-            posix.sigaction(posix.SIG.INT, &sig_action, null);
-            posix.sigaction(posix.SIG.TERM, &sig_action, null);
-            const worker_thread_count = if (cfg.worker_thread_count > 0)
+            const address = try std.Io.net.IpAddress.parse(cfg.ip, port);
+            const worker_count = if (cfg.worker_thread_count > 0)
                 cfg.worker_thread_count
             else
                 try std.Thread.getCpuCount();
-            const io_handler = try ListenerIOHandler.init(listener);
+            const backend: Backend = switch (cfg.backend) {
+                .auto => .epoll,
+                .io_uring => if (sys.is_linux and worker_uring.available()) .io_uring else return error.IoUringUnavailable,
+                .epoll => .epoll,
+            };
+
+            // A write to a closed socket must return EPIPE, not kill us.
+            var ignore = posix.Sigaction{
+                .handler = .{ .handler = posix.SIG.IGN },
+                .mask = posix.sigemptyset(),
+                .flags = 0,
+            };
+            posix.sigaction(.PIPE, &ignore, null);
+
             const srv = try allocator.create(Self);
             errdefer allocator.destroy(srv);
             const handler = try Handler.init(allocator);
+            errdefer handler.deinit();
+            const ws = try WebsocketServer(Handler).init(allocator, handler, cfg.websocket_buffer_size);
+            errdefer ws.deinit();
             srv.* = .{
                 .allocator = allocator,
                 .handler = handler,
-                .ws = try WebsocketServer(Handler).init(allocator, handler, cfg.websocket_buffer_size),
-                .address = address,
-                .workers = try allocator.alloc(Worker, worker_thread_count),
-                .listener = listener,
-                .io_handler = io_handler,
-                .accept_threads = try allocator.alloc(std.Thread, @max(0, cfg.accept_thread_count - 1)),
+                .ws = ws,
+                .workers = try allocator.alloc(AnyWorker, worker_count),
+                .backend = backend,
+                .wakers = try allocator.alloc(sys.Waker, worker_count),
+                .shutdown_flag = .init(false),
+                .signal_target = undefined,
+                .cfg = cfg,
+                .port = port,
             };
             errdefer {
-                srv.ws.deinit();
                 allocator.free(srv.workers);
-                allocator.free(srv.accept_threads);
+                allocator.free(srv.wakers);
             }
-            for (srv.accept_threads) |*t| {
-                t.* = try std.Thread.spawn(.{ .allocator = allocator, .stack_size = 1024 }, loop, .{srv});
+
+            // Linux load-balances SO_REUSEPORT listeners across workers, so
+            // each worker gets its own: no shared accept queue, no handoff.
+            // Elsewhere, workers share one listener.
+            const per_worker = sys.is_linux or @hasDecl(posix.SO, "REUSEPORT_LB");
+            var shared: sys.fd_t = -1;
+            errdefer {
+                if (!per_worker and shared >= 0) sys.close(shared);
             }
-            for (srv.workers) |*w| {
-                switch (mode) {
-                    .TLSDisabled => {
-                        try w.init(.{
+            var initialised: usize = 0;
+            errdefer for (srv.workers[0..initialised]) |*w| w.deinit();
+            var bind_address = address;
+            for (srv.workers, 0..) |*w, i| {
+                const listener = if (per_worker or shared < 0) blk: {
+                    const fd = try sys.listenTcp(bind_address, .{ .reuse_port = per_worker });
+                    if (i == 0) {
+                        // With port 0, the others must bind the chosen port.
+                        srv.port = try sys.localPort(fd);
+                        bind_address.setPort(srv.port);
+                    }
+                    if (sys.is_linux) {
+                        // Only wake accept() once data has arrived.
+                        sys.setsockoptInt(fd, posix.IPPROTO.TCP, std.os.linux.TCP.DEFER_ACCEPT, 1) catch {};
+                    }
+                    if (!per_worker) shared = fd;
+                    break :blk fd;
+                } else shared;
+                const opts: http_worker.Options = .{
+                    .session = .{
+                        .limits = cfg.limits,
+                        .max_requests_per_connection = cfg.max_requests_per_connection,
+                    },
+                    .max_connections = cfg.max_connections_per_worker,
+                    .read_buffer_size = cfg.read_buffer_size,
+                    .buffer_pool_size = cfg.buffer_pool_size,
+                    .out_buffer_size = cfg.out_buffer_size,
+                    .response_body_buffer_size = cfg.response_body_buffer_size,
+                    .response_header_buffer_size = cfg.response_header_buffer_size,
+                    .keep_alive_timeout_s = cfg.keep_alive_timeout_s,
+                    .request_timeout_s = cfg.request_timeout_s,
+                    .read_on_accept = sys.is_linux,
+                };
+                const result = switch (backend) {
+                    .io_uring => if (sys.is_linux) blk: {
+                        w.* = .{ .uring = undefined };
+                        break :blk w.uring.init(.{
+                            .id = i,
                             .allocator = allocator,
-                            .resp_body_buffer_size = cfg.response_body_buffer_size,
-                            .req_buffer_size = cfg.request_buffer_size,
-                            .stack_size = cfg.worker_stack_size,
-                            .handler = srv.handler,
-                            .ws = srv.ws,
+                            .handler = handler,
+                            .ws = ws,
+                            .shutdown = &srv.shutdown_flag,
+                            .listener = listener,
+                            .opts = opts,
+                        });
+                    } else unreachable,
+                    else => blk: {
+                        w.* = .{ .poll = undefined };
+                        break :blk w.poll.init(.{
+                            .id = i,
+                            .allocator = allocator,
+                            .handler = handler,
+                            .ws = ws,
+                            .shutdown = &srv.shutdown_flag,
+                            .listener = listener,
+                            .owns_listener = per_worker,
+                            .opts = opts,
                         });
                     },
-                    .TLSEnabled => {
-                        try w.init(.{
-                            .allocator = allocator,
-                            .resp_body_buffer_size = cfg.response_body_buffer_size,
-                            .req_buffer_size = cfg.request_buffer_size,
-                            .stack_size = cfg.worker_stack_size,
-                            .handler = srv.handler,
-                            .ws = srv.ws,
-                            .cert_filename = cfg.tls_cert_filename,
-                            .key_filename = cfg.tls_key_filename,
-                        });
-                    },
-                }
+                };
+                result catch |err| {
+                    if (per_worker) sys.close(listener);
+                    return err;
+                };
+                initialised += 1;
+                srv.wakers[i] = w.waker();
             }
+            srv.signal_target = .{ .shutdown = &srv.shutdown_flag, .wakers = srv.wakers };
             return srv;
         }
 
-        /// Blocks until the server is shutdown.
+        /// The I/O backend in use (resolves `.auto`).
+        pub fn getBackend(self: *const Self) Backend {
+            return self.backend;
+        }
+
+        /// The bound port (useful after binding port 0).
+        pub fn getPort(self: *const Self) u16 {
+            return self.port;
+        }
+
+        /// Blocks until the server is shut down, then frees it.
         pub fn start(self: *Self) !void {
-            should_shutdown = std.atomic.Value(bool).init(false);
-            try posix.listen(self.listener, std.math.maxInt(i16));
-            try self.loop();
-            std.debug.print("accept-thread-0 joined\n", .{});
-            for (self.accept_threads, 1..) |*t, i| {
-                t.join();
-                std.debug.print("accept-thread-{d} joined\n", .{i});
+            if (self.cfg.handle_signals) {
+                signal_target = &self.signal_target;
+                var action = posix.Sigaction{
+                    .handler = .{ .handler = handleSignal },
+                    .mask = posix.sigemptyset(),
+                    .flags = 0,
+                };
+                posix.sigaction(.INT, &action, null);
+                posix.sigaction(.TERM, &action, null);
             }
-            for (self.workers, 0..) |*w, i| {
-                w.deinit();
-                std.debug.print("worker-thread-{d} joined\n", .{i});
+            var spawned: usize = 0;
+            errdefer {
+                self.shutdown();
+                for (self.workers[0..spawned]) |*w| w.join();
             }
-            posix.close(self.listener);
+            const pin = self.cfg.pin_workers and sys.is_linux;
+            for (self.workers) |*w| {
+                try w.spawn(self.cfg.worker_stack_size, pin);
+                spawned += 1;
+            }
+            for (self.workers) |*w| w.join();
+            if (self.cfg.handle_signals) signal_target = null;
+            self.destroy();
+        }
+
+        /// Thread-safe. Workers stop promptly; start() then returns.
+        pub fn shutdown(self: *Self) void {
+            self.shutdown_flag.store(true, .release);
+            for (self.workers) |*w| w.wake();
+        }
+
+        fn destroy(self: *Self) void {
+            const shared_listener = if (self.workers.len > 0 and self.workers[0] == .poll and
+                !self.workers[0].poll.owns_listener)
+                self.workers[0].poll.listener
+            else
+                -1;
+            for (self.workers) |*w| w.deinit();
+            if (shared_listener >= 0) sys.close(shared_listener);
+            self.ws.deinit();
             self.handler.deinit();
             self.allocator.free(self.workers);
-            self.allocator.free(self.accept_threads);
-            self.ws.deinit();
+            self.allocator.free(self.wakers);
             self.allocator.destroy(self);
-            std.debug.print("shutdown complete\n", .{});
-        }
-
-        pub fn shutdown(_: *Self) void {
-            should_shutdown.store(true, .monotonic);
-        }
-
-        fn loop(self: *Self) !void {
-            while (!should_shutdown.load(.unordered)) {
-                const have_connection = try self.io_handler.poll();
-                if (have_connection) {
-                    self.acceptConnection() catch |err| switch (err) {
-                        error.WouldBlock => {}, // Expected case
-                        else => return err,
-                    };
-                }
-            }
-        }
-
-        fn acceptConnection(self: *Self) !void {
-            const clsock = try posix.accept(self.listener, null, null, posix.SOCK.NONBLOCK);
-            errdefer posix.close(clsock);
-            const send_timeout = posix.timeval{ .sec = 3, .usec = 0 };
-            const recv_timeout = posix.timeval{ .sec = 3, .usec = 0 };
-            try posix.setsockopt(clsock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &std.mem.toBytes(send_timeout));
-            try posix.setsockopt(clsock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(recv_timeout));
-            try posix.setsockopt(clsock, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(@as(c_int, 1)));
-            try posix.setsockopt(clsock, posix.SOL.SOCKET, posix.SO.RCVBUF, &std.mem.toBytes(@as(c_int, 1 << 19)));
-            try posix.setsockopt(clsock, posix.SOL.SOCKET, posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, 1 << 19)));
-            const worker_id = @atomicRmw(usize, &self.next_worker, .Add, 1, .monotonic) % self.workers.len;
-            try self.workers[worker_id].addClient(clsock);
         }
     };
 }
-
-const ListenerKqueue = struct {
-    const Self = @This();
-
-    kfd: i32,
-    timeout: posix.timespec,
-    listener_ident: usize,
-
-    fn init(listener: posix.socket_t) !Self {
-        const kfd = try posix.kqueue();
-        try initializeEvents(kfd, listener);
-        return .{
-            .kfd = kfd,
-            .timeout = posix.timespec{ .sec = 0, .nsec = 50_000_000 },
-            .listener_ident = @intCast(listener),
-        };
-    }
-
-    fn initializeEvents(kfd: i32, listener: posix.socket_t) !void {
-        const events = [_]posix.Kevent{.{
-            .ident = @intCast(listener),
-            .filter = posix.system.EVFILT.READ,
-            // Edge-triggered causes multiple threads to accept the connection.
-            .flags = posix.system.EV.ADD, // | posix.system.EV.CLEAR,
-            .fflags = 0,
-            .data = 0,
-            .udata = @intCast(listener),
-        }};
-        const result = try posix.kevent(kfd, &events, &.{}, null);
-        if (result < 0) {
-            return error.EventRegistrationFailed;
-        }
-    }
-
-    fn poll(self: *Self) !bool {
-        var events: [1]posix.Kevent = undefined;
-        _ = try posix.kevent(self.kfd, &.{}, &events, &self.timeout);
-        if (events[0].ident == self.listener_ident) {
-            return true;
-        }
-        return false;
-    }
-};
-
-const ListenerEpoll = struct {
-    const Self = @This();
-
-    epfd: i32,
-    listener: posix.socket_t,
-
-    fn init(listener: posix.socket_t) !Self {
-        const epfd = try posix.epoll_create1(0);
-        try initializeEvents(epfd, listener);
-        return .{ .epfd = epfd, .listener = listener };
-    }
-
-    fn initializeEvents(epfd: i32, listener: posix.socket_t) !void {
-        var evt = linux.epoll_event{
-            // Edge-triggered causes multiple threads to accept the connection.
-            .events = linux.EPOLL.IN, // | linux.EPOLL.ET,
-            .data = .{ .fd = listener },
-        };
-        try posix.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, listener, &evt);
-    }
-
-    fn poll(self: *Self) !bool {
-        var events: [1]linux.epoll_event = undefined;
-        const n = posix.epoll_wait(self.epfd, &events, 1);
-        if (n == 0) return false;
-        const event = events[0];
-        if (event.data.fd == self.listener) {
-            return true;
-        }
-        return false;
-    }
-};
