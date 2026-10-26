@@ -1,13 +1,14 @@
 .{
-    .name = "peregrine",
+    .name = .peregrine,
     .version = "0.0.0",
-    .minimum_zig_version = "0.14.0",
+    .fingerprint = 0xc6ebc65435ab2557,
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{},
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
         "LICENSE",
-        "README.md",
+        "readme.md",
     },
 }
