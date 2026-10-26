@@ -745,7 +745,11 @@ const View = struct {
     alert: ?[2]u8 = null,
     ku_received: u32 = 0,
 
-    fn sentHello(v: *View, msg: []const u8) !void {
+    fn sentHello(v: *View, bytes: []const u8) !void {
+        // The message as the server frames it: by its length field, which
+        // a mutation may have made lie.
+        const declared = 4 + @as(usize, std.mem.readInt(u24, bytes[1..4], .big));
+        const msg = bytes[0..@min(bytes.len, declared)];
         try v.transcript.appendSlice(v.a, msg);
         v.hello = Hello.parse(v.a, msg) catch null;
     }
@@ -1634,6 +1638,9 @@ const corpus = [_][]const u8{
     @embedFile("testdata/fuzz/hello-2.bin"),
     // Harness: two pre_shared_key extensions counted as valid.
     @embedFile("testdata/fuzz/hello-3.bin"),
+    // Harness: a ClientHello length that lies covered the trailing bytes,
+    // so the server's transcript was shorter than the view's.
+    @embedFile("testdata/fuzz/keys-4.bin"),
 };
 
 test "fuzz: tls.Conn handshake and record mutations" {
