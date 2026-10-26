@@ -20,7 +20,7 @@ pub const Opcode = enum(u4) {
     _,
 
     pub fn fromByte(byte: u8) ?Opcode {
-        const op: Opcode = @enumFromInt(@as(u4, @truncate(byte)));
+        const op: Opcode = @fromBackingInt(@intCast(@as(u4, @truncate(byte))));
         return switch (op) {
             .continuation, .text, .binary, .close, .ping, .pong => op,
             _ => null,
@@ -28,7 +28,7 @@ pub const Opcode = enum(u4) {
     }
 
     pub inline fn isControl(self: Opcode) bool {
-        return @intFromEnum(self) & 0x8 != 0;
+        return @backingInt(self) & 0x8 != 0;
     }
 
     pub fn toString(self: Opcode) []const u8 {
@@ -116,7 +116,7 @@ pub const max_control_payload = 125;
 /// Writes an unmasked (server-to-client) frame header. Returns the slice of
 /// `out` used.
 pub fn encodeHeader(out: *[10]u8, fin: bool, opcode: Opcode, len: usize) []const u8 {
-    out[0] = (if (fin) @as(u8, 0x80) else 0) | @intFromEnum(opcode);
+    out[0] = (if (fin) @as(u8, 0x80) else 0) | @backingInt(opcode);
     if (len < 126) {
         out[1] = @intCast(len);
         return out[0..2];
@@ -479,7 +479,7 @@ const TestDecoder = struct {
                 return;
             } orelse return;
             t.count += 1;
-            t.log.append(testing.allocator, @intFromEnum(fr.opcode)) catch unreachable;
+            t.log.append(testing.allocator, @backingInt(fr.opcode)) catch unreachable;
             var len_buf: [8]u8 = undefined;
             std.mem.writeInt(u64, &len_buf, fr.payload.len, .little);
             t.log.appendSlice(testing.allocator, &len_buf) catch unreachable;

@@ -42,10 +42,14 @@ pub const Mailbox = struct {
     const Self = @This();
 
     mutex: sys.Mutex = .{},
-    /// Slots with new output. Deduplicated by `Conn.posted`, so at most one
-    /// entry per connection and no allocation on post.
+    /// Slots with new output. Deduplicated by `Conn.posted`, so normally at
+    /// most one entry per connection and no allocation on post.
     slots: []u32,
     len: usize = 0,
+    /// Set if the list filled up (only possible if slots were closed and
+    /// reused with stale entries pending); the worker then flushes every
+    /// connection instead.
+    overflowed: bool = false,
     allocator: std.mem.Allocator,
     waker: sys.Waker,
 
@@ -72,9 +76,12 @@ pub const Mailbox = struct {
 
     pub fn post(self: *Self, slot: u32) void {
         self.mutex.lock();
-        // Capacity equals the worker's slot count, so this can't overflow.
-        self.slots[self.len] = slot;
-        self.len += 1;
+        if (self.len < self.slots.len) {
+            self.slots[self.len] = slot;
+            self.len += 1;
+        } else {
+            self.overflowed = true;
+        }
         self.mutex.unlock();
         if (current != self) self.waker.wake();
     }
@@ -87,6 +94,15 @@ pub const Mailbox = struct {
         @memcpy(out[0..n], self.slots[self.len - n ..][0..n]);
         self.len -= n;
         return n;
+    }
+
+    /// Whether posts were dropped since the last call.
+    pub fn takeOverflow(self: *Self) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const o = self.overflowed;
+        self.overflowed = false;
+        return o;
     }
 };
 

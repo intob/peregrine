@@ -37,7 +37,7 @@ const Op = enum(u8) {
 };
 
 inline fn userData(gen: u32, slot: u32, op: Op) u64 {
-    return (@as(u64, gen) << 32) | (@as(u64, slot) << 8) | @intFromEnum(op);
+    return (@as(u64, gen) << 32) | (@as(u64, slot) << 8) | @backingInt(op);
 }
 
 /// Whether io_uring with the features this worker needs is usable (it may be
@@ -273,7 +273,7 @@ pub fn Worker(comptime Handler: type) type {
 
         fn dispatch(self: *Self, cqe: linux.io_uring_cqe) void {
             const ud = cqe.user_data;
-            const op: Op = @enumFromInt(@as(u8, @truncate(ud)));
+            const op: Op = @fromBackingInt(@intCast(@as(u8, @truncate(ud))));
             const slot: u32 = @truncate((ud >> 8) & 0xFF_FFFF);
             const gen: u32 = @intCast(ud >> 32);
             switch (op) {
@@ -788,14 +788,20 @@ pub fn Worker(comptime Handler: type) type {
             var slots: [64]u32 = undefined;
             while (true) {
                 const n = self.mailbox.drain(&slots);
-                if (n == 0) return;
-                for (slots[0..n]) |slot| {
-                    const c = &self.conns[slot];
-                    const w = c.ws orelse continue;
-                    w.clearPosted();
-                    self.wsDrive(c);
+                if (n == 0) break;
+                for (slots[0..n]) |slot| self.wsFlushPosted(&self.conns[slot]);
+            }
+            if (self.mailbox.takeOverflow()) {
+                for (self.conns) |*c| {
+                    if (c.open and c.ws != null) self.wsFlushPosted(c);
                 }
             }
+        }
+
+        fn wsFlushPosted(self: *Self, c: *Conn) void {
+            const w = c.ws orelse return;
+            w.clearPosted();
+            self.wsDrive(c);
         }
     };
 }

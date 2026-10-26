@@ -84,10 +84,10 @@ Note that these benchmarks simply measure serving static GET requests, and they 
 - Feed bytes to the per-connection state machine (`src/http/session.zig`), which parses and handles requests and serialises responses without doing any I/O itself
 - Write responses
 
-### WebSocket threads
-- Join immediately if there are no WS handlers
-- Manage WebSocket connections
-- Parse and handle WebSocket frames
+### WebSockets
+- No separate threads: after the upgrade a connection stays on the worker that accepted it, so WebSockets scale with cores like HTTP does
+- Frames are decoded by an I/O-free per-connection state machine (`src/ws/protocol.zig`): resumable across reads, several frames per read, fragments reassembled, pings answered, close handshake done by the server
+- Output is queued per connection and written as the socket allows; a peer that stops reading is closed after `request_timeout_s`
 
 ### Signal handling
 The server handles the following signals for graceful shutdown:
@@ -223,21 +223,27 @@ pub fn handleRequest(self: *Self, req: *per.Request, resp: *per.Response) void {
     self.dirServer.serve(req, resp) catch {};
 }
 
-pub fn handleWSConn(_: *Self, fd: std.posix.fd_t) void {
-    std.debug.print("handle ws conn... {d}\n", .{fd});
+pub fn handleWSConn(_: *Self, conn: *per.ws.Conn) void {
+    std.debug.print("handle ws conn... {d}\n", .{conn.fd});
 }
 
-pub fn handleWSDisconn(_: *Self, fd: std.posix.fd_t) void {
-    std.debug.print("handle ws disconn... {d}\n", .{fd});
+pub fn handleWSDisconn(_: *Self, conn: *per.ws.Conn) void {
+    std.debug.print("handle ws disconn... {d}\n", .{conn.fd});
 }
 
-pub fn handleWSFrame(_: *Self, fd: std.posix.fd_t, frame: *per.ws.Frame) void {
-    // Reply to the client
-    per.ws.writer.writeMessage(fd, "Hello client!", false) catch |err| {
+// Called with each complete message: text, binary, ping, pong or close.
+// Fragments are reassembled, pings are answered and close frames echoed
+// before the handler sees them.
+pub fn handleWSFrame(_: *Self, conn: *per.ws.Conn, frame: *per.ws.Frame) void {
+    if (frame.opcode != .text and frame.opcode != .binary) return;
+    // Reply to the client (queued; written as the socket allows)
+    conn.send("Hello client!", false) catch |err| {
         std.debug.print("error writing websocket: {any}\n", .{err});
     };
 }
 ```
+
+The hooks run on the worker thread that owns the connection. A `*per.ws.Conn` is valid from `handleWSConn` until `handleWSDisconn` returns; `conn.send`, `conn.ping` and `conn.close(code, reason)` may be called from any thread in that window (for example to broadcast from another connection's handler), so a handler that keeps handles in a table must remove them in `handleWSDisconn` under its own lock. `conn.user` is free for per-connection state. Messages larger than `websocket_max_message_size` fail the connection with close code 1009; `send` fails with `SendQueueFull` once `websocket_max_send_queue_bytes` are unsent.
 
 ## I need your feedback
 I started this project as a way to learn Zig. As such, some of it will be garbage. I would value any feedback.
@@ -255,7 +261,7 @@ See [PLAN.md](PLAN.md) for the full checklist. The main open items:
 - TLS 1.3 support
 - Streaming (chunked) responses
 - `sendfile` for file bodies
-- Make WebSocket component multi-threaded (and give its reader per-connection state)
+- WebSocket extras: `permessage-deflate`, an idle timeout, the Autobahn test suite
 - Tune the io_uring backend until it beats epoll
 - Soak, adversarial and differential (HTTP Garden) testing
 - API reference

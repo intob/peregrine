@@ -343,7 +343,7 @@ fn writeResponse(
     out.append(reason);
     out.append("\r\n");
     out.append(resp.headerBytes());
-    const code = @intFromEnum(resp.status);
+    const code = @backingInt(resp.status);
     const send_body = req.method != .HEAD and code >= 200 and code != 204 and code != 304;
     if (resp.status.allowsContentLength() and !resp.is_ws_upgrade) {
         out.append("content-length: ");

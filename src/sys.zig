@@ -322,7 +322,7 @@ pub const Mutex = struct {
             std.atomic.spinLoopHint();
         }
         while (m.state.swap(.contended, .acquire) != .unlocked) {
-            futexWait(@ptrCast(&m.state.raw), @intFromEnum(State.contended));
+            futexWait(@ptrCast(&m.state.raw), @backingInt(State.contended));
         }
     }
 
@@ -354,7 +354,7 @@ fn futexWake(ptr: *const u32, max_waiters: u32) void {
             while (true) {
                 const status = c.__ulock_wake(flags, ptr, 0);
                 if (status >= 0) return;
-                switch (@as(c.E, @enumFromInt(@as(u16, @intCast(-status))))) {
+                switch (@as(c.E, @fromBackingInt(@intCast(@as(u16, @intCast(-status)))))) {
                     .INTR => continue,
                     else => return,
                 }

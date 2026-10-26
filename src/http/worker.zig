@@ -682,17 +682,22 @@ pub fn Worker(comptime Handler: type) type {
             var slots: [64]u32 = undefined;
             while (true) {
                 const n = self.mailbox.drain(&slots);
-                if (n == 0) return;
-                for (slots[0..n]) |slot| {
-                    const c = &self.conns[slot];
-                    const w = c.ws orelse continue;
-                    w.clearPosted();
-                    if (!self.wsFlush(c)) continue;
-                    // Output may have been stalled; reading resumes once it
-                    // drains.
-                    if (c.read_ready and !w.hasWire()) self.wsReadable(c);
+                if (n == 0) break;
+                for (slots[0..n]) |slot| self.wsFlushPosted(&self.conns[slot]);
+            }
+            if (self.mailbox.takeOverflow()) {
+                for (self.conns) |*c| {
+                    if (c.open and c.ws != null) self.wsFlushPosted(c);
                 }
             }
+        }
+
+        fn wsFlushPosted(self: *Self, c: *Conn) void {
+            const w = c.ws orelse return;
+            w.clearPosted();
+            if (!self.wsFlush(c)) return;
+            // Output may have been stalled; reading resumes once it drains.
+            if (c.read_ready and !w.hasWire()) self.wsReadable(c);
         }
     };
 }

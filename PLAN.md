@@ -21,7 +21,7 @@ whether it can be the *fastest*.
 | 1. Bug fixes | ✅ done |
 | 2. Connection state machine | ✅ done |
 | 3. HTTP/1.1 completeness | ✅ done except streaming responses (deferred, see below) |
-| 4. Throughput architecture | 🟡 mostly done: io_uring works (opt-in) but isn't faster yet; sendfile, NUMA and WebSocket rework open |
+| 4. Throughput architecture | 🟡 mostly done: io_uring works (opt-in) but isn't faster yet; WebSockets reworked (see below); sendfile and NUMA open |
 | 5. Verification | 🟡 fuzzing and first benchmarks done; soak, adversarial and differential testing open |
 
 New layout:
@@ -35,10 +35,13 @@ New layout:
 | `src/http/worker.zig` | epoll/kqueue event loop: accept, read, process, write, timeouts |
 | `src/http/worker_uring.zig` | io_uring event loop (Linux, opt-in) |
 | `src/http/date.zig` | Cached IMF-fixdate `Date` header |
+| `src/ws/protocol.zig` | I/O-free WebSocket frame decoder and message assembler |
+| `src/ws/conn.zig` | Per-connection WebSocket state: send queue, close handshake, cross-thread mailbox |
+| `src/ws/upgrader.zig` | The HTTP upgrade response |
 | `src/server_test.zig` | End-to-end tests over real sockets, run once per available backend |
 | `bench/` | `zig build bench` (parser micro-benchmarks), `zig build bench-server` (load-test target) |
 
-Test suite: 38 tests (`zig build test`), passing on macOS (kqueue), Linux with Docker's
+Test suite: 66 tests (`zig build test`), passing on macOS (kqueue), Linux with Docker's
 default seccomp (epoll; io_uring is blocked there, so `.auto` falls back), and Linux
 with io_uring permitted (epoll and io_uring end-to-end tests). To run the io_uring
 tests in Docker, allow only `io_uring_setup`, `io_uring_enter` and `io_uring_register`
@@ -213,11 +216,78 @@ on top of Docker's default seccomp profile, rather than using `seccomp=unconfine
 - [ ] `sendfile` (or `splice`) for file-descriptor bodies
 - [x] Precomputed fragments: status line, server headers and body go out in at most
       two iovecs per batch
-- [ ] Make WebSockets multi-threaded, or run them on the HTTP workers' event loops.
-      Also give the WebSocket reader per-connection state: like the old HTTP reader,
-      it resets per event (drops a second frame in the same read) and treats
-      `WouldBlock` mid-frame as an error. Bytes after the upgrade request are not
-      forwarded to the WebSocket side
+- [x] **WebSockets run on the HTTP workers' event loops** (see the section below).
+      The reader has per-connection state, is resumable across reads and handles
+      several frames per read; writes are queued per connection and resume on
+      writability; bytes after the upgrade request are the first frames
+
+---
+
+### WebSocket rework (`ws-rework` branch)
+
+The old `src/ws/` ran every WebSocket on one thread with its own poller, reset the
+reader's `pos`/`len` on every event (a second frame in the same read was lost),
+treated `WouldBlock` mid-frame as a disconnect, looped on `write()` and failed when
+the send buffer filled, and dropped bytes that arrived with the upgrade request. It
+also skipped most of RFC 6455's validation.
+
+**Design.** Same shape as the HTTP side: an I/O-free state machine driven by the
+workers.
+
+- `protocol.Decoder` buffers input like `Session` (pooled read buffer, held only
+  while bytes are unprocessed). An unfragmented message that fits the buffer is
+  unmasked and delivered in place; fragmented or larger messages are streamed into
+  a reassembly buffer as bytes arrive, so a frame never has to fit in the read
+  buffer and memory is bounded by `websocket_max_message_size`. Text is validated
+  incrementally so bad UTF-8 fails as soon as it arrives.
+- `ws.Conn` adds a send queue (`shared`, under a mutex, appended by `send` from any
+  thread) and a `wire` buffer (owned by the worker, swapped in O(1) when it runs
+  dry), pong replies, the close handshake and failing with a close code.
+- **No handoff.** After the 101 response is written the connection stays in its
+  worker's slab with a `ws.Conn` attached; the worker's read/write/timeout
+  machinery is reused. Reading pauses while output is stalled; a stalled write or
+  a pending close handshake gets `request_timeout_s`; idle WebSockets have no
+  timeout. Both backends: readiness (`worker.zig`) and io_uring
+  (`worker_uring.zig`, which copies received bytes out of the kernel buffer into
+  the decoder).
+- **Cross-thread sends.** A chat server broadcasts from one connection's handler to
+  connections on other workers, so `send` must work from any thread. Each worker has
+  a `Mailbox`; `send` queues the frame under the connection's mutex and posts the
+  slot (deduplicated per connection; a wake via the worker's waker only when called
+  from another thread). Workers drain the mailbox after every event batch.
+- **Validation** (RFC 6455): client masking, RSV bits, reserved opcodes, 64-bit
+  length MSB, minimal length encoding, control frames ≤125 bytes and unfragmented,
+  fragment sequencing, UTF-8 in text and close reasons, close code ranges, and the
+  message size limit. Failures send a close frame (1002/1007/1009/1011) and close
+  the socket once it is written. Peer close frames are echoed with their code and
+  the server closes the TCP connection (§7.1.1).
+
+**API change** (kept minimal): the hooks identify a connection by `*ws.Conn` rather
+than an fd, since sending must find the per-connection queue and the owning worker:
+`handleWSConn(conn)`, `handleWSDisconn(conn)`, `handleWSFrame(conn, *Frame)`;
+`ws.writer.writeMessage(fd, ...)` is replaced by `conn.send(data, is_binary)`,
+`conn.ping`, `conn.close(code, reason)`. `Frame` carries a complete message
+(`opcode`, `payload`, `closeCode()`). The handle is valid until `handleWSDisconn`
+returns, and that is the rule for other threads too (remove it from your own table
+there, under your own lock). `Config.websocket_buffer_size` is replaced by
+`websocket_max_message_size` (16 MB) and `websocket_max_send_queue_bytes` (4 MB).
+
+**Tests.** `protocol.zig`: every malformed case above plus a random-split property
+test (a mixed sequence of 52 frames, byte by byte and 199 random splits, with small
+and large read buffers, gives identical messages). `conn.zig`: ping/pong, both close
+handshakes, failure codes, queue limits, partial writes, a send from another thread.
+`server_test.zig` (every backend): frames in the same packet as the upgrade request,
+several frames per read, fragmentation with an interleaved ping, a 300 KB message,
+sends from another thread, client- and server-initiated close ending in FIN,
+protocol violations, and a client that stops reading (cut off after the timeout
+while another WebSocket and HTTP on the same worker keep working).
+
+Still open:
+- [ ] `permessage-deflate` (RSV1 is rejected until an extension is negotiated)
+- [ ] Optional idle timeout / server-side keepalive pings
+- [ ] io_uring: parse straight out of the provided buffer like the HTTP path does
+- [ ] Run the Autobahn test suite and a fuzz target over the decoder
+- [ ] Measure: messages/s per core vs. uWebSockets
 
 ---
 
