@@ -18,7 +18,8 @@ const BufferPool = session.BufferPool;
 const Out = session.Out;
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
-const WebsocketServer = @import("../ws/server.zig").WebsocketServer;
+const ws = @import("../ws/conn.zig");
+const WsConn = ws.Conn;
 const Options = @import("./worker.zig").Options;
 
 const NIL: u32 = std.math.maxInt(u32);
@@ -76,6 +77,8 @@ pub fn Worker(comptime Handler: type) type {
             next: u32 = NIL,
             deadline: u32 = 0,
             session: Session = .{},
+            /// Set after a WebSocket upgrade; the session is then unused.
+            ws: ?*WsConn = null,
             /// The session buffer is a kernel-provided recv buffer.
             borrowed: bool = false,
             /// This connection's output. Owned while a write is in flight.
@@ -94,7 +97,6 @@ pub fn Worker(comptime Handler: type) type {
         id: usize,
         allocator: std.mem.Allocator,
         handler: *Handler,
-        ws: *WebsocketServer(Handler),
         shutdown: *const std.atomic.Value(bool),
         opts: Options,
         ring: IoUring,
@@ -105,6 +107,8 @@ pub fn Worker(comptime Handler: type) type {
         listener: sys.fd_t,
         waker: sys.Waker,
         waker_buf: u64 = 0,
+        /// WebSocket connections with new output (posted from any thread).
+        mailbox: ws.Mailbox,
         tick_ts: linux.kernel_timespec = .{ .sec = 1, .nsec = 0 },
         tick_armed: bool = false,
         conns: []Conn,
@@ -128,7 +132,6 @@ pub fn Worker(comptime Handler: type) type {
             id: usize,
             allocator: std.mem.Allocator,
             handler: *Handler,
-            ws: *WebsocketServer(Handler),
             shutdown: *const std.atomic.Value(bool),
             listener: sys.fd_t,
             opts: Options,
@@ -146,6 +149,8 @@ pub fn Worker(comptime Handler: type) type {
             const out_size = @max(session.headRoom(resp), 16 * 1024);
             const waker = try sys.Waker.init();
             errdefer waker.deinit();
+            var mailbox = try ws.Mailbox.init(allocator, opts.max_connections, waker);
+            errdefer mailbox.deinit();
             const conns = try allocator.alloc(Conn, opts.max_connections);
             errdefer allocator.free(conns);
             @memset(conns, .{});
@@ -160,13 +165,13 @@ pub fn Worker(comptime Handler: type) type {
                 .id = cfg.id,
                 .allocator = allocator,
                 .handler = cfg.handler,
-                .ws = cfg.ws,
                 .shutdown = cfg.shutdown,
                 .opts = opts,
                 .ring = undefined,
                 .buffers = undefined,
                 .listener = cfg.listener,
                 .waker = waker,
+                .mailbox = mailbox,
                 .conns = conns,
                 .free_slots = free_slots,
                 .free_len = free_slots.len,
@@ -221,6 +226,7 @@ pub fn Worker(comptime Handler: type) type {
             sys.close(self.listener);
             self.freeBuffers();
             self.ring.deinit();
+            self.mailbox.deinit();
             self.waker.deinit();
             self.pool.deinit();
             self.out_pool.deinit();
@@ -239,6 +245,7 @@ pub fn Worker(comptime Handler: type) type {
         fn run(self: *Self, pin: bool) void {
             defer self.freeBuffers();
             if (pin) sys.pinToCpu(self.id);
+            self.mailbox.bind();
             const rc = linux.io_uring_register(self.ring.fd, .REGISTER_ENABLE_RINGS, null, 0);
             if (std.posix.errno(rc) != .SUCCESS) {
                 std.debug.print("io_uring enable failed: {s}\n", .{@tagName(std.posix.errno(rc))});
@@ -258,6 +265,9 @@ pub fn Worker(comptime Handler: type) type {
                 const n = self.ring.copy_cqes(&cqes, 0) catch 0;
                 self.tick();
                 for (cqes[0..n]) |cqe| self.dispatch(cqe);
+                // WebSocket output queued by handlers during this batch, or
+                // by other threads (which also wrote the waker).
+                self.drainMailbox();
             }
         }
 
@@ -282,7 +292,7 @@ pub fn Worker(comptime Handler: type) type {
             switch (op) {
                 .recv => self.onRecv(c, cqe),
                 .recv_plain => self.onRecvPlain(c, cqe),
-                .write => self.onWrite(c, cqe),
+                .write => if (c.ws != null) self.onWsWrite(c, cqe) else self.onWrite(c, cqe),
                 .cancel => {},
                 else => unreachable,
             }
@@ -335,9 +345,10 @@ pub fn Worker(comptime Handler: type) type {
         /// Fallback when the provided-buffer ring is exhausted: receive into
         /// a pooled session buffer instead.
         fn armRecvPlain(self: *Self, c: *Conn) void {
-            const space = c.session.readSpace(&self.pool, self.opts.session) catch {
-                return self.closeConn(c);
-            };
+            const space = if (c.ws) |w|
+                w.decoder.readSpace(&self.pool) catch return self.closeConn(c)
+            else
+                c.session.readSpace(&self.pool, self.opts.session) catch return self.closeConn(c);
             const sqe = self.getSqe();
             sqe.prep_recv(c.fd, space, 0);
             sqe.user_data = userData(c.gen, self.slotOf(c), .recv_plain);
@@ -501,6 +512,11 @@ pub fn Worker(comptime Handler: type) type {
             c.out = .{ .buf = &.{} };
             if (c.out_body_owned.len > 0) self.allocator.free(c.out_body_owned);
             c.out_body_owned = &.{};
+            if (c.ws) |w| {
+                if (@hasDecl(Handler, "handleWSDisconn")) self.handler.handleWSDisconn(w);
+                w.destroy(&self.pool);
+                c.ws = null;
+            }
         }
 
         fn releaseSlot(self: *Self, c: *Conn) void {
@@ -513,11 +529,37 @@ pub fn Worker(comptime Handler: type) type {
             self.open_count -= 1;
         }
 
+        /// The upgrade response has been written: the connection stays on
+        /// this worker and speaks WebSocket from here on.
         fn upgradeConn(self: *Self, c: *Conn) void {
-            const fd = c.fd;
-            self.freeConnResources(c);
-            self.releaseSlot(c);
-            self.ws.addSocket(fd) catch sys.close(fd);
+            if (!@hasDecl(Handler, "handleWSFrame")) return self.closeConn(c);
+            const w = WsConn.create(self.allocator, c.fd, self.opts.websocket, &self.mailbox, self.slotOf(c)) catch {
+                return self.closeConn(c);
+            };
+            c.ws = w;
+            if (c.out.buf.len > 0) {
+                self.out_pool.release(c.out.buf);
+                c.out = .{ .buf = &.{} };
+            }
+            // Bytes after the upgrade request are the first frames. A
+            // kernel buffer goes back to the ring, so copy out of it.
+            const s = &c.session;
+            if (c.borrowed) {
+                const leftover = s.buf[s.start..s.end];
+                c.borrowed = false;
+                s.* = .{};
+                const space = w.decoder.readSpace(&self.pool) catch return self.closeConn(c);
+                std.debug.assert(space.len >= leftover.len);
+                @memcpy(space[0..leftover.len], leftover);
+                w.decoder.commitRead(leftover.len);
+            } else {
+                w.decoder.adopt(s.buf, s.start, s.end);
+                s.* = .{};
+            }
+            self.unlink(c);
+            if (@hasDecl(Handler, "handleWSConn")) self.handler.handleWSConn(w);
+            _ = w.process(Handler, self.handler);
+            self.wsDrive(c);
         }
 
         // -- Completions -----------------------------------------------------
@@ -538,12 +580,14 @@ pub fn Worker(comptime Handler: type) type {
             if (cqe.res == 0) {
                 if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) self.buffers.put(cqe) catch {};
                 c.peer_closed = true;
-                if (!c.closing) self.drive(c);
-                return;
+                if (c.closing) return;
+                if (c.ws != null) return self.wsDrive(c);
+                return self.drive(c);
             }
             const data = self.buffers.get(cqe) catch return self.closeConn(c);
             defer self.buffers.put(cqe) catch {};
             if (c.closing) return;
+            if (c.ws != null) return self.wsFeed(c, data);
             if (c.session.buf.len == 0) {
                 // Zero-copy: parse straight out of the kernel's buffer.
                 c.session.buf = data;
@@ -562,6 +606,15 @@ pub fn Worker(comptime Handler: type) type {
             c.recv_armed = false;
             if (c.closing) return;
             if (cqe.res < 0) return self.closeConn(c);
+            if (c.ws) |w| {
+                if (cqe.res == 0) {
+                    c.peer_closed = true;
+                } else {
+                    w.decoder.commitRead(@intCast(cqe.res));
+                    _ = w.process(Handler, self.handler);
+                }
+                return self.wsDrive(c);
+            }
             if (cqe.res == 0) {
                 c.peer_closed = true;
             } else {
@@ -672,6 +725,76 @@ pub fn Worker(comptime Handler: type) type {
             } else {
                 c.out_body_owned = try self.allocator.dupe(u8, body);
                 c.out.body = c.out_body_owned;
+            }
+        }
+
+        // -- WebSocket ---------------------------------------------------------
+
+        /// Copies received bytes into the decoder's buffer, running the
+        /// protocol as each chunk lands (a frame held whole may need the
+        /// buffer compacted before the rest fits).
+        fn wsFeed(self: *Self, c: *Conn, data: []const u8) void {
+            const w = c.ws.?;
+            var rest = data;
+            while (rest.len > 0) {
+                const space = w.decoder.readSpace(&self.pool) catch return self.closeConn(c);
+                const n = @min(space.len, rest.len);
+                @memcpy(space[0..n], rest[0..n]);
+                w.decoder.commitRead(n);
+                rest = rest[n..];
+                if (w.process(Handler, self.handler) == .close) break;
+            }
+            self.wsDrive(c);
+        }
+
+        /// Writes queued output, or arms the next recv when there is none.
+        /// A recv is armed only while no write is in flight (backpressure).
+        fn wsDrive(self: *Self, c: *Conn) void {
+            if (c.closing or c.write_inflight) return;
+            const w = c.ws.?;
+            const bytes = w.wireBytes();
+            if (bytes.len > 0) {
+                c.iov[0] = .{ .base = bytes.ptr, .len = bytes.len };
+                const sqe = self.getSqe();
+                sqe.prep_writev(c.fd, c.iov[0..1], 0);
+                sqe.user_data = userData(c.gen, self.slotOf(c), .write);
+                c.write_inflight = true;
+                c.inflight += 1;
+                if (c.list != .active) self.arm(c, .active);
+                return;
+            }
+            if (w.wantsClose() or c.peer_closed) return self.closeConn(c);
+            w.decoder.releaseIfIdle(&self.pool);
+            // Only a pending close handshake has a deadline.
+            if (w.closeSent()) {
+                if (c.list != .active) self.arm(c, .active);
+            } else {
+                self.unlink(c);
+            }
+            self.armRecv(c);
+        }
+
+        fn onWsWrite(self: *Self, c: *Conn, cqe: linux.io_uring_cqe) void {
+            c.write_inflight = false;
+            if (c.closing) return;
+            if (cqe.res < 0) return self.closeConn(c);
+            c.ws.?.advance(@intCast(cqe.res));
+            // Progress extends the deadline; a stalled reader times out.
+            if (cqe.res > 0) self.arm(c, .active);
+            self.wsDrive(c);
+        }
+
+        fn drainMailbox(self: *Self) void {
+            var slots: [64]u32 = undefined;
+            while (true) {
+                const n = self.mailbox.drain(&slots);
+                if (n == 0) return;
+                for (slots[0..n]) |slot| {
+                    const c = &self.conns[slot];
+                    const w = c.ws orelse continue;
+                    w.clearPosted();
+                    self.wsDrive(c);
+                }
             }
         }
     };

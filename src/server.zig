@@ -17,7 +17,7 @@ pub const Backend = enum {
     /// Linux only. Fails at init if io_uring is unavailable.
     io_uring,
 };
-const WebsocketServer = @import("./ws/server.zig").WebsocketServer;
+const ws = @import("./ws/conn.zig");
 
 pub const Config = struct {
     /// I/O backend.
@@ -55,8 +55,12 @@ pub const Config = struct {
     request_timeout_s: u32 = 10,
     /// 0 means unlimited.
     max_requests_per_connection: u32 = 0,
-    /// WebSocket reader buffer size.
-    websocket_buffer_size: usize = 1024 * 32,
+    /// WebSocket messages larger than this fail the connection (1009).
+    websocket_max_message_size: usize = 16 * 1024 * 1024,
+    /// Unsent WebSocket output per connection before `Conn.send` fails with
+    /// SendQueueFull. A connection whose peer stops reading is closed after
+    /// `request_timeout_s` without write progress.
+    websocket_max_send_queue_bytes: usize = 4 * 1024 * 1024,
     /// Install SIGINT/SIGTERM handlers that shut the server down.
     handle_signals: bool = true,
 };
@@ -135,7 +139,6 @@ pub fn Server(comptime Handler: type) type {
 
         allocator: std.mem.Allocator,
         handler: *Handler,
-        ws: *WebsocketServer(Handler),
         workers: []AnyWorker,
         backend: Backend,
         wakers: []sys.Waker,
@@ -168,12 +171,9 @@ pub fn Server(comptime Handler: type) type {
             errdefer allocator.destroy(srv);
             const handler = try Handler.init(allocator);
             errdefer handler.deinit();
-            const ws = try WebsocketServer(Handler).init(allocator, handler, cfg.websocket_buffer_size);
-            errdefer ws.deinit();
             srv.* = .{
                 .allocator = allocator,
                 .handler = handler,
-                .ws = ws,
                 .workers = try allocator.alloc(AnyWorker, worker_count),
                 .backend = backend,
                 .wakers = try allocator.alloc(sys.Waker, worker_count),
@@ -227,6 +227,10 @@ pub fn Server(comptime Handler: type) type {
                     .keep_alive_timeout_s = cfg.keep_alive_timeout_s,
                     .request_timeout_s = cfg.request_timeout_s,
                     .read_on_accept = sys.is_linux,
+                    .websocket = .{
+                        .max_message_size = cfg.websocket_max_message_size,
+                        .max_send_queue_bytes = cfg.websocket_max_send_queue_bytes,
+                    },
                 };
                 const result = switch (backend) {
                     .io_uring => if (sys.is_linux) blk: {
@@ -235,7 +239,6 @@ pub fn Server(comptime Handler: type) type {
                             .id = i,
                             .allocator = allocator,
                             .handler = handler,
-                            .ws = ws,
                             .shutdown = &srv.shutdown_flag,
                             .listener = listener,
                             .opts = opts,
@@ -247,7 +250,6 @@ pub fn Server(comptime Handler: type) type {
                             .id = i,
                             .allocator = allocator,
                             .handler = handler,
-                            .ws = ws,
                             .shutdown = &srv.shutdown_flag,
                             .listener = listener,
                             .owns_listener = per_worker,
@@ -317,7 +319,6 @@ pub fn Server(comptime Handler: type) type {
                 -1;
             for (self.workers) |*w| w.deinit();
             if (shared_listener >= 0) sys.close(shared_listener);
-            self.ws.deinit();
             self.handler.deinit();
             self.allocator.free(self.workers);
             self.allocator.free(self.wakers);

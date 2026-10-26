@@ -11,7 +11,8 @@ const BufferPool = session.BufferPool;
 const Out = session.Out;
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
-const WebsocketServer = @import("../ws/server.zig").WebsocketServer;
+const ws = @import("../ws/conn.zig");
+const WsConn = ws.Conn;
 
 const LISTENER_TOKEN: u64 = std.math.maxInt(u64);
 const WAKER_TOKEN: u64 = std.math.maxInt(u64) - 1;
@@ -32,6 +33,7 @@ pub const Options = struct {
     /// Linux: try reading right after accept (the listener uses
     /// TCP_DEFER_ACCEPT, so data is usually already there).
     read_on_accept: bool,
+    websocket: ws.Options,
 };
 
 pub fn Worker(comptime Handler: type) type {
@@ -56,6 +58,8 @@ pub fn Worker(comptime Handler: type) type {
             next: u32 = NIL,
             deadline: u32 = 0,
             session: Session = .{},
+            /// Set after a WebSocket upgrade; the session is then unused.
+            ws: ?*WsConn = null,
             /// Unsent output after a partial write: an owned copy of the
             /// serialised head bytes, then the body (owned or borrowed).
             pending_head: []u8 = &.{},
@@ -77,13 +81,14 @@ pub fn Worker(comptime Handler: type) type {
         id: usize,
         allocator: std.mem.Allocator,
         handler: *Handler,
-        ws: *WebsocketServer(Handler),
         shutdown: *const std.atomic.Value(bool),
         opts: Options,
         poller: Poller,
         listener: sys.fd_t,
         owns_listener: bool,
         waker: sys.Waker,
+        /// WebSocket connections with new output (posted from any thread).
+        mailbox: ws.Mailbox,
         conns: []Conn,
         free_slots: []u32,
         free_len: usize,
@@ -104,7 +109,6 @@ pub fn Worker(comptime Handler: type) type {
             id: usize,
             allocator: std.mem.Allocator,
             handler: *Handler,
-            ws: *WebsocketServer(Handler),
             shutdown: *const std.atomic.Value(bool),
             listener: sys.fd_t,
             owns_listener: bool,
@@ -118,6 +122,8 @@ pub fn Worker(comptime Handler: type) type {
             errdefer poller.deinit();
             const waker = try sys.Waker.init();
             errdefer waker.deinit();
+            var mailbox = try ws.Mailbox.init(allocator, opts.max_connections, waker);
+            errdefer mailbox.deinit();
             const conns = try allocator.alloc(Conn, opts.max_connections);
             errdefer allocator.free(conns);
             @memset(conns, .{});
@@ -138,13 +144,13 @@ pub fn Worker(comptime Handler: type) type {
                 .id = cfg.id,
                 .allocator = allocator,
                 .handler = cfg.handler,
-                .ws = cfg.ws,
                 .shutdown = cfg.shutdown,
                 .opts = opts,
                 .poller = poller,
                 .listener = cfg.listener,
                 .owns_listener = cfg.owns_listener,
                 .waker = waker,
+                .mailbox = mailbox,
                 .conns = conns,
                 .free_slots = free_slots,
                 .free_len = free_slots.len,
@@ -181,6 +187,7 @@ pub fn Worker(comptime Handler: type) type {
             }
             if (self.owns_listener) sys.close(self.listener);
             self.poller.deinit();
+            self.mailbox.deinit();
             self.waker.deinit();
             self.pool.deinit();
             self.req.deinit();
@@ -192,6 +199,7 @@ pub fn Worker(comptime Handler: type) type {
 
         fn run(self: *Self, pin: bool) void {
             if (pin) sys.pinToCpu(self.id);
+            self.mailbox.bind();
             var events: [512]Poller.Event = undefined;
             while (!self.shutdown.load(.acquire)) {
                 // With no connections there are no timers to run, so block
@@ -206,6 +214,9 @@ pub fn Worker(comptime Handler: type) type {
                         else => |token| self.onConnEvent(ev, token),
                     }
                 }
+                // WebSocket output queued by handlers during this batch, or
+                // by other threads (which also wrote the waker).
+                self.drainMailbox();
             }
         }
 
@@ -355,6 +366,11 @@ pub fn Worker(comptime Handler: type) type {
             self.unlink(c);
             c.session.deinit(&self.pool);
             self.freePending(c);
+            if (c.ws) |w| {
+                if (@hasDecl(Handler, "handleWSDisconn")) self.handler.handleWSDisconn(w);
+                w.destroy(&self.pool);
+                c.ws = null;
+            }
             c.open = false;
             c.fd = -1;
             self.free_slots[self.free_len] = self.slotOf(c);
@@ -362,11 +378,21 @@ pub fn Worker(comptime Handler: type) type {
             self.open_count -= 1;
         }
 
+        /// The upgrade response has been written: the connection stays on
+        /// this worker and speaks WebSocket from here on.
         fn upgradeConn(self: *Self, c: *Conn) void {
-            const fd = c.fd;
-            self.poller.remove(fd);
-            self.releaseConn(c);
-            self.ws.addSocket(fd) catch sys.close(fd);
+            if (!@hasDecl(Handler, "handleWSFrame")) return self.closeConn(c);
+            const w = WsConn.create(self.allocator, c.fd, self.opts.websocket, &self.mailbox, self.slotOf(c)) catch {
+                return self.closeConn(c);
+            };
+            c.ws = w;
+            // Bytes after the upgrade request are the first frames.
+            w.decoder.adopt(c.session.buf, c.session.start, c.session.end);
+            c.session = .{};
+            self.unlink(c);
+            if (@hasDecl(Handler, "handleWSConn")) self.handler.handleWSConn(w);
+            if (!self.wsProcess(c)) return;
+            if (c.read_ready) self.wsReadable(c);
         }
 
         fn freePending(self: *Self, c: *Conn) void {
@@ -387,6 +413,7 @@ pub fn Worker(comptime Handler: type) type {
             // The slot may have been closed (and reused) earlier in this batch.
             if (!c.open or c.gen != gen) return;
             if (Poller.readable(ev)) c.read_ready = true;
+            if (c.ws != null) return self.onWsEvent(c, ev);
             if (c.lingering) {
                 if (c.read_ready) self.drainLingering(c);
                 return;
@@ -561,6 +588,111 @@ pub fn Worker(comptime Handler: type) type {
             // arrives.
             self.onReadable(c);
             return false;
+        }
+
+        // -- WebSocket I/O ------------------------------------------------
+
+        fn onWsEvent(self: *Self, c: *Conn, ev: Poller.Event) void {
+            const w = c.ws.?;
+            if (Poller.writable(ev) and w.hasWire()) {
+                if (!self.wsFlush(c)) return;
+            }
+            // Reading pauses while output is stalled (backpressure).
+            if (c.read_ready and !w.hasWire()) self.wsReadable(c);
+        }
+
+        fn wsReadable(self: *Self, c: *Conn) void {
+            const w = c.ws.?;
+            while (c.read_ready and !w.hasWire()) {
+                const space = w.decoder.readSpace(&self.pool) catch return self.closeConn(c);
+                if (sys.read(c.fd, space)) |n| {
+                    if (n == 0) {
+                        c.peer_closed = true;
+                        c.read_ready = false;
+                    } else {
+                        w.decoder.commitRead(n);
+                        if (n < space.len) c.read_ready = false;
+                    }
+                } else |err| switch (err) {
+                    error.WouldBlock => c.read_ready = false,
+                    else => return self.closeConn(c),
+                }
+                if (!self.wsProcess(c)) return;
+                if (c.peer_closed) return self.closeConn(c);
+            }
+        }
+
+        /// Runs the protocol over buffered input and writes its output.
+        /// Returns false if the connection is gone.
+        fn wsProcess(self: *Self, c: *Conn) bool {
+            const w = c.ws.?;
+            _ = w.process(Handler, self.handler);
+            if (!self.wsFlush(c)) return false;
+            w.decoder.releaseIfIdle(&self.pool);
+            return true;
+        }
+
+        /// Writes queued output. Closes the socket once it is drained if
+        /// the close handshake is over. Returns false if the connection is
+        /// gone.
+        fn wsFlush(self: *Self, c: *Conn) bool {
+            const w = c.ws.?;
+            while (true) {
+                const bytes = w.wireBytes();
+                if (bytes.len == 0) break;
+                const n = sys.write(c.fd, bytes) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        self.wsTimer(c, false);
+                        return true;
+                    },
+                    else => {
+                        self.closeConn(c);
+                        return false;
+                    },
+                };
+                w.advance(n);
+                if (n < bytes.len) {
+                    // Socket buffer full: wait for writability.
+                    self.wsTimer(c, true);
+                    return true;
+                }
+            }
+            if (w.wantsClose()) {
+                self.closeConn(c);
+                return false;
+            }
+            self.wsTimer(c, false);
+            return true;
+        }
+
+        /// A stalled write or a pending close handshake gets the request
+        /// timeout; otherwise WebSocket connections have no timeout.
+        fn wsTimer(self: *Self, c: *Conn, progress: bool) void {
+            const w = c.ws.?;
+            if (w.hasWire()) {
+                if (progress or c.list != .active) self.arm(c, .active);
+            } else if (w.closeSent()) {
+                if (c.list != .active) self.arm(c, .active);
+            } else {
+                self.unlink(c);
+            }
+        }
+
+        fn drainMailbox(self: *Self) void {
+            var slots: [64]u32 = undefined;
+            while (true) {
+                const n = self.mailbox.drain(&slots);
+                if (n == 0) return;
+                for (slots[0..n]) |slot| {
+                    const c = &self.conns[slot];
+                    const w = c.ws orelse continue;
+                    w.clearPosted();
+                    if (!self.wsFlush(c)) continue;
+                    // Output may have been stalled; reading resumes once it
+                    // drains.
+                    if (c.read_ready and !w.hasWire()) self.wsReadable(c);
+                }
+            }
         }
     };
 }

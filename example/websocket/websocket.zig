@@ -42,26 +42,35 @@ const Handler = struct {
         try self.dirServer.serve(req, resp);
     }
 
-    pub fn handleWSConn(_: *Self, fd: std.posix.fd_t) void {
-        std.debug.print("{d} handle ws conn...\n", .{fd});
+    // WebSocket hooks run on the worker that owns the connection. `conn`
+    // is valid until handleWSDisconn returns; conn.send may be called from
+    // any thread until then.
+    pub fn handleWSConn(_: *Self, conn: *per.ws.Conn) void {
+        std.debug.print("{d} handle ws conn...\n", .{conn.fd});
     }
 
-    pub fn handleWSDisconn(_: *Self, fd: std.posix.fd_t) void {
-        std.debug.print("{d} handle ws disconn...\n", .{fd});
+    pub fn handleWSDisconn(_: *Self, conn: *per.ws.Conn) void {
+        std.debug.print("{d} handle ws disconn...\n", .{conn.fd});
     }
 
-    pub fn handleWSFrame(_: *Self, fd: std.posix.fd_t, frame: *per.ws.Frame) void {
-        if (frame.opcode == per.ws.Opcode.close) {
-            std.debug.print("{d} client closed websocket\n", .{fd});
-            return;
+    /// Called with each complete message (fragments reassembled). Pings
+    /// are answered and close frames echoed by the server before this.
+    pub fn handleWSFrame(_: *Self, conn: *per.ws.Conn, frame: *per.ws.Frame) void {
+        switch (frame.opcode) {
+            .close => {
+                std.debug.print("{d} client closed websocket ({?d})\n", .{ conn.fd, frame.closeCode() });
+                return;
+            },
+            .ping, .pong => return,
+            else => {},
         }
         std.debug.print("{d} handle ws frame... {s} {s}\n", .{
-            fd,
+            conn.fd,
             frame.opcode.toString(),
             frame.getPayload(),
         });
-        per.ws.writer.writeMessage(fd, "Hello client!", false) catch |err| {
-            std.debug.print("{d} error writing websocket: {any}\n", .{ fd, err });
+        conn.send("Hello client!", false) catch |err| {
+            std.debug.print("{d} error writing websocket: {any}\n", .{ conn.fd, err });
         };
     }
 };

@@ -108,7 +108,8 @@ pub const Action = enum {
     flush,
     /// Flush Out, then close the connection.
     close,
-    /// Flush Out, then hand the socket to the WebSocket server.
+    /// Flush Out, then hand the connection and any remaining buffered
+    /// bytes to the WebSocket side.
     upgrade,
 };
 
@@ -287,7 +288,8 @@ pub fn process(comptime Handler: type, s: *Session, ctx: *const Context(Handler)
         const more = s.start < s.end;
         writeResponse(ctx.req, ctx.resp, ctx.date, out, keep_alive, more);
         if (ctx.resp.is_ws_upgrade) {
-            s.start = s.end; // bytes after the upgrade request are not forwarded
+            // Anything after the request is the first WebSocket frames; the
+            // event loop hands the buffer to the WebSocket side.
             return .upgrade;
         }
         if (!keep_alive) {
