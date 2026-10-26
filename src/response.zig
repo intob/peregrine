@@ -2,158 +2,126 @@ const std = @import("std");
 const Header = @import("./header.zig").Header;
 const Status = @import("./status.zig").Status;
 
-/// This response is reused.
-/// The reset method is called by the worker, so library users do not need to think about it.
-/// IMPORTANT:
-/// If a field is added, it MUST be reset by the reset() method.
+/// This response is reused for every request on a worker. The server resets
+/// it before calling handleRequest.
+///
+/// Headers are serialised as they are added, so their values are copied and
+/// may be freed as soon as addHeader returns. The server adds Content-Length,
+/// Date and Connection itself.
 pub const Response = struct {
     const Self = @This();
-    const VERSION = "HTTP/1.1 ";
 
-    status: Status align(64) = .ok,
-    headers: [32]Header align(64) = undefined,
-    headers_len: usize align(64) = 0,
-    body: []align(64) u8,
-    body_len: usize align(64) = 0,
-    is_ws_upgrade: bool align(64) = false,
-    status_buf: []align(64) u8,
+    status: Status = .ok,
+    /// Close the connection after this response is sent.
+    close: bool = false,
+    is_ws_upgrade: bool = false,
+    /// Serialised "key: value\r\n" lines.
+    header_buf: []u8,
+    header_len: usize = 0,
+    /// The body to send. Set it with setBody (copies) or setBodyBorrowed.
+    body: []const u8 = "",
+    body_buf: []u8,
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, body_size: usize) !*Self {
-        const next_pow2 = try std.math.ceilPowerOfTwo(usize, body_size);
-        const aligned = std.mem.alignForward(usize, next_pow2, 64);
+    pub fn init(allocator: std.mem.Allocator, body_size: usize, header_size: usize) !*Self {
         const resp = try allocator.create(Self);
-        const status_size = try resp.calcStatusBufferSize();
+        errdefer allocator.destroy(resp);
+        const body_buf = try allocator.alloc(u8, body_size);
+        errdefer allocator.free(body_buf);
         resp.* = .{
             .allocator = allocator,
-            .body = try allocator.alignedAlloc(u8, 64, aligned),
-            .status_buf = try allocator.alignedAlloc(u8, 64, status_size),
+            .body_buf = body_buf,
+            .header_buf = try allocator.alloc(u8, header_size),
         };
-        @memcpy(resp.status_buf[0..VERSION.len], VERSION);
         return resp;
     }
 
     pub fn deinit(self: *Self) void {
-        self.allocator.free(self.body);
-        self.allocator.free(self.status_buf);
+        self.allocator.free(self.body_buf);
+        self.allocator.free(self.header_buf);
         self.allocator.destroy(self);
     }
 
+    /// Add a header. Prefer addNewHeader, which rejects server-managed
+    /// headers at compile time.
     pub fn addHeader(self: *Self, header: Header) !void {
-        if (self.headers_len >= self.headers.len) {
-            return error.HeadersFull;
+        // Reject CR/LF to prevent response splitting.
+        if (std.mem.indexOfAny(u8, header.key, "\r\n:") != null or header.key.len == 0) {
+            return error.InvalidHeader;
         }
-        self.headers[self.headers_len] = header;
-        self.headers_len += 1;
+        if (std.mem.indexOfAny(u8, header.value, "\r\n") != null) return error.InvalidHeader;
+        const needed = header.key.len + 2 + header.value.len + 2;
+        if (self.header_len + needed > self.header_buf.len) return error.HeadersFull;
+        var buf = self.header_buf[self.header_len..];
+        @memcpy(buf[0..header.key.len], header.key);
+        buf = buf[header.key.len..];
+        buf[0..2].* = ": ".*;
+        @memcpy(buf[2..][0..header.value.len], header.value);
+        buf[2 + header.value.len ..][0..2].* = "\r\n".*;
+        self.header_len += needed;
     }
 
     pub fn addNewHeader(self: *Self, comptime key: []const u8, value: []const u8) !void {
-        if (self.headers_len >= self.headers.len) {
-            return error.HeadersFull;
-        }
-        self.headers[self.headers_len] = try Header.init(key, value);
-        self.headers_len += 1;
+        try self.addHeader(Header.init(key, value));
     }
 
-    pub fn serialiseStatusAndHeaders(self: *Self) !usize {
-        var n: usize = VERSION.len;
-        const status = self.status.toString();
-        @memcpy(self.status_buf[n .. n + status.len], status);
-        n += status.len;
-        self.status_buf[n] = '\r';
-        self.status_buf[n + 1] = '\n';
-        n += 2;
-        var i: usize = 0;
-        while (i < self.headers_len) : (i += 1) {
-            const key = self.headers[i].key();
-            @memcpy(self.status_buf[n .. n + key.len], key);
-            n += key.len;
-            self.status_buf[n] = ':';
-            self.status_buf[n + 1] = ' ';
-            n += 2;
-            const val = self.headers[i].value();
-            @memcpy(self.status_buf[n .. n + val.len], val);
-            n += val.len;
-            self.status_buf[n] = '\r';
-            self.status_buf[n + 1] = '\n';
-            n += 2;
-        }
-        return n;
-    }
-
+    /// Copies `buf` into the worker's response buffer.
     pub fn setBody(self: *Self, buf: []const u8) !usize {
-        if (buf.len > self.body.len) {
-            std.debug.print("buf len: {d}, resp body len: {d}\n", .{ buf.len, self.body.len });
+        if (buf.len > self.body_buf.len) {
             return error.ResponseBodyBufferTooSmall;
         }
-        @memcpy(self.body[0..buf.len], buf);
-        self.body_len = buf.len;
+        @memcpy(self.body_buf[0..buf.len], buf);
+        self.body = self.body_buf[0..buf.len];
         return buf.len;
     }
 
-    /// This is called automatically before Handler.handle.
-    /// The response is reused so that no allocations are required per request.
-    /// All fields must be reset to prevent exposing stale data.
-    pub inline fn reset(self: *Self) void {
-        self.status = Status.ok;
-        self.headers_len = 0;
-        self.is_ws_upgrade = false;
+    /// Sends `buf` without copying it. It must stay valid and unchanged until
+    /// the response is sent, which happens before this worker calls
+    /// handleRequest again. Use it for static or cached content.
+    pub fn setBodyBorrowed(self: *Self, buf: []const u8) void {
+        self.body = buf;
     }
 
-    fn calcStatusBufferSize(self: *Self) !usize {
-        const headers_size = (65 + 256 + 4) * self.headers.len;
-        const resp_buf_size = headers_size + "HTTP/1.1 500 Internal Server Error\r\n".len;
-        return std.mem.alignForward(usize, resp_buf_size, 16);
+    /// Returns a slice of the response buffer to write a body into directly.
+    /// Call commitBody with the number of bytes written.
+    pub fn bodyWriteBuffer(self: *Self) []u8 {
+        return self.body_buf;
+    }
+
+    pub fn commitBody(self: *Self, len: usize) void {
+        self.body = self.body_buf[0..len];
+    }
+
+    pub fn headerBytes(self: *const Self) []const u8 {
+        return self.header_buf[0..self.header_len];
+    }
+
+    pub inline fn reset(self: *Self) void {
+        self.status = .ok;
+        self.close = false;
+        self.is_ws_upgrade = false;
+        self.header_len = 0;
+        self.body = "";
     }
 };
 
-test "serialise" {
-    var r = try Response.init(std.testing.allocator, 1024);
+test "headers are serialised on add" {
+    var r = try Response.init(std.testing.allocator, 16, 128);
     defer r.deinit();
-    r.headers[0] = try Header.init("Content-Type", "total/rubbish");
-    r.headers[1] = try Header.init("Content-Length", "0");
-    r.headers_len = 2;
-    const n = try r.serialiseStatusAndHeaders();
-    const expected = "HTTP/1.1 200 OK\r\nContent-Type: total/rubbish\r\nContent-Length: 0\r\n";
-    try std.testing.expectEqualStrings(expected, r.status_buf[0..n]);
-    try std.testing.expectEqual(expected.len, n);
+    try r.addNewHeader("Content-Type", "text/plain");
+    try r.addNewHeader("X-A", "b");
+    try std.testing.expectEqualStrings("Content-Type: text/plain\r\nX-A: b\r\n", r.headerBytes());
 }
 
-test "benchmark serialisation" {
-    const allocator = std.testing.allocator;
-    var resp = try Response.init(allocator, 1024);
-    defer resp.deinit();
-    resp.headers[0] = try Header.init("Content-Type", "total/rubbish");
-    resp.headers[1] = try Header.init("Content-Length", "11");
-    resp.headers[2] = try Header.init("Etag", "32456756753456");
-    resp.headers[3] = try Header.init("Some-Other", "HJFLAEKGJELIUO");
-    resp.headers_len = 4;
-    const iterations: usize = 100_000_000;
-    var timer = try std.time.Timer.start();
-    var i: usize = 0;
-    while (i < iterations) : (i += 1) {
-        const size = try resp.serialiseStatusAndHeaders();
-        std.mem.doNotOptimizeAway(size);
-    }
-    const elapsed = timer.lap();
-    const avg_ns = @divFloor(elapsed, iterations);
-    std.debug.print("Average serialization time: {d}ns\n", .{avg_ns});
+test "header injection is rejected" {
+    var r = try Response.init(std.testing.allocator, 16, 128);
+    defer r.deinit();
+    try std.testing.expectError(error.InvalidHeader, r.addNewHeader("X", "a\r\nSet-Cookie: x"));
+    try std.testing.expectError(error.InvalidHeader, r.addHeader(.{ .key = "X\r\n", .value = "a" }));
 }
 
-test "benchmark add new header" {
-    const allocator = std.testing.allocator;
-    var resp = try Response.init(allocator, 1024);
-    defer resp.deinit();
-    const iterations: usize = 10_000_000;
-    var timer = try std.time.Timer.start();
-    var i: usize = 0;
-    while (i < iterations) : (i += 1) {
-        inline for (0..resp.headers.len) |_| {
-            try resp.addNewHeader("key", "value");
-        }
-        resp.headers_len = 0;
-    }
-    const elapsed = timer.lap();
-    const avg_ns = @divFloor(elapsed, iterations);
-    std.debug.print("Average time: {d}ns\n", .{avg_ns});
+test "header buffer overflow" {
+    var r = try Response.init(std.testing.allocator, 16, 8);
+    defer r.deinit();
+    try std.testing.expectError(error.HeadersFull, r.addNewHeader("Key", "value"));
 }
