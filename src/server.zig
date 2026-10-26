@@ -71,10 +71,15 @@ var signal_target: ?*const SignalTarget = null;
 const SignalTarget = struct {
     shutdown: *std.atomic.Value(bool),
     wakers: []const sys.Waker,
+    /// Shutdown requests still waking workers; the server isn't freed
+    /// until this is zero.
+    waking: *std.atomic.Value(u32),
 };
 
 fn handleSignal(_: posix.SIG) callconv(.c) void {
     const target = signal_target orelse return;
+    _ = target.waking.fetchAdd(1, .acquire);
+    defer _ = target.waking.fetchSub(1, .release);
     target.shutdown.store(true, .release);
     // write(2) is async-signal-safe.
     for (target.wakers) |w| w.wake();
@@ -143,6 +148,8 @@ pub fn Server(comptime Handler: type) type {
         backend: Backend,
         wakers: []sys.Waker,
         shutdown_flag: std.atomic.Value(bool),
+        /// See SignalTarget.waking.
+        waking: std.atomic.Value(u32),
         signal_target: SignalTarget,
         cfg: Config,
         port: u16,
@@ -178,6 +185,7 @@ pub fn Server(comptime Handler: type) type {
                 .backend = backend,
                 .wakers = try allocator.alloc(sys.Waker, worker_count),
                 .shutdown_flag = .init(false),
+                .waking = .init(0),
                 .signal_target = undefined,
                 .cfg = cfg,
                 .port = port,
@@ -264,7 +272,7 @@ pub fn Server(comptime Handler: type) type {
                 initialised += 1;
                 srv.wakers[i] = w.waker();
             }
-            srv.signal_target = .{ .shutdown = &srv.shutdown_flag, .wakers = srv.wakers };
+            srv.signal_target = .{ .shutdown = &srv.shutdown_flag, .wakers = srv.wakers, .waking = &srv.waking };
             return srv;
         }
 
@@ -302,11 +310,16 @@ pub fn Server(comptime Handler: type) type {
             }
             for (self.workers) |*w| w.join();
             if (self.cfg.handle_signals) signal_target = null;
+            // Workers may exit as soon as the flag is set, while shutdown()
+            // is still waking the others: wait for it to finish.
+            while (self.waking.load(.acquire) != 0) std.Thread.yield() catch {};
             self.destroy();
         }
 
         /// Thread-safe. Workers stop promptly; start() then returns.
         pub fn shutdown(self: *Self) void {
+            _ = self.waking.fetchAdd(1, .acquire);
+            defer _ = self.waking.fetchSub(1, .release);
             self.shutdown_flag.store(true, .release);
             for (self.workers) |*w| w.wake();
         }
