@@ -474,7 +474,11 @@ which RFC 9113 deprecated).
       has no ALPN, so TLS+h2 is covered by interop rather than Zig tests)
 - [ ] Priorities: RFC 9218 `priority` header is not parsed (ignored like the rest)
 - [ ] WebSockets over h2 (RFC 8441 extended CONNECT)
-- [ ] Verification: h2spec, fuzzing, split-invariance property tests
+- [x] Verification: h2spec (all 146 cases): 146/146 over TLS, 145/146 over h2c,
+      where the one failure (3.5/2, an invalid connection preface) is the
+      cleartext port answering it as an HTTP/1.1 request (501, then close) rather
+      than closing silently, inherent to serving both on one port. Split
+      invariance and fuzz targets per layer (see above)
 - [ ] Benchmark against h2o and nginx (h2load)
 
 ## M6. HTTP/3 and QUIC ⬜

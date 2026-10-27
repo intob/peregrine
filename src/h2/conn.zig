@@ -166,8 +166,11 @@ const State = enum(u8) {
     open,
 };
 
-/// A recently closed stream, to tell "closed" from "idle" (§5.1).
-const Closed = struct { id: u31 = 0, we_reset: bool = false };
+/// A recently closed stream, to tell "closed" from "idle" (§5.1), and
+/// how it closed: frames after END_STREAM are a connection error, after
+/// the peer's RST_STREAM a stream error, after our RST_STREAM ignored.
+const Closed = struct { id: u31 = 0, how: How = .ended };
+const How = enum(u8) { ended, peer_reset, we_reset };
 
 pub const Conn = struct {
     const Self = @This();
@@ -390,9 +393,8 @@ pub const Conn = struct {
         return null;
     }
 
-    /// Ends a stream. `we_reset` means we sent RST_STREAM (frames that
-    /// follow are ignored rather than errors).
-    fn closeStream(self: *Self, ctx: anytype, s: *Stream, we_reset: bool, abort_exchange: bool) void {
+    /// Ends a stream, remembering how (see Closed).
+    fn closeStream(self: *Self, ctx: anytype, s: *Stream, how: How, abort_exchange: bool) void {
         if (s.exchange != NIL) {
             self.output_streams -= 1;
             if (abort_exchange) self.abortExchange(ctx, s.exchange);
@@ -405,7 +407,7 @@ pub const Conn = struct {
             self.hb_stream = 0;
             self.hb_slot = NIL;
         }
-        self.closed_ring[self.closed_pos] = .{ .id = s.id, .we_reset = we_reset };
+        self.closed_ring[self.closed_pos] = .{ .id = s.id, .how = how };
         self.closed_pos = (self.closed_pos + 1) % self.closed_ring.len;
         s.active = false;
         s.clear();
@@ -425,7 +427,7 @@ pub const Conn = struct {
     /// Resets a stream and closes it.
     fn resetStream(self: *Self, ctx: anytype, s: *Stream, code: ErrorCode) void {
         self.writeRst(s.id, code);
-        self.closeStream(ctx, s, true, true);
+        self.closeStream(ctx, s, .we_reset, true);
     }
 
     /// The worker is closing the connection: tell handlers about live
@@ -515,7 +517,7 @@ pub const Conn = struct {
                 self.resets += 1;
                 if (self.resets > self.opts.max_resets_per_second) return self.fail(.enhance_your_calm);
                 if (r.stream_id > self.last_stream_id or r.stream_id % 2 == 0) return self.fail(.protocol_error);
-                if (self.findStream(r.stream_id)) |s| self.closeStream(ctx, s, false, true);
+                if (self.findStream(r.stream_id)) |s| self.closeStream(ctx, s, .peer_reset, true);
             },
             .settings => |s| self.onSettings(Handler, ctx, s),
             .ping => |p| {
@@ -589,10 +591,11 @@ pub const Conn = struct {
         self.consumeConnection(d.flow_len);
         const s = self.findStream(d.stream_id) orelse {
             if (d.stream_id > self.last_stream_id or d.stream_id % 2 == 0) return self.fail(.protocol_error);
-            if (self.recentlyClosed(d.stream_id)) |c| {
-                if (c.we_reset) return; // §5.1: ignore for a while after our RST
-                return self.writeRst(d.stream_id, .stream_closed);
-            }
+            if (self.recentlyClosed(d.stream_id)) |c| switch (c.how) {
+                .we_reset => return, // §5.1: ignored for a while after our RST
+                .peer_reset => return self.writeRst(d.stream_id, .stream_closed),
+                .ended => return self.fail(.stream_closed),
+            };
             return self.fail(.stream_closed);
         };
         if (s.state != .open) return self.resetStream(ctx, s, .stream_closed);
@@ -667,7 +670,11 @@ pub const Conn = struct {
                 self.hb_trailers = true;
                 self.hb_slot = @intCast((@intFromPtr(s) - @intFromPtr(self.streams.ptr)) / @sizeOf(Stream));
             }
-        } else if (self.recentlyClosed(h.stream_id) != null) {
+        } else if (self.recentlyClosed(h.stream_id)) |c| {
+            // After END_STREAM both ways the client knows the stream is
+            // closed: a connection error (§5.1). After a reset, a stream
+            // error (the block is still decoded, to keep HPACK in sync).
+            if (c.how == .ended) return self.fail(.stream_closed);
             self.hb_discard = .stream_closed;
             self.hb_slot = NIL;
         } else {
@@ -706,7 +713,7 @@ pub const Conn = struct {
                 else => return self.fail(.compression_error),
             };
             if (code == .refused_stream and self.recentlyClosed(stream_id) == null and self.findStream(stream_id) == null) {
-                self.closed_ring[self.closed_pos] = .{ .id = stream_id, .we_reset = true };
+                self.closed_ring[self.closed_pos] = .{ .id = stream_id, .how = .we_reset };
                 self.closed_pos = (self.closed_pos + 1) % self.closed_ring.len;
             }
             return self.writeRst(stream_id, code);
@@ -848,7 +855,7 @@ pub const Conn = struct {
     /// the client is still sending (§8.1).
     fn finishStream(self: *Self, ctx: anytype, s: *Stream) void {
         if (s.state == .open) return self.resetStream(ctx, s, .no_error);
-        self.closeStream(ctx, s, false, false);
+        self.closeStream(ctx, s, .ended, false);
     }
 
     /// Writes a HEADERS frame (with CONTINUATIONs if the block is larger
@@ -1832,22 +1839,34 @@ test "stream states: idle, closed, decreasing ids, even ids, concurrency limit" 
     try h.headers(.{ .stream = 7, .fields = &post });
     try h.expectEvents("headers 7 end=true [:status=200] [content-type=text/plain] [content-length=0] [date]\n");
     try h.expectLog("POST /echo [x-indexed=value that goes into the dynamic table]\nPOST /echo [x-indexed=value that goes into the dynamic table]\nPOST /echo [x-indexed=value that goes into the dynamic table]\n");
-    // DATA and HEADERS on closed streams (we finished them): STREAM_CLOSED.
-    try h.data(1, "x", false);
-    try h.expectEvents("rst 1 stream_closed\n");
-    try h.get(3, "/");
-    try h.expectEvents("rst 3 stream_closed\n");
     // After our RST (refused stream 5), its DATA is ignored.
     try h.data(5, "x", false);
     try h.expectEvents("");
-    // A stream id below the highest, never seen: a connection error.
-    try h.get(9, "/");
+    // A stream the peer reset: DATA and HEADERS on it are stream errors.
+    try h.headers(.{ .stream = 9, .end_stream = false, .fields = &post });
+    try h.rst(9, .cancel);
+    try h.data(9, "x", false);
+    try h.expectEvents("rst 9 stream_closed\n");
+    try h.get(9, "/again");
+    try h.expectEvents("rst 9 stream_closed\n");
+    // DATA on an idle stream: a connection error.
+    try h.get(11, "/");
     h.events.clearRetainingCapacity();
-    try h.get(7, "/again"); // 7 is in the closed ring: stream error
-    try h.expectEvents("rst 7 stream_closed\n");
-    try h.feed(&[_]u8{ 0, 0, 1, 0, 0, 0, 0, 0, 13, 'x' }); // DATA on an idle stream 13
-    try h.expectEvents("goaway last=9 protocol_error\n");
+    try h.feed(&[_]u8{ 0, 0, 1, 0, 0, 0, 0, 0, 13, 'x' });
+    try h.expectEvents("goaway last=11 protocol_error\n");
     try testing.expectEqual(Action.close, h.last);
+    // Frames on a stream that ended normally (END_STREAM both ways): a
+    // connection error (§5.1), as h2spec 5.1/12 checks.
+    for ([_]bool{ false, true }) |use_headers| {
+        const hh = try Harness.init(.{});
+        defer hh.deinit();
+        try hh.preface();
+        try hh.get(1, "/");
+        hh.events.clearRetainingCapacity();
+        if (use_headers) try hh.get(1, "/again") else try hh.data(1, "x", false);
+        try hh.expectEvents("goaway last=1 stream_closed\n");
+        try testing.expectEqual(Action.close, hh.last);
+    }
     // Even stream id, in a fresh connection.
     const h2 = try Harness.init(.{});
     defer h2.deinit();
