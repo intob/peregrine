@@ -56,7 +56,7 @@ Design rules that apply to every layer:
 | M3. WebSockets over HTTP/1.1 | ✅ reworked; permessage-deflate, Autobahn, benchmarks open |
 | M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; faster handshakes, resumption and kTLS are listed under "Later in M4" |
 | M5. HTTP/2 | ✅ h2 over TLS (ALPN) and h2c on every backend, h2spec 146/146 over TLS, fuzzed, benchmarked; WebSockets over h2 and request-body streaming open |
-| M6. HTTP/3 and QUIC | ⬜ |
+| M6. HTTP/3 and QUIC | 🟡 HTTP/3 over QUIC v1 on every backend, interop-tested (aioquic, curl/ngtcp2, h2load), benchmarked against nginx and Caddy; migration, 0-RTT, pacing, ECN, PMTUD open |
 | M7. Verification and benchmarking | 🟡 ongoing for each milestone |
 
 Source layout:
@@ -499,23 +499,78 @@ which RFC 9113 deprecated).
       To do: h2o, a quiet machine, latency percentiles, and `-Dcpu` for x86_64
 - [ ] Benchmark against h2o
 
-## M6. HTTP/3 and QUIC ⬜
+## M6. HTTP/3 and QUIC 🟡
 
-- [ ] UDP workers: socket per worker with `SO_REUSEPORT`; connection IDs encode the
-      worker, and packets that land on the wrong worker are forwarded
-- [ ] QUIC transport (RFC 9000): packet parsing, connection IDs, streams, flow
-      control, connection close, stateless reset, version negotiation, Retry
-      (address validation under load)
-- [ ] QUIC-TLS (RFC 9001): drive `tls/handshake.zig` over CRYPTO frames; packet and
-      header protection keys from the same key schedule
-- [ ] Loss detection and congestion control (RFC 9002): NewReno first, then CUBIC;
-      pacing
-- [ ] UDP batching: GSO/GRO, `sendmmsg`/`recvmmsg`, io_uring
-- [ ] HTTP/3 (RFC 9114) and QPACK (RFC 9204)
-- [ ] `Alt-Svc` advertisement from h1/h2
-- [ ] WebSockets over h3 (RFC 9220)
-- [ ] Verification: quic-interop-runner, fuzzing
-- [ ] Benchmark against h2o, nginx and quiche-based servers
+Done on the `m6-h3` branch, as I/O-free layers like the rest:
+
+| File | Role |
+|---|---|
+| `src/quic/packet.zig` | Varints, long and short headers, packet numbers, Version Negotiation |
+| `src/quic/protection.zig` | Initial secrets, packet and header protection from TLS secrets, key updates, Retry integrity tags |
+| `src/quic/frame.zig` | Every QUIC frame, with the RFC's encoding errors and per-packet-type rules |
+| `src/quic/transport_params.zig` | Client parameters checked, ours encoded |
+| `src/quic/recovery.zig`, `sent.zig`, `ranges.zig`, `stream.zig` | RTT, loss and probe timeouts, CUBIC/NewReno; sent packets with frame records; reassembly, flow control and retransmission bookkeeping |
+| `src/quic/conn.zig` | One server connection: packet number spaces, TLS over CRYPTO, ACKs, loss recovery, streams, key updates, closing |
+| `src/quic/endpoint.zig`, `udp.zig` | A worker's UDP socket and connections: routing by connection ID, timers, VN, stateless reset, Retry, recvmmsg, GSO, BPF steering |
+| `src/h3/qpack.zig`, `frame.zig`, `conn.zig` | QPACK (static table), HTTP/3 frames and SETTINGS, HTTP/3 over a QUIC connection through the handler API |
+| `src/http/fields.zig` | Request field validation shared by HTTP/2 and HTTP/3 |
+
+- [x] UDP workers: a socket per worker with `SO_REUSEPORT` and a classic BPF
+      program on the group that picks the socket from the first byte of the
+      Destination Connection ID; our 8-byte connection IDs start with the
+      owning worker's index, so nothing crosses threads (Linux; macOS serves
+      HTTP/3 from the first worker). epoll, kqueue and io_uring (multishot
+      poll on the socket, a timeout SQE for the next QUIC timer)
+- [x] QUIC transport (RFC 9000): headers, coalesced packets, every frame,
+      transport parameters, stream states, flow control with credit at half a
+      window, MAX_STREAMS as streams close, CONNECTION_CLOSE with closing and
+      draining, idle timeout, stateless reset, Version Negotiation, Retry with
+      an AEAD-sealed address-bound token (`Http3Options.retry`), the
+      anti-amplification limit, PATH_CHALLENGE answered
+- [x] QUIC-TLS (RFC 9001): the TLS handshake in QUIC mode (transport
+      parameters both ways, ALPN required, no middlebox compatibility),
+      packet and header protection with the fused AES-GCM, key updates both
+      ways (ours after 2^22 packets). Every Appendix A vector is a test
+- [x] Loss detection and congestion control (RFC 9002): packet and time
+      thresholds, probe timeouts with backoff, persistent congestion, CUBIC
+      (RFC 9438) with a NewReno option
+- [ ] Pacing, ECN, PMTU discovery (DPLPMTUD); `max_datagram_size` is 1350
+- [x] UDP batching: recvmmsg, GSO (datagrams nearly full are padded to the
+      segment size so runs go out in one sendmsg). GRO still to do
+- [x] HTTP/3 (RFC 9114) and QPACK (RFC 9204, static table, capacity 0):
+      control and QPACK stream rules, frame sequencing, malformed and
+      incomplete requests, 413/431/501 before the rest of the request with
+      STOP_SENDING, later()/stream() exchanges with trailers, GOAWAY with a
+      graceful close once responses are acknowledged
+- [x] `Alt-Svc` on every HTTP/1.1, HTTP/2 and HTTP/3 response (preset
+      header lines, no per-request cost)
+- [ ] Connection migration: NEW_CONNECTION_ID, path validation (we
+      advertise `disable_active_migration`; NAT rebinding is followed
+      without validation)
+- [ ] 0-RTT (needs TLS session tickets, M4)
+- [ ] WebSockets over h3 (RFC 9220), DATAGRAM (RFC 9221)
+- [ ] QPACK dynamic table (better request header compression)
+- [x] Verification: RFC 9001 vectors; in-memory tests of both layers with a
+      QUIC test client written for them (handshake, 40-60 concurrent
+      requests, 3 MB transfers both ways through flow control, 15% loss,
+      key update, every transport and HTTP/3 error); end to end over UDP on
+      every backend; interop with aioquic 1.3, curl 8.23 (ngtcp2 1.25 +
+      OpenSSL 3.5) and h2load (nghttp2 1.70); `fuzz: h3 connection`
+- [ ] quic-interop-runner, h3spec
+- [x] Benchmark against nginx 1.29 (`http3 on`, `quic_gso on`) and Caddy 2.11
+
+HTTP/3 benchmark (Docker on the M2 Pro, Linux 6.12; each server with 6
+workers on CPUs 0-5, `h2load --alpn-list=h3 -t6` on CPUs 6-11, 10 s runs, two
+rounds; host load 5-14, so ±15%). CPU/req is server CPU time per request.
+
+| | peregrine req/s | CPU/req | nginx req/s | CPU/req | Caddy req/s | CPU/req |
+|---|---|---|---|---|---|---|
+| "Hello", 10 conns × 100 streams | 316k-321k | 1.9-2.1 µs | 221k-227k | 4.8-4.9 µs | 160k-179k | 31-33 µs |
+| 64 KiB, 10 × 10 | 77k-78k (4.7 GB/s) | 40 µs | 11k-12k | 149-155 µs | 6.5k-6.7k | 387-403 µs |
+| "Hello", 256 conns × 1 stream | 44k-130k | 16-20 µs | 74k-113k | 27-34 µs | 85k-95k | 62-68 µs |
+
+At 256 × 1, h2load is the limit (it waits about 1.4 ms between requests on a
+connection, for every server), so compare CPU/req there.
 
 ---
 

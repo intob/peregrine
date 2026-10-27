@@ -6,7 +6,7 @@ Priorities, in order:
 - Performance
 - Simplicity
 
-Where it is today: HTTP/1.1, HTTP/2, WebSockets and TLS 1.3 work on every backend. Next is HTTP/3 over QUIC. See [PLAN.md](PLAN.md) for the roadmap and the architecture: every protocol layer is an I/O-free state machine driven by per-core event loops, so the layers stack (TCP → TLS → HTTP/1.1 or HTTP/2; UDP → QUIC → HTTP/3) and the same code runs on every backend.
+Where it is today: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSockets and TLS 1.3 work on every backend. See [PLAN.md](PLAN.md) for the roadmap and the architecture: every protocol layer is an I/O-free state machine driven by per-core event loops, so the layers stack (TCP → TLS → HTTP/1.1 or HTTP/2; UDP → QUIC → HTTP/3) and the same code runs on every backend.
 
 Currently, all heap allocations are made during startup. Internally, no heap allocations are made per-request unless pre-allocated buffers overflow (for example, a request body larger than a pooled read buffer, or a response that can't be written in one go).
 
@@ -25,7 +25,12 @@ Note: This project has just started, and is not yet a complete HTTP server imple
     - HPACK, flow control, up to 128 concurrent streams per connection, graceful GOAWAY
     - The same handler serves HTTP/1.1 and HTTP/2; h2spec passes (146/146 over TLS)
     - Defences against rapid reset, CONTINUATION floods, HPACK bombs, control-frame floods and zero-window stalls
-- Streaming and deferred responses: `resp.stream()` writes a body over time (chunked on HTTP/1.1, DATA frames on HTTP/2), `resp.later()` answers from any thread
+- Support for HTTP/3 (RFC 9114) over QUIC version 1 (RFC 9000, 9001, 9002), written from scratch
+    - The same handler serves HTTP/1.1, HTTP/2 and HTTP/3, from the same worker threads
+    - CUBIC congestion control, key updates, Retry, stateless reset, GSO batching, per-worker UDP sockets steered by connection ID
+    - `Alt-Svc` is added to every response so browsers find HTTP/3
+    - Interop-tested with aioquic, curl (ngtcp2) and h2load
+- Streaming and deferred responses: `resp.stream()` writes a body over time (chunked on HTTP/1.1, DATA frames on HTTP/2 and HTTP/3), `resp.later()` answers from any thread
 - Support for WebSockets
 - TLS 1.3, written from scratch on top of `std.crypto` (no OpenSSL)
     - X25519MLKEM768 (post-quantum hybrid), X25519 and P-256 key exchange, HelloRetryRequest
@@ -49,6 +54,13 @@ Plaintext "Hello, World!" on Linux (Docker on an M2 Pro: kernel 6.12, aarch64). 
 |--------|-------|-----|-----|
 | Keep-alive | 767k–944k | 956k–1.09M | 995k–1.07M |
 | Pipelined ×16 | 1.24M–1.47M | 8.2M–9.4M | 8.5M–8.8M |
+
+HTTP/3 against nginx 1.29 and Caddy 2.11, same setup, `h2load --alpn-list=h3 -t6` on the other 6 cores. CPU/req is the server's CPU time per request; at "-c10 -m100" h2load is the limit for peregrine.
+
+| HTTP/3 | Peregrine | NGINX | Caddy |
+|--------|-----------|-------|-------|
+| "Hello", 10 connections × 100 streams | 316k–321k req/s, 1.9–2.1 µs/req | 221k–227k, 4.8–4.9 µs/req | 160k–179k, 31–33 µs/req |
+| 64 KiB, 10 × 10 | 77k–78k req/s (4.7 GB/s), 40 µs/req | 11k–12k, 149–155 µs/req | 6.5k–6.7k, 387–403 µs/req |
 
 Reproduce: `zig build bench-server -Dtarget=aarch64-linux` (the server takes `[workers] [auto|epoll|io_uring] [port]`), and `zig build bench` for parser micro-benchmarks (about 190 ns to parse a 437-byte browser request with 8 headers).
 
@@ -154,6 +166,15 @@ const srv = try per.Server(Handler).init(gpa, 443, .{
 });
 ```
 Handlers need no changes: a request on an HTTP/2 stream arrives as the same `Request`, with `host` taken from `:authority`.
+
+### Serve HTTP/3
+Set `http3` alongside `tls`: each worker then also serves HTTP/3 on a UDP socket (the TLS port by default), with the same certificate and handler, and every response carries `Alt-Svc: h3=":443"` so browsers switch over.
+```zig
+const srv = try per.Server(Handler).init(gpa, 443, .{
+    .tls = .{ .cert_pem = cert_pem, .key_pem = key_pem, .alpn = &.{ "h2", "http/1.1" } },
+    .http3 = .{}, // .retry = true validates client addresses first
+});
+```
 
 ### Stream or defer a response
 `resp.stream()` sends the status and headers now and returns an `Exchange` for the body; `resp.later()` sends nothing until `ex.respond` or `ex.startStream`, from any thread. Handles are values that stay safe after the exchange ends (calls return `error.Closed`).
@@ -322,7 +343,7 @@ See [PLAN.md](PLAN.md) for the full checklist. In order:
 
 1. TLS 1.3 follow-ups: io_uring support, fuzzing, faster handshakes, RSA certificates, resumption, kTLS on Linux
 2. HTTP/2: HPACK, flow control, RFC 9218 priorities, WebSockets over h2 (RFC 8441), with a handler API that supports streaming responses
-3. HTTP/3 over QUIC: QUIC transport, loss recovery and congestion control, QPACK, GSO/GRO, WebSockets over h3 (RFC 9220)
+3. HTTP/3 follow-ups: connection migration, 0-RTT, pacing, ECN, PMTU discovery, GRO, the QPACK dynamic table, WebSockets over h3 (RFC 9220)
 4. Throughout: `sendfile`, tuning io_uring until it beats epoll, WebSocket `permessage-deflate`, and verification with Autobahn, h2spec, quic-interop-runner, soak, adversarial and differential (HTTP Garden) testing
 5. API reference
 
