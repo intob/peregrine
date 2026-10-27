@@ -51,11 +51,11 @@ Design rules that apply to every layer:
 
 | Milestone | State |
 |---|---|
-| M1. HTTP/1.1 core | ✅ done (streaming responses deferred to the API redesign in M5) |
+| M1. HTTP/1.1 core | ✅ done (streaming responses landed with the M5 handler API) |
 | M2. Throughput architecture | 🟡 io_uring works (opt-in, not yet faster than epoll); sendfile, NUMA open |
 | M3. WebSockets over HTTP/1.1 | ✅ reworked; permessage-deflate, Autobahn, benchmarks open |
 | M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; faster handshakes, resumption and kTLS are listed under "Later in M4" |
-| M5. HTTP/2 | ⬜ next after TLS |
+| M5. HTTP/2 | 🟡 HPACK, framing and the handler API (steps 1-2) done; connection layer next |
 | M6. HTTP/3 and QUIC | ⬜ |
 | M7. Verification and benchmarking | 🟡 ongoing for each milestone |
 
@@ -70,6 +70,10 @@ Source layout:
 | `src/http/worker.zig` | epoll/kqueue event loop: accept, read, process, write, timeouts |
 | `src/http/worker_uring.zig` | io_uring event loop (Linux, opt-in) |
 | `src/http/date.zig` | Cached IMF-fixdate `Date` header |
+| `src/http/exchange.zig` | `Exchange`: a request answered or streamed after `handleRequest` returns (per-worker slab, value handles, HTTP/1.1 framing) |
+| `src/mailbox.zig` | How other threads tell a worker that a WebSocket or an exchange has output |
+| `src/h2/hpack.zig` | HPACK (RFC 7541): tables, Huffman coding, strict limits |
+| `src/h2/frame.zig` | HTTP/2 framing (RFC 9113): I/O-free parser and serialiser |
 | `src/ws/protocol.zig` | I/O-free WebSocket frame decoder and message assembler |
 | `src/ws/conn.zig` | Per-connection WebSocket state: send queue, close handshake, cross-thread mailbox |
 | `src/ws/upgrader.zig` | The HTTP upgrade response |
@@ -111,9 +115,8 @@ Done on the `http-core` branch (Zig 0.16 → 0.17 port, then a rewrite of the ho
   (no syscall per connection, request deadline not extended by reads, so slowloris
   is bounded); lingering close after error responses; response header CR/LF injection
   rejected.
-- **Deferred:** chunked/streaming responses. The handler API is synchronous
-  (`handleRequest` fills a Response and returns). This becomes part of the handler API
-  redesign in M5, because HTTP/2 and HTTP/3 need streaming and multiplexing anyway.
+- **Deferred, then done in M5:** chunked/streaming responses, through
+  `resp.stream()` and `resp.later()` (see M5).
 
 Proof: a session property test feeds 16 mixed pipelined requests byte by byte and in
 199 random splits and checks the output is byte-identical (it caught a real bug); an
@@ -397,11 +400,23 @@ Later in M4:
 Prerequisite: TLS with ALPN (M4). Also `h2c` with prior knowledge (no `Upgrade: h2c`,
 which RFC 9113 deprecated).
 
-- [ ] **Handler API redesign**, shared by HTTP/1.1, h2 and h3: streaming responses
-      (and chunked HTTP/1.1 responses, deferred from M1), streaming request bodies,
-      trailers, and a handler that can respond later (needed for multiplexing). Keep
-      the synchronous fast path for the simple case. Proposal (not yet agreed):
-      `docs/handler-api-proposal.md`
+- [x] **Handler API, steps 1 and 2** of `docs/handler-api-proposal.md`, on HTTP/1.1
+      (`src/http/exchange.zig`, `src/mailbox.zig`): `resp.later()` and
+      `resp.stream()` turn a request into an `Exchange`, a value handle
+      `{slab, slot, generation}` into a per-worker slab; `ex.respond`,
+      `ex.startStream`, `ex.write`, `ex.writeBorrowed` (released on the worker
+      thread once written), `ex.finish(trailers)`, `ex.abort`, `ex.setTimeout` work
+      from any thread through the worker's mailbox, now keyed by (kind, slot,
+      generation) for WebSockets and exchanges alike. HTTP/1.1 framing (chunked with
+      trailers, Content-Length, close-delimited for HTTP/1.0, nothing for HEAD) is
+      written by the worker as the queue drains, one chunk per drain. Bounded queue
+      with `handleWritable`; `handleAbort` when the client leaves or the exchange
+      times out (`response_timeout_s` for `later()`, `request_timeout_s` between
+      writes). Pipelining rule: parsing pauses while an exchange is pending. The
+      synchronous path is unchanged: one branch on `resp.mode`, measured within
+      noise (`zig build bench`, keep-alive and pipelined wrk)
+- [ ] Handler API step 3 (`handleHead`, streamed request bodies, request trailers):
+      after h2
 - [x] Frame layer (RFC 9113), `src/h2/frame.zig`: I/O-free `Reader` with the
       `Session` buffer discipline (pooled, held only while bytes are unprocessed,
       grown for a frame larger than a pool buffer), a parser for every frame type

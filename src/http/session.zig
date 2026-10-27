@@ -58,12 +58,16 @@ pub const BufferPool = struct {
     }
 };
 
-/// Serialised output waiting to be written: `buf[0..len]` then `body`.
+/// Serialised output waiting to be written: `buf[0..len]`, then `body`,
+/// then `tail`.
 pub const Out = struct {
     buf: []u8,
     len: usize = 0,
     /// An uncopied response body sent after buf[0..len].
     body: []const u8 = "",
+    /// Sent after the body: the CRLF that ends a chunk of a streamed
+    /// response whose bytes are borrowed.
+    tail: []const u8 = "",
 
     pub inline fn isEmpty(self: *const Out) bool {
         return self.len == 0 and self.body.len == 0;
@@ -72,13 +76,14 @@ pub const Out = struct {
     pub inline fn clear(self: *Out) void {
         self.len = 0;
         self.body = "";
+        self.tail = "";
     }
 
     pub inline fn totalLen(self: *const Out) usize {
-        return self.len + self.body.len;
+        return self.len + self.body.len + self.tail.len;
     }
 
-    pub fn iovecs(self: *const Out, iov: *[2]iovec_const) []iovec_const {
+    pub fn iovecs(self: *const Out, iov: *[3]iovec_const) []iovec_const {
         var n: usize = 0;
         if (self.len > 0) {
             iov[n] = .{ .base = self.buf.ptr, .len = self.len };
@@ -88,14 +93,18 @@ pub const Out = struct {
             iov[n] = .{ .base = self.body.ptr, .len = self.body.len };
             n += 1;
         }
+        if (self.tail.len > 0) {
+            iov[n] = .{ .base = self.tail.ptr, .len = self.tail.len };
+            n += 1;
+        }
         return iov[0..n];
     }
 
-    inline fn free(self: *const Out) usize {
+    pub inline fn free(self: *const Out) usize {
         return self.buf.len - self.len;
     }
 
-    inline fn append(self: *Out, bytes: []const u8) void {
+    pub inline fn append(self: *Out, bytes: []const u8) void {
         @memcpy(self.buf[self.len..][0..bytes.len], bytes);
         self.len += bytes.len;
     }
@@ -111,6 +120,10 @@ pub const Action = enum {
     /// Flush Out, then hand the connection and any remaining buffered
     /// bytes to the WebSocket side.
     upgrade,
+    /// Flush Out; the response (or the rest of it) comes through the
+    /// exchange the handler took (`resp.exchange`). Don't call process
+    /// again until it ends: responses go out in request order.
+    wait,
 };
 
 pub const Options = struct {
@@ -136,6 +149,13 @@ pub const Session = struct {
     /// The event loop should drain input before closing (lingering close),
     /// or the kernel may reset the connection and destroy the response.
     linger: bool = false,
+    /// An exchange is pending on this connection: parsing is paused.
+    waiting: bool = false,
+    /// What the pending exchange's response needs to know about its
+    /// request, for the worker to bind.
+    wait_keep_alive: bool = true,
+    wait_is_head: bool = false,
+    wait_http10: bool = false,
 
     pub inline fn buffered(self: *const Self) usize {
         return self.end - self.start;
@@ -230,6 +250,7 @@ pub fn headRoom(resp: *const Response) usize {
 
 pub fn process(comptime Handler: type, s: *Session, ctx: *const Context(Handler), out: *Out) Action {
     const opts = ctx.opts;
+    if (s.waiting) return .wait;
     while (true) {
         // A borrowed body must be written before the response is reused,
         // and Out must have room for the largest possible response head.
@@ -281,10 +302,22 @@ pub fn process(comptime Handler: type, s: *Session, ctx: *const Context(Handler)
         ctx.handler.handleRequest(ctx.req, ctx.resp);
 
         s.requests +|= 1;
-        const keep_alive = ctx.req.keep_alive and !ctx.resp.close and
+        var keep_alive = ctx.req.keep_alive and !ctx.resp.close and
             (opts.max_requests_per_connection == 0 or s.requests < opts.max_requests_per_connection);
         s.start += total;
         s.resetRequestState();
+        if (ctx.resp.mode != .sync) {
+            // The response comes through the exchange. A streamed body
+            // without a length to an HTTP/1.0 client is close-delimited.
+            const http10 = ctx.req.version == .@"HTTP/1.0";
+            if (ctx.resp.mode == .stream and http10 and ctx.resp.content_length == null) keep_alive = false;
+            s.waiting = true;
+            s.wait_keep_alive = keep_alive;
+            s.wait_is_head = ctx.req.method == .HEAD;
+            s.wait_http10 = http10;
+            if (ctx.resp.mode == .stream) writeStreamHead(ctx.req, ctx.resp, ctx.date, out, keep_alive);
+            return .wait;
+        }
         const more = s.start < s.end;
         writeResponse(ctx.req, ctx.resp, ctx.date, out, keep_alive, more);
         if (ctx.resp.is_ws_upgrade) {
@@ -328,6 +361,37 @@ fn errorResponse(s: *Session, ctx: anytype, out: *Out, err: parser.ParseError) A
     s.start = s.end;
     s.linger = true;
     return .close;
+}
+
+/// The head of a `resp.stream()` response: chunked unless the handler set
+/// a Content-Length (or the client is HTTP/1.0, which gets no framing).
+fn writeStreamHead(
+    req: *const Request,
+    resp: *Response,
+    date_line: *const [date.header_len]u8,
+    out: *Out,
+    keep_alive: bool,
+) void {
+    out.append("HTTP/1.1 ");
+    out.append(resp.status.toString());
+    out.append("\r\n");
+    out.append(resp.headerBytes());
+    if (resp.status.allowsContentLength()) {
+        if (resp.content_length) |n| {
+            out.append("content-length: ");
+            out.len += std.fmt.printInt(out.buf[out.len..], n, 10, .lower, .{});
+            out.append("\r\n");
+        } else if (req.version != .@"HTTP/1.0") {
+            out.append("transfer-encoding: chunked\r\n");
+        }
+    }
+    out.append(date_line);
+    if (!keep_alive) {
+        out.append("connection: close\r\n");
+    } else if (req.version == .@"HTTP/1.0") {
+        out.append("connection: keep-alive\r\n");
+    }
+    out.append("\r\n");
 }
 
 fn writeResponse(
@@ -468,6 +532,7 @@ const Harness = struct {
                     h.closed = true;
                     break;
                 },
+                .wait => break,
             }
         }
         h.session.releaseIfIdle(&h.pool);

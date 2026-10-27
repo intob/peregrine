@@ -77,6 +77,16 @@ pub const Config = struct {
     /// SendQueueFull. A connection whose peer stops reading is closed after
     /// `request_timeout_s` without write progress.
     websocket_max_send_queue_bytes: usize = 4 * 1024 * 1024,
+    /// Requests a worker may hold open at once through `resp.later()` or
+    /// `resp.stream()`; beyond this they fail with TooManyExchanges.
+    max_exchanges_per_worker: u32 = 1024,
+    /// Unsent bytes per exchange before `ex.write` fails with WouldBlock
+    /// (handleWritable is called once it drains).
+    max_exchange_queue_bytes: usize = 4 * 1024 * 1024,
+    /// Seconds a `resp.later()` exchange may wait for its response before
+    /// the connection is closed (`ex.setTimeout` overrides it). A stream
+    /// gets `request_timeout_s` between writes.
+    response_timeout_s: u32 = 30,
     /// Install SIGINT/SIGTERM handlers that shut the server down.
     handle_signals: bool = true,
     /// Serve TLS 1.3 on this port. The PEM data is parsed during init and
@@ -268,6 +278,12 @@ pub fn Server(comptime Handler: type) type {
                     .websocket = .{
                         .max_message_size = cfg.websocket_max_message_size,
                         .max_send_queue_bytes = cfg.websocket_max_send_queue_bytes,
+                    },
+                    .max_exchanges = cfg.max_exchanges_per_worker,
+                    .exchange = .{
+                        .max_queue_bytes = cfg.max_exchange_queue_bytes,
+                        .response_timeout_s = cfg.response_timeout_s,
+                        .request_timeout_s = cfg.request_timeout_s,
                     },
                     .tls = if (srv.tls_credentials != null) &srv.tls_config else null,
                     .tls_buffer_pool_size = if (cfg.tls) |t| t.buffer_pool_size else 0,

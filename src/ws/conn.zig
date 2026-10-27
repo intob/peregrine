@@ -36,75 +36,7 @@ pub const SendError = error{
     OutOfMemory,
 };
 
-/// How other threads tell a worker that connections have output to write.
-/// Each worker owns one; connections post their slot number into it.
-pub const Mailbox = struct {
-    const Self = @This();
-
-    mutex: sys.Mutex = .{},
-    /// Slots with new output. Deduplicated by `Conn.posted`, so normally at
-    /// most one entry per connection and no allocation on post.
-    slots: []u32,
-    len: usize = 0,
-    /// Set if the list filled up (only possible if slots were closed and
-    /// reused with stale entries pending); the worker then flushes every
-    /// connection instead.
-    overflowed: bool = false,
-    allocator: std.mem.Allocator,
-    waker: sys.Waker,
-
-    /// The mailbox of the worker running on this thread, so posts from the
-    /// owning worker skip the wake-up syscall (it drains after each batch).
-    threadlocal var current: ?*Self = null;
-
-    pub fn init(allocator: std.mem.Allocator, capacity: usize, waker: sys.Waker) !Self {
-        return .{
-            .slots = try allocator.alloc(u32, capacity),
-            .allocator = allocator,
-            .waker = waker,
-        };
-    }
-
-    pub fn deinit(self: *Self) void {
-        self.allocator.free(self.slots);
-    }
-
-    /// Called by the owning worker thread once it starts.
-    pub fn bind(self: *Self) void {
-        current = self;
-    }
-
-    pub fn post(self: *Self, slot: u32) void {
-        self.mutex.lock();
-        if (self.len < self.slots.len) {
-            self.slots[self.len] = slot;
-            self.len += 1;
-        } else {
-            self.overflowed = true;
-        }
-        self.mutex.unlock();
-        if (current != self) self.waker.wake();
-    }
-
-    /// Moves posted slots into `out`, returning how many. Call until 0.
-    pub fn drain(self: *Self, out: []u32) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const n = @min(out.len, self.len);
-        @memcpy(out[0..n], self.slots[self.len - n ..][0..n]);
-        self.len -= n;
-        return n;
-    }
-
-    /// Whether posts were dropped since the last call.
-    pub fn takeOverflow(self: *Self) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const o = self.overflowed;
-        self.overflowed = false;
-        return o;
-    }
-};
+pub const Mailbox = @import("../mailbox.zig").Mailbox;
 
 pub const Conn = struct {
     const Self = @This();
@@ -119,6 +51,7 @@ pub const Conn = struct {
     decoder: protocol.Decoder,
     mailbox: *Mailbox,
     slot: u32,
+    gen: u32,
 
     mutex: sys.Mutex = .{},
     /// Frames queued by send() from any thread. Guarded by `mutex`.
@@ -139,7 +72,7 @@ pub const Conn = struct {
     /// Worker only: the connection was failed (protocol error, limit).
     failed: bool = false,
 
-    pub fn create(allocator: std.mem.Allocator, fd: sys.fd_t, opts: Options, mailbox: *Mailbox, slot: u32) !*Self {
+    pub fn create(allocator: std.mem.Allocator, fd: sys.fd_t, opts: Options, mailbox: *Mailbox, slot: u32, gen: u32) !*Self {
         const self = try allocator.create(Self);
         self.* = .{
             .fd = fd,
@@ -148,6 +81,7 @@ pub const Conn = struct {
             .decoder = protocol.Decoder.init(allocator, opts.max_message_size),
             .mailbox = mailbox,
             .slot = slot,
+            .gen = gen,
         };
         return self;
     }
@@ -217,7 +151,7 @@ pub const Conn = struct {
             self.posted = true;
             break :blk post;
         };
-        if (post) self.mailbox.post(self.slot);
+        if (post) self.mailbox.post(.{ .kind = .ws, .slot = self.slot, .gen = @intCast(self.gen & 0x7fffffff) });
     }
 
     // -- Worker side -------------------------------------------------------
@@ -366,7 +300,7 @@ const Harness = struct {
             .conn = undefined,
         };
         h.mailbox.bind();
-        h.conn = try Conn.create(testing.allocator, 7, opts, &h.mailbox, 0);
+        h.conn = try Conn.create(testing.allocator, 7, opts, &h.mailbox, 0, 1);
         return h;
     }
 
@@ -403,8 +337,8 @@ const Harness = struct {
     }
 
     fn drainMailbox(h: *Harness) usize {
-        var slots: [4]u32 = undefined;
-        return h.mailbox.drain(&slots);
+        var entries: [4]@import("../mailbox.zig").Entry = undefined;
+        return h.mailbox.drain(&entries);
     }
 };
 

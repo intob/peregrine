@@ -2,6 +2,12 @@ pub const Header = @import("./header.zig").Header;
 pub const Method = @import("./method.zig").Method;
 pub const Request = @import("./request.zig").Request;
 pub const Response = @import("./response.zig").Response;
+/// A request answered after handleRequest returns (`resp.later()`) or
+/// streamed (`resp.stream()`). See src/http/exchange.zig.
+pub const Exchange = @import("./http/exchange.zig").Exchange;
+pub const ExchangeHead = @import("./http/exchange.zig").Head;
+pub const ExchangeError = @import("./http/exchange.zig").Error;
+pub const Release = @import("./http/exchange.zig").Release;
 pub const Server = @import("./server.zig").Server;
 pub const Config = @import("./server.zig").Config;
 pub const ServerConfig = Config;
@@ -30,6 +36,8 @@ test {
     _ = @import("./http/parser.zig");
     _ = @import("./http/session.zig");
     _ = @import("./http/date.zig");
+    _ = @import("./http/exchange.zig");
+    _ = @import("./mailbox.zig");
     _ = @import("./poller.zig");
     _ = @import("./sys.zig");
     _ = @import("./ws/protocol.zig");

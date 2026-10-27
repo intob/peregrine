@@ -8,6 +8,7 @@ const Config = @import("./server.zig").Config;
 const Backend = @import("./server.zig").Backend;
 const Request = @import("./request.zig").Request;
 const Response = @import("./response.zig").Response;
+const Exchange = @import("./http/exchange.zig").Exchange;
 const ws = @import("./ws/ws.zig");
 const testing = std.testing;
 
@@ -22,6 +23,13 @@ const TestHandler = struct {
     queue_full: std.atomic.Value(bool) = .init(false),
     /// The last close code received from a client (0 = none).
     close_code: std.atomic.Value(u16) = .init(0),
+    /// Exchange hooks and state.
+    aborts: std.atomic.Value(usize) = .init(0),
+    writable_calls: std.atomic.Value(usize) = .init(0),
+    releases: std.atomic.Value(usize) = .init(0),
+    /// A streamed flood: bytes still to send on the exchange in `flood`.
+    flood_left: usize = 0,
+    flood: ?Exchange = null,
 
     pub fn init(allocator: std.mem.Allocator) !*TestHandler {
         const h = try allocator.create(TestHandler);
@@ -82,8 +90,89 @@ const TestHandler = struct {
         }
     }
 
-    pub fn handleRequest(_: *TestHandler, req: *Request, resp: *Response) void {
+    pub fn handleWritable(self: *TestHandler, ex: Exchange) void {
+        _ = self.writable_calls.fetchAdd(1, .monotonic);
+        self.pumpFlood(ex);
+    }
+
+    pub fn handleAbort(self: *TestHandler, _: Exchange) void {
+        _ = self.aborts.fetchAdd(1, .monotonic);
+        self.flood = null;
+    }
+
+    fn release(ctx: ?*anyopaque) void {
+        const self: *TestHandler = @ptrCast(@alignCast(ctx.?));
+        _ = self.releases.fetchAdd(1, .monotonic);
+    }
+
+    /// Streams the flood until the queue is full or the body is done.
+    fn pumpFlood(self: *TestHandler, ex: Exchange) void {
+        while (self.flood_left > 0) {
+            const n = @min(self.flood_left, 64 * 1024);
+            ex.writeBorrowed(big_body[0..n], null) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => return,
+            };
+            self.flood_left -= n;
+        }
+        ex.finish(&.{}) catch {};
+        self.flood = null;
+    }
+
+    fn laterThread(self: *TestHandler, ex: Exchange, kind: u8) void {
+        sleepMs(20);
+        switch (kind) {
+            'r' => ex.respond(.{ .status = .accepted, .headers = &.{.{ .key = "x-later", .value = "1" }} }, "later-body") catch unreachable,
+            's' => {
+                ex.startStream(.{ .headers = &.{.{ .key = "x-later", .value = "stream" }} }) catch unreachable;
+                ex.write("part1,") catch unreachable;
+                ex.writeBorrowed(big_body[0..100], .{ .ctx = self, .func = release }) catch unreachable;
+                ex.write("part3") catch unreachable;
+                ex.finish(&.{.{ .key = "x-trailer", .value = "end" }}) catch unreachable;
+            },
+            else => unreachable,
+        }
+    }
+
+    pub fn handleRequest(self: *TestHandler, req: *Request, resp: *Response) void {
         const path = req.getPath();
+        if (std.mem.eql(u8, path, "/later") or std.mem.eql(u8, path, "/later-stream")) {
+            // Answered from another thread, after the handler returns.
+            const ex = resp.later() catch unreachable;
+            const t = std.Thread.spawn(.{}, laterThread, .{ self, ex, @as(u8, if (path.len == 6) 'r' else 's') }) catch unreachable;
+            t.detach();
+            return;
+        }
+        if (std.mem.eql(u8, path, "/stream")) {
+            resp.addNewHeader("x-stream", "1") catch {};
+            const ex = resp.stream() catch unreachable;
+            ex.write("hello ") catch unreachable;
+            ex.writeBorrowed(big_body[0 .. 200 * 1024], .{ .ctx = self, .func = release }) catch unreachable;
+            ex.write(" world") catch unreachable;
+            ex.finish(&.{.{ .key = "x-trailer", .value = "t" }}) catch unreachable;
+            return;
+        }
+        if (std.mem.eql(u8, path, "/stream-cl")) {
+            resp.setContentLength(11);
+            const ex = resp.stream() catch unreachable;
+            ex.write("hello world") catch unreachable;
+            ex.finish(&.{}) catch unreachable;
+            return;
+        }
+        if (std.mem.eql(u8, path, "/flood-stream")) {
+            // 64 MB through backpressure: more than the queue, the socket
+            // buffers and the client's patience in one go.
+            const ex = resp.stream() catch unreachable;
+            self.flood = ex;
+            self.flood_left = 64 * 1024 * 1024;
+            self.pumpFlood(ex);
+            return;
+        }
+        if (std.mem.eql(u8, path, "/hang")) {
+            // Never answered: the client leaves, or the timeout ends it.
+            _ = resp.later() catch unreachable;
+            return;
+        }
         if (std.mem.eql(u8, path, "/ws")) {
             ws.upgrader.handleUpgrade(undefined, req, resp) catch {
                 resp.status = .bad_request;
@@ -204,6 +293,80 @@ const Client = struct {
     fn consume(self: *Client, n: usize) void {
         std.mem.copyForwards(u8, self.buf[0 .. self.len - n], self.buf[n..self.len]);
         self.len -= n;
+    }
+
+    /// Reads a head without requiring Content-Length.
+    fn readHead(self: *Client, out_head: []u8) ![]const u8 {
+        const head_end = while (true) {
+            if (std.mem.indexOf(u8, self.buf[0..self.len], "\r\n\r\n")) |i| break i + 4;
+            if (try self.fill() == 0) return error.EndOfStream;
+        };
+        @memcpy(out_head[0..head_end], self.buf[0..head_end]);
+        self.consume(head_end);
+        return out_head[0..head_end];
+    }
+
+    fn readLine(self: *Client) ![]const u8 {
+        const end = while (true) {
+            if (std.mem.indexOf(u8, self.buf[0..self.len], "\r\n")) |i| break i;
+            if (try self.fill() == 0) return error.EndOfStream;
+        };
+        // Valid until the next consume; callers copy what they need.
+        return self.buf[0..end];
+    }
+
+    fn readExact(self: *Client, out: []u8) !void {
+        var got: usize = 0;
+        while (got < out.len) {
+            if (self.len == 0) {
+                if (try self.fill() == 0) return error.EndOfStream;
+            }
+            const take = @min(self.len, out.len - got);
+            @memcpy(out[got..][0..take], self.buf[0..take]);
+            got += take;
+            self.consume(take);
+        }
+    }
+
+    /// Decodes a chunked body into `body` (null discards), returning the
+    /// body length and the trailer lines.
+    fn readChunked(self: *Client, body: ?[]u8, trailers: []u8) !struct { body_len: usize, trailers: []const u8 } {
+        var total: usize = 0;
+        var tlen: usize = 0;
+        while (true) {
+            const line = try self.readLine();
+            const size = try std.fmt.parseInt(usize, line, 16);
+            self.consume(line.len + 2);
+            if (size == 0) break;
+            if (body) |b| {
+                try self.readExact(b[total..][0..size]);
+            } else {
+                var sink: [4096]u8 = undefined;
+                var left = size;
+                while (left > 0) {
+                    const n = @min(left, sink.len);
+                    try self.readExact(sink[0..n]);
+                    left -= n;
+                }
+            }
+            total += size;
+            var crlf: [2]u8 = undefined;
+            try self.readExact(&crlf);
+            try testing.expectEqualStrings("\r\n", &crlf);
+        }
+        while (true) {
+            const line = try self.readLine();
+            if (line.len == 0) {
+                self.consume(2);
+                break;
+            }
+            @memcpy(trailers[tlen..][0..line.len], line);
+            tlen += line.len;
+            trailers[tlen] = '\n';
+            tlen += 1;
+            self.consume(line.len + 2);
+        }
+        return .{ .body_len = total, .trailers = trailers[0..tlen] };
     }
 
     fn expectClosed(self: *Client) !void {
@@ -725,6 +888,165 @@ test "accepted sockets inherit TCP_NODELAY and O_NONBLOCK" {
     try testing.expect(try sys.getsockoptInt(fd, posix.IPPROTO.TCP, sys.TCP_NODELAY) != 0);
 }
 
+// -- Exchanges: later() and stream() ---------------------------------------
+
+test "exchange: later() answered from another thread, pipelined requests wait" {
+    try forEachBackend(testLater);
+}
+
+fn testLater(backend: Backend) !void {
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    const r = try Running.start(backend, .{ .worker_thread_count = 1 });
+    defer r.stop();
+    var c = try Client.connect(r.port);
+    defer c.close();
+    var head: [4096]u8 = undefined;
+    var body: [256]u8 = undefined;
+    // Three pipelined requests: the deferred one first, then two sync
+    // ones that must wait and come out in order.
+    try c.send("GET /later HTTP/1.1\r\nHost: x\r\n\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+    var res = try c.readResponse(&head, &body);
+    try testing.expectEqual(@as(u16, 202), res.status);
+    try testing.expect(std.mem.indexOf(u8, res.head, "x-later: 1\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, res.head, "\r\ndate: ") != null);
+    try testing.expectEqualStrings("later-body", body[0..res.body_len]);
+    res = try c.readResponse(&head, &body);
+    try testing.expect(std.mem.indexOf(u8, res.head, "x-path: /a\r\n") != null);
+    res = try c.readResponse(&head, &body);
+    try testing.expect(std.mem.indexOf(u8, res.head, "x-path: /b\r\n") != null);
+
+    // later() turned into a stream from the other thread, with trailers.
+    try c.send("GET /later-stream HTTP/1.1\r\nHost: x\r\n\r\n");
+    const h = try c.readHead(&head);
+    try testing.expect(std.mem.startsWith(u8, h, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.indexOf(u8, h, "transfer-encoding: chunked\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, h, "x-later: stream\r\n") != null);
+    var trailers: [256]u8 = undefined;
+    const ch = try c.readChunked(&body, &trailers);
+    try testing.expectEqual(@as(usize, 6 + 100 + 5), ch.body_len);
+    try testing.expectEqualStrings("part1,", body[0..6]);
+    try testing.expectEqualSlices(u8, big_body[0..100], body[6..106]);
+    try testing.expectEqualStrings("part3", body[106..111]);
+    try testing.expectEqualStrings("x-trailer: end\n", ch.trailers);
+    sleepMs(10);
+    try testing.expectEqual(@as(usize, 1), r.srv.handler.releases.load(.monotonic));
+
+    // HEAD and HTTP/1.0 through later().
+    try c.send("HEAD /later HTTP/1.1\r\nHost: x\r\n\r\n");
+    const hh = try c.readHead(&head);
+    try testing.expect(std.mem.indexOf(u8, hh, "content-length: 10\r\n") != null);
+    try c.send("GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+    res = try c.readResponse(&head, &body);
+    try testing.expect(std.mem.indexOf(u8, res.head, "x-path: /x\r\n") != null);
+    var c10 = try Client.connect(r.port);
+    defer c10.close();
+    try c10.send("GET /later-stream HTTP/1.0\r\n\r\n");
+    const h10 = try c10.readHead(&head);
+    try testing.expect(std.mem.indexOf(u8, h10, "connection: close\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, h10, "chunked") == null);
+    var raw: [111]u8 = undefined;
+    try c10.readExact(&raw);
+    try testing.expectEqualStrings("part3", raw[106..]);
+    try c10.expectClosed();
+}
+
+test "exchange: stream() with chunked and content-length framing" {
+    try forEachBackend(testStream);
+}
+
+fn testStream(backend: Backend) !void {
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    const r = try Running.start(backend, .{ .worker_thread_count = 1 });
+    defer r.stop();
+    var c = try Client.connect(r.port);
+    defer c.close();
+    var head: [4096]u8 = undefined;
+    const body = try testing.allocator.alloc(u8, 256 * 1024);
+    defer testing.allocator.free(body);
+    var trailers: [256]u8 = undefined;
+    for (0..3) |_| {
+        try c.send("GET /stream HTTP/1.1\r\nHost: x\r\n\r\n");
+        const h = try c.readHead(&head);
+        try testing.expect(std.mem.startsWith(u8, h, "HTTP/1.1 200 OK\r\nx-stream: 1\r\ntransfer-encoding: chunked\r\ndate: "));
+        const ch = try c.readChunked(body, &trailers);
+        try testing.expectEqual(@as(usize, 6 + 200 * 1024 + 6), ch.body_len);
+        try testing.expectEqualStrings("hello ", body[0..6]);
+        try testing.expectEqualSlices(u8, big_body[0 .. 200 * 1024], body[6 .. 6 + 200 * 1024]);
+        try testing.expectEqualStrings(" world", body[6 + 200 * 1024 ..][0..6]);
+        try testing.expectEqualStrings("x-trailer: t\n", ch.trailers);
+    }
+    try testing.expectEqual(@as(usize, 3), r.srv.handler.releases.load(.monotonic));
+    // Pipelined behind a stream, a content-length stream, a sync request.
+    try c.send("GET /stream-cl HTTP/1.1\r\nHost: x\r\n\r\nGET /after HTTP/1.1\r\nHost: x\r\n\r\n");
+    var res = try c.readResponse(&head, body);
+    try testing.expectEqual(@as(usize, 11), res.body_len);
+    try testing.expectEqualStrings("hello world", body[0..11]);
+    try testing.expect(std.mem.indexOf(u8, res.head, "chunked") == null);
+    res = try c.readResponse(&head, body);
+    try testing.expect(std.mem.indexOf(u8, res.head, "x-path: /after\r\n") != null);
+    // HEAD of a stream: head only, and the connection goes on.
+    try c.send("HEAD /stream HTTP/1.1\r\nHost: x\r\n\r\nGET /after2 HTTP/1.1\r\nHost: x\r\n\r\n");
+    const hh = try c.readHead(&head);
+    try testing.expect(std.mem.indexOf(u8, hh, "x-stream: 1\r\n") != null);
+    res = try c.readResponse(&head, body);
+    try testing.expect(std.mem.indexOf(u8, res.head, "x-path: /after2\r\n") != null);
+}
+
+test "exchange: backpressure with handleWritable, abort on disconnect, timeout" {
+    try forEachBackend(testStreamBackpressure);
+}
+
+fn testStreamBackpressure(backend: Backend) !void {
+    const r = try Running.start(backend, .{
+        .worker_thread_count = 1,
+        .max_exchange_queue_bytes = 256 * 1024,
+        .response_timeout_s = 1,
+        .request_timeout_s = 1,
+    });
+    defer r.stop();
+    // 64 MB through a 256 KB queue to a client that reads slowly.
+    {
+        var c = try Client.connect(r.port);
+        defer c.close();
+        try c.send("GET /flood-stream HTTP/1.1\r\nHost: x\r\n\r\n");
+        var head: [4096]u8 = undefined;
+        _ = try c.readHead(&head);
+        var trailers: [16]u8 = undefined;
+        const ch = try c.readChunked(null, &trailers);
+        try testing.expectEqual(@as(usize, 64 * 1024 * 1024), ch.body_len);
+        try testing.expect(r.srv.handler.writable_calls.load(.monotonic) > 0);
+        // Another request on the connection afterwards.
+        try c.send("GET /after HTTP/1.1\r\nHost: x\r\n\r\n");
+        const res = try c.readResponse(&head, null);
+        try testing.expectEqual(@as(u16, 200), res.status);
+    }
+    // The client leaves while a stream is in progress: handleAbort.
+    {
+        var c = try Client.connect(r.port);
+        try c.send("GET /flood-stream HTTP/1.1\r\nHost: x\r\n\r\n");
+        sleepMs(50);
+        c.close();
+        const start = sys.nanoTimestamp();
+        while (r.srv.handler.aborts.load(.monotonic) == 0) {
+            if (sys.nanoTimestamp() - start > 4 * std.time.ns_per_s) return error.NoAbort;
+            sleepMs(10);
+        }
+    }
+    // A later() exchange nobody answers times out: the connection closes
+    // and handleAbort runs.
+    {
+        var c = try Client.connect(r.port);
+        defer c.close();
+        try c.send("GET /hang HTTP/1.1\r\nHost: x\r\n\r\n");
+        const start = sys.nanoTimestamp();
+        try c.expectClosed();
+        const elapsed = sys.nanoTimestamp() - start;
+        try testing.expect(elapsed < 3 * std.time.ns_per_s);
+        sleepMs(10);
+        try testing.expectEqual(@as(usize, 2), r.srv.handler.aborts.load(.monotonic));
+    }
+}
+
 // -- TLS --------------------------------------------------------------------
 
 const tls_testdata = @import("./tls/credentials.zig").testdata;
@@ -870,6 +1192,38 @@ fn testTlsKeepAlive(backend: Backend) !void {
     try testing.expectEqualSlices(u8, &big_body, got);
     resp = try c.readResponse(null);
     try testing.expect(resp.body_len > 0);
+
+    // A streamed response over TLS: head, chunks (one borrowed, larger
+    // than a record), trailers, then a pipelined sync request.
+    try c.send("GET /stream HTTP/1.1\r\nHost: x\r\n\r\nGET /after HTTP/1.1\r\nHost: x\r\n\r\n");
+    {
+        const rd = &c.client.reader;
+        const status_line = try rd.takeDelimiterInclusive('\n');
+        try testing.expect(std.mem.startsWith(u8, status_line, "HTTP/1.1 200"));
+        var chunked = false;
+        while (true) {
+            const line = try rd.takeDelimiterInclusive('\n');
+            if (line.len == 2) break;
+            if (std.mem.eql(u8, line, "transfer-encoding: chunked\r\n")) chunked = true;
+        }
+        try testing.expect(chunked);
+        var total: usize = 0;
+        while (true) {
+            const size_line = try rd.takeDelimiterInclusive('\n');
+            const size = try std.fmt.parseInt(usize, size_line[0 .. size_line.len - 2], 16);
+            if (size == 0) break;
+            try rd.readSliceAll(got[total..][0..size]);
+            total += size;
+            _ = try rd.takeDelimiterInclusive('\n');
+        }
+        const trailer = try rd.takeDelimiterInclusive('\n');
+        try testing.expectEqualStrings("x-trailer: t\r\n", trailer);
+        _ = try rd.takeDelimiterInclusive('\n');
+        try testing.expectEqual(@as(usize, 6 + 200 * 1024 + 6), total);
+        try testing.expectEqualSlices(u8, big_body[0 .. 200 * 1024], got[6 .. 6 + 200 * 1024]);
+    }
+    resp = try c.readResponse(&body);
+    try testing.expectEqualStrings("ok", body[0..resp.body_len]);
 
     try c.send("GET /last HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
     resp = try c.readResponse(&body);

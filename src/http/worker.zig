@@ -15,6 +15,9 @@ const ws = @import("../ws/conn.zig");
 const WsConn = ws.Conn;
 const tls = @import("../tls/conn.zig");
 const TlsConn = tls.Conn;
+const mailbox_mod = @import("../mailbox.zig");
+const Mailbox = mailbox_mod.Mailbox;
+const exchange = @import("./exchange.zig");
 
 const LISTENER_TOKEN: u64 = std.math.maxInt(u64);
 const WAKER_TOKEN: u64 = std.math.maxInt(u64) - 1;
@@ -36,6 +39,9 @@ pub const Options = struct {
     /// TCP_DEFER_ACCEPT, so data is usually already there).
     read_on_accept: bool,
     websocket: ws.Options,
+    /// Exchanges (`resp.later()`, `resp.stream()`) per worker.
+    max_exchanges: u32 = 1024,
+    exchange: exchange.Options = .{},
     /// TLS for every connection, if set.
     tls: ?*const tls.Config = null,
     /// TLS record buffers preallocated per worker (input and output each).
@@ -58,7 +64,7 @@ pub fn Worker(comptime Handler: type) type {
             /// Draining input after an error response (see Session.linger).
             lingering: bool = false,
             lingered: u32 = 0,
-            after_flush: enum(u8) { none, close, upgrade } = .none,
+            after_flush: enum(u8) { none, close, upgrade, exchange_done } = .none,
             list: ListId = .none,
             prev: u32 = NIL,
             next: u32 = NIL,
@@ -70,11 +76,18 @@ pub fn Worker(comptime Handler: type) type {
             /// session (or the WebSocket decoder).
             tls: ?*TlsConn = null,
             /// Unsent output after a partial write: an owned copy of the
-            /// serialised head bytes, then the body (owned or borrowed).
+            /// serialised head bytes, then the body (owned or borrowed),
+            /// then the tail (static).
             pending_head: []u8 = &.{},
             pending_head_pos: usize = 0,
             pending_body: []const u8 = "",
             pending_body_owned: []u8 = &.{},
+            pending_tail: []const u8 = "",
+            /// The exchange whose response this connection is waiting
+            /// for or writing (a slot in the worker's slab), or NIL.
+            exchange: u32 = NIL,
+            /// Borrowed exchange bytes in the output, released once written.
+            release: ?exchange.Release = null,
 
             /// Output not yet written: plaintext waiting to be written (or
             /// encrypted), or TLS records waiting to be written.
@@ -83,7 +96,7 @@ pub fn Worker(comptime Handler: type) type {
             }
 
             inline fn hasPendingPlain(c: *const Conn) bool {
-                return c.pending_head_pos < c.pending_head.len or c.pending_body.len > 0;
+                return c.pending_head_pos < c.pending_head.len or c.pending_body.len > 0 or c.pending_tail.len > 0;
             }
         };
 
@@ -102,8 +115,10 @@ pub fn Worker(comptime Handler: type) type {
         listener: sys.fd_t,
         owns_listener: bool,
         waker: sys.Waker,
-        /// WebSocket connections with new output (posted from any thread).
-        mailbox: ws.Mailbox,
+        /// WebSocket connections and exchanges with new output (posted
+        /// from any thread).
+        mailbox: Mailbox,
+        exchanges: exchange.Slab = undefined,
         conns: []Conn,
         free_slots: []u32,
         free_len: usize,
@@ -140,7 +155,7 @@ pub fn Worker(comptime Handler: type) type {
             errdefer poller.deinit();
             const waker = try sys.Waker.init();
             errdefer waker.deinit();
-            var mailbox = try ws.Mailbox.init(allocator, opts.max_connections, waker);
+            var mailbox = try Mailbox.init(allocator, opts.max_connections + opts.max_exchanges, waker);
             errdefer mailbox.deinit();
             const conns = try allocator.alloc(Conn, opts.max_connections);
             errdefer allocator.free(conns);
@@ -189,6 +204,12 @@ pub fn Worker(comptime Handler: type) type {
                 .rng = .init(seed),
             };
             self.refreshDate();
+            // The slab posts to this worker's mailbox, which must not move
+            // (workers live in a stable slice).
+            self.exchanges = try exchange.Slab.init(allocator, opts.max_exchanges, &self.mailbox, opts.exchange);
+            errdefer self.exchanges.deinit();
+            self.resp.exchanges = &self.exchanges;
+            self.resp.now = &self.now;
             try self.poller.add(self.listener, LISTENER_TOKEN, .level_read);
             try self.poller.add(self.waker.read_fd, WAKER_TOKEN, .level_read);
         }
@@ -212,6 +233,7 @@ pub fn Worker(comptime Handler: type) type {
             }
             if (self.owns_listener) sys.close(self.listener);
             self.poller.deinit();
+            self.exchanges.deinit();
             self.mailbox.deinit();
             self.waker.deinit();
             self.pool.deinit();
@@ -268,6 +290,19 @@ pub fn Worker(comptime Handler: type) type {
             self.refreshDate();
             self.expire(&self.idle);
             self.expire(&self.active);
+            self.expireExchanges();
+        }
+
+        /// Exchanges have their own deadlines (set per exchange), so they
+        /// are scanned rather than kept on an ordered list.
+        fn expireExchanges(self: *Self) void {
+            if (self.exchanges.active_count == 0) return;
+            for (self.exchanges.entries, 0..) |*e, slot| {
+                if (!e.active) continue;
+                if (@as(i32, @bitCast(e.deadline -% self.now)) > 0) continue;
+                const c = &self.conns[e.conn_slot];
+                if (c.open and c.gen == e.conn_gen and c.exchange == slot) self.closeConn(c);
+            }
         }
 
         fn expire(self: *Self, list: *List) void {
@@ -304,7 +339,10 @@ pub fn Worker(comptime Handler: type) type {
             const list = self.listFor(id);
             const slot = self.slotOf(c);
             c.list = id;
-            c.deadline = self.now +% list.timeout;
+            // `now` is truncated to the second, so add one: the timeout
+            // then fires between T and T+1 seconds after arming, never
+            // before T.
+            c.deadline = self.now +% list.timeout +% 1;
             c.prev = list.tail;
             c.next = NIL;
             if (list.tail != NIL) self.conns[list.tail].next = slot else list.head = slot;
@@ -316,6 +354,11 @@ pub fn Worker(comptime Handler: type) type {
         /// extended by further reads (slowloris), only by write progress.
         fn updateTimer(self: *Self, c: *Conn) void {
             const handshaking = c.tls != null and c.tls.?.isHandshaking();
+            if (c.exchange != NIL and !c.hasPending()) {
+                // The exchange's own deadline applies.
+                self.unlink(c);
+                return;
+            }
             if (c.session.inRequest() or c.hasPending() or handshaking) {
                 if (c.list != .active) self.arm(c, .active);
             } else {
@@ -420,6 +463,7 @@ pub fn Worker(comptime Handler: type) type {
             self.unlink(c);
             c.session.deinit(&self.pool);
             self.freePending(c);
+            if (c.exchange != NIL) self.dropExchange(c, true);
             if (c.ws) |w| {
                 if (@hasDecl(Handler, "handleWSDisconn")) self.handler.handleWSDisconn(w);
                 w.destroy(&self.pool);
@@ -441,7 +485,7 @@ pub fn Worker(comptime Handler: type) type {
         /// this worker and speaks WebSocket from here on.
         fn upgradeConn(self: *Self, c: *Conn) void {
             if (!@hasDecl(Handler, "handleWSFrame")) return self.closeConn(c);
-            const w = WsConn.create(self.allocator, c.fd, self.opts.websocket, &self.mailbox, self.slotOf(c)) catch {
+            const w = WsConn.create(self.allocator, c.fd, self.opts.websocket, &self.mailbox, self.slotOf(c), c.gen) catch {
                 return self.closeConn(c);
             };
             c.ws = w;
@@ -461,6 +505,114 @@ pub fn Worker(comptime Handler: type) type {
             c.pending_head_pos = 0;
             c.pending_body = "";
             c.pending_body_owned = &.{};
+            c.pending_tail = "";
+            if (c.release) |r| {
+                r.call();
+                c.release = null;
+            }
+        }
+
+        // -- Exchanges ----------------------------------------------------
+
+        /// The session returned `.wait`: the handler took an exchange for
+        /// this request. Bind it to the connection.
+        fn bindExchange(self: *Self, c: *Conn) void {
+            const ex = self.resp.exchange;
+            const e = self.exchanges.entry(ex.slot);
+            const s = &c.session;
+            c.exchange = ex.slot;
+            e.mutex.lock();
+            e.conn_slot = self.slotOf(c);
+            e.conn_gen = c.gen;
+            e.bound = true;
+            e.keep_alive = s.wait_keep_alive;
+            e.is_head = s.wait_is_head;
+            e.http10 = s.wait_http10;
+            if (self.resp.mode == .stream) {
+                // The session wrote the head; fix the body framing now.
+                // beginStream set the state when stream() was called;
+                // the handler may have written or finished since.
+                e.head_pending = false;
+                e.framing = exchange.streamFraming(self.resp.status, s.wait_is_head, s.wait_http10, self.resp.content_length);
+                e.deadline = self.now +% self.opts.exchange.request_timeout_s +% 1;
+            } else {
+                e.head_pending = true;
+            }
+            e.mutex.unlock();
+        }
+
+        /// Writes queued exchange output until the socket is full or the
+        /// queue is empty. Returns false if the connection is gone.
+        fn exchangeFlush(self: *Self, c: *Conn) bool {
+            while (!c.hasPending()) {
+                const ex = self.exchanges.handle(c.exchange);
+                const r = ex.fill(&self.out, &self.date_line, self.now);
+                if (r.aborted) {
+                    self.out.clear();
+                    self.closeConn(c);
+                    return false;
+                }
+                c.release = r.release;
+                if (!self.out.isEmpty()) {
+                    if (!self.writeOut(c)) return false;
+                }
+                if (r.notify and @hasDecl(Handler, "handleWritable")) self.handler.handleWritable(ex);
+                if (c.hasPending()) {
+                    c.after_flush = if (r.done) .exchange_done else .none;
+                    self.arm(c, .active);
+                    return true;
+                }
+                if (c.release) |rel| {
+                    rel.call();
+                    c.release = null;
+                }
+                if (r.done) {
+                    self.exchangeDone(c);
+                    return false;
+                }
+                if (!r.progressed) break;
+            }
+            return true;
+        }
+
+        /// Ends the exchange and lets the connection go on: close if the
+        /// request asked for it, otherwise the next pipelined request.
+        fn exchangeDone(self: *Self, c: *Conn) void {
+            const keep_alive = self.exchanges.entry(c.exchange).keep_alive;
+            self.dropExchange(c, false);
+            if (!keep_alive) return self.finish(c);
+            self.onReadable(c);
+        }
+
+        /// Frees the connection's exchange. `gone` means it did not end
+        /// through the handle: the handler is told through handleAbort if
+        /// it may still be using it.
+        fn dropExchange(self: *Self, c: *Conn, gone: bool) void {
+            const slot = c.exchange;
+            c.exchange = NIL;
+            c.session.waiting = false;
+            if (c.release) |r| {
+                r.call();
+                c.release = null;
+            }
+            if (gone and @hasDecl(Handler, "handleAbort")) {
+                const e = self.exchanges.entry(slot);
+                e.mutex.lock();
+                const in_use = e.state == .later or e.state == .streaming;
+                e.mutex.unlock();
+                if (in_use) self.handler.handleAbort(self.exchanges.handle(slot));
+            }
+            self.exchanges.release(slot);
+        }
+
+        /// A post from the mailbox for an exchange.
+        fn exchangePosted(self: *Self, slot: u32, gen: u31) void {
+            const e = self.exchanges.entry(slot);
+            if (!e.active or (e.gen & 0x7fffffff) != gen or !e.bound) return;
+            const c = &self.conns[e.conn_slot];
+            if (!c.open or c.gen != e.conn_gen or c.exchange != slot) return;
+            if (c.ws != null or c.lingering) return;
+            _ = self.exchangeFlush(c);
         }
 
         // -- I/O -----------------------------------------------------------
@@ -480,7 +632,10 @@ pub fn Worker(comptime Handler: type) type {
             if (Poller.writable(ev) and c.hasPending()) {
                 if (!self.writePending(c)) return;
             }
-            if (c.read_ready and !c.hasPending()) self.onReadable(c);
+            // Reading pauses while output is stalled, and while an
+            // exchange is pending (its response goes out before any
+            // further pipelined request is parsed).
+            if (c.read_ready and !c.hasPending() and c.exchange == NIL) self.onReadable(c);
         }
 
         fn onReadable(self: *Self, c: *Conn) void {
@@ -560,6 +715,10 @@ pub fn Worker(comptime Handler: type) type {
                             .close => .close,
                             .upgrade => .upgrade,
                             .flush, .need_more => .none,
+                            .wait => blk: {
+                                if (c.exchange == NIL) self.bindExchange(c);
+                                break :blk .none;
+                            },
                         };
                         return .blocked;
                     }
@@ -575,6 +734,11 @@ pub fn Worker(comptime Handler: type) type {
                         self.upgradeConn(c);
                         return .gone;
                     },
+                    .wait => {
+                        if (c.exchange == NIL) self.bindExchange(c);
+                        if (!self.exchangeFlush(c)) return .gone;
+                        return .blocked;
+                    },
                 }
             }
         }
@@ -584,7 +748,7 @@ pub fn Worker(comptime Handler: type) type {
         /// if the connection was closed.
         fn writeOut(self: *Self, c: *Conn) bool {
             if (c.tls) |t| return self.tlsWriteOut(c, t);
-            var iov: [2]sys.iovec_const = undefined;
+            var iov: [3]sys.iovec_const = undefined;
             const total = self.out.totalLen();
             const n = sys.writev(c.fd, self.out.iovecs(&iov)) catch |err| switch (err) {
                 error.WouldBlock => 0,
@@ -613,7 +777,8 @@ pub fn Worker(comptime Handler: type) type {
                 c.pending_head = try self.allocator.dupe(u8, out.buf[written..out.len]);
                 c.pending_head_pos = 0;
             }
-            const body_written = written -| out.len;
+            const body_written = @min(written -| out.len, out.body.len);
+            c.pending_tail = out.tail[written -| (out.len + out.body.len) ..];
             const body_rest = out.body[body_written..];
             if (body_rest.len == 0) return;
             const resp_buf = self.resp.body_buf;
@@ -648,7 +813,16 @@ pub fn Worker(comptime Handler: type) type {
                     self.upgradeConn(c);
                     return false;
                 },
+                .exchange_done => {
+                    c.after_flush = .none;
+                    self.exchangeDone(c);
+                    return false;
+                },
                 .none => {},
+            }
+            if (c.exchange != NIL) {
+                _ = self.exchangeFlush(c);
+                return false;
             }
             // Resume: buffered requests may be waiting even if no new data
             // arrives.
@@ -659,7 +833,7 @@ pub fn Worker(comptime Handler: type) type {
         /// Writes pending plaintext. Returns whether bytes were written, or
         /// null if the connection was closed.
         fn writePendingPlain(self: *Self, c: *Conn) ?bool {
-            var iov: [2]sys.iovec_const = undefined;
+            var iov: [3]sys.iovec_const = undefined;
             var iov_len: usize = 0;
             const head_rest = c.pending_head[c.pending_head_pos..];
             if (head_rest.len > 0) {
@@ -668,6 +842,10 @@ pub fn Worker(comptime Handler: type) type {
             }
             if (c.pending_body.len > 0) {
                 iov[iov_len] = .{ .base = c.pending_body.ptr, .len = c.pending_body.len };
+                iov_len += 1;
+            }
+            if (c.pending_tail.len > 0) {
+                iov[iov_len] = .{ .base = c.pending_tail.ptr, .len = c.pending_tail.len };
                 iov_len += 1;
             }
             const n = sys.writev(c.fd, iov[0..iov_len]) catch |err| switch (err) {
@@ -684,7 +862,9 @@ pub fn Worker(comptime Handler: type) type {
         fn advancePending(c: *Conn, n: usize) void {
             const from_head = @min(n, c.pending_head.len - c.pending_head_pos);
             c.pending_head_pos += from_head;
-            c.pending_body = c.pending_body[n - from_head ..];
+            const from_body = @min(n - from_head, c.pending_body.len);
+            c.pending_body = c.pending_body[from_body..];
+            c.pending_tail = c.pending_tail[n - from_head - from_body ..];
         }
 
         // -- TLS I/O --------------------------------------------------------
@@ -754,8 +934,9 @@ pub fn Worker(comptime Handler: type) type {
             // writability edge that never comes.
             while (true) {
                 const head = out.buf[@min(consumed, out.len)..out.len];
-                const body = out.body[consumed -| out.len..];
-                consumed += t.encrypt(&.{ head, body }) catch {
+                const body = out.body[@min(consumed -| out.len, out.body.len)..];
+                const tail = out.tail[consumed -| (out.len + out.body.len)..];
+                consumed += t.encrypt(&.{ head, body, tail }) catch {
                     self.closeConn(c);
                     return false;
                 };
@@ -777,7 +958,7 @@ pub fn Worker(comptime Handler: type) type {
             while (true) {
                 progressed = (self.tlsFlush(c, t) orelse return null) or progressed;
                 if (t.hasWire() or !c.hasPendingPlain()) return progressed;
-                const consumed = t.encrypt(&.{ c.pending_head[c.pending_head_pos..], c.pending_body }) catch {
+                const consumed = t.encrypt(&.{ c.pending_head[c.pending_head_pos..], c.pending_body, c.pending_tail }) catch {
                     self.closeConn(c);
                     return null;
                 };
@@ -886,15 +1067,26 @@ pub fn Worker(comptime Handler: type) type {
         }
 
         fn drainMailbox(self: *Self) void {
-            var slots: [64]u32 = undefined;
+            var entries: [64]mailbox_mod.Entry = undefined;
             while (true) {
-                const n = self.mailbox.drain(&slots);
+                const n = self.mailbox.drain(&entries);
                 if (n == 0) break;
-                for (slots[0..n]) |slot| self.wsFlushPosted(&self.conns[slot]);
+                for (entries[0..n]) |e| switch (e.kind) {
+                    .ws => {
+                        const c = &self.conns[e.slot];
+                        if (c.open and (c.gen & 0x7fffffff) == e.gen) self.wsFlushPosted(c);
+                    },
+                    .exchange => self.exchangePosted(e.slot, e.gen),
+                };
             }
             if (self.mailbox.takeOverflow()) {
                 for (self.conns) |*c| {
-                    if (c.open and c.ws != null) self.wsFlushPosted(c);
+                    if (!c.open) continue;
+                    if (c.ws != null) {
+                        self.wsFlushPosted(c);
+                    } else if (c.exchange != NIL and !c.lingering) {
+                        _ = self.exchangeFlush(c);
+                    }
                 }
             }
         }

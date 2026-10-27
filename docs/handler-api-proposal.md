@@ -1,7 +1,23 @@
 # Handler API redesign (M5): proposal
 
-Status: proposal, no code. Written at the end of M4 so HTTP/2 work can start
-from an agreed shape. Decisions marked **(decide)** are open.
+Status: steps 1 and 2 of "Suggested order of work" are implemented on HTTP/1.1
+(`src/http/exchange.zig`, `src/mailbox.zig`); step 3 (request bodies) waits
+until after h2. Decisions taken on the **(decide)** items:
+
+- The name is `Exchange` (h2/h3 use "stream" for something else).
+- `response_timeout_s` is a separate config value for `later()` exchanges;
+  a stream gets `request_timeout_s` between writes; `ex.setTimeout(seconds)`
+  overrides either for one exchange.
+- `handleBody` chunks (step 3) will always be copied by the handler, today's
+  rule for `Request`.
+- `sendfile`/`splice` through `writeBorrowed` waits for kTLS.
+
+Differences from the text below, as implemented: `ex.respond(head, body)` and
+`ex.startStream(head)` take a `Head { status, headers, content_length }`;
+`writeBorrowed(bytes, release)` takes an optional `Release { ctx, func }`;
+`resp.setContentLength(n)` must be called before `resp.stream()`; `abort()` on
+a `later()` exchange that has not responded closes the connection without a
+response; a `finish` short of the declared Content-Length aborts the exchange.
 
 ## What has to change, and what must not
 

@@ -1,6 +1,17 @@
 const std = @import("std");
 const Header = @import("./header.zig").Header;
 const Status = @import("./status.zig").Status;
+const exchange = @import("./http/exchange.zig");
+pub const Exchange = exchange.Exchange;
+
+pub const Mode = enum(u8) {
+    /// The response is complete when handleRequest returns.
+    sync,
+    /// `later()`: nothing is sent until `ex.respond` or `ex.startStream`.
+    later,
+    /// `stream()`: the head is sent now, the body through `ex.write`.
+    stream,
+};
 
 /// This response is reused for every request on a worker. The server resets
 /// it before calling handleRequest.
@@ -22,6 +33,16 @@ pub const Response = struct {
     body: []const u8 = "",
     body_buf: []u8,
     allocator: std.mem.Allocator,
+    /// Set by later() and stream(); checked by the session once.
+    mode: Mode = .sync,
+    /// The exchange taken by later() or stream().
+    exchange: Exchange = undefined,
+    /// For stream(): send a Content-Length body instead of chunked.
+    content_length: ?usize = null,
+    /// The worker's exchange slab and clock; null in handlers run
+    /// without a worker (tests, benchmarks), where later()/stream() fail.
+    exchanges: ?*exchange.Slab = null,
+    now: *const u32 = &zero_now,
 
     pub fn init(allocator: std.mem.Allocator, body_size: usize, header_size: usize) !*Self {
         const resp = try allocator.create(Self);
@@ -96,14 +117,54 @@ pub const Response = struct {
         return self.header_buf[0..self.header_len];
     }
 
+    /// Sends the status and the headers added so far now, and the body
+    /// later through the returned exchange: `ex.write`, `ex.finish`. The
+    /// body is chunked unless setContentLength was called. Call it last;
+    /// the body set on `resp` is ignored.
+    pub fn stream(self: *Self) error{ TooManyExchanges, NoWorker, AlreadyTaken }!Exchange {
+        const ex = try self.take();
+        self.mode = .stream;
+        // Writes may start right away, before the worker binds the
+        // exchange to the connection.
+        self.exchanges.?.beginStream(ex.slot, self.content_length);
+        return ex;
+    }
+
+    /// Sends nothing now. Later, from any thread, `ex.respond` sends a
+    /// complete response or `ex.startStream` begins a streamed one. The
+    /// connection waits (further pipelined requests queue behind it).
+    pub fn later(self: *Self) error{ TooManyExchanges, NoWorker, AlreadyTaken }!Exchange {
+        const ex = try self.take();
+        self.mode = .later;
+        return ex;
+    }
+
+    fn take(self: *Self) error{ TooManyExchanges, NoWorker, AlreadyTaken }!Exchange {
+        if (self.mode != .sync) return error.AlreadyTaken;
+        const slab = self.exchanges orelse return error.NoWorker;
+        self.exchange = try slab.create(self.now.*);
+        return self.exchange;
+    }
+
+    /// With stream(): the body length, so the response uses
+    /// Content-Length framing. `write` then fails past this many bytes
+    /// and `finish` fails short of it. Call it before stream().
+    pub fn setContentLength(self: *Self, n: usize) void {
+        self.content_length = n;
+    }
+
     pub inline fn reset(self: *Self) void {
         self.status = .ok;
         self.close = false;
         self.is_ws_upgrade = false;
         self.header_len = 0;
         self.body = "";
+        self.mode = .sync;
+        self.content_length = null;
     }
 };
+
+const zero_now: u32 = 0;
 
 test "headers are serialised on add" {
     var r = try Response.init(std.testing.allocator, 16, 128);
