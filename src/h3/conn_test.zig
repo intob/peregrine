@@ -582,3 +582,83 @@ test "HTTP/3: GOAWAY finishes requests in flight, then closes" {
     try testing.expectEqualStrings("late", r.body.items);
     try testing.expectEqual(@as(u64, 0x100), h.client.closed.?.code);
 }
+
+// -- Fuzzing ----------------------------------------------------------------------
+
+/// A completed handshake with the client's control stream open, then a
+/// fuzzer-chosen mix of raw QUIC frames in 1-RTT packets, bytes on request
+/// and unidirectional streams (with or without FIN), and lost datagrams.
+/// Checked: no crash, leak or out-of-bounds access; a connection that
+/// closes does so with a transport or HTTP/3 error code; every response
+/// the client sees parses as HTTP/3 frames.
+fn fuzzH3(_: void, smith: *std.testing.Smith) anyerror!void {
+    const h = try Harness.init();
+    defer h.deinit();
+    h.h3_opts.limits.max_body_size = 4096;
+    try h.startClient();
+    var ids: [4]u64 = undefined;
+    var nids: usize = 0;
+    var data: [512]u8 = undefined;
+    var ops: usize = 0;
+    while (ops < 24 and !smith.eos()) : (ops += 1) {
+        const op = smith.value(u8);
+        const n = smith.slice(data[0..@min(data.len, 1 + @as(usize, smith.value(u8)) * 2)]);
+        const bytes = data[0..n];
+        switch (op % 6) {
+            0 => try h.client.injectFrames(bytes),
+            1 => {
+                if (nids < ids.len) {
+                    ids[nids] = try h.client.openBidi();
+                    nids += 1;
+                }
+                try h.client.write(ids[nids - 1], bytes, op & 0x80 != 0);
+            },
+            2 => {
+                if (nids == 0) continue;
+                const id = ids[smith.value(u8) % nids];
+                const s = try h.client.getStream(id);
+                if (s.send.fin) continue;
+                try h.client.write(id, bytes, op & 0x80 != 0);
+            },
+            3 => {
+                const id = try h.client.openUni();
+                try h.client.write(id, bytes, op & 0x80 != 0);
+            },
+            4 => {
+                // A well-formed request.
+                if (nids < ids.len) {
+                    ids[nids] = try h.request("GET", "/", &.{}, "");
+                    nids += 1;
+                }
+            },
+            else => {},
+        }
+        try h.run(3);
+        if (h.server.?.isClosed() or h.client.closed != null) break;
+    }
+    try h.run(20);
+    if (h.client.closed) |c| {
+        const ok = if (c.app) (c.code >= 0x100 and c.code <= 0x110) or (c.code >= 0x200 and c.code <= 0x202) else c.code <= 0x1ff;
+        try testing.expect(ok);
+    }
+    for (ids[0..nids]) |id| {
+        var r = h.response(id) catch |err| switch (err) {
+            error.Truncated => continue, // still arriving, or reset
+            else => return err,
+        };
+        r.deinit();
+    }
+}
+
+test "fuzz: h3 connection" {
+    try std.testing.fuzz({}, fuzzH3, .{
+        .corpus = &.{
+            // A request through raw STREAM frames; MAX_DATA; PING.
+            &[_]u8{ 0x04, 0x00, 0x00, 0x10, 0x01, 0x01 },
+            // HEADERS on a request stream, then DATA.
+            &[_]u8{ 0x01, 0x10, 0x01, 0x0b, 0x00, 0x00, 0xd1, 0xd7, 0x51, 0x01, '/', 0xc4, 0x00, 0x01, 'x', 0x81, 0x00 },
+            // A control stream with a GOAWAY, an encoder stream.
+            &[_]u8{ 0x03, 0x04, 0x00, 0x07, 0x01, 0x00, 0x03, 0x01, 0x02 },
+        },
+    });
+}

@@ -12,6 +12,25 @@ const Allocator = std.mem.Allocator;
 /// heavy loss; each costs 16 bytes.
 pub const max_fragments = 1024;
 
+/// After dropping bytes before `head`: reset when nothing is left, and
+/// compact once the dead prefix is at least half the buffer, so each byte
+/// is moved at most a constant number of times.
+fn dropHead(buf: *std.ArrayList(u8), head: *usize) void {
+    if (head.* == buf.items.len) {
+        buf.clearRetainingCapacity();
+        head.* = 0;
+    } else if (head.* >= 4096 and head.* * 2 >= buf.items.len) {
+        compact(buf, head);
+    }
+}
+
+fn compact(buf: *std.ArrayList(u8), head: *usize) void {
+    const left = buf.items.len - head.*;
+    std.mem.copyForwards(u8, buf.items[0..left], buf.items[head.*..]);
+    buf.shrinkRetainingCapacity(left);
+    head.* = 0;
+}
+
 pub const RecvError = error{
     /// Data past the advertised limit (FLOW_CONTROL_ERROR).
     FlowControl,
@@ -25,8 +44,11 @@ pub const RecvError = error{
 pub const RecvStream = struct {
     const Self = @This();
 
-    /// Bytes from `read_off` on; out-of-order data sits at its offset.
+    /// Bytes from `read_off` on start at buf.items[head]; out-of-order
+    /// data sits at its offset. Consumed bytes before `head` are dropped
+    /// in bulk (compacting per read would be quadratic).
     buf: std.ArrayList(u8) = .empty,
+    head: usize = 0,
     /// Where `buf` starts in the stream (the application consumed below).
     read_off: u64 = 0,
     /// Received ranges above `read_off`.
@@ -67,7 +89,7 @@ pub const RecvStream = struct {
         const start = offset + skip;
         const bytes = data[skip..];
         if (bytes.len == 0) return raised;
-        const rel: usize = @intCast(start - self.read_off);
+        const rel: usize = self.head + @as(usize, @intCast(start - self.read_off));
         if (self.buf.items.len < rel + bytes.len) {
             const old = self.buf.items.len;
             try self.buf.resize(a, rel + bytes.len);
@@ -86,16 +108,20 @@ pub const RecvStream = struct {
     pub fn readable(self: *const Self) []u8 {
         const first = self.received.first() orelse return self.buf.items[0..0];
         if (first.start != self.read_off) return self.buf.items[0..0];
-        return self.buf.items[0..@intCast(first.end - first.start)];
+        return self.buf.items[self.head..][0..@intCast(first.end - first.start)];
+    }
+
+    /// Bytes held: unread, and out of order.
+    pub fn buffered(self: *const Self) usize {
+        return self.buf.items.len - self.head;
     }
 
     pub fn consume(self: *Self, n: usize) void {
         if (n == 0) return;
         self.read_off += n;
         self.received.removeBelow(self.read_off);
-        const left = self.buf.items.len - n;
-        std.mem.copyForwards(u8, self.buf.items[0..left], self.buf.items[n..]);
-        self.buf.shrinkRetainingCapacity(left);
+        self.head += n;
+        dropHead(&self.buf, &self.head);
     }
 
     /// Everything up to the final size has been read.
@@ -115,8 +141,10 @@ pub const RecvStream = struct {
 pub const SendStream = struct {
     const Self = @This();
 
-    /// Unacknowledged data, from offset `base`.
+    /// Unacknowledged data, from offset `base`, starting at
+    /// buf.items[head] (acknowledged bytes before it are dropped in bulk).
     buf: std.ArrayList(u8) = .empty,
+    head: usize = 0,
     base: u64 = 0,
     /// The next new byte to send.
     sent_off: u64 = 0,
@@ -145,16 +173,23 @@ pub const SendStream = struct {
 
     /// Total bytes written.
     pub inline fn writeOff(self: *const Self) u64 {
-        return self.base + self.buf.items.len;
+        return self.base + self.buffered();
+    }
+
+    /// Bytes written and not yet acknowledged.
+    pub inline fn buffered(self: *const Self) usize {
+        return self.buf.items.len - self.head;
     }
 
     pub fn write(self: *Self, a: Allocator, data: []const u8) Allocator.Error!void {
         std.debug.assert(!self.fin);
+        if (self.head > 0 and self.buf.unusedCapacitySlice().len < data.len) compact(&self.buf, &self.head);
         try self.buf.appendSlice(a, data);
     }
 
     /// Room for `n` more bytes, to be filled and committed with `commit`.
     pub fn reserve(self: *Self, a: Allocator, n: usize) Allocator.Error![]u8 {
+        if (self.head > 0 and self.buf.unusedCapacitySlice().len < n) compact(&self.buf, &self.head);
         try self.buf.ensureUnusedCapacity(a, n);
         return self.buf.unusedCapacitySlice()[0..n];
     }
@@ -194,7 +229,7 @@ pub const SendStream = struct {
         if (self.lost.first()) |r| {
             const len: usize = @intCast(@min(r.end - r.start, max));
             if (len == 0) return null;
-            const rel: usize = @intCast(r.start - self.base);
+            const rel: usize = self.head + @as(usize, @intCast(r.start - self.base));
             const fin = self.fin_lost and r.start + len == self.writeOff();
             return .{ .offset = r.start, .data = self.buf.items[rel..][0..len], .fin = fin, .retransmit = true };
         }
@@ -205,7 +240,7 @@ pub const SendStream = struct {
         const len: usize = @intCast(@min(limit -| self.sent_off, max));
         const fin = self.fin and self.sent_off + len == self.writeOff();
         if (len == 0 and !(fin and !self.fin_sent)) return null;
-        const rel: usize = @intCast(self.sent_off - self.base);
+        const rel: usize = self.head + @as(usize, @intCast(self.sent_off - self.base));
         return .{ .offset = self.sent_off, .data = self.buf.items[rel..][0..len], .fin = fin, .retransmit = false };
     }
 
@@ -237,9 +272,8 @@ pub const SendStream = struct {
         const first = self.acked.first().?;
         if (first.start == self.base) {
             const n: usize = @intCast(first.end - self.base);
-            const left = self.buf.items.len - n;
-            std.mem.copyForwards(u8, self.buf.items[0..left], self.buf.items[n..]);
-            self.buf.shrinkRetainingCapacity(left);
+            self.head += n;
+            dropHead(&self.buf, &self.head);
             self.base = first.end;
             self.acked.removeBelow(self.base);
         }
@@ -271,7 +305,7 @@ pub const SendStream = struct {
 
     /// Everything, FIN included, has been acknowledged.
     pub fn allAcked(self: *const Self) bool {
-        return self.fin and self.fin_acked and self.buf.items.len == 0;
+        return self.fin and self.fin_acked and self.buffered() == 0;
     }
 };
 

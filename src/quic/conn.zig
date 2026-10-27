@@ -832,7 +832,7 @@ pub const Conn = struct {
                 const st = self.streamAt(s.slot, s.gen) orelse return;
                 st.send.onAcked(a, s.offset, s.len, s.fin) catch {};
                 if (st.writable_at) |level| {
-                    if (st.send.buf.items.len <= level) {
+                    if (st.send.buffered() <= level) {
                         st.writable_at = null;
                         self.pushEvent(.{ .stream_writable = s.slot });
                     }
@@ -1344,7 +1344,7 @@ pub const Conn = struct {
 
     /// Bytes written and not yet acknowledged.
     pub fn streamBuffered(self: *Self, slot: u32) usize {
-        return self.streams[slot].send.buf.items.len;
+        return self.streams[slot].send.buffered();
     }
 
     /// Ask for a stream_writable event once buffered bytes fall to `level`.
@@ -1376,7 +1376,7 @@ pub const Conn = struct {
         s.released = true;
         // Unread data no longer holds connection credit.
         if (s.hasRecv() and s.recv_reset == null) {
-            const unread = s.recv.buf.items.len;
+            const unread = s.recv.buffered();
             if (unread > 0) {
                 s.recv.consume(unread);
                 self.creditConnection(unread);
@@ -1428,6 +1428,9 @@ pub const Conn = struct {
         if (b.packets == 0) return 0;
         // §14.1: datagrams with ack-eliciting Initial packets are padded.
         if (has_initial and b.pos < 1200 and out.len >= 1200 and max >= 1200) b.padTo(1200);
+        // A nearly full datagram is padded to the full size, so runs of
+        // them are equal and go out as one GSO send.
+        if (b.open and b.space == .application and b.pos + protection.tag_len + 64 >= max and b.pos + protection.tag_len < max) b.padTo(max);
         self.sealLast(&b, now);
         self.bytes_sent += b.pos;
         return b.pos;
