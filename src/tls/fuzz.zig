@@ -1149,12 +1149,12 @@ const Script = struct {
     view: *View,
 
     fn send(s: *Script, rec: Rec) !void {
-        if (trace) std.debug.print("send {s} ct {d} epoch {d} len {d} pad {d} -> state {s} failed {} alert {any}\n", .{ @tagName(rec.kind), rec.ct, rec.epoch, rec.data.len, rec.padding, @tagName(s.view.state), s.probe.conn.failed, s.view.alert });
         try s.recs.append(s.a, rec);
         const start = s.stream.items.len;
         try s.ser.write(s.a, &s.stream, rec, false);
         try s.probe.feed(s.stream.items[start..], &.{});
         try s.view.pump(s.probe.result.wire.items);
+        if (trace) std.debug.print("send {s} ct {d} epoch {d} len {d} pad {d} frags {any} -> state {s} failed {} alert {any}\n", .{ @tagName(rec.kind), rec.ct, rec.epoch, rec.data.len, rec.padding, rec.frags, @tagName(s.view.state), s.probe.conn.failed, s.view.alert });
     }
 };
 
@@ -1441,6 +1441,7 @@ fn runScript(
     // Finished.
     const fin = view.client_finished.?;
     var finished = true;
+    var fin_omitted = false;
     switch (smith.valueRangeAtMost(u8, 0, 11)) {
         0...6 => try s.send(.{ .kind = .sealed, .ct = ct_handshake, .data = fin, .frags = try fragSizes(a, smith) }),
         7 => {
@@ -1477,6 +1478,7 @@ fn runScript(
             // have yet, so the model gives up.
             exp.exact = false;
             finished = false;
+            fin_omitted = true;
         },
     }
     if (finished and exp.live()) exp.finished = true;
@@ -1497,7 +1499,11 @@ fn runScript(
                 // Padding up to the 2^14 + 1 inner plaintext limit.
                 const pad_max: u16 = @intCast(record.max_plaintext - len);
                 const padding = if (smith.boolWeighted(3, 1)) 0 else smith.valueRangeAtMost(u16, 0, pad_max);
-                try s.send(.{ .kind = .sealed, .ct = ct_app, .epoch = epoch, .data = data, .padding = padding, .frags = if (padding == 0) try fragSizes(a, smith) else &.{} });
+                const frags = if (padding == 0) try fragSizes(a, smith) else &.{};
+                // Without Finished the server may skip these as rejected
+                // 0-RTT data, against a budget that counts each record's
+                // overhead: there, record boundaries do matter.
+                try s.send(.{ .kind = .sealed, .ct = ct_app, .epoch = epoch, .data = data, .padding = padding, .frags = if (fin_omitted) &.{} else frags });
                 if (exp.live()) try exp.app.appendSlice(a, data);
             },
             6, 7 => {
@@ -1647,6 +1653,9 @@ const corpus = [_][]const u8{
     // Harness: bytes after a short-framed ClientHello1 garbled ClientHello2.
     @embedFile("testdata/fuzz/retry-5.bin"),
     @embedFile("testdata/fuzz/retry-6.bin"),
+    // Harness: without Finished, application records split into more
+    // records used up the server's budget for skipping 0-RTT data.
+    @embedFile("testdata/fuzz/split-7.bin"),
 };
 
 test "fuzz: tls.Conn handshake and record mutations" {
