@@ -291,6 +291,7 @@ pub const Conn = struct {
     /// A PATH_CHALLENGE to answer.
     path_response: ?[8]u8 = null,
     lost_packets: u64 = 0,
+    packets_received: u64 = 0,
 
     pub const InitOptions = struct {
         /// The client's Initial: its DCID, SCID.
@@ -434,8 +435,10 @@ pub const Conn = struct {
     // -- Receiving ------------------------------------------------------------
 
     /// Processes one datagram (its packets are decrypted in place).
-    pub fn recv(self: *Self, datagram: []u8, now: u64) void {
-        if (self.state == .closed or self.state == .draining) return;
+    /// Returns whether any packet in it was authenticated, for the worker
+    /// to trust its source address.
+    pub fn recv(self: *Self, datagram: []u8, now: u64) bool {
+        if (self.state == .closed or self.state == .draining) return false;
         self.bytes_received += datagram.len;
         if (self.state == .closing) {
             // Answer with our CONNECTION_CLOSE again, at a bounded rate.
@@ -443,12 +446,13 @@ pub const Conn = struct {
                 self.close_resends += 1;
                 self.close_pending = true;
             }
-            return;
+            return false;
         }
+        const before = self.packets_received;
         var rest = datagram;
         var first_dcid: ?[]const u8 = null;
         while (rest.len > 0) {
-            const h = packet.parseHeader(rest, self.cfg.cid_len) catch return;
+            const h = packet.parseHeader(rest, self.cfg.cid_len) catch break;
             const pkt = rest[0..h.len];
             rest = rest[h.len..];
             // §12.2: coalesced packets share the DCID; others are dropped.
@@ -456,8 +460,9 @@ pub const Conn = struct {
                 if (!std.mem.eql(u8, d, h.dcid)) continue;
             } else first_dcid = h.dcid;
             self.recvPacket(h, pkt, now);
-            if (self.state == .closing or self.state == .draining or self.state == .closed) return;
+            if (self.state == .closing or self.state == .draining or self.state == .closed) break;
         }
+        return self.packets_received != before;
     }
 
     fn recvPacket(self: *Self, h: packet.Header, pkt: []u8, now: u64) void {
@@ -493,6 +498,7 @@ pub const Conn = struct {
         const reserved: u8 = if (h.type == .one_rtt) 0x18 else 0x0c;
         if (pkt[0] & reserved != 0) return self.fail(.protocol_violation, 0, now);
         if (pn < sp.rx_floor or sp.rx_ranges.contains(pn)) return; // duplicate
+        self.packets_received += 1;
         if (phase_change) self.commitKeyUpdate(pn, now);
 
         if (space == .handshake and !self.spaces[0].discarded) {
@@ -1017,7 +1023,9 @@ pub const Conn = struct {
         var t: ?u64 = self.loss_timer;
         if (self.idleTimeout()) |idle| t = min(t, self.last_activity + idle);
         for (&self.spaces) |*sp| {
-            if (sp.ack_deadline) |d| t = min(t, d);
+            if (sp.ack_deadline) |d| {
+                if (sp.ack_wanted and !sp.rx_ranges.isEmpty() and !sp.discarded) t = min(t, d);
+            }
         }
         if (self.prev_keys_until) |d| t = min(t, d);
         return t;
@@ -1055,7 +1063,10 @@ pub const Conn = struct {
                 self.onLossTimeout(now);
             }
         }
-        // ACK deadlines are met by `send`.
+        // ACK deadlines are met by `send`; drop any with nothing to send.
+        for (&self.spaces) |*sp| {
+            if (sp.ack_deadline != null and (!sp.ack_wanted or sp.rx_ranges.isEmpty() or sp.discarded)) sp.ack_deadline = null;
+        }
     }
 
     // -- Streams --------------------------------------------------------------

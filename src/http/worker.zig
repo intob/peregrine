@@ -21,9 +21,11 @@ const exchange = @import("./exchange.zig");
 const h2 = @import("../h2/conn.zig");
 const H2Conn = h2.Conn;
 const h2_preface = @import("../h2/frame.zig").preface;
+const quic_endpoint = @import("../quic/endpoint.zig");
 
 const LISTENER_TOKEN: u64 = std.math.maxInt(u64);
 const WAKER_TOKEN: u64 = std.math.maxInt(u64) - 1;
+const UDP_TOKEN: u64 = std.math.maxInt(u64) - 2;
 const NIL: u32 = std.math.maxInt(u32);
 /// Connections accepted per listener event, to stay fair to existing ones.
 const ACCEPT_BATCH = 64;
@@ -54,6 +56,8 @@ pub const Options = struct {
     tls: ?*const tls.Config = null,
     /// TLS record buffers preallocated per worker (input and output each).
     tls_buffer_pool_size: usize = 0,
+    /// HTTP/3 on the worker's UDP socket, if it has one.
+    quic: ?quic_endpoint.Options = null,
 };
 
 pub fn Worker(comptime Handler: type) type {
@@ -158,6 +162,9 @@ pub fn Worker(comptime Handler: type) type {
         tls_pools: ?tls.Pools = null,
         /// Handshake randomness, seeded from the OS once per worker.
         rng: std.Random.ChaCha,
+        /// HTTP/3 connections on this worker's UDP socket.
+        quic: ?quic_endpoint.Endpoint(Handler) = null,
+        udp: sys.fd_t = -1,
 
         pub const InitConfig = struct {
             id: usize,
@@ -167,6 +174,8 @@ pub fn Worker(comptime Handler: type) type {
             listener: sys.fd_t,
             owns_listener: bool,
             opts: Options,
+            /// A UDP socket for HTTP/3 (with `opts.quic`), owned by the worker.
+            udp: sys.fd_t = -1,
         };
 
         pub fn init(self: *Self, cfg: InitConfig) !void {
@@ -233,6 +242,14 @@ pub fn Worker(comptime Handler: type) type {
             self.resp.now = &self.now;
             try self.poller.add(self.listener, LISTENER_TOKEN, .level_read);
             try self.poller.add(self.waker.read_fd, WAKER_TOKEN, .level_read);
+            if (cfg.udp >= 0) {
+                if (opts.quic) |qopts| {
+                    self.udp = cfg.udp;
+                    self.quic = try .init(allocator, qopts, cfg.udp);
+                    self.quic.?.bindWorker(self.handler, self.req, self.resp, &self.date_line, &self.now, &self.exchanges);
+                    try self.poller.add(cfg.udp, UDP_TOKEN, .level_read);
+                }
+            }
         }
 
         pub fn spawn(self: *Self, stack_size: usize, pin: bool) !void {
@@ -253,6 +270,8 @@ pub fn Worker(comptime Handler: type) type {
                 if (c.open) self.closeConn(c);
             }
             if (self.owns_listener) sys.close(self.listener);
+            if (self.quic) |*ep| ep.deinit();
+            if (self.udp >= 0) sys.close(self.udp);
             self.poller.deinit();
             self.exchanges.deinit();
             self.mailbox.deinit();
@@ -273,20 +292,29 @@ pub fn Worker(comptime Handler: type) type {
             while (!self.shutdown.load(.acquire)) {
                 // With no connections there are no timers to run, so block
                 // until something happens (shutdown uses the waker).
-                const timeout: i32 = if (self.open_count == 0) -1 else 1000;
+                var timeout: i32 = if (self.open_count == 0) -1 else 1000;
+                if (self.quic) |*ep| {
+                    // QUIC timers need millisecond resolution; exchanges on
+                    // HTTP/3 still want the per-second tick.
+                    if (ep.connections() > 0 and timeout < 0) timeout = 1000;
+                    if (ep.timeoutMs(nowUs())) |ms| timeout = if (timeout < 0) ms else @min(timeout, ms);
+                }
                 const n = self.poller.wait(&events, timeout);
                 self.tick();
                 for (events[0..n]) |ev| {
                     switch (Poller.token(ev)) {
                         LISTENER_TOKEN => self.acceptConnections(),
                         WAKER_TOKEN => self.drainWaker(),
+                        UDP_TOKEN => self.quic.?.onReadable(nowUs()),
                         else => |token| self.onConnEvent(ev, token),
                     }
                 }
                 // WebSocket output queued by handlers during this batch, or
                 // by other threads (which also wrote the waker).
                 self.drainMailbox();
+                if (self.quic) |*ep| ep.onTimers(nowUs());
             }
+            if (self.quic) |*ep| ep.shutdown(nowUs());
             // Shutting down: tell HTTP/2 clients with one GOAWAY each
             // (best effort, one write), before deinit closes the sockets.
             for (self.conns) |*c| {
@@ -304,6 +332,10 @@ pub fn Worker(comptime Handler: type) type {
                     conn.advance(n);
                 }
             }
+        }
+
+        fn nowUs() u64 {
+            return sys.nanoTimestamp() / std.time.ns_per_us;
         }
 
         fn drainWaker(self: *Self) void {
@@ -350,6 +382,10 @@ pub fn Worker(comptime Handler: type) type {
             for (self.exchanges.entries, 0..) |*e, slot| {
                 if (!e.active) continue;
                 if (@as(i32, @bitCast(e.deadline -% self.now)) > 0) continue;
+                if (e.conn_slot & quic_endpoint.exchange_slot_flag != 0) {
+                    if (self.quic) |*ep| ep.onExchangeTimeout(e.conn_slot, e.conn_gen, @intCast(slot), nowUs());
+                    continue;
+                }
                 const c = &self.conns[e.conn_slot];
                 if (!c.open or c.gen != e.conn_gen) continue;
                 if (c.h2) |conn| {
@@ -675,6 +711,10 @@ pub fn Worker(comptime Handler: type) type {
         fn exchangePosted(self: *Self, slot: u32, gen: u31) void {
             const e = self.exchanges.entry(slot);
             if (!e.active or (e.gen & 0x7fffffff) != gen or !e.bound) return;
+            if (e.conn_slot & quic_endpoint.exchange_slot_flag != 0) {
+                if (self.quic) |*ep| ep.onExchangePosted(e.conn_slot, e.conn_gen, slot, nowUs());
+                return;
+            }
             const c = &self.conns[e.conn_slot];
             if (!c.open or c.gen != e.conn_gen) return;
             if (c.h2) |conn| {
@@ -1055,7 +1095,7 @@ pub fn Worker(comptime Handler: type) type {
                 c.pending_head_pos = 0;
             }
             const body_written = @min(written -| out.len, out.body.len);
-            c.pending_tail = out.tail[written -| (out.len + out.body.len) ..];
+            c.pending_tail = out.tail[written -| (out.len + out.body.len)..];
             const body_rest = out.body[body_written..];
             if (body_rest.len == 0) return;
             const resp_buf = self.resp.body_buf;
@@ -1368,6 +1408,10 @@ pub fn Worker(comptime Handler: type) type {
                 };
             }
             if (self.mailbox.takeOverflow()) {
+                for (self.exchanges.entries, 0..) |*e, slot| {
+                    if (e.active and e.bound and e.conn_slot & quic_endpoint.exchange_slot_flag != 0)
+                        self.exchangePosted(@intCast(slot), @intCast(e.gen & 0x7fffffff));
+                }
                 for (self.conns) |*c| {
                     if (!c.open or c.lingering) continue;
                     if (c.ws != null) {

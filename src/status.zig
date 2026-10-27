@@ -78,7 +78,7 @@ pub const Status = enum(u16) {
 
     /// RFC 9110 §8.6: no Content-Length in 1xx or 204 responses.
     pub fn allowsContentLength(self: Status) bool {
-        const code = @intFromEnum(self);
+        const code = @backingInt(self);
         return code >= 200 and code != 204;
     }
 };

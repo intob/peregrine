@@ -1743,3 +1743,175 @@ test "tls: bad credentials fail init" {
     cfg.tls.?.key_pem = tls_testdata.p384_key;
     try testing.expectError(error.KeyCertificateMismatch, Server(TestHandler).init(testing.allocator, 0, cfg));
 }
+
+// -- HTTP/3 over UDP ------------------------------------------------------------
+
+const quic_test_client = @import("./quic/test_client.zig");
+const h3frame = @import("./h3/frame.zig");
+const qpack = @import("./h3/qpack.zig");
+const quic_packet = @import("./quic/packet.zig");
+
+/// The QUIC test client on a connected UDP socket.
+const H3Client = struct {
+    fd: sys.fd_t,
+    c: *quic_test_client.Client,
+
+    fn connect(port: u16) !H3Client {
+        const nonblock: u32 = if (sys.is_linux) std.os.linux.SOCK.NONBLOCK else 0;
+        const rc = system.socket(posix.AF.INET, posix.SOCK.DGRAM | nonblock, posix.IPPROTO.UDP);
+        if (posix.errno(rc) != .SUCCESS) return error.SocketFailed;
+        const fd: sys.fd_t = @intCast(rc);
+        var addr = std.mem.zeroes(posix.sockaddr.in);
+        addr.family = posix.AF.INET;
+        addr.port = std.mem.nativeToBig(u16, port);
+        addr.addr = @bitCast([4]u8{ 127, 0, 0, 1 });
+        if (posix.errno(system.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in))) != .SUCCESS) return error.ConnectFailed;
+        if (!sys.is_linux) try sys.setNonBlocking(fd);
+        sys.setsockoptInt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, 8 << 20) catch {};
+        var dcid: [8]u8 = undefined;
+        sys.randomBytes(&dcid);
+        const c = try quic_test_client.Client.init(testing.allocator, .{ .dcid = dcid, .max_stream_data = 16 << 20, .max_data = 64 << 20 });
+        return .{ .fd = fd, .c = c };
+    }
+
+    fn close(self: *H3Client) void {
+        self.c.deinit();
+        sys.close(self.fd);
+    }
+
+    /// Exchanges datagrams until `done` holds or `ms` pass.
+    fn runUntil(self: *H3Client, ms: u64, ctx: anytype, comptime done: fn (@TypeOf(ctx), *H3Client) bool) !void {
+        const began = sys.nanoTimestamp();
+        var buf: [65536]u8 = undefined;
+        var quiet: u32 = 0;
+        while (!done(ctx, self)) {
+            if (sys.nanoTimestamp() - began > ms * std.time.ns_per_ms) return error.Timeout;
+            while (true) {
+                const n = try self.c.send(&buf);
+                if (n == 0) break;
+                _ = sys.write(self.fd, buf[0..n]) catch {};
+            }
+            var got = false;
+            while (true) {
+                const n = sys.read(self.fd, &buf) catch break;
+                try self.c.recv(buf[0..n]);
+                got = true;
+            }
+            if (!got) {
+                quiet += 1;
+                // No loss on loopback in practice; resend now and then anyway.
+                if (quiet % 200 == 0) try self.c.retransmit();
+                sleepMs(1);
+            } else quiet = 0;
+        }
+    }
+
+    fn start(self: *H3Client) !void {
+        try self.runUntil(5000, {}, struct {
+            fn f(_: void, h: *H3Client) bool {
+                return h.c.handshake_done;
+            }
+        }.f);
+        const control = try self.c.openUni();
+        try self.c.write(control, &.{ 0x00, 0x04, 0x00 }, false);
+    }
+
+    fn request(self: *H3Client, method: []const u8, path: []const u8, body: []const u8) !u64 {
+        const id = try self.c.openBidi();
+        var section: [512]u8 = undefined;
+        var n: usize = 2;
+        @memcpy(section[0..2], &qpack.section_prefix);
+        for ([_][2][]const u8{ .{ ":method", method }, .{ ":scheme", "https" }, .{ ":authority", "localhost" }, .{ ":path", path } }) |f|
+            n += try qpack.encodeField(section[n..], f[0], f[1]);
+        var hdr: [16]u8 = undefined;
+        var w: quic_packet.Writer = .{ .buf = &hdr };
+        h3frame.writeHeader(&w, .headers, n);
+        try self.c.write(id, w.written(), false);
+        try self.c.write(id, section[0..n], body.len == 0);
+        if (body.len > 0) {
+            w = .{ .buf = &hdr };
+            h3frame.writeHeader(&w, .data, body.len);
+            try self.c.write(id, w.written(), false);
+            try self.c.write(id, body, true);
+        }
+        return id;
+    }
+
+    fn waitFinished(self: *H3Client, ids: []const u64) !void {
+        try self.runUntil(10_000, ids, struct {
+            fn f(list: []const u64, h: *H3Client) bool {
+                for (list) |id| if (!h.c.finished(id)) return false;
+                return true;
+            }
+        }.f);
+    }
+
+    const Resp = struct { status: [3]u8 = @splat('?'), body: std.ArrayList(u8) = .empty, trailers: usize = 0 };
+
+    fn response(self: *H3Client, id: u64) !Resp {
+        var r: Resp = .{};
+        var data = self.c.readAll(id);
+        var dec = try qpack.Decoder.init(testing.allocator, .{});
+        defer dec.deinit();
+        var seen_headers = false;
+        while (data.len > 0) {
+            const fh = h3frame.parseHeader(data) orelse return error.Truncated;
+            const payload = data[fh.size..][0..@intCast(fh.len)];
+            data = data[fh.size + payload.len ..];
+            switch (fh.type) {
+                .headers => {
+                    const Sink = struct {
+                        r: *Resp,
+                        pub fn header(s: *@This(), name: []const u8, value: []const u8) !void {
+                            if (std.mem.eql(u8, name, ":status")) s.r.status = value[0..3].*;
+                        }
+                    };
+                    var sink: Sink = .{ .r = &r };
+                    try dec.decode(payload, &sink);
+                    if (seen_headers) r.trailers += 1;
+                    seen_headers = true;
+                },
+                .data => try r.body.appendSlice(testing.allocator, payload),
+                else => {},
+            }
+        }
+        return r;
+    }
+};
+
+test "http3: requests over UDP, large bodies, exchanges from other threads" {
+    var cfg = tlsConfig();
+    cfg.http3 = .{};
+    const r = try Running.start(.epoll, cfg);
+    defer r.stop();
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    var cl = try H3Client.connect(r.srv.getQuicPort());
+    defer cl.close();
+    try cl.start();
+    const hello = try cl.request("GET", "/hello", "");
+    const big = try cl.request("GET", "/big", "");
+    const later = try cl.request("GET", "/later", "");
+    const streamed = try cl.request("GET", "/stream", "");
+    const echo = try cl.request("POST", "/echo", "an upload body");
+    try cl.waitFinished(&.{ hello, big, later, streamed, echo });
+
+    var a = try cl.response(hello);
+    defer a.body.deinit(testing.allocator);
+    try testing.expectEqualStrings("200", &a.status);
+    try testing.expectEqualStrings("ok", a.body.items);
+    var b = try cl.response(big);
+    defer b.body.deinit(testing.allocator);
+    try testing.expectEqual(big_body.len, b.body.items.len);
+    try testing.expect(std.mem.eql(u8, &big_body, b.body.items));
+    var c = try cl.response(later);
+    defer c.body.deinit(testing.allocator);
+    try testing.expectEqualStrings("202", &c.status);
+    try testing.expect(c.body.items.len > 0);
+    var d = try cl.response(streamed);
+    defer d.body.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 6 + 200 * 1024 + 6), d.body.items.len);
+    try testing.expectEqual(@as(usize, 1), d.trailers);
+    var e = try cl.response(echo);
+    defer e.body.deinit(testing.allocator);
+    try testing.expectEqualStrings("an upload body", e.body.items);
+}

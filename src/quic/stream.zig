@@ -8,8 +8,9 @@ const RangeSet = ranges.RangeSet;
 const Allocator = std.mem.Allocator;
 
 /// Out-of-order fragments a stream may hold before the connection is
-/// closed (fragmentation defence).
-pub const max_fragments = 64;
+/// closed (fragmentation defence). Enough for a full window of 1 MB with
+/// heavy loss; each costs 16 bytes.
+pub const max_fragments = 1024;
 
 pub const RecvError = error{
     /// Data past the advertised limit (FLOW_CONTROL_ERROR).
@@ -306,7 +307,7 @@ test "receive: reordering, duplicates, flow control and final size" {
     // Fragmentation is bounded.
     s.reset(0);
     var i: u64 = 0;
-    const err: ?RecvError = while (i < 1000) : (i += 1) {
+    const err: ?RecvError = while (i < 5000) : (i += 1) {
         _ = s.recv(a, 1 + i * 2, "x", false) catch |e| break e;
     } else null;
     try testing.expectEqual(@as(?RecvError, error.Fragmented), err);

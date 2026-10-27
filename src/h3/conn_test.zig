@@ -168,7 +168,7 @@ const Harness = struct {
             });
             h.h3c = try h3.Conn.init(h.a, h.h3_opts, h.server.?);
         }
-        h.server.?.recv(dgram, h.now_us);
+        _ = h.server.?.recv(dgram, h.now_us);
         h.serverProcess();
     }
 
@@ -213,11 +213,11 @@ const Harness = struct {
             h.now_us += 1000;
             if (!progress) {
                 if (h.server) |s| {
-                    if (s.deadline()) |d| {
+                    if (s.deadline()) |d| if (d < h.now_us + 2 * std.time.us_per_s) {
                         if (d > h.now_us) h.now_us = d;
                         s.onTimeout(h.now_us);
                         h.serverProcess();
-                    }
+                    };
                 }
                 try h.client.retransmit();
             }

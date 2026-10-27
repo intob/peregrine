@@ -1166,7 +1166,7 @@ test "decoder rejects malformed blocks" {
     // Index 0.
     try testing.expectError(error.CompressionError, dec.decode(&.{0x80}, &sink));
     // Index past the tables (static 61, dynamic empty).
-    try testing.expectError(error.CompressionError, dec.decode(&.{ 0xbe }, &sink));
+    try testing.expectError(error.CompressionError, dec.decode(&.{0xbe}, &sink));
     try testing.expectError(error.CompressionError, dec.decode(&.{ 0xff, 0x00 }, &sink));
     // Literal with a name index past the tables.
     try testing.expectError(error.CompressionError, dec.decode(&.{ 0x7f, 0x00, 0x01, 'x' }, &sink));

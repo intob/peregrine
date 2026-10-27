@@ -568,7 +568,6 @@ pub const Exchange = struct {
         if (!e.keep_alive) out.append("connection: close\r\n");
         out.append("\r\n");
     }
-
 };
 
 /// What `h2Poll` found.

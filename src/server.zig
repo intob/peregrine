@@ -21,6 +21,31 @@ const ws = @import("./ws/conn.zig");
 const tls_conn = @import("./tls/conn.zig");
 pub const H2Options = @import("./h2/conn.zig").Options;
 const Credentials = @import("./tls/credentials.zig").Credentials;
+const quic_conn = @import("./quic/conn.zig");
+const quic_endpoint = @import("./quic/endpoint.zig");
+const udp = @import("./quic/udp.zig");
+const h3 = @import("./h3/conn.zig");
+const recovery = @import("./quic/recovery.zig");
+
+pub const Http3Options = struct {
+    /// UDP port; 0 for the TLS listener's port.
+    port: u16 = 0,
+    /// Validate every client's address with a Retry before its handshake
+    /// (one more round trip; a defence against spoofed floods).
+    retry: bool = false,
+    max_connections_per_worker: u32 = 4096,
+    /// Concurrent requests per connection.
+    max_streams: u32 = 100,
+    /// Largest UDP payload sent. 1200 bytes is safe on every path; 1350
+    /// fits typical Ethernet paths with room for tunnels.
+    max_datagram_size: u16 = 1350,
+    /// Milliseconds without traffic before a connection is closed.
+    idle_timeout_ms: u64 = 30_000,
+    congestion: recovery.Algorithm = .cubic,
+    /// Connection receive window, and per request stream.
+    max_data: u64 = 16 * 1024 * 1024,
+    max_stream_data: u64 = 1024 * 1024,
+};
 
 pub const TlsOptions = struct {
     /// PEM certificate chain, leaf first.
@@ -101,6 +126,9 @@ pub const Config = struct {
     /// HTTP/2 connection settings. `limits`, the HPACK header list size and
     /// the request timeout are taken from this Config.
     h2: H2Options = .{},
+    /// HTTP/3 over QUIC on a UDP port, with the TLS certificate. Needs
+    /// `tls` and the epoll/kqueue backend.
+    http3: ?Http3Options = null,
 };
 
 /// The server that a signal handler should stop.
@@ -193,6 +221,8 @@ pub fn Server(comptime Handler: type) type {
         port: u16,
         tls_credentials: ?Credentials = null,
         tls_config: tls_conn.Config = undefined,
+        quic_tls_config: tls_conn.Config = undefined,
+        quic_port: u16 = 0,
 
         pub fn init(allocator: std.mem.Allocator, port: u16, cfg: Config) !*Self {
             const address = try std.Io.net.IpAddress.parse(cfg.ip, port);
@@ -240,9 +270,22 @@ pub fn Server(comptime Handler: type) type {
             if (cfg.tls) |t| {
                 srv.tls_credentials = try Credentials.fromPem(allocator, t.cert_pem, t.key_pem);
                 srv.tls_config = .{ .credentials = &srv.tls_credentials.?, .alpn = t.alpn };
+                srv.quic_tls_config = .{ .credentials = &srv.tls_credentials.?, .alpn = &.{"h3"}, .quic = true };
                 srv.cfg.tls = null; // the PEM data may be freed after init
             }
             errdefer if (srv.tls_credentials) |*c| c.deinit();
+            if (cfg.http3 != null) {
+                if (srv.tls_credentials == null) return error.Http3NeedsTls;
+                if (backend == .io_uring) return error.Http3NeedsEpoll;
+            }
+            // Linux steers each connection's datagrams to its worker
+            // (SO_REUSEPORT with a BPF program); elsewhere only the first
+            // worker serves HTTP/3.
+            var udp_fds: [256]sys.fd_t = @splat(-1);
+            if (worker_count > udp_fds.len and cfg.http3 != null) return error.TooManyWorkers;
+            errdefer for (udp_fds) |fd| {
+                if (fd >= 0) sys.close(fd);
+            };
 
             // Linux load-balances SO_REUSEPORT listeners across workers, so
             // each worker gets its own: no shared accept queue, no handoff.
@@ -302,7 +345,17 @@ pub fn Server(comptime Handler: type) type {
                     .h2 = h2_opts,
                     .tls = if (srv.tls_credentials != null) &srv.tls_config else null,
                     .tls_buffer_pool_size = if (cfg.tls) |t| t.buffer_pool_size else 0,
+                    .quic = if (cfg.http3) |o| srv.quicOptions(o, i, worker_count) else null,
                 };
+                if (cfg.http3) |o| {
+                    if (sys.is_linux or i == 0) {
+                        if (i == 0) srv.quic_port = if (o.port != 0) o.port else srv.port;
+                        var ua = address;
+                        ua.setPort(srv.quic_port);
+                        udp_fds[i] = try udp.bind(ua, sys.is_linux);
+                        if (i == 0 and srv.quic_port == 0) srv.quic_port = try udp.localPort(udp_fds[0]);
+                    }
+                }
                 const result = switch (backend) {
                     .io_uring => if (sys.is_linux) blk: {
                         w.* = .{ .uring = undefined };
@@ -325,9 +378,12 @@ pub fn Server(comptime Handler: type) type {
                             .listener = listener,
                             .owns_listener = per_worker,
                             .opts = opts,
+                            .udp = udp_fds[i],
                         });
                     },
                 };
+                // The worker owns its UDP socket now.
+                udp_fds[i] = -1;
                 result catch |err| {
                     if (per_worker) sys.close(listener);
                     return err;
@@ -335,8 +391,40 @@ pub fn Server(comptime Handler: type) type {
                 initialised += 1;
                 srv.wakers[i] = w.waker();
             }
+            if (cfg.http3 != null and sys.is_linux and worker_count > 1) {
+                // Without steering the kernel hashes the 4-tuple, which keeps
+                // a connection on one worker until the client's address
+                // changes; with it, connection IDs decide.
+                udp.attachSteering(srv.workers[0].poll.udp, @intCast(worker_count)) catch {};
+            }
             srv.signal_target = .{ .shutdown = &srv.shutdown_flag, .wakers = srv.wakers, .waking = &srv.waking };
             return srv;
+        }
+
+        fn quicOptions(srv: *Self, o: Http3Options, index: usize, count: usize) quic_endpoint.Options {
+            var h3_opts: h3.Options = .{ .limits = srv.cfg.limits };
+            h3_opts.qpack.max_field_section_size = @intCast(@min(srv.cfg.limits.max_header_bytes, std.math.maxInt(u32)));
+            return .{
+                .quic = .{
+                    .tls = &srv.quic_tls_config,
+                    .max_idle_timeout_ms = o.idle_timeout_ms,
+                    .max_data = o.max_data,
+                    .max_stream_data_bidi = o.max_stream_data,
+                    .max_streams_bidi = o.max_streams,
+                    .max_datagram_size = o.max_datagram_size,
+                    .congestion = o.congestion,
+                },
+                .h3 = h3_opts,
+                .max_connections = o.max_connections_per_worker,
+                .worker_index = @intCast(index),
+                .worker_count = @intCast(if (sys.is_linux) count else 1),
+                .retry = if (o.retry) .always else .never,
+            };
+        }
+
+        /// The UDP port serving HTTP/3 (useful after binding port 0).
+        pub fn getQuicPort(self: *const Self) u16 {
+            return self.quic_port;
         }
 
         /// The I/O backend in use (resolves `.auto`).

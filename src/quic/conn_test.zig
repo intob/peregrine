@@ -135,7 +135,7 @@ const Harness = struct {
             });
             h.first_datagram_len = dgram.len;
         }
-        h.server.?.recv(dgram, h.now);
+        _ = h.server.?.recv(dgram, h.now);
         try EchoApp.run(h.server.?);
     }
 
@@ -169,11 +169,13 @@ const Harness = struct {
                 // Quiet: jump to the server's next deadline, and let the
                 // client resend what is still unacknowledged.
                 if (h.server) |s| {
-                    if (s.deadline()) |d| {
+                    // Timers a quiet connection would reach soon (loss and
+                    // probe timeouts), not the idle timeout.
+                    if (s.deadline()) |d| if (d < h.now + 2 * std.time.us_per_s) {
                         if (d > h.now) h.now = d;
                         s.onTimeout(h.now);
                         try EchoApp.run(s);
-                    }
+                    };
                 }
                 try h.client.retransmit();
             }
