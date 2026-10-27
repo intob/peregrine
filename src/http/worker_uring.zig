@@ -7,9 +7,9 @@
 //!   (natural backpressure)
 //! - writes queued as SQEs, so one io_uring_enter submits every recv and write
 //!   produced by a batch of completions
-//! - TLS like worker.zig: ciphertext is copied out of the kernel buffer into
-//!   the tls.Conn and decrypted into the session; output is encrypted from the
-//!   connection's Out as the wire buffer drains
+//! - TLS like worker.zig: records are decrypted in place in the kernel buffer
+//!   or straight into the session; output is encrypted from the connection's
+//!   Out as the wire buffer drains
 const std = @import("std");
 const linux = std.os.linux;
 const IoUring = linux.IoUring;
@@ -825,17 +825,25 @@ pub fn Worker(comptime Handler: type) type {
 
         // -- TLS ---------------------------------------------------------------
 
-        /// Copies ciphertext out of a kernel buffer (which goes back to the
-        /// ring when this returns) and decrypts it, then runs the session or
-        /// WebSocket. Each round decrypts every complete record, so what is
-        /// left in the TLS buffer is less than a record and the next chunk
-        /// always fits.
-        fn tlsFeed(self: *Self, c: *Conn, t: *TlsConn, data: []const u8) void {
+        /// Decrypts ciphertext from a kernel buffer (which goes back to the
+        /// ring when this returns), then runs the session or WebSocket.
+        /// Records are decrypted in place in the kernel buffer, or straight
+        /// into the session; only a record that spans two receives is
+        /// copied into the TLS buffer, up to its end, and a partial record
+        /// left at the end of the chunk is kept there.
+        fn tlsFeed(self: *Self, c: *Conn, t: *TlsConn, data: []u8) void {
             var rest = data;
             while (rest.len > 0) {
+                if (t.canBorrow()) {
+                    t.borrowInput(rest);
+                    if (!self.tlsDecrypt(c, t)) return;
+                    t.endBorrow() catch return self.closeConn(c);
+                    break;
+                }
                 const space = t.readSpace() catch return self.closeConn(c);
                 std.debug.assert(space.len > 0);
-                const n = @min(space.len, rest.len);
+                const need = t.partialRecordNeed();
+                const n = @min(space.len, rest.len, if (need > 0) need else rest.len);
                 @memcpy(space[0..n], rest[0..n]);
                 t.commitRead(n);
                 rest = rest[n..];

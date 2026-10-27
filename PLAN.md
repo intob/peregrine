@@ -348,10 +348,13 @@ Later in M4:
       runs each): GET 64 KiB 87k-96k → 121k-130k req/s and 51-53 → 31 µs server CPU
       per request; POST 12 KiB 15.5 → 10.6-10.9 µs; "Hello" 8.0-8.2 → 7.7-8.0 µs.
       x86_64 (AES-NI + PCLMUL) would want the same treatment
-- [ ] io_uring + TLS: decrypt straight out of the kernel's provided buffer when it
-      holds whole records (as the plaintext path parses in place). The copy costs
-      uploads about 17% more server CPU than on epoll (18.5 vs 15.9 µs per 12 KiB
-      upload)
+- [x] io_uring + TLS: records are decrypted in place in the kernel's provided
+      buffer, or straight into the session (`tls.Conn.borrowInput`); only a record
+      that spans two receives is copied, up to its end, and a partial record at the
+      end of a receive is kept. The split-invariance test replays every split
+      copied and borrowed, with the borrowed buffer poisoned afterwards. The gain
+      was within noise: the copy wasn't what made uploads slower on io_uring,
+      because plaintext uploads have the same gap
 - [ ] Faster handshakes: measure on Linux; candidates are P-256 signing, ML-KEM
       encapsulation, and the per-handshake allocations (handshake state, flight buffer)
 - [x] Send KeyUpdate before the AES-GCM record limit: after 2^24 records under one

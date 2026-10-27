@@ -846,6 +846,20 @@ fn testTlsKeepAlive(backend: Backend) !void {
     resp = try c.readResponse(&body);
     try testing.expectEqualStrings("ok", body[0..resp.body_len]);
 
+    // A body of many full records, which span the server's reads (on
+    // io_uring, its kernel buffers).
+    const upload = try testing.allocator.alloc(u8, 300 * 1024);
+    defer testing.allocator.free(upload);
+    for (upload, 0..) |*b, i| b.* = @truncate(i *% 7);
+    var head_buf: [96]u8 = undefined;
+    try c.send(try std.fmt.bufPrint(&head_buf, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: {d}\r\n\r\n", .{upload.len}));
+    try c.send(upload);
+    const echoed = try testing.allocator.alloc(u8, upload.len);
+    defer testing.allocator.free(echoed);
+    resp = try c.readResponse(echoed);
+    try testing.expectEqual(upload.len, resp.body_len);
+    try testing.expectEqualSlices(u8, upload, echoed);
+
     // Larger than the TLS output buffer and the socket buffer: encrypted in
     // pieces as the socket drains.
     const got = try testing.allocator.alloc(u8, big_body_len);

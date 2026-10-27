@@ -71,6 +71,8 @@ pub const Conn = struct {
     in_buf: []u8 = &.{},
     in_start: usize = 0,
     in_end: usize = 0,
+    /// `in_buf` is the caller's (see `borrowInput`), not the pool's.
+    borrowed: bool = false,
     /// Decrypted application data not yet taken (points into in_buf).
     plain: []u8 = &.{},
 
@@ -99,7 +101,7 @@ pub const Conn = struct {
         self.freeHandshake();
         if (self.read) |*p| p.wipe();
         if (self.write) |*p| p.wipe();
-        if (self.in_buf.len > 0) self.pools.in.release(self.in_buf);
+        if (self.in_buf.len > 0 and !self.borrowed) self.pools.in.release(self.in_buf);
         if (self.wire_buf.len > 0) self.pools.out.release(self.wire_buf);
         self.* = undefined;
     }
@@ -126,6 +128,7 @@ pub const Conn = struct {
     /// Space to read ciphertext into. Empty while the buffer is full of
     /// decrypted data not yet taken with `readPlain`.
     pub fn readSpace(self: *Self) ![]u8 {
+        std.debug.assert(!self.borrowed);
         if (self.in_buf.len == 0) {
             self.in_buf = try self.pools.in.acquire();
             self.in_start = 0;
@@ -137,6 +140,59 @@ pub const Conn = struct {
 
     pub fn commitRead(self: *Self, n: usize) void {
         self.in_end += n;
+    }
+
+    /// Bytes to read before the buffered input ends on a record boundary
+    /// (the header first, then the rest of the record), or 0 when nothing
+    /// is buffered. Reading no more than this into `readSpace` lets the
+    /// rest of a chunk go through `borrowInput`.
+    pub fn partialRecordNeed(self: *const Self) usize {
+        const avail = self.in_end - self.in_start;
+        if (avail == 0 or self.failed or self.peer_closed) return 0;
+        if (avail < record.header_len) return record.header_len - avail;
+        const header = self.in_buf[self.in_start..][0..record.header_len];
+        const len = std.mem.readInt(u16, header[3..5], .big);
+        return (record.header_len + len) -| avail;
+    }
+
+    /// Whether `borrowInput` may be called: nothing is buffered.
+    pub fn canBorrow(self: *const Self) bool {
+        return self.in_start == self.in_end and self.plain.len == 0;
+    }
+
+    /// Processes ciphertext from `data` without copying it into the input
+    /// buffer: records are decrypted in place or straight into `readPlain`'s
+    /// destination. For a buffer the caller gets back (say, a kernel recv
+    /// buffer): call `endBorrow` before `data` is reused.
+    pub fn borrowInput(self: *Self, data: []u8) void {
+        std.debug.assert(self.canBorrow() and !self.borrowed);
+        if (self.in_buf.len > 0) self.pools.in.release(self.in_buf);
+        self.in_buf = data;
+        self.in_start = 0;
+        self.in_end = data.len;
+        self.borrowed = true;
+    }
+
+    /// Copies what is left of borrowed input (a partial record, or records
+    /// not yet processed) into a pooled buffer. Dropped after a failure or
+    /// the peer's close, since it would never be read.
+    pub fn endBorrow(self: *Self) !void {
+        std.debug.assert(self.borrowed);
+        const plain = self.plain;
+        const rest = self.in_buf[self.in_start..self.in_end];
+        self.borrowed = false;
+        self.in_buf = &.{};
+        self.in_start = 0;
+        self.in_end = 0;
+        self.plain = &.{};
+        if (self.failed or self.peer_closed or plain.len + rest.len == 0) return;
+        if (plain.len + rest.len > in_buffer_size) return error.BufferFull;
+        self.in_buf = try self.pools.in.acquire();
+        @memcpy(self.in_buf[0..plain.len], plain);
+        self.plain = self.in_buf[0..plain.len];
+        @memcpy(self.in_buf[plain.len..][0..rest.len], rest);
+        self.in_start = plain.len;
+        self.in_end = plain.len + rest.len;
     }
 
     fn compact(self: *Self) void {
@@ -191,7 +247,7 @@ pub const Conn = struct {
 
     /// Return the input buffer to the pool when nothing is buffered.
     pub fn releaseIfIdle(self: *Self) void {
-        if (self.in_buf.len > 0 and self.in_start == self.in_end and self.plain.len == 0) {
+        if (self.in_buf.len > 0 and !self.borrowed and self.in_start == self.in_end and self.plain.len == 0) {
             self.pools.in.release(self.in_buf);
             self.in_buf = &.{};
             self.in_start = 0;
@@ -223,7 +279,7 @@ pub const Conn = struct {
         };
         if (avail < record.header_len + len) {
             // Make room for the rest of the record.
-            if (self.in_start > 0 and self.in_start + record.header_len + len > self.in_buf.len) self.compact();
+            if (!self.borrowed and self.in_start > 0 and self.in_start + record.header_len + len > self.in_buf.len) self.compact();
             return null;
         }
         const rec = self.in_buf[self.in_start..][0 .. record.header_len + len];
@@ -682,7 +738,7 @@ test "std's TLS client follows our KeyUpdates" {
     }
 }
 
-test "split invariance: any split of the client's bytes gives identical output" {
+test "split invariance: any split of the client's bytes gives identical output, copied or borrowed" {
     const td = credentials.testdata;
     var server: TestServer = undefined;
     try server.init(td.p256_cert, td.p256_key);
@@ -692,40 +748,71 @@ test "split invariance: any split of the client's bytes gives identical output" 
     // so it is deterministic), then replay the client's bytes in pieces.
     var transcript: std.ArrayList(u8) = .empty;
     defer transcript.deinit(testing.allocator);
-    try runAgainstStdClient(&server, "GET / HTTP/1.1\r\nHost: x\r\n\r\n", &transcript);
+    // Long enough that its record outgrows `readPlain`'s buffer below.
+    const msg = "GET / HTTP/1.1\r\nHost: x\r\nX-Pad: " ++ &@as([600]u8, @splat('a')) ++ "\r\n\r\n";
+    try runAgainstStdClient(&server, msg, &transcript);
     const input = transcript.items;
 
     const Replay = struct {
-        fn run(srv: *TestServer, bytes: []const u8, splits: []const usize, wire: *std.ArrayList(u8), plain_out: *std.ArrayList(u8)) !void {
+        const Mode = enum {
+            copy,
+            /// As the io_uring worker does: each chunk sits in a buffer
+            /// that is reused afterwards (poisoned here), and is borrowed
+            /// once nothing is buffered.
+            borrow,
+            /// Borrow, but take only one piece of plaintext before the
+            /// chunk ends, so the rest is kept by `endBorrow`.
+            borrow_partial,
+        };
+
+        fn run(srv: *TestServer, bytes: []const u8, splits: []const usize, mode: Mode, wire: *std.ArrayList(u8), plain_out: *std.ArrayList(u8)) !void {
             var conn = try Conn.init(testing.allocator, &srv.pools, &srv.config, &testEntropy(5));
             defer conn.deinit();
             var pos: usize = 0;
             var si: usize = 0;
-            var buf: [100]u8 = undefined;
+            var kernel: [2048]u8 = undefined;
             while (pos < bytes.len) {
                 const want = if (si < splits.len) splits[si] else bytes.len - pos;
                 si += 1;
-                var chunk = bytes[pos..@min(bytes.len, pos + want)];
-                pos += chunk.len;
+                const len = @min(bytes.len - pos, want, kernel.len);
+                @memcpy(kernel[0..len], bytes[pos..][0..len]);
+                pos += len;
+                var chunk = kernel[0..len];
                 while (chunk.len > 0) {
+                    if (mode != .copy and conn.canBorrow()) {
+                        conn.borrowInput(chunk);
+                        try drain(&conn, if (mode == .borrow) null else 1, wire, plain_out);
+                        try conn.endBorrow();
+                        @memset(&kernel, 0xaa);
+                        break;
+                    }
                     const space = try conn.readSpace();
-                    const k = @min(space.len, chunk.len);
+                    const need = if (mode == .copy) 0 else conn.partialRecordNeed();
+                    const k = @min(space.len, chunk.len, if (need > 0) need else chunk.len);
                     @memcpy(space[0..k], chunk[0..k]);
                     conn.commitRead(k);
                     chunk = chunk[k..];
-                    while (true) {
-                        const n = conn.readPlain(&buf);
-                        if (n == 0) break;
-                        try plain_out.appendSlice(testing.allocator, buf[0..n]);
-                        var sent: usize = 0;
-                        while (sent < n) sent += try conn.encrypt(&.{buf[sent..n]});
-                    }
-                    try wire.appendSlice(testing.allocator, conn.wireBytes());
-                    conn.advance(conn.wireBytes().len);
-                    try testing.expect(!conn.failed);
+                    try drain(&conn, null, wire, plain_out);
                 }
             }
+            try drain(&conn, null, wire, plain_out);
             try testing.expect(conn.peer_closed);
+        }
+
+        /// Echoes decrypted data (at most `limit` pieces of it).
+        fn drain(conn: *Conn, limit: ?usize, wire: *std.ArrayList(u8), plain_out: *std.ArrayList(u8)) !void {
+            var buf: [100]u8 = undefined;
+            var pieces: usize = 0;
+            while (limit == null or pieces < limit.?) : (pieces += 1) {
+                const n = conn.readPlain(&buf);
+                if (n == 0) break;
+                try plain_out.appendSlice(testing.allocator, buf[0..n]);
+                var sent: usize = 0;
+                while (sent < n) sent += try conn.encrypt(&.{buf[sent..n]});
+            }
+            try wire.appendSlice(testing.allocator, conn.wireBytes());
+            conn.advance(conn.wireBytes().len);
+            try testing.expect(!conn.failed);
         }
     };
 
@@ -733,24 +820,27 @@ test "split invariance: any split of the client's bytes gives identical output" 
     defer ref_wire.deinit(testing.allocator);
     var ref_plain: std.ArrayList(u8) = .empty;
     defer ref_plain.deinit(testing.allocator);
-    try Replay.run(&server, input, &.{}, &ref_wire, &ref_plain);
-    try testing.expectEqualStrings("GET / HTTP/1.1\r\nHost: x\r\n\r\n", ref_plain.items);
+    try Replay.run(&server, input, &.{}, .copy, &ref_wire, &ref_plain);
+    try testing.expectEqualStrings(msg, ref_plain.items);
 
     var prng = std.Random.DefaultPrng.init(0x5eed);
     const random = prng.random();
     var splits: [4096]usize = undefined;
-    for (0..100) |round| {
+    for (0..300) |i| {
+        const round = i / 3;
+        const modes = [_]Replay.Mode{ .copy, .borrow, .borrow_partial };
+        const mode = modes[i % 3];
         var n: usize = 0;
         var covered: usize = 0;
         while (covered < input.len and n < splits.len) : (n += 1) {
-            splits[n] = if (round == 0) 1 else random.intRangeAtMost(usize, 1, 300);
+            splits[n] = if (round == 0) 1 else random.intRangeAtMost(usize, 1, 1500);
             covered += splits[n];
         }
         var wire: std.ArrayList(u8) = .empty;
         defer wire.deinit(testing.allocator);
         var plain: std.ArrayList(u8) = .empty;
         defer plain.deinit(testing.allocator);
-        try Replay.run(&server, input, splits[0..n], &wire, &plain);
+        try Replay.run(&server, input, splits[0..n], mode, &wire, &plain);
         // Record boundaries in the output may differ (application data is
         // encrypted as it arrives), so compare the decrypted streams.
         try testing.expectEqualSlices(u8, ref_plain.items, plain.items);
