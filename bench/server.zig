@@ -3,7 +3,8 @@
 //! bodies are read and discarded.
 //! Usage: bench-server [workers] [auto|epoll|io_uring] [port] [tls]
 //! With `tls`, serves TLS 1.3 with the self-signed P-256 certificate in
-//! this directory.
+//! this directory, with ALPN "h2" and "http/1.1". Plaintext serves HTTP/1.1
+//! and HTTP/2 with prior knowledge (h2c).
 const std = @import("std");
 const per = @import("peregrine");
 
@@ -35,7 +36,12 @@ pub fn main(init: std.process.Init) !void {
     const srv = try per.Server(Handler).init(std.heap.smp_allocator, port, .{
         .worker_thread_count = workers,
         .backend = backend,
-        .tls = if (use_tls) .{ .cert_pem = @embedFile("cert.pem"), .key_pem = @embedFile("key.pem") } else null,
+        .h2c = true,
+        .tls = if (use_tls) .{
+            .cert_pem = @embedFile("cert.pem"),
+            .key_pem = @embedFile("key.pem"),
+            .alpn = &.{ "h2", "http/1.1" },
+        } else null,
     });
     std.debug.print("listening on :{d} ({s}, {d} workers{s})\n", .{ srv.getPort(), @tagName(srv.getBackend()), srv.workers.len, if (use_tls) ", tls" else "" });
     try srv.start();

@@ -30,6 +30,9 @@ const Options = @import("./worker.zig").Options;
 const mailbox_mod = @import("../mailbox.zig");
 const Mailbox = mailbox_mod.Mailbox;
 const exchange = @import("./exchange.zig");
+const h2 = @import("../h2/conn.zig");
+const H2Conn = h2.Conn;
+const h2_preface = @import("../h2/frame.zig").preface;
 
 const NIL: u32 = std.math.maxInt(u32);
 const SPECIAL_SLOT: u32 = 0xFF_FFFF;
@@ -91,6 +94,9 @@ pub fn Worker(comptime Handler: type) type {
             /// Set on TLS listeners: sits between the socket and the
             /// session (or the WebSocket decoder).
             tls: ?*TlsConn = null,
+            /// Set once the connection speaks HTTP/2 (ALPN or h2c).
+            h2: ?*H2Conn = null,
+            proto_decided: bool = false,
             /// The session buffer is a kernel-provided recv buffer.
             borrowed: bool = false,
             /// This connection's output. Owned while a write is in flight.
@@ -146,6 +152,7 @@ pub fn Worker(comptime Handler: type) type {
         idle: List,
         active: List,
         open_count: usize = 0,
+        h2_count: usize = 0,
         thread: ?std.Thread = null,
         tls_pools: ?tls.Pools = null,
         /// Handshake randomness, seeded from the OS once per worker.
@@ -305,6 +312,22 @@ pub fn Worker(comptime Handler: type) type {
                 // by other threads (which also wrote the waker).
                 self.drainMailbox();
             }
+            // Shutting down: one GOAWAY per HTTP/2 connection, best effort.
+            for (self.conns) |*c| {
+                if (!c.open or c.h2 == null or c.closing or c.write_inflight) continue;
+                const conn = c.h2.?;
+                conn.shutdown();
+                if (c.tls) |t| {
+                    if (t.isEstablished() and !t.hasWire()) {
+                        const n = t.encrypt(&.{conn.wireBytes()}) catch 0;
+                        conn.advance(n);
+                        tlsWriteOnce(c, t);
+                    }
+                } else {
+                    const n = sys.write(c.fd, conn.wireBytes()) catch 0;
+                    conn.advance(n);
+                }
+            }
         }
 
         fn dispatch(self: *Self, cqe: linux.io_uring_cqe) void {
@@ -328,7 +351,7 @@ pub fn Worker(comptime Handler: type) type {
             switch (op) {
                 .recv => self.onRecv(c, cqe),
                 .recv_plain => self.onRecvPlain(c, cqe),
-                .write => if (c.ws != null) self.onWsWrite(c, cqe) else self.onWrite(c, cqe),
+                .write => if (c.ws != null) self.onWsWrite(c, cqe) else if (c.h2 != null) self.onH2Write(c, cqe) else self.onWrite(c, cqe),
                 .cancel => {},
                 else => unreachable,
             }
@@ -388,6 +411,7 @@ pub fn Worker(comptime Handler: type) type {
             std.debug.assert(!c.borrowed);
             if (c.tls) |t| return t.partialRecordNeed() > 0;
             if (c.ws) |w| return w.decoder.buf.len > 0;
+            if (c.h2) |conn| return conn.reader.buf.len > 0;
             return c.session.buf.len > 0;
         }
 
@@ -398,6 +422,8 @@ pub fn Worker(comptime Handler: type) type {
                 t.readSpace() catch return self.closeConn(c)
             else if (c.ws) |w|
                 w.decoder.readSpace(&self.pool) catch return self.closeConn(c)
+            else if (c.h2) |conn|
+                conn.readSpace(&self.pool) catch return self.closeConn(c)
             else
                 c.session.readSpace(&self.pool, self.opts.session) catch return self.closeConn(c);
             const sqe = self.getSqe();
@@ -451,6 +477,17 @@ pub fn Worker(comptime Handler: type) type {
             self.expire(&self.idle);
             self.expire(&self.active);
             self.expireExchanges();
+            self.tickH2();
+        }
+
+        fn tickH2(self: *Self) void {
+            if (self.h2_count == 0) return;
+            for (self.conns) |*c| {
+                if (!c.open or c.h2 == null or c.closing) continue;
+                const ctx = self.h2Context(c);
+                c.h2.?.tick(Handler, &ctx);
+                self.h2Drive(c);
+            }
         }
 
         fn expireExchanges(self: *Self) void {
@@ -459,7 +496,14 @@ pub fn Worker(comptime Handler: type) type {
                 if (!e.active) continue;
                 if (@as(i32, @bitCast(e.deadline -% self.now)) > 0) continue;
                 const c = &self.conns[e.conn_slot];
-                if (c.open and c.gen == e.conn_gen and c.exchange == slot) self.closeConn(c);
+                if (!c.open or c.gen != e.conn_gen or c.closing) continue;
+                if (c.h2) |conn| {
+                    const ctx = self.h2Context(c);
+                    conn.onExchangeTimeout(Handler, &ctx, @intCast(slot));
+                    self.h2Drive(c);
+                } else if (c.exchange == slot) {
+                    self.closeConn(c);
+                }
             }
         }
 
@@ -625,6 +669,14 @@ pub fn Worker(comptime Handler: type) type {
                 c.release = null;
             }
             if (c.exchange != NIL) self.dropExchange(c, true);
+            if (c.h2) |conn| {
+                const ctx = self.h2Context(c);
+                conn.abortAll(&ctx);
+                conn.deinit(&self.pool);
+                self.allocator.destroy(conn);
+                c.h2 = null;
+                self.h2_count -= 1;
+            }
             if (c.ws) |w| {
                 if (@hasDecl(Handler, "handleWSDisconn")) self.handler.handleWSDisconn(w);
                 w.destroy(&self.pool);
@@ -711,6 +763,7 @@ pub fn Worker(comptime Handler: type) type {
             if (c.closing) return;
             if (c.tls) |t| return self.tlsFeed(c, t, data);
             if (c.ws != null) return self.wsFeed(c, data);
+            if (c.h2 != null) return self.h2Feed(c, data);
             if (c.session.buf.len == 0) {
                 // Zero-copy: parse straight out of the kernel's buffer.
                 c.session.buf = data;
@@ -746,6 +799,15 @@ pub fn Worker(comptime Handler: type) type {
                     _ = w.process(Handler, self.handler);
                 }
                 return self.wsDrive(c);
+            }
+            if (c.h2) |conn| {
+                if (cqe.res == 0) {
+                    c.peer_closed = true;
+                } else {
+                    conn.commitRead(@intCast(cqe.res));
+                    if (!self.h2Process(c)) return;
+                }
+                return self.h2Drive(c);
             }
             if (cqe.res == 0) {
                 c.peer_closed = true;
@@ -888,15 +950,231 @@ pub fn Worker(comptime Handler: type) type {
             const e = self.exchanges.entry(slot);
             if (!e.active or (e.gen & 0x7fffffff) != gen or !e.bound) return;
             const c = &self.conns[e.conn_slot];
-            if (!c.open or c.gen != e.conn_gen or c.exchange != slot) return;
-            if (c.ws != null or c.lingering) return;
+            if (!c.open or c.gen != e.conn_gen or c.closing) return;
+            if (c.h2) |conn| {
+                const ctx = self.h2Context(c);
+                conn.onExchangePosted(Handler, &ctx, slot);
+                return self.h2Drive(c);
+            }
+            if (c.exchange != slot or c.ws != null or c.lingering) return;
             self.exchangeDrive(c);
+        }
+
+        // -- HTTP/2 ---------------------------------------------------------
+
+        fn h2Context(self: *Self, c: *Conn) h2.Context(Handler) {
+            return .{
+                .handler = self.handler,
+                .req = self.req,
+                .resp = self.resp,
+                .date = &self.date_line,
+                .now = self.now,
+                .exchanges = &self.exchanges,
+                .conn_slot = self.slotOf(c),
+                .conn_gen = c.gen,
+            };
+        }
+
+        /// Switches to HTTP/2, adopting the session's bytes (copied out of
+        /// a kernel buffer if that is where they are).
+        fn attachH2(self: *Self, c: *Conn) bool {
+            const conn = self.allocator.create(H2Conn) catch return false;
+            conn.* = H2Conn.init(self.allocator, self.opts.h2) catch {
+                self.allocator.destroy(conn);
+                return false;
+            };
+            const s = &c.session;
+            if (s.buf.len > 0) {
+                const leftover = s.buf[s.start..s.end];
+                if (c.borrowed) {
+                    c.borrowed = false;
+                    var rest = leftover;
+                    while (rest.len > 0) {
+                        const space = conn.readSpace(&self.pool) catch {
+                            conn.deinit(&self.pool);
+                            self.allocator.destroy(conn);
+                            s.* = .{};
+                            return false;
+                        };
+                        const n = @min(space.len, rest.len);
+                        @memcpy(space[0..n], rest[0..n]);
+                        conn.commitRead(n);
+                        rest = rest[n..];
+                    }
+                } else {
+                    conn.reader.buf = s.buf;
+                    conn.reader.start = s.start;
+                    conn.reader.end = s.end;
+                }
+                s.* = .{};
+            }
+            if (c.out.buf.len > 0) {
+                self.out_pool.release(c.out.buf);
+                c.out = .{ .buf = &.{} };
+            }
+            c.h2 = conn;
+            c.proto_decided = true;
+            self.h2_count += 1;
+            return true;
+        }
+
+        /// Plaintext with h2c: the first bytes decide. False while more
+        /// bytes are needed (or the connection was closed).
+        fn decideProto(self: *Self, c: *Conn) bool {
+            if (c.proto_decided) return true;
+            if (c.tls) |t| {
+                // ALPN decides, once the handshake is done. Application
+                // data from the same read may already sit in the session
+                // buffer; attachH2 adopts it.
+                // Nothing to decide yet: carry on (the handshake flight
+                // still has to be written), and look again later.
+                if (!t.isEstablished()) return true;
+                c.proto_decided = true;
+                if (t.alpn != null and std.mem.eql(u8, t.alpn.?, "h2")) {
+                    if (!self.attachH2(c)) {
+                        self.closeConn(c);
+                        return false;
+                    }
+                }
+                return true;
+            }
+            if (!self.opts.h2c) {
+                c.proto_decided = true;
+                return true;
+            }
+            const s = &c.session;
+            const data = s.buf[s.start..s.end];
+            if (data.len < h2_preface.len) {
+                if (std.mem.startsWith(u8, h2_preface, data)) return false;
+                c.proto_decided = true;
+                return true;
+            }
+            if (std.mem.eql(u8, data[0..h2_preface.len], h2_preface)) {
+                if (!self.attachH2(c)) {
+                    self.closeConn(c);
+                    return false;
+                }
+                return true;
+            }
+            c.proto_decided = true;
+            return true;
+        }
+
+        /// Copies received bytes into the connection and runs it, a
+        /// buffer's worth at a time (frames are consumed as they complete,
+        /// so a chunk always fits in the end).
+        fn h2Feed(self: *Self, c: *Conn, data: []const u8) void {
+            const conn = c.h2.?;
+            var rest = data;
+            while (rest.len > 0) {
+                const space = conn.readSpace(&self.pool) catch return self.closeConn(c);
+                const n = @min(space.len, rest.len);
+                @memcpy(space[0..n], rest[0..n]);
+                conn.commitRead(n);
+                rest = rest[n..];
+                self.h2Run(c);
+            }
+            self.h2Drive(c);
+        }
+
+        /// Runs the connection over buffered input without driving I/O.
+        fn h2Run(self: *Self, c: *Conn) void {
+            if (c.closing) return;
+            const conn = c.h2 orelse return;
+            const ctx = self.h2Context(c);
+            _ = conn.process(Handler, &ctx);
+        }
+
+        /// Runs the connection over buffered input and queues its output.
+        /// Output is double-buffered, so this is fine while a write is in
+        /// flight. Returns false if the connection is gone.
+        fn h2Process(self: *Self, c: *Conn) bool {
+            if (c.closing) return false;
+            const conn = c.h2 orelse return false;
+            const gen = c.gen;
+            const ctx = self.h2Context(c);
+            _ = conn.process(Handler, &ctx);
+            self.h2Drive(c);
+            // The close may have completed at once (no operation in
+            // flight), releasing the slot: `closing` is false again then.
+            return c.open and c.gen == gen and !c.closing and c.h2 != null;
+        }
+
+        /// Queues a write of pending frames, or arms the next recv when
+        /// there is nothing to write. One write at a time; no recv while
+        /// a write is in flight (backpressure).
+        fn h2Drive(self: *Self, c: *Conn) void {
+            if (c.closing or c.write_inflight) return;
+            const conn = c.h2 orelse return;
+            if (c.tls) |t| {
+                switch (self.tlsSubmit(c, t)) {
+                    .idle => {},
+                    .writing => {
+                        c.after_write = .none;
+                        if (c.list != .active) self.arm(c, .active);
+                        return;
+                    },
+                    .closed => return,
+                }
+            }
+            const bytes = if (c.tls != null) "" else conn.wireBytes();
+            if (bytes.len > 0) {
+                c.iov[0] = .{ .base = bytes.ptr, .len = bytes.len };
+                const sqe = self.getSqe();
+                sqe.prep_writev(c.fd, c.iov[0..1], 0);
+                sqe.user_data = userData(c.gen, self.slotOf(c), .write);
+                c.write_inflight = true;
+                c.inflight += 1;
+                if (c.list != .active) self.arm(c, .active);
+                return;
+            }
+            if (conn.wantsClose() or c.peer_closed) return self.closeConn(c);
+            conn.releaseIfIdle(&self.pool);
+            if (c.tls) |t| t.releaseIfIdle();
+            if (conn.activeStreams() == 0 and !conn.inFrame()) {
+                self.arm(c, .idle);
+            } else {
+                self.unlink(c);
+            }
+            self.armRecv(c);
+        }
+
+        fn onH2Write(self: *Self, c: *Conn, cqe: linux.io_uring_cqe) void {
+            c.write_inflight = false;
+            if (c.closing) return;
+            if (cqe.res < 0) return self.closeConn(c);
+            const conn = c.h2.?;
+            if (c.tls) |t| t.advance(@intCast(cqe.res)) else conn.advance(@intCast(cqe.res));
+            if (cqe.res > 0) self.arm(c, .active);
+            if (c.tls) |t| {
+                if (t.hasWire()) return self.h2Drive(c);
+            }
+            if (conn.hasWire()) return self.h2Drive(c);
+            // Written: streams waiting for room continue, then input that
+            // arrived while output was pending is processed.
+            const ctx = self.h2Context(c);
+            conn.pump(Handler, &ctx);
+            if (conn.hasWire()) return self.h2Drive(c);
+            if (!self.h2Process(c)) return;
+            self.h2Drive(c);
         }
 
         /// Runs the session until it needs input, or output must be written
         /// first. Arms the next recv when idle.
         fn drive(self: *Self, c: *Conn) void {
             if (c.write_inflight or c.closing) return;
+            if (c.h2 != null) return self.h2Drive(c);
+            if (!c.proto_decided) {
+                if (!self.decideProto(c)) {
+                    // Part of a preface: keep it and wait for the rest.
+                    if (c.closing) return;
+                    if (c.peer_closed) return self.closeConn(c);
+                    if (c.borrowed) self.unborrow(c) catch return self.closeConn(c);
+                    self.updateTimer(c);
+                    return self.armRecv(c);
+                }
+                if (c.h2 != null) return self.h2Drive(c);
+            }
             const ctx: session.Context(Handler) = .{
                 .handler = self.handler,
                 .req = self.req,
@@ -1006,7 +1284,7 @@ pub fn Worker(comptime Handler: type) type {
                 // WebSocket is closing (tlsDecrypt stopped early).
                 if (t.peer_closed or (c.ws != null and c.ws.?.wantsClose())) break;
             }
-            if (c.ws != null) self.wsDrive(c) else self.drive(c);
+            if (c.ws != null) self.wsDrive(c) else if (c.h2 != null) self.h2Drive(c) else self.drive(c);
         }
 
         /// Decrypts every complete record into the session (or the
@@ -1014,7 +1292,28 @@ pub fn Worker(comptime Handler: type) type {
         /// failure sends the alert and closes. Returns false if the
         /// connection was closed.
         fn tlsDecrypt(self: *Self, c: *Conn, t: *TlsConn) bool {
+            if (!c.proto_decided and t.isEstablished()) {
+                c.proto_decided = true;
+                if (t.alpn != null and std.mem.eql(u8, t.alpn.?, "h2")) {
+                    if (!self.attachH2(c)) {
+                        self.closeConn(c);
+                        return false;
+                    }
+                }
+            }
             while (t.hasBufferedInput()) {
+                if (c.h2) |conn| {
+                    const space = conn.readSpace(&self.pool) catch {
+                        self.closeConn(c);
+                        return false;
+                    };
+                    conn.commitRead(t.readPlain(space));
+                    // Run only: I/O is driven once the input is consumed
+                    // (arming a recv now, with plaintext still untaken,
+                    // would give it an empty buffer and read as EOF).
+                    self.h2Run(c);
+                    continue;
+                }
                 if (c.ws) |w| {
                     const space = w.decoder.readSpace(&self.pool) catch {
                         self.closeConn(c);
@@ -1055,6 +1354,15 @@ pub fn Worker(comptime Handler: type) type {
                             return .closed;
                         };
                         w.advance(n);
+                    }
+                } else if (c.h2) |conn| {
+                    const bytes = conn.wireBytes();
+                    if (bytes.len > 0) {
+                        const n = t.encrypt(&.{bytes}) catch {
+                            self.closeConn(c);
+                            return .closed;
+                        };
+                        conn.advance(n);
                     }
                 } else if (c.sent < c.out.totalLen()) {
                     const head = c.out.buf[@min(c.sent, c.out.len)..c.out.len];
@@ -1168,9 +1476,15 @@ pub fn Worker(comptime Handler: type) type {
             }
             if (self.mailbox.takeOverflow()) {
                 for (self.conns) |*c| {
-                    if (!c.open) continue;
+                    if (!c.open or c.closing) continue;
                     if (c.ws != null) {
                         self.wsFlushPosted(c);
+                    } else if (c.h2 != null) {
+                        for (self.exchanges.entries, 0..) |*e, slot| {
+                            if (e.active and e.bound and e.conn_slot == self.slotOf(c) and e.conn_gen == c.gen) {
+                                self.exchangePosted(@intCast(slot), @intCast(e.gen & 0x7fffffff));
+                            }
+                        }
                     } else if (c.exchange != NIL and !c.lingering) {
                         self.exchangeDrive(c);
                     }

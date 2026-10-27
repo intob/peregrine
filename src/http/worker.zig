@@ -18,6 +18,9 @@ const TlsConn = tls.Conn;
 const mailbox_mod = @import("../mailbox.zig");
 const Mailbox = mailbox_mod.Mailbox;
 const exchange = @import("./exchange.zig");
+const h2 = @import("../h2/conn.zig");
+const H2Conn = h2.Conn;
+const h2_preface = @import("../h2/frame.zig").preface;
 
 const LISTENER_TOKEN: u64 = std.math.maxInt(u64);
 const WAKER_TOKEN: u64 = std.math.maxInt(u64) - 1;
@@ -42,6 +45,11 @@ pub const Options = struct {
     /// Exchanges (`resp.later()`, `resp.stream()`) per worker.
     max_exchanges: u32 = 1024,
     exchange: exchange.Options = .{},
+    /// HTTP/2 with prior knowledge on plaintext connections (the client
+    /// sends the connection preface instead of an HTTP/1.1 request).
+    h2c: bool = false,
+    /// HTTP/2 connection settings (over TLS with ALPN "h2", or h2c).
+    h2: h2.Options = .{},
     /// TLS for every connection, if set.
     tls: ?*const tls.Config = null,
     /// TLS record buffers preallocated per worker (input and output each).
@@ -75,6 +83,12 @@ pub fn Worker(comptime Handler: type) type {
             /// Set on TLS listeners: sits between the socket and the
             /// session (or the WebSocket decoder).
             tls: ?*TlsConn = null,
+            /// Set once the connection speaks HTTP/2 (ALPN or h2c); the
+            /// session is then unused.
+            h2: ?*H2Conn = null,
+            /// HTTP/1.1 or HTTP/2 has been decided (ALPN, or the first
+            /// bytes on a plaintext listener with h2c).
+            proto_decided: bool = false,
             /// Unsent output after a partial write: an owned copy of the
             /// serialised head bytes, then the body (owned or borrowed),
             /// then the tail (static).
@@ -93,6 +107,11 @@ pub fn Worker(comptime Handler: type) type {
             /// encrypted), or TLS records waiting to be written.
             inline fn hasPending(c: *const Conn) bool {
                 return c.hasPendingPlain() or (c.tls != null and c.tls.?.hasWire());
+            }
+
+            /// Unsent HTTP/2 output: frames, or TLS records holding them.
+            inline fn h2HasWire(c: *const Conn) bool {
+                return c.h2.?.hasWire() or (c.tls != null and c.tls.?.hasWire());
             }
 
             inline fn hasPendingPlain(c: *const Conn) bool {
@@ -133,6 +152,8 @@ pub fn Worker(comptime Handler: type) type {
         idle: List,
         active: List,
         open_count: usize = 0,
+        /// Connections speaking HTTP/2 (their streams are ticked once a second).
+        h2_count: usize = 0,
         thread: ?std.Thread = null,
         tls_pools: ?tls.Pools = null,
         /// Handshake randomness, seeded from the OS once per worker.
@@ -266,6 +287,23 @@ pub fn Worker(comptime Handler: type) type {
                 // by other threads (which also wrote the waker).
                 self.drainMailbox();
             }
+            // Shutting down: tell HTTP/2 clients with one GOAWAY each
+            // (best effort, one write), before deinit closes the sockets.
+            for (self.conns) |*c| {
+                if (!c.open or c.h2 == null) continue;
+                const conn = c.h2.?;
+                conn.shutdown();
+                if (c.tls) |t| {
+                    if (t.isEstablished() and !t.hasWire()) {
+                        const n = t.encrypt(&.{conn.wireBytes()}) catch 0;
+                        conn.advance(n);
+                        self.tlsWriteOnce(c, t);
+                    }
+                } else if (!c.hasPending()) {
+                    const n = sys.write(c.fd, conn.wireBytes()) catch 0;
+                    conn.advance(n);
+                }
+            }
         }
 
         fn drainWaker(self: *Self) void {
@@ -291,6 +329,18 @@ pub fn Worker(comptime Handler: type) type {
             self.expire(&self.idle);
             self.expire(&self.active);
             self.expireExchanges();
+            self.tickH2();
+        }
+
+        /// Stream timeouts inside HTTP/2 connections.
+        fn tickH2(self: *Self) void {
+            if (self.h2_count == 0) return;
+            for (self.conns) |*c| {
+                if (!c.open or c.h2 == null or c.lingering) continue;
+                const ctx = self.h2Context(c);
+                c.h2.?.tick(Handler, &ctx);
+                if (!self.h2Flush(c)) continue;
+            }
         }
 
         /// Exchanges have their own deadlines (set per exchange), so they
@@ -301,7 +351,15 @@ pub fn Worker(comptime Handler: type) type {
                 if (!e.active) continue;
                 if (@as(i32, @bitCast(e.deadline -% self.now)) > 0) continue;
                 const c = &self.conns[e.conn_slot];
-                if (c.open and c.gen == e.conn_gen and c.exchange == slot) self.closeConn(c);
+                if (!c.open or c.gen != e.conn_gen) continue;
+                if (c.h2) |conn| {
+                    // One stream's deadline: reset it, keep the connection.
+                    const ctx = self.h2Context(c);
+                    conn.onExchangeTimeout(Handler, &ctx, @intCast(slot));
+                    _ = self.h2Flush(c);
+                } else if (c.exchange == slot) {
+                    self.closeConn(c);
+                }
             }
         }
 
@@ -469,6 +527,14 @@ pub fn Worker(comptime Handler: type) type {
                 w.destroy(&self.pool);
                 c.ws = null;
             }
+            if (c.h2) |conn| {
+                const ctx = self.h2Context(c);
+                conn.abortAll(&ctx);
+                conn.deinit(&self.pool);
+                self.allocator.destroy(conn);
+                c.h2 = null;
+                self.h2_count -= 1;
+            }
             if (c.tls) |t| {
                 t.deinit();
                 self.allocator.destroy(t);
@@ -610,9 +676,206 @@ pub fn Worker(comptime Handler: type) type {
             const e = self.exchanges.entry(slot);
             if (!e.active or (e.gen & 0x7fffffff) != gen or !e.bound) return;
             const c = &self.conns[e.conn_slot];
-            if (!c.open or c.gen != e.conn_gen or c.exchange != slot) return;
-            if (c.ws != null or c.lingering) return;
+            if (!c.open or c.gen != e.conn_gen) return;
+            if (c.h2) |conn| {
+                if (c.lingering) return;
+                const ctx = self.h2Context(c);
+                conn.onExchangePosted(Handler, &ctx, slot);
+                _ = self.h2Flush(c);
+                return;
+            }
+            if (c.exchange != slot or c.ws != null or c.lingering) return;
             _ = self.exchangeFlush(c);
+        }
+
+        // -- HTTP/2 ---------------------------------------------------------
+
+        fn h2Context(self: *Self, c: *Conn) h2.Context(Handler) {
+            return .{
+                .handler = self.handler,
+                .req = self.req,
+                .resp = self.resp,
+                .date = &self.date_line,
+                .now = self.now,
+                .exchanges = &self.exchanges,
+                .conn_slot = self.slotOf(c),
+                .conn_gen = c.gen,
+            };
+        }
+
+        /// Switches the connection to HTTP/2, adopting any bytes the
+        /// session already holds (the preface, perhaps more).
+        fn attachH2(self: *Self, c: *Conn) bool {
+            const conn = self.allocator.create(H2Conn) catch return false;
+            conn.* = H2Conn.init(self.allocator, self.opts.h2) catch {
+                self.allocator.destroy(conn);
+                return false;
+            };
+            const s = &c.session;
+            if (s.buf.len > 0) {
+                conn.reader.buf = s.buf;
+                conn.reader.start = s.start;
+                conn.reader.end = s.end;
+                s.* = .{};
+            }
+            c.h2 = conn;
+            c.proto_decided = true;
+            self.h2_count += 1;
+            return true;
+        }
+
+        /// Plaintext with h2c: the first bytes decide. Returns false while
+        /// undecided (more bytes needed).
+        fn decideProto(self: *Self, c: *Conn) bool {
+            if (c.proto_decided) return true;
+            if (c.tls) |t| {
+                // ALPN decides, once the handshake is done. Application
+                // data from the same read may already sit in the session
+                // buffer; attachH2 adopts it.
+                // Nothing to decide yet: carry on (the handshake flight
+                // still has to be written), and look again later.
+                if (!t.isEstablished()) return true;
+                c.proto_decided = true;
+                if (t.alpn != null and std.mem.eql(u8, t.alpn.?, "h2")) {
+                    if (!self.attachH2(c)) {
+                        self.closeConn(c);
+                        return false;
+                    }
+                }
+                return true;
+            }
+            if (!self.opts.h2c) {
+                c.proto_decided = true;
+                return true;
+            }
+            const s = &c.session;
+            const data = s.buf[s.start..s.end];
+            if (data.len < h2_preface.len) {
+                if (std.mem.startsWith(u8, h2_preface, data)) return false;
+                c.proto_decided = true;
+                return true;
+            }
+            if (std.mem.eql(u8, data[0..h2_preface.len], h2_preface)) {
+                if (!self.attachH2(c)) {
+                    self.closeConn(c);
+                    return false;
+                }
+                return true;
+            }
+            c.proto_decided = true;
+            return true;
+        }
+
+        fn onH2Event(self: *Self, c: *Conn, ev: Poller.Event) void {
+            if (Poller.writable(ev) and c.h2HasWire()) {
+                if (!self.h2Flush(c)) return;
+                // Output drained: pending stream data and parsing resume.
+                if (!c.h2HasWire() and !self.h2Process(c)) return;
+            }
+            if (c.read_ready and !c.h2HasWire()) self.h2Readable(c);
+        }
+
+        fn h2Readable(self: *Self, c: *Conn) void {
+            while (!c.h2HasWire()) {
+                const tls_buffered = c.tls != null and c.tls.?.hasBufferedInput();
+                if (!c.read_ready and !tls_buffered) break;
+                if (c.read_ready and !self.readSocket(c)) return;
+                if (c.tls) |t| {
+                    if (!self.tlsDecrypt(c, t)) return;
+                }
+                if (!self.h2Process(c)) return;
+                if (c.peer_closed) return self.closeConn(c);
+            }
+            self.h2Timer(c);
+        }
+
+        /// Runs the connection over buffered input and writes its output.
+        /// Returns false if the connection is gone.
+        fn h2Process(self: *Self, c: *Conn) bool {
+            const conn = c.h2.?;
+            while (true) {
+                const ctx = self.h2Context(c);
+                const action = conn.process(Handler, &ctx);
+                if (!self.h2Flush(c)) return false;
+                switch (action) {
+                    .flush => if (c.h2HasWire()) break,
+                    .need_more => break,
+                    .close => {
+                        if (c.h2HasWire()) break;
+                        self.closeConn(c);
+                        return false;
+                    },
+                }
+            }
+            conn.releaseIfIdle(&self.pool);
+            if (c.tls) |t| t.releaseIfIdle();
+            self.h2Timer(c);
+            return true;
+        }
+
+        /// Writes queued frames (through TLS if set). Closes once drained
+        /// if the connection wants it. Returns false if it is gone.
+        fn h2Flush(self: *Self, c: *Conn) bool {
+            const conn = c.h2.?;
+            while (true) {
+                if (c.tls) |t| {
+                    const progressed = self.tlsFlush(c, t) orelse return false;
+                    if (t.hasWire()) {
+                        self.h2Timer(c);
+                        _ = progressed;
+                        return true;
+                    }
+                    const bytes = conn.wireBytes();
+                    if (bytes.len == 0) break;
+                    const n = t.encrypt(&.{bytes}) catch {
+                        self.closeConn(c);
+                        return false;
+                    };
+                    conn.advance(n);
+                    continue;
+                }
+                const bytes = conn.wireBytes();
+                if (bytes.len == 0) break;
+                const n = sys.write(c.fd, bytes) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        self.h2Timer(c);
+                        return true;
+                    },
+                    else => {
+                        self.closeConn(c);
+                        return false;
+                    },
+                };
+                conn.advance(n);
+                if (n < bytes.len) {
+                    self.h2Timer(c);
+                    return true;
+                }
+            }
+            if (conn.wantsClose()) {
+                self.closeConn(c);
+                return false;
+            }
+            // Output drained: streams waiting for room continue.
+            const ctx = self.h2Context(c);
+            conn.pump(Handler, &ctx);
+            if (conn.hasWire()) return self.h2Flush(c);
+            self.h2Timer(c);
+            return true;
+        }
+
+        /// Stalled output gets the request timeout; an idle connection the
+        /// keep-alive timeout; one with streams in flight relies on the
+        /// stream and exchange deadlines.
+        fn h2Timer(self: *Self, c: *Conn) void {
+            const conn = c.h2.?;
+            if (c.h2HasWire()) {
+                if (c.list != .active) self.arm(c, .active);
+            } else if (conn.activeStreams() == 0 and !conn.inFrame()) {
+                self.arm(c, .idle);
+            } else {
+                self.unlink(c);
+            }
         }
 
         // -- I/O -----------------------------------------------------------
@@ -625,6 +888,7 @@ pub fn Worker(comptime Handler: type) type {
             if (!c.open or c.gen != gen) return;
             if (Poller.readable(ev)) c.read_ready = true;
             if (c.ws != null) return self.onWsEvent(c, ev);
+            if (c.h2 != null) return self.onH2Event(c, ev);
             if (c.lingering) {
                 if (c.read_ready) self.drainLingering(c);
                 return;
@@ -644,6 +908,16 @@ pub fn Worker(comptime Handler: type) type {
                 if (c.tls) |t| {
                     if (!self.tlsDecrypt(c, t)) return;
                 }
+                if (c.h2 != null) return self.h2Readable(c);
+                if (!self.decideProto(c)) {
+                    if (!c.open) return;
+                    if (c.h2 != null) return self.h2Readable(c);
+                    if (c.peer_closed) return self.closeConn(c);
+                    // Part of a preface: wait for the rest.
+                    if (!c.read_ready) break;
+                    continue;
+                }
+                if (c.h2 != null) return self.h2Readable(c);
                 switch (self.processBuffered(c)) {
                     .ok => {},
                     .blocked => return self.updateTimer(c),
@@ -663,6 +937,7 @@ pub fn Worker(comptime Handler: type) type {
             const space = blk: {
                 if (c.tls) |t| break :blk t.readSpace();
                 if (c.ws) |w| break :blk w.decoder.readSpace(&self.pool);
+                if (c.h2) |conn| break :blk conn.readSpace(&self.pool);
                 break :blk c.session.readSpace(&self.pool, self.opts.session);
             } catch {
                 self.closeConn(c);
@@ -680,6 +955,8 @@ pub fn Worker(comptime Handler: type) type {
                     t.commitRead(n);
                 } else if (c.ws) |w| {
                     w.decoder.commitRead(n);
+                } else if (c.h2) |conn| {
+                    conn.commitRead(n);
                 } else {
                     c.session.commitRead(n);
                 }
@@ -875,16 +1152,27 @@ pub fn Worker(comptime Handler: type) type {
         /// writes TLS output such as the handshake. Returns false if the
         /// connection was closed.
         fn tlsDecrypt(self: *Self, c: *Conn, t: *TlsConn) bool {
+            if (!c.proto_decided and t.isEstablished()) {
+                // ALPN decided the protocol.
+                c.proto_decided = true;
+                if (t.alpn != null and std.mem.eql(u8, t.alpn.?, "h2")) {
+                    if (!self.attachH2(c)) {
+                        self.closeConn(c);
+                        return false;
+                    }
+                }
+            }
             if (t.hasBufferedInput()) {
                 const space = blk: {
                     if (c.ws) |w| break :blk w.decoder.readSpace(&self.pool);
+                    if (c.h2) |conn| break :blk conn.readSpace(&self.pool);
                     break :blk c.session.readSpace(&self.pool, self.opts.session);
                 } catch {
                     self.closeConn(c);
                     return false;
                 };
                 const n = t.readPlain(space);
-                if (c.ws) |w| w.decoder.commitRead(n) else c.session.commitRead(n);
+                if (c.ws) |w| w.decoder.commitRead(n) else if (c.h2) |conn| conn.commitRead(n) else c.session.commitRead(n);
             }
             if (t.failed) {
                 // Send the alert, then give up on the connection.
@@ -1081,10 +1369,16 @@ pub fn Worker(comptime Handler: type) type {
             }
             if (self.mailbox.takeOverflow()) {
                 for (self.conns) |*c| {
-                    if (!c.open) continue;
+                    if (!c.open or c.lingering) continue;
                     if (c.ws != null) {
                         self.wsFlushPosted(c);
-                    } else if (c.exchange != NIL and !c.lingering) {
+                    } else if (c.h2 != null) {
+                        for (self.exchanges.entries, 0..) |*e, slot| {
+                            if (e.active and e.bound and e.conn_slot == self.slotOf(c) and e.conn_gen == c.gen) {
+                                self.exchangePosted(@intCast(slot), @intCast(e.gen & 0x7fffffff));
+                            }
+                        }
+                    } else if (c.exchange != NIL) {
                         _ = self.exchangeFlush(c);
                     }
                 }

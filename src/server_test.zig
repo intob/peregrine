@@ -10,6 +10,9 @@ const Request = @import("./request.zig").Request;
 const Response = @import("./response.zig").Response;
 const Exchange = @import("./http/exchange.zig").Exchange;
 const ws = @import("./ws/ws.zig");
+const h2frame = @import("./h2/frame.zig");
+const hpack = @import("./h2/hpack.zig");
+const BufferPool = @import("./http/session.zig").BufferPool;
 const testing = std.testing;
 
 const big_body_len = 8 * 1024 * 1024;
@@ -1045,6 +1048,451 @@ fn testStreamBackpressure(backend: Backend) !void {
         sleepMs(10);
         try testing.expectEqual(@as(usize, 2), r.srv.handler.aborts.load(.monotonic));
     }
+}
+
+// -- HTTP/2 over cleartext (h2c, prior knowledge) ---------------------------
+
+/// An HTTP/2 client over TCP: HPACK, frames, and flow control enough to
+/// drive the server.
+const H2Client = struct {
+    tcp: Client,
+    enc: hpack.Encoder,
+    dec: hpack.Decoder,
+    pool: BufferPool,
+    reader: h2frame.Reader = .{},
+    /// Our receive windows, replenished in batches.
+    conn_consumed: u32 = 0,
+    max_frame_size: u32 = 16384,
+
+    const Reply = struct {
+        status: u16 = 0,
+        /// "name=value\n" lines of the head, then of the trailers.
+        head: std.ArrayList(u8) = .empty,
+        trailers: std.ArrayList(u8) = .empty,
+        body: std.ArrayList(u8) = .empty,
+        done: bool = false,
+        rst: ?h2frame.ErrorCode = null,
+        consumed: u32 = 0,
+
+        fn deinit(r: *Reply) void {
+            r.head.deinit(testing.allocator);
+            r.trailers.deinit(testing.allocator);
+            r.body.deinit(testing.allocator);
+        }
+    };
+
+    fn connect(port: u16) !*H2Client {
+        const a = testing.allocator;
+        const self = try a.create(H2Client);
+        errdefer a.destroy(self);
+        self.* = .{
+            .tcp = try Client.connect(port),
+            .enc = try hpack.Encoder.init(a, 4096),
+            .dec = try hpack.Decoder.init(a, .{ .max_header_list_size = 1 << 20 }),
+            .pool = try BufferPool.init(a, 16 * 1024 + 9, 1),
+        };
+        try self.tcp.send(h2frame.preface);
+        var buf: [64]u8 = undefined;
+        const n = try h2frame.writeSettings(&buf, &.{.{ .id = .max_concurrent_streams, .value = 1000 }});
+        try self.tcp.send(buf[0..n]);
+        return self;
+    }
+
+    fn close(self: *H2Client) void {
+        self.tcp.close();
+        self.enc.deinit();
+        self.dec.deinit();
+        self.reader.deinit(&self.pool);
+        self.pool.deinit();
+        testing.allocator.destroy(self);
+    }
+
+    fn request(self: *H2Client, stream: u31, method: []const u8, path: []const u8, body: ?[]const u8) !void {
+        var block: [1024]u8 = undefined;
+        var bn: usize = 0;
+        bn += try self.enc.encode(block[bn..], ":method", method, .{});
+        bn += try self.enc.encode(block[bn..], ":scheme", "http", .{});
+        bn += try self.enc.encode(block[bn..], ":path", path, .{});
+        bn += try self.enc.encode(block[bn..], ":authority", "localhost", .{});
+        var hdr: [1100]u8 = undefined;
+        var flags: u8 = h2frame.flag.end_headers;
+        if (body == null) flags |= h2frame.flag.end_stream;
+        const n = try h2frame.writeHeaders(&hdr, stream, flags, block[0..bn]);
+        try self.tcp.send(hdr[0..n]);
+        if (body) |b| {
+            var rest = b;
+            while (true) {
+                const k = @min(rest.len, self.max_frame_size);
+                const out = try testing.allocator.alloc(u8, k + h2frame.header_len);
+                defer testing.allocator.free(out);
+                const dn = try h2frame.writeData(out, stream, k == rest.len, rest[0..k]);
+                try self.tcp.send(out[0..dn]);
+                rest = rest[k..];
+                if (rest.len == 0) break;
+            }
+        }
+    }
+
+    fn sendWindow(self: *H2Client, stream: u31, inc: u31) !void {
+        var buf: [h2frame.header_len + 4]u8 = undefined;
+        const n = try h2frame.writeWindowUpdate(&buf, stream, inc);
+        try self.tcp.send(buf[0..n]);
+    }
+
+    /// Reads frames until every response in `responses` (indexed by
+    /// stream id) is done, or a GOAWAY arrives. Answers SETTINGS and PING,
+    /// replenishes windows.
+    fn collect(self: *H2Client, responses: *std.AutoHashMap(u31, *Reply)) !?h2frame.ErrorCode {
+        const a = testing.allocator;
+        while (true) {
+            var pending: usize = 0;
+            var it = responses.valueIterator();
+            while (it.next()) |r| {
+                if (!r.*.done) pending += 1;
+            }
+            if (pending == 0) return null;
+            const space = try self.reader.readSpace(&self.pool, .{});
+            const n = try sys.read(self.tcp.fd, space);
+            if (n == 0) return error.EndOfStream;
+            self.reader.commitRead(n);
+            while (true) {
+                switch (self.reader.next(.{})) {
+                    .need_more => break,
+                    .failure => return error.BadServerFrame,
+                    .frame => |fr| switch (fr) {
+                        .settings => |st| {
+                            if (st.ack) continue;
+                            var sit = st.iterator();
+                            while (sit.next()) |setting| {
+                                if (setting.id == .max_frame_size) self.max_frame_size = setting.value;
+                            }
+                            var buf: [h2frame.header_len]u8 = undefined;
+                            _ = try h2frame.writeSettingsAck(&buf);
+                            try self.tcp.send(&buf);
+                        },
+                        .ping => |p| {
+                            if (p.ack) continue;
+                            var buf: [h2frame.header_len + 8]u8 = undefined;
+                            const pn = try h2frame.writePing(&buf, true, p.data);
+                            try self.tcp.send(buf[0..pn]);
+                        },
+                        .goaway => |g| return g.code,
+                        .headers => |h| {
+                            const r = responses.get(h.stream_id) orelse return error.UnknownStream;
+                            const Sink = struct {
+                                r: *Reply,
+                                trailers: bool,
+                                pub fn header(sk: *@This(), name: []const u8, value: []const u8) !void {
+                                    if (std.mem.eql(u8, name, ":status")) {
+                                        sk.r.status = try std.fmt.parseInt(u16, value, 10);
+                                        return;
+                                    }
+                                    const list = if (sk.trailers) &sk.r.trailers else &sk.r.head;
+                                    try list.print(testing.allocator, "{s}={s}\n", .{ name, value });
+                                }
+                            };
+                            var sink: Sink = .{ .r = r, .trailers = r.status != 0 };
+                            try self.dec.decode(h.fragment, &sink);
+                            if (h.end_stream) r.done = true;
+                        },
+                        .data => |d| {
+                            const r = responses.get(d.stream_id) orelse return error.UnknownStream;
+                            try r.body.appendSlice(a, d.data);
+                            if (d.end_stream) r.done = true;
+                            self.conn_consumed += d.flow_len;
+                            r.consumed += d.flow_len;
+                            if (self.conn_consumed >= 32 * 1024) {
+                                try self.sendWindow(0, @intCast(self.conn_consumed));
+                                self.conn_consumed = 0;
+                            }
+                            if (!r.done and r.consumed >= 32 * 1024) {
+                                try self.sendWindow(d.stream_id, @intCast(r.consumed));
+                                r.consumed = 0;
+                            }
+                        },
+                        .rst_stream => |rs| {
+                            const r = responses.get(rs.stream_id) orelse return error.UnknownStream;
+                            r.rst = rs.code;
+                            r.done = true;
+                        },
+                        .window_update, .continuation, .priority, .unknown => {},
+                    },
+                }
+            }
+            self.reader.releaseIfIdle(&self.pool);
+        }
+    }
+
+    /// One request, one response.
+    fn fetch(self: *H2Client, stream: u31, method: []const u8, path: []const u8, body: ?[]const u8, out: *Reply) !void {
+        try self.request(stream, method, path, body);
+        var map = std.AutoHashMap(u31, *Reply).init(testing.allocator);
+        defer map.deinit();
+        try map.put(stream, out);
+        const goaway = try self.collect(&map);
+        if (goaway != null) return error.GoAway;
+    }
+};
+
+fn h2Config() Config {
+    return .{ .h2c = true, .worker_thread_count = 1 };
+}
+
+test "h2c: many concurrent streams, and HTTP/1.1 on the same port" {
+    try forEachBackend(testH2Streams);
+}
+
+fn testH2Streams(backend: Backend) !void {
+    const r = try Running.start(backend, h2Config());
+    defer r.stop();
+    const c = try H2Client.connect(r.port);
+    defer c.close();
+    // 100 requests before reading anything.
+    const count = 100;
+    var responses: [count]H2Client.Reply = undefined;
+    for (&responses) |*x| x.* = .{};
+    defer for (&responses) |*x| x.deinit();
+    var map = std.AutoHashMap(u31, *H2Client.Reply).init(testing.allocator);
+    defer map.deinit();
+    var path: [16]u8 = undefined;
+    for (0..count) |i| {
+        const stream: u31 = @intCast(2 * i + 1);
+        const p = try std.fmt.bufPrint(&path, "/s{d}", .{i});
+        if (i % 10 == 9) {
+            try c.request(stream, "POST", "/echo", p);
+        } else {
+            try c.request(stream, "GET", p, null);
+        }
+        try map.put(stream, &responses[i]);
+    }
+    try testing.expectEqual(@as(?h2frame.ErrorCode, null), try c.collect(&map));
+    for (&responses, 0..) |*x, i| {
+        try testing.expectEqual(@as(u16, 200), x.status);
+        const p = try std.fmt.bufPrint(&path, "/s{d}", .{i});
+        if (i % 10 == 9) {
+            try testing.expectEqualStrings(p, x.body.items);
+        } else {
+            try testing.expectEqualStrings("ok", x.body.items);
+            var expected: [32]u8 = undefined;
+            try testing.expect(std.mem.indexOf(u8, x.head.items, try std.fmt.bufPrint(&expected, "x-path={s}\n", .{p})) != null);
+        }
+        try testing.expect(std.mem.indexOf(u8, x.head.items, "date=") != null);
+    }
+    // The connection is reusable afterwards.
+    var again: H2Client.Reply = .{};
+    defer again.deinit();
+    try c.fetch(2 * count + 1, "GET", "/again", null, &again);
+    try testing.expectEqualStrings("ok", again.body.items);
+    // Meanwhile HTTP/1.1 on the same port, and a bad preface is HTTP/1.1
+    // (501: PRI is not a method we know).
+    var h1 = try Client.connect(r.port);
+    defer h1.close();
+    try h1.send("GET /one HTTP/1.1\r\nHost: x\r\n\r\n");
+    var head: [4096]u8 = undefined;
+    const res = try h1.readResponse(&head, null);
+    try testing.expectEqual(@as(u16, 200), res.status);
+    var bad = try Client.connect(r.port);
+    defer bad.close();
+    try bad.send("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\nX");
+    // The preface is complete and matched before the X: HTTP/2, and X is
+    // not a frame header yet. Send a full preface mismatch instead.
+    var bad2 = try Client.connect(r.port);
+    defer bad2.close();
+    try bad2.send("PRI * HTTP/2.0\r\n\r\nSX\r\n\r\n");
+    const res2 = try bad2.readResponse(&head, null);
+    try testing.expectEqual(@as(u16, 501), res2.status);
+}
+
+test "h2c: large bodies through flow control, both directions" {
+    try forEachBackend(testH2LargeBodies);
+}
+
+fn testH2LargeBodies(backend: Backend) !void {
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    const r = try Running.start(backend, h2Config());
+    defer r.stop();
+    const c = try H2Client.connect(r.port);
+    defer c.close();
+    // 8 MB down, through 65535-byte windows replenished by the client.
+    var big: H2Client.Reply = .{};
+    defer big.deinit();
+    try c.fetch(1, "GET", "/big", null, &big);
+    try testing.expectEqual(@as(u16, 200), big.status);
+    try testing.expectEqual(@as(usize, big_body_len), big.body.items.len);
+    try testing.expect(std.mem.eql(u8, &big_body, big.body.items));
+    // 600 KB up (within the server's 1 MiB stream window), echoed.
+    const upload = big_body[0 .. 600 * 1024];
+    var echo: H2Client.Reply = .{};
+    defer echo.deinit();
+    try c.fetch(3, "POST", "/echo", upload, &echo);
+    try testing.expectEqual(@as(u16, 200), echo.status);
+    try testing.expectEqualSlices(u8, upload, echo.body.items);
+    // 1 MiB up in 10000-byte frames, so frames straddle the server's
+    // receive buffers (a regression: the io_uring worker armed a receive
+    // while still copying the previous one).
+    c.max_frame_size = 10000;
+    const upload2 = big_body[0 .. 1000 * 1000];
+    var echo2: H2Client.Reply = .{};
+    defer echo2.deinit();
+    try c.fetch(5, "POST", "/echo", upload2, &echo2);
+    try testing.expectEqual(@as(u16, 200), echo2.status);
+    try testing.expectEqualSlices(u8, upload2, echo2.body.items);
+    c.max_frame_size = 16384;
+    // Two large responses interleaved on one connection.
+    var a: H2Client.Reply = .{};
+    defer a.deinit();
+    var b: H2Client.Reply = .{};
+    defer b.deinit();
+    var map = std.AutoHashMap(u31, *H2Client.Reply).init(testing.allocator);
+    defer map.deinit();
+    try c.request(7, "GET", "/copy-big", null);
+    try c.request(9, "GET", "/big", null);
+    try map.put(7, &a);
+    try map.put(9, &b);
+    try testing.expectEqual(@as(?h2frame.ErrorCode, null), try c.collect(&map));
+    try testing.expectEqual((Config{}).response_body_buffer_size, a.body.items.len);
+    for (a.body.items, 0..) |byte, i| {
+        if (byte != @as(u8, @truncate(i *% 7))) return error.CorruptCopiedBody;
+    }
+    try testing.expect(std.mem.eql(u8, &big_body, b.body.items));
+}
+
+test "h2c: later() from another thread, stream() with trailers" {
+    try forEachBackend(testH2Exchanges);
+}
+
+fn testH2Exchanges(backend: Backend) !void {
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    const r = try Running.start(backend, h2Config());
+    defer r.stop();
+    const c = try H2Client.connect(r.port);
+    defer c.close();
+    var later: H2Client.Reply = .{};
+    defer later.deinit();
+    var stream: H2Client.Reply = .{};
+    defer stream.deinit();
+    var later_stream: H2Client.Reply = .{};
+    defer later_stream.deinit();
+    var sync: H2Client.Reply = .{};
+    defer sync.deinit();
+    var map = std.AutoHashMap(u31, *H2Client.Reply).init(testing.allocator);
+    defer map.deinit();
+    try c.request(1, "GET", "/later", null);
+    try c.request(3, "GET", "/stream", null);
+    try c.request(5, "GET", "/later-stream", null);
+    try c.request(7, "GET", "/sync", null);
+    try map.put(1, &later);
+    try map.put(3, &stream);
+    try map.put(5, &later_stream);
+    try map.put(7, &sync);
+    try testing.expectEqual(@as(?h2frame.ErrorCode, null), try c.collect(&map));
+    try testing.expectEqual(@as(u16, 202), later.status);
+    try testing.expect(std.mem.indexOf(u8, later.head.items, "x-later=1\n") != null);
+    try testing.expectEqualStrings("later-body", later.body.items);
+    try testing.expectEqual(@as(u16, 200), stream.status);
+    try testing.expectEqual(@as(usize, 6 + 200 * 1024 + 6), stream.body.items.len);
+    try testing.expectEqualStrings("hello ", stream.body.items[0..6]);
+    try testing.expectEqualSlices(u8, big_body[0 .. 200 * 1024], stream.body.items[6 .. 6 + 200 * 1024]);
+    try testing.expectEqualStrings("x-trailer=t\n", stream.trailers.items);
+    try testing.expectEqualStrings("x-later=stream\n", later_stream.head.items[0..15]);
+    try testing.expectEqual(@as(usize, 111), later_stream.body.items.len);
+    try testing.expectEqualStrings("x-trailer=end\n", later_stream.trailers.items);
+    try testing.expectEqualStrings("ok", sync.body.items);
+    sleepMs(10);
+    try testing.expect(r.srv.handler.releases.load(.monotonic) >= 2);
+    // A stream reset by the client while its exchange is pending: handleAbort.
+    try c.request(9, "GET", "/hang", null);
+    var buf: [h2frame.header_len + 4]u8 = undefined;
+    const n = try h2frame.writeRstStream(&buf, 9, .cancel);
+    try c.tcp.send(buf[0..n]);
+    const start = sys.nanoTimestamp();
+    while (r.srv.handler.aborts.load(.monotonic) == 0) {
+        if (sys.nanoTimestamp() - start > 4 * std.time.ns_per_s) return error.NoAbort;
+        sleepMs(10);
+    }
+    // And the connection still works.
+    var after: H2Client.Reply = .{};
+    defer after.deinit();
+    try c.fetch(11, "GET", "/after", null, &after);
+    try testing.expectEqualStrings("ok", after.body.items);
+}
+
+test "h2c: GOAWAY on shutdown" {
+    try forEachBackend(testH2Goaway);
+}
+
+fn testH2Goaway(backend: Backend) !void {
+    const r = try Running.start(backend, h2Config());
+    const c = try H2Client.connect(r.port);
+    defer c.close();
+    // A request to make sure the connection is established as HTTP/2.
+    var first: H2Client.Reply = .{};
+    defer first.deinit();
+    try c.fetch(1, "GET", "/", null, &first);
+    try testing.expectEqualStrings("ok", first.body.items);
+    // Shut the server down: GOAWAY, then the connection closes.
+    r.stop();
+    var never: H2Client.Reply = .{};
+    defer never.deinit();
+    var map = std.AutoHashMap(u31, *H2Client.Reply).init(testing.allocator);
+    defer map.deinit();
+    try map.put(3, &never);
+    const result = c.collect(&map);
+    try testing.expectEqual(@as(?h2frame.ErrorCode, .no_error), try result);
+    try c.tcp.expectClosed();
+}
+
+test "h2c: the client's GOAWAY closes the connection, and the worker goes on" {
+    try forEachBackend(testH2ClientGoaway);
+}
+
+fn testH2ClientGoaway(backend: Backend) !void {
+    const r = try Running.start(backend, h2Config());
+    defer r.stop();
+    // What curl does: a request, then GOAWAY, then FIN. The connection is
+    // closed while the worker is still feeding it input (a regression:
+    // the io_uring worker used a freed connection afterwards).
+    for (0..3) |_| {
+        const c = try H2Client.connect(r.port);
+        defer c.close();
+        var first: H2Client.Reply = .{};
+        defer first.deinit();
+        try c.fetch(1, "GET", "/", null, &first);
+        try testing.expectEqualStrings("ok", first.body.items);
+        var buf: [h2frame.header_len + 8]u8 = undefined;
+        const n = try h2frame.writeGoaway(&buf, 1, .no_error, "");
+        try c.tcp.send(buf[0..n]);
+        try c.tcp.expectClosed();
+    }
+    // GOAWAY in the same segment as the request: the response still comes.
+    const c = try H2Client.connect(r.port);
+    defer c.close();
+    var block: [256]u8 = undefined;
+    var bn: usize = 0;
+    bn += try c.enc.encode(block[bn..], ":method", "GET", .{});
+    bn += try c.enc.encode(block[bn..], ":scheme", "http", .{});
+    bn += try c.enc.encode(block[bn..], ":path", "/", .{});
+    var out: [512]u8 = undefined;
+    var on = try h2frame.writeHeaders(&out, 1, h2frame.flag.end_headers | h2frame.flag.end_stream, block[0..bn]);
+    on += try h2frame.writeGoaway(out[on..], 1, .no_error, "");
+    try c.tcp.send(out[0..on]);
+    var reply: H2Client.Reply = .{};
+    defer reply.deinit();
+    var map = std.AutoHashMap(u31, *H2Client.Reply).init(testing.allocator);
+    defer map.deinit();
+    try map.put(1, &reply);
+    _ = c.collect(&map) catch |err| switch (err) {
+        error.EndOfStream => {},
+        else => return err,
+    };
+    try testing.expectEqualStrings("ok", reply.body.items);
+    // The worker still serves others.
+    var h1 = try Client.connect(r.port);
+    defer h1.close();
+    try h1.send("GET /one HTTP/1.1\r\nHost: x\r\n\r\n");
+    var head: [4096]u8 = undefined;
+    const res = try h1.readResponse(&head, null);
+    try testing.expectEqual(@as(u16, 200), res.status);
 }
 
 // -- TLS --------------------------------------------------------------------

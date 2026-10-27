@@ -43,8 +43,9 @@ pub const Options = struct {
     /// ENHANCE_YOUR_CALM (CVE-2023-44487).
     max_resets_per_second: u32 = 100,
     /// Frames per second that carry no request progress (PING, SETTINGS,
-    /// PRIORITY, WINDOW_UPDATE, RST_STREAM, empty DATA and HEADERS, unknown
-    /// types) before ENHANCE_YOUR_CALM.
+    /// PRIORITY, empty DATA and HEADERS, unknown types) before
+    /// ENHANCE_YOUR_CALM. WINDOW_UPDATE carries flow-control credit and is
+    /// not counted; RST_STREAM has its own budget.
     max_control_frames_per_second: u32 = 1000,
     /// Seconds a stream may hold unsent output against a zero window, or a
     /// header block may stay incomplete, before it is reset.
@@ -76,6 +77,9 @@ pub fn Context(comptime Handler: type) type {
         conn_gen: u32,
     };
 }
+
+/// Output capacity kept per idle connection.
+const idle_capacity = 16 * 1024;
 
 const StreamState = enum(u8) {
     /// Request head or body still arriving.
@@ -174,9 +178,12 @@ pub const Conn = struct {
     frame_opts: frame.Options,
     decoder: hpack.Decoder,
     encoder: hpack.Encoder,
-    /// Serialised output; the worker writes `out.items[out_pos..]`.
+    /// Serialised output being appended. `wireBytes` swaps it into `wire`
+    /// once the wire is drained, so frames can be queued while a write of
+    /// the wire is in flight (as ws.Conn does).
     out: std.ArrayList(u8) = .empty,
-    out_pos: usize = 0,
+    wire: std.ArrayList(u8) = .empty,
+    wire_pos: usize = 0,
     state: State = .preface,
     failed: bool = false,
     goaway_sent: bool = false,
@@ -246,7 +253,7 @@ pub const Conn = struct {
             self.recv_window = @min(opts.connection_window, frame.max_window_size);
         }
         try self.out.appendSlice(allocator, buf[0..n]);
-        try self.out.ensureTotalCapacity(allocator, opts.out_limit + 2 * opts.max_frame_size);
+        try self.out.ensureTotalCapacity(allocator, idle_capacity);
         try self.enc_buf.ensureTotalCapacity(allocator, 4096);
         return self;
     }
@@ -261,6 +268,7 @@ pub const Conn = struct {
         self.decoder.deinit();
         self.encoder.deinit();
         self.out.deinit(self.allocator);
+        self.wire.deinit(self.allocator);
         self.hb_buf.deinit(self.allocator);
         self.enc_buf.deinit(self.allocator);
     }
@@ -275,8 +283,18 @@ pub const Conn = struct {
         self.reader.commitRead(n);
     }
 
+    /// Returns the input buffer when nothing is buffered, and trims
+    /// output buffers that grew for a large response once the connection
+    /// is idle.
     pub fn releaseIfIdle(self: *Self, pool: *BufferPool) void {
         self.reader.releaseIfIdle(pool);
+        if (self.stream_count == 0 and !self.hasWire()) {
+            if (self.out.capacity > 2 * idle_capacity) {
+                self.out.clearAndFree(self.allocator);
+                self.out.ensureTotalCapacity(self.allocator, idle_capacity) catch {};
+            }
+            if (self.wire.capacity > 2 * idle_capacity) self.wire.clearAndFree(self.allocator);
+        }
     }
 
     /// Whether a frame is partially received (for timeouts).
@@ -286,20 +304,28 @@ pub const Conn = struct {
 
     // -- Output -----------------------------------------------------------
 
-    pub fn wireBytes(self: *const Self) []const u8 {
-        return self.out.items[self.out_pos..];
+    /// Bytes to write next, refilled from `out` when the wire is empty.
+    /// Not to be called while a write of the previous bytes is in flight.
+    pub fn wireBytes(self: *Self) []const u8 {
+        if (self.wire_pos == self.wire.items.len) {
+            self.wire.clearRetainingCapacity();
+            self.wire_pos = 0;
+            std.mem.swap(std.ArrayList(u8), &self.out, &self.wire);
+        }
+        return self.wire.items[self.wire_pos..];
     }
 
+    /// Unsent bytes, on the wire or queued.
     pub inline fn hasWire(self: *const Self) bool {
-        return self.out_pos < self.out.items.len;
+        return self.wire_pos < self.wire.items.len or self.out.items.len > 0;
     }
 
     pub fn advance(self: *Self, n: usize) void {
-        self.out_pos += n;
-        if (self.out_pos == self.out.items.len) {
-            self.out.clearRetainingCapacity();
-            self.out_pos = 0;
-        }
+        self.wire_pos += n;
+    }
+
+    fn unsent(self: *const Self) usize {
+        return self.out.items.len + (self.wire.items.len - self.wire_pos);
     }
 
     /// The connection should be closed once `out` is written.
@@ -420,7 +446,7 @@ pub const Conn = struct {
         self.refreshBudgets(ctx.now);
         while (true) {
             if (self.failed) return .close;
-            if (self.out.items.len - self.out_pos > self.opts.out_limit) return .flush;
+            if (self.unsent() > self.opts.out_limit) return .flush;
             if (self.state == .preface) {
                 const data = self.reader.buf[self.reader.start..self.reader.end];
                 if (data.len < frame.preface.len) {
@@ -486,7 +512,6 @@ pub const Conn = struct {
             .continuation => |c| self.onContinuation(Handler, ctx, c),
             .priority => self.countControl(),
             .rst_stream => |r| {
-                self.countControl();
                 self.resets += 1;
                 if (self.resets > self.opts.max_resets_per_second) return self.fail(.enhance_your_calm);
                 if (r.stream_id > self.last_stream_id or r.stream_id % 2 == 0) return self.fail(.protocol_error);
@@ -538,7 +563,6 @@ pub const Conn = struct {
     }
 
     fn onWindowUpdate(self: *Self, comptime Handler: type, ctx: *const Context(Handler), w: anytype) void {
-        self.countControl();
         if (w.stream_id == 0) {
             self.send_window += w.increment;
             if (self.send_window > frame.max_window_size) return self.fail(.flow_control_error);
@@ -892,7 +916,7 @@ pub const Conn = struct {
         var sent: usize = 0;
         while (true) {
             const window = @min(s.send_window, self.send_window);
-            const room = self.opts.out_limit + 2 * self.opts.max_frame_size -| self.out.items.len;
+            const room = self.opts.out_limit + 2 * self.opts.max_frame_size -| self.unsent();
             const max = @min(@as(usize, if (window > 0) @intCast(window) else 0), self.peer_max_frame_size, room -| frame.header_len);
             const n = @min(max, data.len - sent);
             const last = sent + n == data.len;
@@ -960,7 +984,7 @@ pub const Conn = struct {
         if (self.output_streams == 0 or self.failed) return;
         for (self.streams) |*s| {
             if (!s.active or !s.hasOutput()) continue;
-            if (self.out.items.len - self.out_pos > self.opts.out_limit) return;
+            if (self.unsent() > self.opts.out_limit) return;
             self.pumpStream(Handler, ctx, s);
             if (self.failed) return;
         }
@@ -988,7 +1012,7 @@ pub const Conn = struct {
         const e = ctx.exchanges.entry(s.exchange);
         const is_head = e.is_head;
         while (true) {
-            if (self.out.items.len - self.out_pos > self.opts.out_limit) return;
+            if (self.unsent() > self.opts.out_limit) return;
             // The head, if any, must precede the data: fetch it first.
             var r = exchange.h2Poll(ex, &.{}, ctx.now);
             if (r.aborted) return self.resetStream(ctx, s, .internal_error);
@@ -1001,7 +1025,7 @@ pub const Conn = struct {
                 return; // later(): nothing yet
             }
             const window = @min(s.send_window, self.send_window);
-            const room = self.opts.out_limit + 2 * self.opts.max_frame_size -| self.out.items.len;
+            const room = self.opts.out_limit + 2 * self.opts.max_frame_size -| self.unsent();
             var max = @min(@as(usize, if (window > 0) @intCast(window) else 0), self.peer_max_frame_size, room -| frame.header_len);
             if (is_head) max = self.peer_max_frame_size;
             if (max == 0) {
@@ -2189,7 +2213,11 @@ test "defence: SETTINGS, PING and empty frame floods" {
             0 => try frame.writePing(&buf, false, "pingping"),
             1 => try frame.writeSettings(&buf, &.{}),
             2 => try frame.writeData(&buf, 1, false, ""),
-            else => try frame.writeWindowUpdate(&buf, 0, 1),
+            else => blk: {
+                frame.writeHeader(buf[0..frame.header_len], 5, .priority, 0, 1);
+                @memset(buf[frame.header_len..][0..5], 0);
+                break :blk frame.header_len + 5;
+            },
         };
         try h.feed(buf[0..n]);
         try testing.expect(i < 40);

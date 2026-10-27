@@ -457,6 +457,21 @@ which RFC 9113 deprecated).
       connection closed when its window is the cause). Proof: a scripted-client
       harness (each §8 rule, stream states, flow control, exchanges, GOAWAY),
       split invariance per stream, a fuzz target
+- [x] **Worker integration** on epoll, kqueue and io_uring: ALPN "h2" over TLS
+      (decided once the handshake completes, adopting application data from the
+      same read), h2c with prior knowledge on plaintext listeners (`Config.h2c`:
+      the first 24 bytes decide, HTTP/1.1 otherwise), the mailbox routes exchange
+      posts and deadlines to the stream, GOAWAY on shutdown (one best-effort write
+      per connection). Output is double-buffered (`out`/`wire`) so the connection
+      runs while a write is in flight on io_uring; the connection is only run, not
+      driven, inside receive loops (a recv armed with plaintext still untaken read
+      as EOF). End-to-end tests on every backend over h2c: 100 concurrent streams
+      plus HTTP/1.1 on the same port, 8 MB down and 1 MB up through flow control
+      (frames straddling receive buffers), `later()` from another thread and
+      `stream()` with trailers, GOAWAY on shutdown, the client's GOAWAY.
+      Interop (curl --http2 and --http2-prior-knowledge, nghttp, OpenSSL s_client
+      ALPN): all pass on macOS, Linux epoll and Linux io_uring (std's TLS client
+      has no ALPN, so TLS+h2 is covered by interop rather than Zig tests)
 - [ ] Priorities: RFC 9218 `priority` header is not parsed (ignored like the rest)
 - [ ] WebSockets over h2 (RFC 8441 extended CONNECT)
 - [ ] Verification: h2spec, fuzzing, split-invariance property tests

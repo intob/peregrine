@@ -1,6 +1,7 @@
 //! HTTPS on port 3443 with the self-signed certificate in this directory
-//! (CN=localhost, created with server.conf). Try:
+//! (CN=localhost, created with server.conf), HTTP/2 negotiated with ALPN. Try:
 //!   curl --cacert example/https/server.pem https://localhost:3443/
+//!   curl --http2 --cacert example/https/server.pem -v https://localhost:3443/
 const std = @import("std");
 const per = @import("peregrine");
 
@@ -24,6 +25,7 @@ pub fn main(init: std.process.Init) !void {
         .tls = .{
             .cert_pem = @embedFile("server.pem"),
             .key_pem = @embedFile("server.key"),
+            .alpn = &.{ "h2", "http/1.1" },
         },
     });
     std.debug.print("listening on https://localhost:3443\n", .{});

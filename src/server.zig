@@ -19,6 +19,7 @@ pub const Backend = enum {
 };
 const ws = @import("./ws/conn.zig");
 const tls_conn = @import("./tls/conn.zig");
+pub const H2Options = @import("./h2/conn.zig").Options;
 const Credentials = @import("./tls/credentials.zig").Credentials;
 
 pub const TlsOptions = struct {
@@ -92,6 +93,14 @@ pub const Config = struct {
     /// Serve TLS 1.3 on this port. The PEM data is parsed during init and
     /// need not outlive it.
     tls: ?TlsOptions = null,
+    /// HTTP/2 with prior knowledge on plaintext connections: a client that
+    /// sends the HTTP/2 connection preface instead of an HTTP/1.1 request
+    /// gets HTTP/2 (RFC 9113 §3.3). Over TLS, HTTP/2 is negotiated with
+    /// ALPN when "h2" is in `TlsOptions.alpn`.
+    h2c: bool = false,
+    /// HTTP/2 connection settings. `limits`, the HPACK header list size and
+    /// the request timeout are taken from this Config.
+    h2: H2Options = .{},
 };
 
 /// The server that a signal handler should stop.
@@ -245,6 +254,10 @@ pub fn Server(comptime Handler: type) type {
             }
             var initialised: usize = 0;
             errdefer for (srv.workers[0..initialised]) |*w| w.deinit();
+            var h2_opts = cfg.h2;
+            h2_opts.limits = cfg.limits;
+            h2_opts.hpack.max_header_list_size = @intCast(@min(cfg.limits.max_header_bytes, std.math.maxInt(u32)));
+            h2_opts.request_timeout_s = cfg.request_timeout_s;
             var bind_address = address;
             for (srv.workers, 0..) |*w, i| {
                 const listener = if (per_worker or shared < 0) blk: {
@@ -285,6 +298,8 @@ pub fn Server(comptime Handler: type) type {
                         .response_timeout_s = cfg.response_timeout_s,
                         .request_timeout_s = cfg.request_timeout_s,
                     },
+                    .h2c = cfg.h2c,
+                    .h2 = h2_opts,
                     .tls = if (srv.tls_credentials != null) &srv.tls_config else null,
                     .tls_buffer_pool_size = if (cfg.tls) |t| t.buffer_pool_size else 0,
                 };
