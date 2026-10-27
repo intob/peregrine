@@ -55,7 +55,7 @@ Design rules that apply to every layer:
 | M2. Throughput architecture | 🟡 io_uring works (opt-in, not yet faster than epoll); sendfile, NUMA open |
 | M3. WebSockets over HTTP/1.1 | ✅ reworked; permessage-deflate, Autobahn, benchmarks open |
 | M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; faster handshakes, resumption and kTLS are listed under "Later in M4" |
-| M5. HTTP/2 | 🟡 HPACK, framing and the handler API (steps 1-2) done; connection layer next |
+| M5. HTTP/2 | ✅ h2 over TLS (ALPN) and h2c on every backend, h2spec 146/146 over TLS, fuzzed, benchmarked; WebSockets over h2 and request-body streaming open |
 | M6. HTTP/3 and QUIC | ⬜ |
 | M7. Verification and benchmarking | 🟡 ongoing for each milestone |
 
@@ -479,7 +479,25 @@ which RFC 9113 deprecated).
       cleartext port answering it as an HTTP/1.1 request (501, then close) rather
       than closing silently, inherent to serving both on one port. Split
       invariance and fuzz targets per layer (see above)
-- [ ] Benchmark against h2o and nginx (h2load)
+- [x] Benchmark against nginx with h2load (h2o has no Alpine package; still to do).
+      Docker on the M2 Pro, Linux 6.12, host under other load (load average 5-12,
+      so ±10%): each server with 6 workers on CPUs 0-5, `h2load -t6` on CPUs 6-11,
+      10 s per run, two interleaved rounds; nginx 1.26 with `http2 on`,
+      TLSv1.3, `return 200` for "Hello, World!" and a 64 KiB file, otherwise
+      defaults. CPU/req is the server's CPU time per request, the better measure:
+      at `-c10 -m100` h2load itself is the bottleneck.
+
+| | peregrine req/s | peregrine CPU/req | nginx req/s | nginx CPU/req |
+|---|---|---|---|---|
+| h2c "Hello", 10 conns × 100 streams | 527k-541k | 0.59-0.64 µs | 128k-148k | 4.5-4.9 µs |
+| h2c "Hello", 256 conns × 1 stream | 410k-439k | 6.7-7.9 µs | 97k-103k | 15.7-16.1 µs |
+| h2c 64 KiB, 10 conns × 10 streams | 193k-210k (12.6-13.8 GB/s) | 20.9-21.0 µs | 11.0k-13.1k | 111-112 µs |
+| TLS "Hello", 10 × 100 | 515k-519k | 0.66-0.72 µs | 88k-95k | 4.2-4.8 µs |
+| TLS "Hello", 256 × 1 | 160k-172k | 11.2-12.0 µs | 70k-70k | 29.9-30.8 µs |
+| TLS 64 KiB, 10 × 10 | 64k-73k (4.2-4.8 GB/s) | 31.8-34.3 µs | 10.4k-11.6k | 131-139 µs |
+
+      To do: h2o, a quiet machine, latency percentiles, and `-Dcpu` for x86_64
+- [ ] Benchmark against h2o
 
 ## M6. HTTP/3 and QUIC ⬜
 
