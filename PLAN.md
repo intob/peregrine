@@ -337,10 +337,17 @@ Later in M4:
       16.6 µs per request for hello / 64 KiB / upload; after: 8.1-8.3 / 50-54 /
       15.6-16.5). A fresh 16 KiB session buffer can't take a full record (16385 bytes
       with the content type), so those are still copied
-- [ ] **Faster AES-GCM.** The real limit: std's AES-GCM runs at about 2.2 GB/s per
-      direction per core on the M2 Pro, against 6.5 GB/s for OpenSSL's AES-128-GCM on
-      the same machine. A fused, interleaved CTR + GHASH (8 blocks at a time) is the
-      next step for bulk transfers; kTLS sidesteps it on Linux
+- [x] **Faster AES-GCM** (`src/tls/aes_gcm.zig`, aarch64 with AES + PMULL; std's
+      AES and GHASH elsewhere). std's AES-GCM ran at about 2.3 GB/s per direction per
+      core on the M2 Pro: two passes, and AES rounds that run `aese` with a zero key
+      and XOR each round key separately. Now one pass, 8 blocks at a time, round keys
+      inside `aese`, one GHASH reduction per 8 blocks; output identical to std (tested
+      against it). `zig build bench-tls`, seal+open AES-128-GCM: 16 KiB 14.2 → 3.7 µs
+      (about 8.8 GB/s per direction, `openssl speed` gives 8.8), 1 KiB 1252 → 281 ns,
+      32 B 284 → 65 ns; AES-256 3.3-4.6x. End to end (epoll, as above, two interleaved
+      runs each): GET 64 KiB 87k-96k → 121k-130k req/s and 51-53 → 31 µs server CPU
+      per request; POST 12 KiB 15.5 → 10.6-10.9 µs; "Hello" 8.0-8.2 → 7.7-8.0 µs.
+      x86_64 (AES-NI + PCLMUL) would want the same treatment
 - [ ] io_uring + TLS: decrypt straight out of the kernel's provided buffer when it
       holds whole records (as the plaintext path parses in place). The copy costs
       uploads about 17% more server CPU than on epoll (18.5 vs 15.9 µs per 12 KiB

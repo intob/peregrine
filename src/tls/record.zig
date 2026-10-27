@@ -3,6 +3,7 @@
 const std = @import("std");
 const tls = std.crypto.tls;
 const key_schedule = @import("./key_schedule.zig");
+const aes_gcm = @import("./aes_gcm.zig");
 const errors = @import("./errors.zig");
 
 pub const ContentType = tls.ContentType;
@@ -111,8 +112,10 @@ fn AesGcmKey(comptime Aes: type) type {
     };
 }
 
-const Aes128GcmKey = AesGcmKey(std.crypto.core.aes.Aes128);
-const Aes256GcmKey = AesGcmKey(std.crypto.core.aes.Aes256);
+/// The fused AES-GCM in aes_gcm.zig where the CPU has AES and PMULL
+/// instructions it can use, std's AES and GHASH otherwise.
+const Aes128GcmKey = if (aes_gcm.supported) aes_gcm.Key(std.crypto.core.aes.Aes128) else AesGcmKey(std.crypto.core.aes.Aes128);
+const Aes256GcmKey = if (aes_gcm.supported) aes_gcm.Key(std.crypto.core.aes.Aes256) else AesGcmKey(std.crypto.core.aes.Aes256);
 const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 
 pub const Opened = struct {
@@ -428,31 +431,40 @@ test "expanded AES-GCM matches std's AEAD" {
     var c1: [m.len]u8 = undefined;
     var c2: [m.len]u8 = undefined;
     var back: [m.len]u8 = undefined;
-    // Lengths around block and GHASH aggregation boundaries, and records.
-    const lens = [_]usize{ 0, 1, 15, 16, 17, 63, 64, 65, 351, 352, 1343, 1344, 5247, 5248, max_plaintext + 1, m.len };
-    inline for (.{ std.crypto.aead.aes_gcm.Aes128Gcm, std.crypto.aead.aes_gcm.Aes256Gcm }, .{ Aes128GcmKey, Aes256GcmKey }) |Std, Ours| {
+    var ad_buf: [300]u8 = undefined;
+    // Lengths around block, 8-block stride and GHASH aggregation
+    // boundaries, and records.
+    const lens = [_]usize{ 0, 1, 15, 16, 17, 63, 64, 65, 112, 127, 128, 129, 143, 255, 256, 257, 351, 352, 1343, 1344, 5247, 5248, max_plaintext + 1, m.len };
+    const ad_lens = [_]usize{ 5, 0, 1, 16, 17, 128, 129, 300 };
+    const Aes128 = std.crypto.core.aes.Aes128;
+    const Aes256 = std.crypto.core.aes.Aes256;
+    const Std = .{ std.crypto.aead.aes_gcm.Aes128Gcm, std.crypto.aead.aes_gcm.Aes256Gcm, std.crypto.aead.aes_gcm.Aes128Gcm, std.crypto.aead.aes_gcm.Aes256Gcm };
+    const Ours = .{ AesGcmKey(Aes128), AesGcmKey(Aes256), Aes128GcmKey, Aes256GcmKey };
+    inline for (Std, Ours) |S, O| {
         for (0..8) |round| for (lens) |len| {
-            var key: [Std.key_length]u8 = undefined;
+            var key: [S.key_length]u8 = undefined;
             var npub: [12]u8 = undefined;
-            var ad: [5]u8 = undefined;
+            const ad = ad_buf[0..ad_lens[round]];
             random.bytes(&key);
             random.bytes(&npub);
-            random.bytes(&ad);
+            random.bytes(ad);
             random.bytes(m[0..len]);
-            const ours = Ours.init(key);
+            const ours = O.init(key);
             var t1: [tag_len]u8 = undefined;
             var t2: [tag_len]u8 = undefined;
-            Std.encrypt(c1[0..len], &t1, m[0..len], &ad, npub, key);
-            ours.encrypt(c2[0..len], &t2, m[0..len], &ad, npub);
+            S.encrypt(c1[0..len], &t1, m[0..len], ad, npub, key);
+            ours.encrypt(c2[0..len], &t2, m[0..len], ad, npub);
             try std.testing.expectEqualSlices(u8, c1[0..len], c2[0..len]);
             try std.testing.expectEqualSlices(u8, &t1, &t2);
-            try ours.decrypt(back[0..len], c1[0..len], t1, &ad, npub);
+            try ours.decrypt(back[0..len], c1[0..len], t1, ad, npub);
             try std.testing.expectEqualSlices(u8, m[0..len], back[0..len]);
-            // In place, and a tampered tag.
-            try ours.decrypt(c2[0..len], c2[0..len], t2, &ad, npub);
+            // In place, and a tampered tag, which leaves no plaintext.
+            try ours.decrypt(c2[0..len], c2[0..len], t2, ad, npub);
             try std.testing.expectEqualSlices(u8, m[0..len], c2[0..len]);
             t1[round % tag_len] ^= 1;
-            try std.testing.expectError(error.AuthenticationFailed, ours.decrypt(back[0..len], c1[0..len], t1, &ad, npub));
+            @memset(back[0..len], 0xaa);
+            try std.testing.expectError(error.AuthenticationFailed, ours.decrypt(back[0..len], c1[0..len], t1, ad, npub));
+            if (len > 0) try std.testing.expect(!std.mem.eql(u8, m[0..len], back[0..len]));
         };
     }
 }
