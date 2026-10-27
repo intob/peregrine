@@ -123,21 +123,63 @@ pub const Opened = struct {
     data: []u8,
 };
 
+/// An AEAD key, expanded once (AES-GCM) for every record or packet sealed
+/// with it. Shared by TLS records and QUIC packet protection.
+pub const Aead = struct {
+    const Self = @This();
+
+    suite: Suite,
+    key: [max_key_len]u8,
+    expanded: union { aes128: Aes128GcmKey, aes256: Aes256GcmKey, none: void } = .{ .none = {} },
+
+    /// `key` is the suite's key length.
+    pub fn init(suite: Suite, key: []const u8) Self {
+        var self: Self = .{ .suite = suite, .key = @splat(0) };
+        @memcpy(self.key[0..key.len], key);
+        self.expanded = switch (suite) {
+            .aes_128_gcm_sha256 => .{ .aes128 = .init(self.key[0..16].*) },
+            .aes_256_gcm_sha384 => .{ .aes256 = .init(self.key) },
+            .chacha20_poly1305_sha256 => .{ .none = {} },
+        };
+        return self;
+    }
+
+    pub fn wipe(self: *Self) void {
+        std.crypto.secureZero(u8, &self.key);
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.expanded));
+    }
+
+    pub fn encrypt(self: *const Self, c: []u8, tag: *[tag_len]u8, m: []const u8, ad: []const u8, n: [12]u8) void {
+        switch (self.suite) {
+            .aes_128_gcm_sha256 => self.expanded.aes128.encrypt(c, tag, m, ad, n),
+            .aes_256_gcm_sha384 => self.expanded.aes256.encrypt(c, tag, m, ad, n),
+            .chacha20_poly1305_sha256 => ChaCha20Poly1305.encrypt(c, tag, m, ad, n, self.key),
+        }
+    }
+
+    /// Verifies before decrypting; `m` may alias `c`.
+    pub fn decrypt(self: *const Self, m: []u8, c: []const u8, tag: [tag_len]u8, ad: []const u8, n: [12]u8) error{AuthenticationFailed}!void {
+        return switch (self.suite) {
+            .aes_128_gcm_sha256 => self.expanded.aes128.decrypt(m, c, tag, ad, n),
+            .aes_256_gcm_sha384 => self.expanded.aes256.decrypt(m, c, tag, ad, n),
+            .chacha20_poly1305_sha256 => ChaCha20Poly1305.decrypt(m, c, tag, ad, n, self.key),
+        };
+    }
+};
+
 /// AEAD state for one direction of a connection at one encryption level.
 pub const Protection = struct {
     const Self = @This();
 
     suite: Suite,
-    key: [max_key_len]u8,
+    aead: Aead,
     iv: [12]u8,
     seq: u64 = 0,
     /// The traffic secret the key came from, kept for KeyUpdate.
     secret: [max_hash_len]u8,
-    /// The expanded key for AES-GCM suites (ChaCha20 has no key schedule).
-    expanded: union { aes128: Aes128GcmKey, aes256: Aes256GcmKey, none: void } = .{ .none = {} },
 
     pub fn init(suite: Suite, secret: []const u8) Self {
-        var self: Self = .{ .suite = suite, .key = undefined, .iv = undefined, .secret = @splat(0) };
+        var self: Self = .{ .suite = suite, .aead = undefined, .iv = undefined, .secret = @splat(0) };
         @memcpy(self.secret[0..secret.len], secret);
         self.derive();
         return self;
@@ -149,16 +191,12 @@ pub const Protection = struct {
                 const ks = s.Schedule();
                 const secret = self.secret[0..ks.hash_len].*;
                 const key_len = s.Aead().key_length;
-                self.key = @splat(0);
-                self.key[0..key_len].* = ks.trafficKey(key_len, secret);
+                var key = ks.trafficKey(key_len, secret);
+                defer std.crypto.secureZero(u8, &key);
+                self.aead = .init(s, &key);
                 self.iv = ks.trafficIv(secret);
             },
         }
-        self.expanded = switch (self.suite) {
-            .aes_128_gcm_sha256 => .{ .aes128 = .init(self.key[0..16].*) },
-            .aes_256_gcm_sha384 => .{ .aes256 = .init(self.key) },
-            .chacha20_poly1305_sha256 => .{ .none = {} },
-        };
         self.seq = 0;
     }
 
@@ -174,27 +212,16 @@ pub const Protection = struct {
     }
 
     pub fn wipe(self: *Self) void {
-        std.crypto.secureZero(u8, &self.key);
+        self.aead.wipe();
         std.crypto.secureZero(u8, &self.secret);
-        std.crypto.secureZero(u8, std.mem.asBytes(&self.expanded));
     }
 
     fn encrypt(self: *const Self, c: []u8, tag: *[tag_len]u8, m: []const u8, ad: []const u8) void {
-        const n = self.nonce();
-        switch (self.suite) {
-            .aes_128_gcm_sha256 => self.expanded.aes128.encrypt(c, tag, m, ad, n),
-            .aes_256_gcm_sha384 => self.expanded.aes256.encrypt(c, tag, m, ad, n),
-            .chacha20_poly1305_sha256 => ChaCha20Poly1305.encrypt(c, tag, m, ad, n, self.key),
-        }
+        self.aead.encrypt(c, tag, m, ad, self.nonce());
     }
 
     fn decrypt(self: *const Self, m: []u8, c: []const u8, tag: [tag_len]u8, ad: []const u8) error{AuthenticationFailed}!void {
-        const n = self.nonce();
-        return switch (self.suite) {
-            .aes_128_gcm_sha256 => self.expanded.aes128.decrypt(m, c, tag, ad, n),
-            .aes_256_gcm_sha384 => self.expanded.aes256.decrypt(m, c, tag, ad, n),
-            .chacha20_poly1305_sha256 => ChaCha20Poly1305.decrypt(m, c, tag, ad, n, self.key),
-        };
+        return self.aead.decrypt(m, c, tag, ad, self.nonce());
     }
 
     fn nonce(self: *const Self) [12]u8 {
@@ -494,7 +521,7 @@ fn sealInner(p: *Protection, out: []u8, inner: []const u8) []u8 {
     std.mem.writeInt(u16, rec[3..5], @intCast(inner.len + tag_len), .big);
     @memcpy(rec[header_len..][0..inner.len], inner);
     const A = Suite.aes_128_gcm_sha256.Aead();
-    A.encrypt(rec[header_len..][0..inner.len], rec[header_len + inner.len ..][0..tag_len], rec[header_len..][0..inner.len], rec[0..header_len], p.nonce(), p.key[0..A.key_length].*);
+    A.encrypt(rec[header_len..][0..inner.len], rec[header_len + inner.len ..][0..tag_len], rec[header_len..][0..inner.len], rec[0..header_len], p.nonce(), p.aead.key[0..A.key_length].*);
     p.seq += 1;
     return rec;
 }

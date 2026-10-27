@@ -52,6 +52,15 @@ test {
     _ = @import("./h2/hpack.zig");
     _ = @import("./h2/frame.zig");
     _ = @import("./h2/conn.zig");
+    _ = @import("./quic/packet.zig");
+    _ = @import("./quic/protection.zig");
+    _ = @import("./quic/frame.zig");
+    _ = @import("./quic/transport_params.zig");
+    _ = @import("./quic/ranges.zig");
+    _ = @import("./quic/recovery.zig");
+    _ = @import("./quic/stream.zig");
+    _ = @import("./quic/sent.zig");
+    _ = @import("./quic/conn_test.zig");
     _ = @import("./server_test.zig");
     @import("std").testing.refAllDecls(@This());
 }

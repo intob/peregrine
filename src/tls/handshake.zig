@@ -10,6 +10,12 @@
 //!   sink.changeCipherSpec() !void       (TCP middlebox compatibility only)
 //!   sink.writeSecret(level: Level, suite: Suite, secret: []const u8) !void
 //!   sink.readSecret(level: Level, suite: Suite, secret: []const u8) !void
+//!   sink.transportParameters(client: []const u8) ![]const u8   (QUIC only)
+//!
+//! With `Config.quic` (RFC 9001 §8), the client's quic_transport_parameters
+//! extension is required and handed to the sink, which returns ours for
+//! EncryptedExtensions; ALPN is required; the legacy session ID must be
+//! empty, so no change_cipher_spec is ever sent.
 //!
 //! Scope: full handshakes with certificate authentication, no PSK, no 0-RTT,
 //! no client certificates.
@@ -42,6 +48,8 @@ pub const Config = struct {
     /// In preference order. Key shares the client sent are preferred over
     /// a better group that would need a HelloRetryRequest.
     groups: []const NamedGroup = &.{ .x25519_ml_kem768, .x25519, .secp256r1 },
+    /// QUIC (RFC 9001) rather than TLS over TCP.
+    quic: bool = false,
 };
 
 const has_aes = switch (@import("builtin").cpu.arch) {
@@ -115,6 +123,9 @@ pub const Handshake = struct {
 
     /// Negotiated ALPN protocol (points into the config), if any.
     alpn: ?[]const u8 = null,
+    /// QUIC: our transport parameters, as the sink returned them; sent in
+    /// EncryptedExtensions.
+    transport_params: []const u8 = &.{},
     /// The client offered 0-RTT data; it is rejected, so the record layer
     /// must skip it.
     early_data_offered: bool = false,
@@ -204,6 +215,12 @@ pub const Handshake = struct {
         const retry = self.state == .client_hello_retry;
 
         if (!hello.tls13) return error.ProtocolVersion;
+        if (self.config.quic) {
+            // RFC 9001 §8.4: QUIC has no middlebox compatibility mode.
+            if (hello.session_id.len != 0) return error.IllegalParameter;
+            // §8.2: the extension is mandatory.
+            if (hello.quic_transport_params == null) return error.MissingExtension;
+        }
         if (retry) {
             if (hello.early_data) return error.IllegalParameter;
             if (!std.mem.eql(u8, hello.session_id, self.session_id_buf[0..self.session_id_len]))
@@ -272,6 +289,18 @@ pub const Handshake = struct {
             if (hello.alpn) |offered| {
                 self.alpn = try selectAlpn(self.config.alpn, offered);
             }
+        }
+        if (self.config.quic) {
+            // §8.1: a QUIC handshake must agree on an application protocol.
+            if (self.alpn == null) return error.NoApplicationProtocol;
+            const Sink = switch (@typeInfo(@TypeOf(sink))) {
+                .pointer => |p| p.child,
+                else => @TypeOf(sink),
+            };
+            // Only QUIC sinks have transport parameters; a QUIC config with
+            // a TCP sink is a programming error.
+            if (!@hasDecl(Sink, "transportParameters")) return error.InternalError;
+            self.transport_params = try sink.transportParameters(hello.quic_transport_params.?);
         }
 
         self.transcript.update(msg);
@@ -381,7 +410,7 @@ pub const Handshake = struct {
         const creds = self.config.credentials;
         var chain_len: usize = 0;
         for (creds.chain) |c| chain_len += 3 + c.len + 2;
-        const flight_len = 64 + 300 + chain_len + credentials.max_signature_len + record.max_hash_len;
+        const flight_len = 64 + 300 + self.transport_params.len + chain_len + credentials.max_signature_len + record.max_hash_len;
         const flight = self.allocator.alloc(u8, flight_len) catch return error.InternalError;
         defer self.allocator.free(flight);
         var w: Writer = .{ .buf = flight };
@@ -396,6 +425,11 @@ pub const Handshake = struct {
             w.int(u16, @intCast(1 + proto.len));
             w.int(u8, @intCast(proto.len));
             w.bytes(proto);
+        }
+        if (self.config.quic) {
+            w.int(u16, @backingInt(ExtensionType.quic_transport_parameters));
+            w.int(u16, @intCast(self.transport_params.len));
+            w.bytes(self.transport_params);
         }
         w.end(u16, exts);
         w.endMessage(hdr);
@@ -609,6 +643,8 @@ const ClientHello = struct {
     key_shares: ?[]const u8 = null,
     /// The ProtocolNameList contents.
     alpn: ?[]const u8 = null,
+    /// The quic_transport_parameters extension's contents.
+    quic_transport_params: ?[]const u8 = null,
     tls13: bool = false,
     early_data: bool = false,
     psk: bool = false,
@@ -669,6 +705,10 @@ const ClientHello = struct {
                     hello.alpn = protos;
                 },
                 .early_data => hello.early_data = true,
+                .quic_transport_parameters => {
+                    hello.quic_transport_params = ext;
+                    continue;
+                },
                 .psk_key_exchange_modes => {
                     hello.psk_modes = true;
                     continue;

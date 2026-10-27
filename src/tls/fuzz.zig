@@ -712,7 +712,7 @@ fn seal(p: *Protection, a: Allocator, out: *std.ArrayList(u8), inner: []const u8
     switch (p.suite) {
         inline else => |s| {
             const A = s.Aead();
-            A.encrypt(body[0..inner.len], body[inner.len..][0..record.tag_len], body[0..inner.len], rec[0..record.header_len], nonce, p.key[0..A.key_length].*);
+            A.encrypt(body[0..inner.len], body[inner.len..][0..record.tag_len], body[0..inner.len], rec[0..record.header_len], nonce, p.aead.key[0..A.key_length].*);
         },
     }
     p.seq += 1;

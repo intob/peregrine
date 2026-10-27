@@ -23,7 +23,7 @@ fn stdSeal(comptime A: type, p: *Protection, out: []u8, data_len: usize) usize {
     std.mem.writeInt(u16, out[3..5], @intCast(inner_len + record.tag_len), .big);
     const inner = out[record.header_len..][0..inner_len];
     inner[data_len] = 23;
-    A.encrypt(inner, out[record.header_len + inner_len ..][0..record.tag_len], inner, out[0..record.header_len], nonce(p), p.key[0..A.key_length].*);
+    A.encrypt(inner, out[record.header_len + inner_len ..][0..record.tag_len], inner, out[0..record.header_len], nonce(p), p.aead.key[0..A.key_length].*);
     p.seq += 1;
     return record.header_len + inner_len + record.tag_len;
 }
@@ -31,7 +31,7 @@ fn stdSeal(comptime A: type, p: *Protection, out: []u8, data_len: usize) usize {
 fn stdOpen(comptime A: type, p: *Protection, rec: []u8) !void {
     const body = rec[record.header_len..];
     const ct = body[0 .. body.len - record.tag_len];
-    try A.decrypt(ct, ct, body[ct.len..][0..record.tag_len].*, rec[0..record.header_len], nonce(p), p.key[0..A.key_length].*);
+    try A.decrypt(ct, ct, body[ct.len..][0..record.tag_len].*, rec[0..record.header_len], nonce(p), p.aead.key[0..A.key_length].*);
     p.seq += 1;
 }
 
