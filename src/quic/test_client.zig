@@ -77,6 +77,7 @@ pub const Client = struct {
     max_streams_bidi: u64 = 0,
     max_data_seen: u64 = 0,
     peer_max_stream_data_bidi: u64 = 0,
+    peer_max_stream_data_uni: u64 = 0,
     peer_max_data: u64 = 0,
     data_sent: u64 = 0,
     /// Frames to append to the next 1-RTT packet (raw, for error tests).
@@ -317,7 +318,7 @@ pub const Client = struct {
             const s = try self.a.create(Stream);
             s.* = .{};
             s.recv.reset(0);
-            s.send.reset(if (id & 2 == 0) self.peer_max_stream_data_bidi else 0);
+            s.send.reset(if (id & 2 == 0) self.peer_max_stream_data_bidi else if (id & 1 == 0) self.peer_max_stream_data_uni else 0);
             gop.value_ptr.* = s;
         }
         return gop.value_ptr.*;
@@ -406,6 +407,7 @@ pub const Client = struct {
             switch (id) {
                 0x04 => self.peer_max_data = try vr.varint(),
                 0x06 => self.peer_max_stream_data_bidi = try vr.varint(),
+                0x07 => self.peer_max_stream_data_uni = try vr.varint(),
                 0x08 => self.max_streams_bidi = try vr.varint(),
                 else => {},
             }
@@ -424,6 +426,13 @@ pub const Client = struct {
     }
 
     // -- Streams ----------------------------------------------------------------
+
+    pub fn openUni(self: *Self) !u64 {
+        const id = self.next_uni;
+        self.next_uni += 4;
+        _ = try self.getStream(id);
+        return id;
+    }
 
     pub fn openBidi(self: *Self) !u64 {
         const id = self.next_bidi;

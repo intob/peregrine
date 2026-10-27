@@ -1287,6 +1287,11 @@ pub const Conn = struct {
         return self.streams[slot].recv.finished();
     }
 
+    /// All data was received (the FIN and everything before it).
+    pub fn streamComplete(self: *Self, slot: u32) bool {
+        return self.streams[slot].recv.complete();
+    }
+
     /// The peer reset its sending side with this code.
     pub fn streamResetCode(self: *Self, slot: u32) ?u64 {
         return self.streams[slot].recv_reset;
@@ -1319,6 +1324,11 @@ pub const Conn = struct {
         if (s.reset_code != null or s.send.fin) return;
         s.send.finish();
         self.queueSend(slot);
+    }
+
+    /// Client request streams not yet finished both ways (and freed).
+    pub fn openRequestStreams(self: *const Self) u64 {
+        return self.bidi_opened - self.bidi_closed;
     }
 
     /// Bytes written and not yet acknowledged.

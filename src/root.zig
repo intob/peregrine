@@ -61,6 +61,11 @@ test {
     _ = @import("./quic/stream.zig");
     _ = @import("./quic/sent.zig");
     _ = @import("./quic/conn_test.zig");
+    _ = @import("./h3/qpack.zig");
+    _ = @import("./h3/frame.zig");
+    _ = @import("./h3/conn.zig");
+    _ = @import("./h3/conn_test.zig");
+    _ = @import("./http/fields.zig");
     _ = @import("./server_test.zig");
     @import("std").testing.refAllDecls(@This());
 }
