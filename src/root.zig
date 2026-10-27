@@ -40,6 +40,7 @@ test {
     _ = @import("./tls/handshake.zig");
     _ = @import("./tls/conn.zig");
     _ = @import("./tls/fuzz.zig");
+    _ = @import("./h2/hpack.zig");
     _ = @import("./server_test.zig");
     @import("std").testing.refAllDecls(@This());
 }

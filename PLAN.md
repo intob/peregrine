@@ -403,7 +403,15 @@ which RFC 9113 deprecated).
       the synchronous fast path for the simple case. Proposal (not yet agreed):
       `docs/handler-api-proposal.md`
 - [ ] Frame layer (RFC 9113): I/O-free, same buffer discipline as `Session`
-- [ ] HPACK (RFC 7541): static/dynamic tables, Huffman decode/encode, strict limits
+- [x] HPACK (RFC 7541), `src/h2/hpack.zig`: static and dynamic tables, integer
+      and string coding, a nibble-driven Huffman decoder generated at comptime from
+      the Appendix B table (checked canonical and complete), an encoder with
+      incremental indexing and Huffman-when-shorter. Limits: table size (a size
+      update above what we advertised is a COMPRESSION_ERROR), header list size
+      (decoding continues so the table stays in sync, then HeaderListTooLarge),
+      field length. Proof: every Appendix C example byte for byte in both
+      directions (C.2-C.6, with table contents and sizes), round-trip property
+      tests, a fuzz target over the decoder
 - [ ] Streams: state machine, concurrency limits, priorities (RFC 9218
       `Priority` header and `PRIORITY_UPDATE`; ignore RFC 7540 priorities)
 - [ ] Flow control (connection and stream windows), batching `WINDOW_UPDATE`s
