@@ -129,10 +129,25 @@ end-to-end test pipelines 8 MB + 1 MB responses to a slow reader.
       recv armed at a time (backpressure); writes queued as SQEs so one
       `io_uring_enter` covers a batch; `SINGLE_ISSUER | DEFER_TASKRUN`;
       cancel-before-close with in-flight op counting
-- [ ] **Make io_uring faster than epoll.** Equal within noise today, so `.auto` picks
-      epoll. To try: multishot recv, registered (direct) fds, `send` instead of
-      `writev` for one buffer, `send_zc` for large bodies, bigger completion batches,
-      back off re-arming accept on `EMFILE`
+- [ ] **Make io_uring faster than epoll.** Equal within noise for small requests,
+      so `.auto` picks epoll. To try: multishot recv, registered (direct) fds, `send`
+      instead of `writev` for one buffer, `send_zc` for large bodies, bigger
+      completion batches, back off re-arming accept on `EMFILE`.
+      Uploads are slower: a 12 KiB POST (plaintext, c=64) cost 12.4 µs of server
+      CPU on io_uring against 6.7-7.1 on epoll. Found with perf and counters (Docker
+      on the M2 Pro, host under load, interleaved runs):
+  - [x] About two thirds of these requests arrive in two receives. The rest went
+        through a second kernel buffer and was copied after the first part;
+        a connection holding partial input now receives straight into that
+        buffer, as on epoll: 11.0-12.1 → 10.0-10.3 µs
+  - [ ] The kernel copies into the coldest buffer: the ring is FIFO over 256 ×
+        16 KiB per worker, where epoll reuses hot pooled buffers. 16 buffers gave
+        8.8-8.9 µs in one set of runs and were within noise of 256 in the next, so
+        the default stays until it's measured on a quiet machine (a small ring
+        trades this for ENOBUFS round trips under bursts)
+  - [ ] The first part of a split request (4.3 KB on average) is still copied out
+        of the kernel buffer. Holding the kernel buffer and receiving the rest into
+        its tail would avoid that when the request fits
 - [x] Listener per worker with `SO_REUSEPORT` (`SO_REUSEPORT_LB` where available);
       macOS workers share one listener in their own kqueues
 - [x] `TCP_DEFER_ACCEPT` plus reading straight after accept
@@ -354,7 +369,7 @@ Later in M4:
       end of a receive is kept. The split-invariance test replays every split
       copied and borrowed, with the borrowed buffer poisoned afterwards. The gain
       was within noise: the copy wasn't what made uploads slower on io_uring,
-      because plaintext uploads have the same gap
+      because plaintext uploads have the same gap (see M2)
 - [ ] Faster handshakes: measure on Linux; candidates are P-256 signing, ML-KEM
       encapsulation, and the per-handshake allocations (handshake state, flight buffer)
 - [x] Send KeyUpdate before the AES-GCM record limit: after 2^24 records under one

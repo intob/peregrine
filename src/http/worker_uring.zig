@@ -4,7 +4,8 @@
 //! - multishot accept on the worker's own SO_REUSEPORT listener
 //! - recv with kernel-selected provided buffers, so idle connections hold no
 //!   buffer; a recv is armed only when the connection is ready for more input
-//!   (natural backpressure)
+//!   (natural backpressure). A connection holding part of a request, record
+//!   or frame receives the rest straight into that buffer instead
 //! - writes queued as SQEs, so one io_uring_enter submits every recv and write
 //!   produced by a batch of completions
 //! - TLS like worker.zig: records are decrypted in place in the kernel buffer
@@ -353,6 +354,7 @@ pub fn Worker(comptime Handler: type) type {
 
         fn armRecv(self: *Self, c: *Conn) void {
             if (c.recv_armed or c.closing or c.peer_closed) return;
+            if (!c.lingering and holdsPartialInput(c)) return self.armRecvPlain(c);
             const sqe = self.getSqe();
             sqe.prep_rw(.RECV, c.fd, 0, 0, 0);
             sqe.flags |= linux.IOSQE_BUFFER_SELECT;
@@ -362,8 +364,20 @@ pub fn Worker(comptime Handler: type) type {
             c.inflight += 1;
         }
 
-        /// Fallback when the provided-buffer ring is exhausted: receive into
-        /// a pooled session buffer instead.
+        /// Whether the connection holds part of a request, TLS record or
+        /// WebSocket frame. The rest is then received straight into the
+        /// buffer holding it, as on epoll: through a kernel buffer it would
+        /// be copied, and requests split across two receives are common
+        /// (most 12 KiB uploads under load).
+        fn holdsPartialInput(c: *const Conn) bool {
+            std.debug.assert(!c.borrowed);
+            if (c.tls) |t| return t.partialRecordNeed() > 0;
+            if (c.ws) |w| return w.decoder.buf.len > 0;
+            return c.session.buf.len > 0;
+        }
+
+        /// Receives into a pooled buffer: the one holding partial input, or
+        /// a fresh one when the provided-buffer ring is exhausted.
         fn armRecvPlain(self: *Self, c: *Conn) void {
             const space = if (c.tls) |t|
                 t.readSpace() catch return self.closeConn(c)
@@ -797,7 +811,9 @@ pub fn Worker(comptime Handler: type) type {
                 }
             }
             if (c.peer_closed) return self.closeConn(c);
-            if (!c.borrowed) c.session.releaseIfIdle(&self.pool);
+            // Keep a partial request before the kernel buffer goes back.
+            if (c.borrowed) self.unborrow(c) catch return self.closeConn(c);
+            c.session.releaseIfIdle(&self.pool);
             if (c.tls) |t| t.releaseIfIdle();
             self.updateTimer(c);
             self.armRecv(c);
