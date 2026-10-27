@@ -74,6 +74,7 @@ Source layout:
 | `src/mailbox.zig` | How other threads tell a worker that a WebSocket or an exchange has output |
 | `src/h2/hpack.zig` | HPACK (RFC 7541): tables, Huffman coding, strict limits |
 | `src/h2/frame.zig` | HTTP/2 framing (RFC 9113): I/O-free parser and serialiser |
+| `src/h2/conn.zig` | One HTTP/2 connection: streams, flow control, request assembly, responses through the handler API, defences |
 | `src/ws/protocol.zig` | I/O-free WebSocket frame decoder and message assembler |
 | `src/ws/conn.zig` | Per-connection WebSocket state: send queue, close handshake, cross-thread mailbox |
 | `src/ws/upgrader.zig` | The HTTP upgrade response |
@@ -433,12 +434,30 @@ which RFC 9113 deprecated).
       field length. Proof: every Appendix C example byte for byte in both
       directions (C.2-C.6, with table contents and sizes), round-trip property
       tests, a fuzz target over the decoder
-- [ ] Streams: state machine, concurrency limits, priorities (RFC 9218
-      `Priority` header and `PRIORITY_UPDATE`; ignore RFC 7540 priorities)
-- [ ] Flow control (connection and stream windows), batching `WINDOW_UPDATE`s
-- [ ] Defences: rapid reset (CVE-2023-44487), CONTINUATION flood, HPACK bomb,
-      settings/ping floods, zero-window stalls
-- [ ] Graceful shutdown with `GOAWAY`
+- [x] **Connection layer**, `src/h2/conn.zig`, I/O-free: preface, SETTINGS
+      exchange and ack, PING, GOAWAY both ways (graceful: open streams finish, new
+      ones are refused), stream states with a ring of recently closed streams to
+      tell "closed" from "idle" (§5.1), `SETTINGS_MAX_CONCURRENT_STREAMS` with
+      REFUSED_STREAM (the refused block is still decoded so HPACK stays in sync),
+      connection and stream flow control with WINDOW_UPDATEs batched at half a
+      window, request assembly (CONTINUATION, pseudo-headers, §8.2 and §8.3
+      validation, content-length checks, trailers validated and dropped, a `host`
+      header synthesised from `:authority`). Each stream maps to the handler API:
+      the synchronous path serialises HEADERS+DATA when `handleRequest` returns
+      with no allocation in steady state (a body the windows don't allow is copied
+      to the stream's pending buffer); `later()`/`stream()` exchanges are drained
+      per stream, trailers as a trailing HEADERS. Priorities (RFC 7540 and RFC
+      9218) are accepted and ignored. Output backpressure: parsing stops above
+      `out_limit` until the worker has written.
+      Defences, each with a test: rapid reset (RST_STREAM budget per second),
+      CONTINUATION flood (block bounded by `max_header_bytes`, and a block that
+      never completes times out), HPACK bomb (header list size limit, 431, table
+      in sync), SETTINGS/PING/empty-frame floods (control frames per second),
+      zero-window stalls (stream reset after `request_timeout_s` without window;
+      connection closed when its window is the cause). Proof: a scripted-client
+      harness (each §8 rule, stream states, flow control, exchanges, GOAWAY),
+      split invariance per stream, a fuzz target
+- [ ] Priorities: RFC 9218 `priority` header is not parsed (ignored like the rest)
 - [ ] WebSockets over h2 (RFC 8441 extended CONNECT)
 - [ ] Verification: h2spec, fuzzing, split-invariance property tests
 - [ ] Benchmark against h2o and nginx (h2load)

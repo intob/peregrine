@@ -106,6 +106,8 @@ pub const Entry = struct {
     keep_alive: bool = true,
     is_head: bool = false,
     http10: bool = false,
+    /// HTTP/2: the stream this exchange answers (0 on HTTP/1.1).
+    stream_id: u32 = 0,
     /// Head to write before the body (`later()` exchanges): the session
     /// already wrote it for `stream()`.
     head_pending: bool = false,
@@ -216,6 +218,7 @@ pub const Slab = struct {
         e.head_pending = false;
         e.framing = .chunked;
         e.keep_alive = true;
+        e.stream_id = 0;
         // Deadlines are whole seconds: +1 so at least the timeout passes.
         e.deadline = now +% self.opts.response_timeout_s +% 1;
         e.mutex.unlock();
@@ -567,6 +570,94 @@ pub const Exchange = struct {
     }
 
 };
+
+/// What `h2Poll` found.
+pub const H2Poll = struct {
+    /// A response head to send before any data: the status and the
+    /// serialised "name: value\r\n" lines (valid until the exchange ends).
+    head: ?struct { status: Status, headers: []const u8, content_length: ?usize } = null,
+    /// Body bytes copied into `dest`.
+    n: usize = 0,
+    /// Every queued byte has been taken and `finish` was called;
+    /// `trailers` are the serialised trailer lines, possibly empty.
+    end: bool = false,
+    trailers: []const u8 = "",
+    /// Data remains queued (dest was too small).
+    more: bool = false,
+    notify: bool = false,
+    aborted: bool = false,
+    progressed: bool = false,
+};
+
+/// Worker thread, for HTTP/2: moves queued output into `dest` (a DATA
+/// frame's payload), copying borrowed bytes too (releasing them once
+/// fully taken). The caller frames it.
+pub fn h2Poll(ex: Exchange, dest: []u8, now: u32) H2Poll {
+    const e = &ex.slab.entries[ex.slot];
+    std.debug.assert(e.active and e.gen == ex.gen);
+    var r: H2Poll = .{};
+    e.mutex.lock();
+    defer e.mutex.unlock();
+    e.posted = false;
+    if (e.new_deadline) |d| {
+        e.deadline = d;
+        e.new_deadline = null;
+    }
+    if (e.state == .aborted) {
+        r.aborted = true;
+        return r;
+    }
+    if (e.state == .later) return r;
+    if (e.head_pending) {
+        r.head = .{ .status = e.head_status, .headers = e.head.items, .content_length = e.head_length };
+        e.head_pending = false;
+        r.progressed = true;
+    }
+    while (e.segments.items.len > 0 and r.n < dest.len) {
+        const room = dest.len - r.n;
+        const seg = &e.segments.items[0];
+        switch (seg.*) {
+            .copied => |*len| {
+                const n = @min(len.*, room);
+                @memcpy(dest[r.n..][0..n], e.bytes.items[e.bytes_pos..][0..n]);
+                len.* -= n;
+                e.bytes_pos += n;
+                r.n += n;
+                e.queued -= n;
+                if (len.* == 0) {
+                    _ = e.segments.orderedRemove(0);
+                    if (e.segments.items.len == 0) {
+                        e.bytes.clearRetainingCapacity();
+                        e.bytes_pos = 0;
+                    }
+                }
+            },
+            .borrowed => |*b| {
+                const n = @min(b.bytes.len, room);
+                @memcpy(dest[r.n..][0..n], b.bytes[0..n]);
+                b.bytes = b.bytes[n..];
+                r.n += n;
+                e.queued -= n;
+                if (b.bytes.len == 0) {
+                    if (b.release) |rel| rel.call();
+                    _ = e.segments.orderedRemove(0);
+                }
+            },
+        }
+    }
+    if (r.n > 0) r.progressed = true;
+    r.more = e.segments.items.len > 0;
+    if (!r.more and e.state == .finished) {
+        r.end = true;
+        r.trailers = e.trailers.items;
+    }
+    if (r.progressed) e.deadline = now +% ex.slab.opts.request_timeout_s +% 1;
+    if (e.wants_writable and e.queued <= ex.slab.opts.max_queue_bytes / 2) {
+        e.wants_writable = false;
+        r.notify = true;
+    }
+    return r;
+}
 
 /// How a response body goes on the wire, from the request and the head.
 pub fn streamFraming(status: Status, is_head: bool, http10: bool, content_length: ?usize) Framing {

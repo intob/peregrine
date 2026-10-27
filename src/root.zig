@@ -50,6 +50,7 @@ test {
     _ = @import("./tls/fuzz.zig");
     _ = @import("./h2/hpack.zig");
     _ = @import("./h2/frame.zig");
+    _ = @import("./h2/conn.zig");
     _ = @import("./server_test.zig");
     @import("std").testing.refAllDecls(@This());
 }
