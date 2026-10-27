@@ -54,7 +54,7 @@ Design rules that apply to every layer:
 | M1. HTTP/1.1 core | ✅ done (streaming responses deferred to the API redesign in M5) |
 | M2. Throughput architecture | 🟡 io_uring works (opt-in, not yet faster than epoll); sendfile, NUMA open |
 | M3. WebSockets over HTTP/1.1 | ✅ reworked; permessage-deflate, Autobahn, benchmarks open |
-| M4. TLS 1.3 | 🟡 **working on epoll/kqueue** (HTTP and WebSockets, interop-tested); io_uring, fuzzing and handshake speed open |
+| M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; faster handshakes, resumption and kTLS are listed under "Later in M4" |
 | M5. HTTP/2 | ⬜ next after TLS |
 | M6. HTTP/3 and QUIC | ⬜ |
 | M7. Verification and benchmarking | 🟡 ongoing for each milestone |
@@ -75,7 +75,8 @@ Source layout:
 | `src/ws/upgrader.zig` | The HTTP upgrade response |
 | `src/tls/` | I/O-free TLS 1.3 server (M4): see below |
 | `src/server_test.zig` | End-to-end tests over real sockets, run once per available backend |
-| `bench/` | `zig build bench` (parser micro-benchmarks), `zig build bench-server` (load-test target) |
+| `bench/` | `zig build bench` (parser micro-benchmarks), `zig build bench-tls` (record protection), `zig build bench-server` (load-test target, plaintext or TLS) |
+| `docs/handler-api-proposal.md` | Proposed M5 handler API: streaming, deferred responses, trailers |
 
 Tests run with `zig build test` on macOS (kqueue), Linux with Docker's default seccomp
 (epoll; io_uring is blocked there, so `.auto` falls back), and Linux with io_uring
@@ -222,17 +223,27 @@ Ed25519, `std.crypto.tls` enums and `hkdfExpandLabel`.
 | `record.zig` | Record protection: AEAD with per-record nonce (IV xor sequence number), record header as AAD, inner content type and padding removal, record size limits |
 | `conn.zig` | `tls.Conn`: one TLS-over-TCP connection. Buffers ciphertext like `Session` does (pooled, held only while unprocessed), drives the handshake, decrypts application data for the HTTP/WebSocket layers and encrypts their output into a wire buffer |
 | `credentials.zig` | PEM/DER loading of the certificate chain and private key; signing CertificateVerify |
+| `fuzz.zig` | Fuzz target over `tls.Conn`: a scripted client (see the checklist) |
 
 The handshake keeps a running transcript hash, not the transcript, and its state is
 freed when the handshake ends, so an established connection only holds two record
-protection states (keys, IVs, sequence numbers).
+protection states (keys, IVs, sequence numbers, and for AES-GCM the expanded key
+schedule and GHASH table, about 500 bytes each).
 
-**Worker integration** (epoll/kqueue): the TLS connection sits between the socket and
-the session (or the WebSocket decoder). Reads go socket → `tls.Conn` (decrypt) →
-session buffer. Writes go session `Out` → `tls.Conn` (encrypt into records of up to
-16 KB) → socket. The existing pending-output and backpressure machinery covers the
-ciphertext too: unsent ciphertext counts as pending output, and plaintext not yet
-encrypted is kept like an unsent response.
+**Worker integration**: the TLS connection sits between the socket and the session
+(or the WebSocket decoder). Reads go socket → `tls.Conn` (decrypt) → session buffer;
+a record whose plaintext fits the free space is decrypted straight into it. Writes go
+session `Out` → `tls.Conn` (encrypt into records of up to 16 KB) → socket. The
+existing pending-output and backpressure machinery covers the ciphertext too: unsent
+ciphertext counts as pending output, and plaintext not yet encrypted is kept like an
+unsent response.
+
+On io_uring, ciphertext lands in kernel-provided buffers (so idle connections still
+hold no buffer), is copied into the `tls.Conn`, and every complete record is decrypted
+before the kernel buffer goes back; a TLS input buffer holds one whole record, so what
+is left always fits. Output is encrypted from the connection's `Out` as the wire
+buffer drains, one write SQE at a time; alerts and close_notify use one direct write,
+as on epoll, which is safe because no write SQE is in flight at those points.
 
 Checklist:
 - [x] Decide: rewrite as I/O-free layers in `src/tls/` instead of fixing the old
@@ -265,9 +276,34 @@ Checklist:
       in both directions, Ed25519 certificates (std's client can't check those: its
       CertificateVerify scheme check has no Ed25519 case). curl 8.7 (LibreSSL) with ALPN
 - [x] `example/https` (`zig build run-https`)
-- [ ] io_uring backend integration (`.io_uring` + TLS is rejected at init for now;
-      `.auto` picks epoll)
-- [ ] Fuzz target over `tls.Conn` (ClientHello mutations and record splits)
+- [x] io_uring backend integration; every TLS end-to-end test runs on each backend
+- [x] Fuzz target over `tls.Conn` (`src/tls/fuzz.zig`). A scripted client starts from
+      a session recorded with std's client, swaps in key shares it holds the private
+      keys for, mutates the ClientHello (lengths, extensions, key shares, PSK
+      placement, the answer to a HelloRetryRequest), follows the server's replies to
+      derive the real keys, and sends valid and invalid records (Finished variants,
+      application data with padding, KeyUpdate, alerts, corrupted, oversized, empty
+      and early-data records). The bytes are replayed with other read splits and
+      record boundaries. Checked: no crash or out-of-bounds access; the output
+      decrypts and verifies; every failure ends with a fatal alert, the one RFC 8446
+      names where it names one; splits never change the output; a script without
+      faults completes with its plaintext intact. Fuzzed on Linux (Docker, ReleaseSafe,
+      6 instances) for 2 h 16 min of wall time (just over 2 h active), about 10.9M
+      runs; the coverage-guided runs found 7 bugs in the harness's own model and none
+      in the server. Found in the server while building the harness (pseudo-random
+      inputs): padding could take the inner plaintext past 2^14 + 1 bytes (now
+      record_overflow); a tag-only record got bad_record_mac instead of
+      unexpected_message; 0-RTT data arriving after our HelloRetryRequest was
+      rejected instead of skipped (§4.2.10). Also added: pre_shared_key without
+      psk_key_exchange_modes is rejected (§4.2.9). Inputs that once failed are kept
+      in `src/tls/testdata/fuzz/` and replayed by every `zig build test`; without
+      `--fuzz` the harness also runs 64 PRNG-driven inputs. Coverage stays near 20% of
+      the instrumented PCs in the test binary (which includes std and the rest of the
+      library): 3180 PCs seen after the first minutes, 3269 at the end. The next gains
+      need new script paths more than more hours.
+      Run it: `zig build test --fuzz -Doptimize=ReleaseSafe -Dtest-filter="fuzz: tls"`
+      on Linux. With several fuzz instances, run a short single-instance pass first
+      (`--fuzz=200`): instances racing to create the coverage file panic in 0.17
 
 First numbers (macOS, M2 Pro, all cores, `wrk -t4 -c64`, so wrk-bound and only
 relative): keep-alive "Hello" over TLS 136k req/s vs. 146k plaintext; full handshakes
@@ -275,13 +311,52 @@ relative): keep-alive "Hello" over TLS 136k req/s vs. 146k plaintext; full hands
 cost is mostly std's P-256 signing and ML-KEM, which have no assembly fast paths:
 profile before deciding what to optimise.
 
+Linux numbers (Docker on M2 Pro, `bench-server ... tls`: 6 workers on CPUs 0-5, `wrk
+-t6` with OpenSSL 3.3 on CPUs 6-11, keep-alive, AES-128-GCM, X25519; built with
+`-Dcpu=apple_m2`, since generic aarch64 has no AES instructions and std falls back to
+software AES). wrk does as much TLS work as the server, so throughput is partly
+wrk-bound; server CPU per request is the better measure:
+
+| | req/s | server CPU | CPU per request |
+|---|---|---|---|
+| "Hello", c=256, epoll | 295k-317k | 2.5 cores | 8.1-8.3 µs |
+| GET 64 KiB, c=64, epoll | 97k-103k (5.9-6.3 GB/s) | 5.3 cores | 50-54 µs |
+| POST 12 KiB, c=64, epoll | 281k-294k | 4.6 cores | 15.6-16.5 µs |
+| "Hello", c=256, io_uring | 310k-314k | 2.7 cores | 8.5 µs |
+| GET 64 KiB, c=64, io_uring | 96k-101k | 5.1 cores | 50-53 µs |
+| POST 12 KiB, c=64, io_uring | 257k-261k | 4.8 cores | 18.5 µs |
+
 Later in M4:
-- [ ] Faster record crypto: keep expanded AES key schedules per connection instead of
-      re-expanding per record (std's AEAD API takes raw keys), and decrypt straight
-      into the session buffer
+- [x] Faster record crypto: keep expanded AES key schedules (and GHASH's powers of
+      H) per key instead of per record, and decrypt straight into the session buffer
+      when the record fits. Smaller win than expected, because ARM's AES and PMULL
+      instructions make the setup cheap: seal+open 3-4% faster for 32 B-4 KiB records,
+      1% at 16 KiB, and skipping the copy saves about 3% at 16 KiB (`zig build
+      bench-tls`). End to end, server CPU per request fell 1-9% for 64 KiB downloads
+      and 12 KiB uploads, and throughput moved within noise (before: 8.3 / 55.6 /
+      16.6 µs per request for hello / 64 KiB / upload; after: 8.1-8.3 / 50-54 /
+      15.6-16.5). A fresh 16 KiB session buffer can't take a full record (16385 bytes
+      with the content type), so those are still copied
+- [ ] **Faster AES-GCM.** The real limit: std's AES-GCM runs at about 2.2 GB/s per
+      direction per core on the M2 Pro, against 6.5 GB/s for OpenSSL's AES-128-GCM on
+      the same machine. A fused, interleaved CTR + GHASH (8 blocks at a time) is the
+      next step for bulk transfers; kTLS sidesteps it on Linux
+- [ ] io_uring + TLS: decrypt straight out of the kernel's provided buffer when it
+      holds whole records (as the plaintext path parses in place). The copy costs
+      uploads about 17% more server CPU than on epoll (18.5 vs 15.9 µs per 12 KiB
+      upload)
 - [ ] Faster handshakes: measure on Linux; candidates are P-256 signing, ML-KEM
       encapsulation, and the per-handshake allocations (handshake state, flight buffer)
-- [ ] Send KeyUpdate before the AES-GCM record limit (about 2^24.5 records per key)
+- [x] Send KeyUpdate before the AES-GCM record limit: after 2^24 records under one
+      key (the power of two below §5.5's 2^24.5), for every suite (only AES-GCM needs
+      it, one rule is simpler), `update_not_requested`, only when the wire buffer has
+      room so it never grows it. `Conn.key_update_limit` is lowered in tests, and
+      std's TLS client follows the updates
+- [ ] Known leniencies, all harmless for real clients: a KeyUpdate split across two
+      records (allowed by RFC 8446 if neither spans a key change) is rejected;
+      non-handshake records between the fragments of a handshake message are not
+      (§5.1 says they MUST NOT appear); change_cipher_spec before ClientHello is
+      dropped rather than rejected
 - [ ] RSA certificates (RSA-PSS signing: std has only verification)
 - [ ] Session tickets and resumption (PSK-DHE); 0-RTT only with replay protection
 - [ ] Several certificates selected by SNI; OCSP stapling
@@ -300,7 +375,8 @@ which RFC 9113 deprecated).
 - [ ] **Handler API redesign**, shared by HTTP/1.1, h2 and h3: streaming responses
       (and chunked HTTP/1.1 responses, deferred from M1), streaming request bodies,
       trailers, and a handler that can respond later (needed for multiplexing). Keep
-      the synchronous fast path for the simple case
+      the synchronous fast path for the simple case. Proposal (not yet agreed):
+      `docs/handler-api-proposal.md`
 - [ ] Frame layer (RFC 9113): I/O-free, same buffer discipline as `Session`
 - [ ] HPACK (RFC 7541): static/dynamic tables, Huffman decode/encode, strict limits
 - [ ] Streams: state machine, concurrency limits, priorities (RFC 9218
@@ -338,6 +414,7 @@ which RFC 9113 deprecated).
 - [x] Fuzzing with Zig's built-in fuzzer: `fuzz: split invariance` in `session.zig`
       (about 322K runs on Linux, no failures; `zig build test --fuzz=300K`. On macOS
       the 0.17 fuzz runner hung at 0% CPU, so run it on Linux)
+- [x] TLS fuzz target over `tls.Conn` (see M4)
 - [ ] Structure-aware fuzzing (grammar-based request generation)
 - [ ] Differential parser testing (HTTP Garden) for smuggling discrepancies
 - [ ] Protocol suites: Autobahn (WebSockets), tlsfuzzer/BoGo (TLS), h2spec (h2),
@@ -351,7 +428,7 @@ which RFC 9113 deprecated).
         **Still to do: separate machines**
   - [x] `wrk` keep-alive, plus pipelined ×16 (TechEmpower plaintext style)
   - [ ] Latency percentiles at a fixed rate (`wrk2`)
-  - [ ] TLS: handshakes/s per core, and throughput over TLS
+  - [ ] TLS: handshakes/s per core. Throughput over TLS: first numbers in M4
   - [ ] h2/h3: h2load
   - [x] Baseline nginx. Still to do: h2o, a minimal raw-epoll C server, Zap
 
