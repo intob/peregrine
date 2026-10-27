@@ -58,6 +58,8 @@ pub const Options = struct {
     tls_buffer_pool_size: usize = 0,
     /// HTTP/3 on the worker's UDP socket, if it has one.
     quic: ?quic_endpoint.Options = null,
+    /// Header lines added to every response, e.g. "alt-svc: ...\r\n".
+    preset_headers: []const u8 = "",
 };
 
 pub fn Worker(comptime Handler: type) type {
@@ -240,6 +242,7 @@ pub fn Worker(comptime Handler: type) type {
             errdefer self.exchanges.deinit();
             self.resp.exchanges = &self.exchanges;
             self.resp.now = &self.now;
+            try self.resp.setPresetHeaders(opts.preset_headers);
             try self.poller.add(self.listener, LISTENER_TOKEN, .level_read);
             try self.poller.add(self.waker.read_fd, WAKER_TOKEN, .level_read);
             if (cfg.udp >= 0) {

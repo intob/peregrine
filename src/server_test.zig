@@ -1846,7 +1846,7 @@ const H3Client = struct {
         }.f);
     }
 
-    const Resp = struct { status: [3]u8 = @splat('?'), body: std.ArrayList(u8) = .empty, trailers: usize = 0 };
+    const Resp = struct { status: [3]u8 = @splat('?'), body: std.ArrayList(u8) = .empty, trailers: usize = 0, alt_svc: bool = false };
 
     fn response(self: *H3Client, id: u64) !Resp {
         var r: Resp = .{};
@@ -1864,6 +1864,7 @@ const H3Client = struct {
                         r: *Resp,
                         pub fn header(s: *@This(), name: []const u8, value: []const u8) !void {
                             if (std.mem.eql(u8, name, ":status")) s.r.status = value[0..3].*;
+                            if (std.mem.eql(u8, name, "alt-svc") and std.mem.startsWith(u8, value, "h3=\":")) s.r.alt_svc = true;
                         }
                     };
                     var sink: Sink = .{ .r = &r };
@@ -1880,9 +1881,13 @@ const H3Client = struct {
 };
 
 test "http3: requests over UDP, large bodies, exchanges from other threads" {
+    try forEachBackend(testHttp3);
+}
+
+fn testHttp3(backend: Backend) !void {
     var cfg = tlsConfig();
     cfg.http3 = .{};
-    const r = try Running.start(.epoll, cfg);
+    const r = try Running.start(backend, cfg);
     defer r.stop();
     for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
     var cl = try H3Client.connect(r.srv.getQuicPort());
@@ -1899,6 +1904,8 @@ test "http3: requests over UDP, large bodies, exchanges from other threads" {
     defer a.body.deinit(testing.allocator);
     try testing.expectEqualStrings("200", &a.status);
     try testing.expectEqualStrings("ok", a.body.items);
+    // Every response advertises HTTP/3 (Alt-Svc).
+    try testing.expect(a.alt_svc);
     var b = try cl.response(big);
     defer b.body.deinit(testing.allocator);
     try testing.expectEqual(big_body.len, b.body.items.len);

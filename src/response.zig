@@ -29,6 +29,8 @@ pub const Response = struct {
     /// Serialised "key: value\r\n" lines.
     header_buf: []u8,
     header_len: usize = 0,
+    /// See setPresetHeaders.
+    preset_len: usize = 0,
     /// The body to send. Set it with setBody (copies) or setBodyBorrowed.
     body: []const u8 = "",
     body_buf: []u8,
@@ -153,11 +155,20 @@ pub const Response = struct {
         self.content_length = n;
     }
 
+    /// Header lines the server adds to every response (such as Alt-Svc),
+    /// kept at the start of the header buffer across resets.
+    pub fn setPresetHeaders(self: *Self, lines: []const u8) error{HeadersFull}!void {
+        if (lines.len > self.header_buf.len / 2) return error.HeadersFull;
+        @memcpy(self.header_buf[0..lines.len], lines);
+        self.preset_len = lines.len;
+        self.header_len = lines.len;
+    }
+
     pub inline fn reset(self: *Self) void {
         self.status = .ok;
         self.close = false;
         self.is_ws_upgrade = false;
-        self.header_len = 0;
+        self.header_len = self.preset_len;
         self.body = "";
         self.mode = .sync;
         self.content_length = null;

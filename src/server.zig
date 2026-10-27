@@ -45,6 +45,11 @@ pub const Http3Options = struct {
     /// Connection receive window, and per request stream.
     max_data: u64 = 16 * 1024 * 1024,
     max_stream_data: u64 = 1024 * 1024,
+    /// Advertise HTTP/3 on every response (Alt-Svc, RFC 7838), which is how
+    /// browsers find it. The port is the UDP port.
+    alt_svc: bool = true,
+    /// Alt-Svc lifetime, in seconds.
+    alt_svc_max_age: u32 = 86400,
 };
 
 pub const TlsOptions = struct {
@@ -127,7 +132,7 @@ pub const Config = struct {
     /// the request timeout are taken from this Config.
     h2: H2Options = .{},
     /// HTTP/3 over QUIC on a UDP port, with the TLS certificate. Needs
-    /// `tls` and the epoll/kqueue backend.
+    /// `tls`.
     http3: ?Http3Options = null,
 };
 
@@ -223,6 +228,7 @@ pub fn Server(comptime Handler: type) type {
         tls_config: tls_conn.Config = undefined,
         quic_tls_config: tls_conn.Config = undefined,
         quic_port: u16 = 0,
+        alt_svc_buf: [64]u8 = undefined,
 
         pub fn init(allocator: std.mem.Allocator, port: u16, cfg: Config) !*Self {
             const address = try std.Io.net.IpAddress.parse(cfg.ip, port);
@@ -274,10 +280,7 @@ pub fn Server(comptime Handler: type) type {
                 srv.cfg.tls = null; // the PEM data may be freed after init
             }
             errdefer if (srv.tls_credentials) |*c| c.deinit();
-            if (cfg.http3 != null) {
-                if (srv.tls_credentials == null) return error.Http3NeedsTls;
-                if (backend == .io_uring) return error.Http3NeedsEpoll;
-            }
+            if (cfg.http3 != null and srv.tls_credentials == null) return error.Http3NeedsTls;
             // Linux steers each connection's datagrams to its worker
             // (SO_REUSEPORT with a BPF program); elsewhere only the first
             // worker serves HTTP/3.
@@ -317,7 +320,7 @@ pub fn Server(comptime Handler: type) type {
                     if (!per_worker) shared = fd;
                     break :blk fd;
                 } else shared;
-                const opts: http_worker.Options = .{
+                var opts: http_worker.Options = .{
                     .session = .{
                         .limits = cfg.limits,
                         .max_requests_per_connection = cfg.max_requests_per_connection,
@@ -355,6 +358,9 @@ pub fn Server(comptime Handler: type) type {
                         udp_fds[i] = try udp.bind(ua, sys.is_linux);
                         if (i == 0 and srv.quic_port == 0) srv.quic_port = try udp.localPort(udp_fds[0]);
                     }
+                    if (o.alt_svc) {
+                        opts.preset_headers = std.fmt.bufPrint(&srv.alt_svc_buf, "alt-svc: h3=\":{d}\"; ma={d}\r\n", .{ srv.quic_port, o.alt_svc_max_age }) catch unreachable;
+                    }
                 }
                 const result = switch (backend) {
                     .io_uring => if (sys.is_linux) blk: {
@@ -366,6 +372,7 @@ pub fn Server(comptime Handler: type) type {
                             .shutdown = &srv.shutdown_flag,
                             .listener = listener,
                             .opts = opts,
+                            .udp = udp_fds[i],
                         });
                     } else unreachable,
                     else => blk: {
@@ -395,7 +402,11 @@ pub fn Server(comptime Handler: type) type {
                 // Without steering the kernel hashes the 4-tuple, which keeps
                 // a connection on one worker until the client's address
                 // changes; with it, connection IDs decide.
-                udp.attachSteering(srv.workers[0].poll.udp, @intCast(worker_count)) catch {};
+                const fd0 = switch (srv.workers[0]) {
+                    .poll => |*w| w.udp,
+                    .uring => |*w| if (sys.is_linux) w.udp else unreachable,
+                };
+                udp.attachSteering(fd0, @intCast(worker_count)) catch {};
             }
             srv.signal_target = .{ .shutdown = &srv.shutdown_flag, .wakers = srv.wakers, .waking = &srv.waking };
             return srv;

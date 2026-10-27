@@ -30,6 +30,7 @@ const Options = @import("./worker.zig").Options;
 const mailbox_mod = @import("../mailbox.zig");
 const Mailbox = mailbox_mod.Mailbox;
 const exchange = @import("./exchange.zig");
+const quic_endpoint = @import("../quic/endpoint.zig");
 const h2 = @import("../h2/conn.zig");
 const H2Conn = h2.Conn;
 const h2_preface = @import("../h2/frame.zig").preface;
@@ -46,6 +47,10 @@ const Op = enum(u8) {
     accept,
     waker,
     tick,
+    /// The HTTP/3 UDP socket is readable (multishot poll).
+    udp,
+    /// The next QUIC timer.
+    quic_timer,
 };
 
 inline fn userData(gen: u32, slot: u32, op: Op) u64 {
@@ -137,6 +142,12 @@ pub fn Worker(comptime Handler: type) type {
         exchanges: exchange.Slab = undefined,
         tick_ts: linux.kernel_timespec = .{ .sec = 1, .nsec = 0 },
         tick_armed: bool = false,
+        /// HTTP/3 connections on this worker's UDP socket.
+        quic: ?quic_endpoint.Endpoint(Handler) = null,
+        udp: sys.fd_t = -1,
+        quic_ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
+        /// When the armed QUIC timeout fires (monotonic microseconds).
+        quic_timer_at: ?u64 = null,
         conns: []Conn,
         free_slots: []u32,
         free_len: usize,
@@ -167,6 +178,8 @@ pub fn Worker(comptime Handler: type) type {
             opts: Options,
             ring_entries: u16 = 4096,
             recv_buffer_count: u16 = 256,
+            /// A UDP socket for HTTP/3 (with `opts.quic`), owned by the worker.
+            udp: sys.fd_t = -1,
         };
 
         pub fn init(self: *Self, cfg: InitConfig) !void {
@@ -241,7 +254,15 @@ pub fn Worker(comptime Handler: type) type {
             errdefer self.exchanges.deinit();
             self.resp.exchanges = &self.exchanges;
             self.resp.now = &self.now;
+            try self.resp.setPresetHeaders(opts.preset_headers);
             self.refreshDate();
+            if (cfg.udp >= 0) {
+                if (opts.quic) |qopts| {
+                    self.udp = cfg.udp;
+                    self.quic = try .init(allocator, qopts, cfg.udp);
+                    self.quic.?.bindWorker(self.handler, self.req, self.resp, &self.date_line, &self.now, &self.exchanges);
+                }
+            }
         }
 
         pub fn spawn(self: *Self, stack_size: usize, pin: bool) !void {
@@ -265,6 +286,8 @@ pub fn Worker(comptime Handler: type) type {
                 }
             }
             sys.close(self.listener);
+            if (self.quic) |*ep| ep.deinit();
+            if (self.udp >= 0) sys.close(self.udp);
             self.freeBuffers();
             self.ring.deinit();
             self.exchanges.deinit();
@@ -296,6 +319,7 @@ pub fn Worker(comptime Handler: type) type {
             }
             self.armAccept();
             self.armWaker();
+            if (self.quic != null) self.armUdp();
             var cqes: [512]linux.io_uring_cqe = undefined;
             while (!self.shutdown.load(.acquire)) {
                 _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
@@ -311,7 +335,12 @@ pub fn Worker(comptime Handler: type) type {
                 // WebSocket output queued by handlers during this batch, or
                 // by other threads (which also wrote the waker).
                 self.drainMailbox();
+                if (self.quic) |*ep| {
+                    ep.onTimers(nowUs());
+                    self.armQuicTimer();
+                }
             }
+            if (self.quic) |*ep| ep.shutdown(nowUs());
             // Shutting down: one GOAWAY per HTTP/2 connection, best effort.
             for (self.conns) |*c| {
                 if (!c.open or c.h2 == null or c.closing or c.write_inflight) continue;
@@ -341,6 +370,18 @@ pub fn Worker(comptime Handler: type) type {
                 .tick => {
                     self.tick_armed = false;
                     self.armTick();
+                    return;
+                },
+                .udp => {
+                    self.quic.?.onReadable(nowUs());
+                    if (cqe.flags & linux.IORING_CQE_F_MORE == 0) self.armUdp();
+                    return;
+                },
+                .quic_timer => {
+                    // Timers run after the batch; arm the next one then.
+                    if (self.quic_timer_at) |at| {
+                        if (at <= nowUs()) self.quic_timer_at = null;
+                    }
                     return;
                 },
                 else => {},
@@ -376,6 +417,35 @@ pub fn Worker(comptime Handler: type) type {
             sqe.user_data = userData(0, SPECIAL_SLOT, .accept);
         }
 
+        fn nowUs() u64 {
+            return sys.nanoTimestamp() / std.time.ns_per_us;
+        }
+
+        fn armUdp(self: *Self) void {
+            const sqe = self.getSqe();
+            sqe.prep_poll_add(self.udp, linux.POLL.IN);
+            sqe.len = linux.IORING_POLL_ADD_MULTI;
+            sqe.user_data = userData(0, SPECIAL_SLOT, .udp);
+        }
+
+        /// A timeout for the earliest QUIC timer, unless one at least as
+        /// early is armed already.
+        fn armQuicTimer(self: *Self) void {
+            const now = nowUs();
+            const ms = self.quic.?.timeoutMs(now) orelse return;
+            const at = now + @as(u64, @intCast(ms)) * 1000;
+            if (self.quic_timer_at) |armed| {
+                if (armed <= at and armed > now) return;
+            }
+            self.quic_timer_at = at;
+            self.quic_ts = .{ .sec = @intCast(@divTrunc(ms, 1000)), .nsec = @intCast(@rem(ms, 1000) * std.time.ns_per_ms) };
+            const sqe = self.getSqe();
+            sqe.prep_timeout(&self.quic_ts, 0, 0);
+            sqe.user_data = userData(0, SPECIAL_SLOT, .quic_timer);
+            // The connection tick also drives HTTP/3 exchange deadlines.
+            self.armTick();
+        }
+
         fn armWaker(self: *Self) void {
             const sqe = self.getSqe();
             sqe.prep_read(self.waker.read_fd, std.mem.asBytes(&self.waker_buf), 0);
@@ -383,7 +453,8 @@ pub fn Worker(comptime Handler: type) type {
         }
 
         fn armTick(self: *Self) void {
-            if (self.tick_armed or self.open_count == 0) return;
+            const quic_conns = if (self.quic) |*ep| ep.connections() else 0;
+            if (self.tick_armed or (self.open_count == 0 and quic_conns == 0)) return;
             const sqe = self.getSqe();
             sqe.prep_timeout(&self.tick_ts, 0, 0);
             sqe.user_data = userData(0, SPECIAL_SLOT, .tick);
@@ -495,6 +566,10 @@ pub fn Worker(comptime Handler: type) type {
             for (self.exchanges.entries, 0..) |*e, slot| {
                 if (!e.active) continue;
                 if (@as(i32, @bitCast(e.deadline -% self.now)) > 0) continue;
+                if (e.conn_slot & quic_endpoint.exchange_slot_flag != 0) {
+                    if (self.quic) |*ep| ep.onExchangeTimeout(e.conn_slot, e.conn_gen, @intCast(slot), nowUs());
+                    continue;
+                }
                 const c = &self.conns[e.conn_slot];
                 if (!c.open or c.gen != e.conn_gen or c.closing) continue;
                 if (c.h2) |conn| {
@@ -949,6 +1024,10 @@ pub fn Worker(comptime Handler: type) type {
         fn exchangePosted(self: *Self, slot: u32, gen: u31) void {
             const e = self.exchanges.entry(slot);
             if (!e.active or (e.gen & 0x7fffffff) != gen or !e.bound) return;
+            if (e.conn_slot & quic_endpoint.exchange_slot_flag != 0) {
+                if (self.quic) |*ep| ep.onExchangePosted(e.conn_slot, e.conn_gen, slot, nowUs());
+                return;
+            }
             const c = &self.conns[e.conn_slot];
             if (!c.open or c.gen != e.conn_gen or c.closing) return;
             if (c.h2) |conn| {
@@ -1475,6 +1554,10 @@ pub fn Worker(comptime Handler: type) type {
                 };
             }
             if (self.mailbox.takeOverflow()) {
+                for (self.exchanges.entries, 0..) |*e, slot| {
+                    if (e.active and e.bound and e.conn_slot & quic_endpoint.exchange_slot_flag != 0)
+                        self.exchangePosted(@intCast(slot), @intCast(e.gen & 0x7fffffff));
+                }
                 for (self.conns) |*c| {
                     if (!c.open or c.closing) continue;
                     if (c.ws != null) {
