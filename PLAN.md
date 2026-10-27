@@ -402,7 +402,13 @@ which RFC 9113 deprecated).
       trailers, and a handler that can respond later (needed for multiplexing). Keep
       the synchronous fast path for the simple case. Proposal (not yet agreed):
       `docs/handler-api-proposal.md`
-- [ ] Frame layer (RFC 9113): I/O-free, same buffer discipline as `Session`
+- [x] Frame layer (RFC 9113), `src/h2/frame.zig`: I/O-free `Reader` with the
+      `Session` buffer discipline (pooled, held only while bytes are unprocessed,
+      grown for a frame larger than a pool buffer), a parser for every frame type
+      that checks lengths, flags, padding, stream identifiers and SETTINGS values
+      and maps each violation to the RFC's connection or stream error code, and
+      serialisers. Proof: a test per malformed case, split invariance, a fuzz
+      target
 - [x] HPACK (RFC 7541), `src/h2/hpack.zig`: static and dynamic tables, integer
       and string coding, a nibble-driven Huffman decoder generated at comptime from
       the Appendix B table (checked canonical and complete), an encoder with
