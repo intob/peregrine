@@ -6,7 +6,7 @@ Priorities, in order:
 - Performance
 - Simplicity
 
-Where it is today: HTTP/1.1, WebSockets and TLS 1.3 work (TLS on the epoll/kqueue backends). Next is HTTP/2, then HTTP/3 over QUIC. See [PLAN.md](PLAN.md) for the roadmap and the architecture: every protocol layer is an I/O-free state machine driven by per-core event loops, so the layers stack (TCP → TLS → HTTP/1.1 or HTTP/2; UDP → QUIC → HTTP/3) and the same code runs on every backend.
+Where it is today: HTTP/1.1, HTTP/2, WebSockets and TLS 1.3 work on every backend. Next is HTTP/3 over QUIC. See [PLAN.md](PLAN.md) for the roadmap and the architecture: every protocol layer is an I/O-free state machine driven by per-core event loops, so the layers stack (TCP → TLS → HTTP/1.1 or HTTP/2; UDP → QUIC → HTTP/3) and the same code runs on every backend.
 
 Currently, all heap allocations are made during startup. Internally, no heap allocations are made per-request unless pre-allocated buffers overflow (for example, a request body larger than a pooled read buffer, or a response that can't be written in one go).
 
@@ -21,12 +21,17 @@ Note: This project has just started, and is not yet a complete HTTP server imple
     - `Expect: 100-continue`, `HEAD`, automatic `Content-Length` and `Date`
     - Strict parsing that rejects request smuggling vectors (see `src/http/parser.zig`)
     - Request size limits, idle/request timeouts (slowloris-resistant)
+- Support for HTTP/2 (RFC 9113), over TLS with ALPN and over cleartext with prior knowledge (h2c)
+    - HPACK, flow control, up to 128 concurrent streams per connection, graceful GOAWAY
+    - The same handler serves HTTP/1.1 and HTTP/2; h2spec passes (146/146 over TLS)
+    - Defences against rapid reset, CONTINUATION floods, HPACK bombs, control-frame floods and zero-window stalls
+- Streaming and deferred responses: `resp.stream()` writes a body over time (chunked on HTTP/1.1, DATA frames on HTTP/2), `resp.later()` answers from any thread
 - Support for WebSockets
 - TLS 1.3, written from scratch on top of `std.crypto` (no OpenSSL)
     - X25519MLKEM768 (post-quantum hybrid), X25519 and P-256 key exchange, HelloRetryRequest
     - AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305
     - ECDSA P-256/P-384 and Ed25519 certificates, ALPN, KeyUpdate
-    - HTTP and WebSockets over TLS, on the epoll/kqueue backends (io_uring not yet)
+    - HTTP/1.1, HTTP/2 and WebSockets over TLS, on every backend
 - Cross-platform IO Multiplexing
     - Kqueue support for BSD and MacOS systems
     - Epoll support for Linux systems
@@ -139,6 +144,37 @@ const srv = try per.Server(Handler).init(gpa, 443, .{
 });
 ```
 RSA certificates aren't supported yet. Session resumption and 0-RTT aren't either: every connection does a full handshake.
+
+### Serve HTTP/2
+Over TLS, add `"h2"` to the ALPN list; on a plaintext port, set `h2c` to accept the HTTP/2 connection preface (clients with prior knowledge, such as `curl --http2-prior-knowledge`). Both ports keep serving HTTP/1.1.
+```zig
+const srv = try per.Server(Handler).init(gpa, 443, .{
+    .h2c = true,
+    .tls = .{ .cert_pem = cert_pem, .key_pem = key_pem, .alpn = &.{ "h2", "http/1.1" } },
+});
+```
+Handlers need no changes: a request on an HTTP/2 stream arrives as the same `Request`, with `host` taken from `:authority`.
+
+### Stream or defer a response
+`resp.stream()` sends the status and headers now and returns an `Exchange` for the body; `resp.later()` sends nothing until `ex.respond` or `ex.startStream`, from any thread. Handles are values that stay safe after the exchange ends (calls return `error.Closed`).
+```zig
+pub fn handleRequest(self: *Handler, req: *per.Request, resp: *per.Response) void {
+    if (std.mem.eql(u8, req.getPath(), "/events")) {
+        resp.addNewHeader("content-type", "text/event-stream") catch {};
+        const ex = resp.stream() catch return;
+        ex.write("data: hello\n\n") catch {};
+        ex.finish(&.{}) catch {}; // or keep the handle and write later
+        return;
+    }
+    if (std.mem.eql(u8, req.getPath(), "/report")) {
+        const ex = resp.later() catch return;
+        self.jobs.submit(ex); // another thread calls ex.respond(.{ .status = .ok }, body)
+        return;
+    }
+    resp.setBodyBorrowed("hello"); // the synchronous path, as before
+}
+```
+A full queue makes `ex.write` return `error.WouldBlock`; the optional `handleWritable(ex)` hook is called once it drains. `handleAbort(ex)` is called if the client leaves or the exchange times out (`response_timeout_s` for `later()`, `request_timeout_s` between writes).
 
 ### Implement a server
 ```zig
