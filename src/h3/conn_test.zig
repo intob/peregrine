@@ -514,6 +514,33 @@ test "HTTP/3: control and QPACK stream rules" {
             try h.client.write(c, &.{ 0x02, 0xc1, 0x01, 'x' }, false);
         }
     }.f);
+    // The encoder stream ended inside an instruction.
+    try expectConnectionError(0x104, struct {
+        fn f(h: *Harness) !void {
+            const c = try h.client.openUni();
+            try h.client.write(c, &.{ 0x02, 0x3f }, true);
+        }
+    }.f);
+    // A table capacity too large to decode, terminated and not.
+    try expectConnectionError(0x201, struct {
+        fn f(h: *Harness) !void {
+            const c = try h.client.openUni();
+            try h.client.write(c, &.{ 0x02, 0x3f, 0xff, 0xff, 0xff, 0xff, 0x7f }, false);
+        }
+    }.f);
+    try expectConnectionError(0x201, struct {
+        fn f(h: *Harness) !void {
+            const c = try h.client.openUni();
+            try h.client.write(c, &.{ 0x02, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff }, false);
+        }
+    }.f);
+    // An Insert Count Increment too large to decode.
+    try expectConnectionError(0x202, struct {
+        fn f(h: *Harness) !void {
+            const c = try h.client.openUni();
+            try h.client.write(c, &.{ 0x03, 0x7f, 0xff, 0xff, 0xff, 0xff, 0x7f }, false);
+        }
+    }.f);
     // A Section Acknowledgment on the decoder stream.
     try expectConnectionError(0x202, struct {
         fn f(h: *Harness) !void {
@@ -554,7 +581,7 @@ test "HTTP/3: unknown stream types and frame types are ignored" {
     // A reserved frame type on a request stream, before HEADERS.
     const id = try h.client.openBidi();
     try h.client.write(id, &.{ 0x21, 0x02, 0xaa, 0xbb }, false);
-    try h.writeHeaders(id, &.{ .{ .name = ":method", .value = "GET" }, .{ .name = ":scheme", .value = "https" }, .{ .name = ":path", .value = "/" } }, &.{}, true);
+    try h.writeHeaders(id, &.{ .{ .name = ":method", .value = "GET" }, .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "a" }, .{ .name = ":path", .value = "/" } }, &.{}, true);
     try h.run(30);
     try testing.expectEqual(@as(?u64, 0x103), (try h.client.getStream(g)).stop_code);
     var r = try h.response(id);

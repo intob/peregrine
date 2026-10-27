@@ -556,7 +556,8 @@ Done on the `m6-h3` branch, as I/O-free layers like the rest:
       key update, every transport and HTTP/3 error); end to end over UDP on
       every backend; interop with aioquic 1.3, curl 8.23 (ngtcp2 1.25 +
       OpenSSL 3.5) and h2load (nghttp2 1.70); `fuzz: h3 connection`
-- [ ] quic-interop-runner, h3spec
+- [x] h3spec 0.1.14: 77/77 on kqueue, epoll and io_uring
+- [ ] quic-interop-runner
 - [x] Benchmark against nginx 1.29 (`http3 on`, `quic_gso on`) and Caddy 2.11
 
 HTTP/3 benchmark (Docker on the M2 Pro, Linux 6.12; each server with 6

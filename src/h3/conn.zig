@@ -27,6 +27,21 @@ const Allocator = std.mem.Allocator;
 
 const NIL: u32 = std.math.maxInt(u32);
 
+/// A QPACK prefixed integer from a stream: null if it isn't all there yet,
+/// an error if it overflows (where HPACK's decoder can't tell the two
+/// apart).
+fn qpackInt(data: []const u8, comptime prefix: u4) error{Overflow}!?@import("../h2/hpack.zig").Int {
+    if (data.len == 0) return null;
+    const r = @import("../h2/hpack.zig").decodeInt(data, prefix) catch {
+        // Complete (a byte without the continuation bit after the first)
+        // yet undecodable, or five continuation bytes and still going:
+        // too large either way.
+        for (data[1..@min(data.len, 6)]) |b| if (b & 0x80 == 0) return error.Overflow;
+        return if (data.len >= 6) error.Overflow else null;
+    };
+    return r;
+}
+
 pub const Options = struct {
     limits: parser.Limits = .{},
     qpack: qpack.Limits = .{},
@@ -279,12 +294,12 @@ pub const Conn = struct {
         const q = self.quic;
         const s = &self.streams[slot];
         while (true) {
-            if (q.streamResetCode(slot) != null or q.streamFinished(slot)) {
-                // §6.2.1, RFC 9204 §4.2: critical streams must not close.
-                if (s.uni == .control or s.uni == .qpack_encoder or s.uni == .qpack_decoder)
-                    return self.fail(.closed_critical_stream, "critical stream closed", now_us);
-                return self.release(slot);
-            }
+            // §6.2.1, RFC 9204 §4.2: critical streams must not close, even
+            // with an instruction left unfinished.
+            const critical = s.uni == .control or s.uni == .qpack_encoder or s.uni == .qpack_decoder;
+            if (q.streamResetCode(slot) != null or (critical and q.streamComplete(slot)))
+                return if (critical) self.fail(.closed_critical_stream, "critical stream closed", now_us) else self.release(slot);
+            if (q.streamFinished(slot)) return self.release(slot);
             const data = q.streamReadable(slot);
             if (data.len == 0) return;
             switch (s.uni) {
@@ -325,7 +340,7 @@ pub const Conn = struct {
                     while (pos < data.len) {
                         const b = data[pos];
                         if (b & 0xe0 != 0x20) return self.fail(.qpack_encoder_stream_error, "insert without a table", now_us);
-                        const r = @import("../h2/hpack.zig").decodeInt(data[pos..], 5) catch break;
+                        const r = (qpackInt(data[pos..], 5) catch return self.fail(.qpack_encoder_stream_error, "table capacity", now_us)) orelse break;
                         if (r.value != 0) return self.fail(.qpack_encoder_stream_error, "table capacity", now_us);
                         pos += r.len;
                     }
@@ -339,7 +354,7 @@ pub const Conn = struct {
                     while (pos < data.len) {
                         const b = data[pos];
                         if (b & 0xc0 != 0x40) return self.fail(.qpack_decoder_stream_error, "nothing to acknowledge", now_us);
-                        const r = @import("../h2/hpack.zig").decodeInt(data[pos..], 6) catch break;
+                        const r = (qpackInt(data[pos..], 6) catch return self.fail(.qpack_decoder_stream_error, "stream id", now_us)) orelse break;
                         pos += r.len;
                     }
                     q.streamConsume(slot, pos);
@@ -397,7 +412,7 @@ pub const Conn = struct {
                 },
             }
         }
-        if (q.streamResetCode(slot) != null or q.streamFinished(slot))
+        if (q.streamResetCode(slot) != null or q.streamComplete(slot))
             self.fail(.closed_critical_stream, "control stream closed", now_us);
     }
 

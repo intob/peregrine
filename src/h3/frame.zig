@@ -111,17 +111,18 @@ pub const Settings = struct {
 pub fn parseSettings(payload: []const u8) error{ Settings, Frame }!Settings {
     var s: Settings = .{};
     var r: Reader = .{ .data = payload };
-    var seen: [8]u64 = undefined;
+    // Any identifier may appear once, known or not. A peer has no reason
+    // to send many; past the bound the frame is refused.
+    var seen: [64]u64 = undefined;
     var n: usize = 0;
     while (r.left() > 0) {
         const id = r.varint() catch return error.Frame;
         const v = r.varint() catch return error.Frame;
         if (SettingId.reservedH2(id)) return error.Settings;
-        if (id <= 0x08 or id == 0x33) {
-            for (seen[0..n]) |x| if (x == id) return error.Settings;
-            seen[n] = id;
-            n += 1;
-        }
+        for (seen[0..n]) |x| if (x == id) return error.Settings;
+        if (n == seen.len) return error.Settings;
+        seen[n] = id;
+        n += 1;
         switch (@as(SettingId, @fromBackingInt(id))) {
             .qpack_max_table_capacity => s.qpack_max_table_capacity = v,
             .max_field_section_size => s.max_field_section_size = v,
@@ -155,6 +156,7 @@ test "frame headers and settings" {
     try testing.expect(s.enable_connect_protocol);
     try testing.expectError(error.Settings, parseSettings(&.{ 0x02, 0x00 })); // HTTP/2's ENABLE_PUSH
     try testing.expectError(error.Settings, parseSettings(&.{ 0x06, 0x01, 0x06, 0x02 })); // duplicate
+    try testing.expectError(error.Settings, parseSettings(&.{ 0x21, 0x00, 0x21, 0x01 })); // duplicate unknown
     try testing.expectError(error.Settings, parseSettings(&.{ 0x08, 0x02 }));
     try testing.expectError(error.Frame, parseSettings(&.{ 0x06, 0x40 }));
 }

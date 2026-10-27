@@ -96,7 +96,16 @@ pub const Fields = struct {
             self.fault = .protocol;
             return;
         };
-        if (self.scheme == null or path.value_len == 0) self.fault = .protocol;
+        const scheme = self.scheme orelse {
+            self.fault = .protocol;
+            return;
+        };
+        if (path.value_len == 0) self.fault = .protocol;
+        // http and https URIs have an authority: the request names it in
+        // :authority or Host (RFC 9113 §8.3.1, RFC 9114 §4.3.1).
+        const s = self.value(scheme);
+        if ((std.mem.eql(u8, s, "https") or std.mem.eql(u8, s, "http")) and self.authority == null and !self.has_host)
+            self.fault = .protocol;
     }
 
     /// Appends request body bytes, up to `max` in all (then body_too_large).
@@ -305,6 +314,7 @@ test "request fields: valid, malformed, host synthesis" {
         &.{ .{ ":method", "GET" }, .{ ":scheme", "https" }, .{ ":path", "/" }, .{ "x", " lead" } },
         &.{ .{ ":method", "GET" }, .{ ":scheme", "https" }, .{ ":path", "/" }, .{ "content-length", "+5" } },
         &.{ .{ ":method", "GET" }, .{ ":scheme", "https" }, .{ ":path", "/" }, .{ ":status", "200" } },
+        &.{ .{ ":method", "GET" }, .{ ":scheme", "https" }, .{ ":path", "/" } }, // no authority or host
     };
     for (cases) |c| {
         f.clear();
@@ -317,6 +327,7 @@ test "request fields: valid, malformed, host synthesis" {
     s = f.sink(a);
     try s.header(":method", "POST");
     try s.header(":scheme", "https");
+    try s.header(":authority", "example.com");
     try s.header(":path", "/");
     try s.header("content-length", "5000");
     try f.endHead(a, 1024);
