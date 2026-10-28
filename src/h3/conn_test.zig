@@ -110,6 +110,7 @@ const TestHandler = struct {
         }
         if (req.body.len > 0) self.log.print(a, " body={d}", .{req.body.len}) catch unreachable;
         for (req.trailers) |t| self.log.print(a, " trailer[{s}={s}]", .{ t.key, t.value }) catch unreachable;
+        if (req.early_data) self.log.appendSlice(a, " early") catch unreachable;
         self.log.append(a, '\n') catch unreachable;
         const path = req.getPath();
         if (std.mem.eql(u8, path, "/up-sync")) {
@@ -187,6 +188,8 @@ const Harness = struct {
     slab: exchange.Slab,
     date_line: [date.header_len]u8 = undefined,
     now_us: u64 = 1_000_000,
+    /// Requests are in 0-RTT data, as the endpoint would say.
+    early_data: bool = false,
     now: u32 = 1000,
     qdec: qpack.Decoder,
     h3_opts: h3.Options = .{},
@@ -256,6 +259,7 @@ const Harness = struct {
             .conn_slot = 3,
             .conn_gen = 7,
             .pool = &h.pool,
+            .early_data = h.early_data,
         };
     }
 
@@ -1277,4 +1281,29 @@ test "fuzz: h3 connection" {
             &[_]u8{ 0x03, 0x04, 0x00, 0x07, 0x01, 0x00, 0x03, 0x01, 0x02 },
         },
     });
+}
+
+test "HTTP/3 0-RTT: safe methods are handled in early data, others get 425 Too Early" {
+    const h = try Harness.init();
+    defer h.deinit();
+    try h.startClient();
+    h.early_data = true;
+    const get = try h.request("GET", "/a", &.{}, "");
+    const post = try h.request("POST", "/echo", &.{}, "hi");
+    try h.run(100);
+    var g = try h.response(get);
+    defer g.deinit();
+    try testing.expectEqualStrings("200", g.status.?);
+    var p = try h.response(post);
+    defer p.deinit();
+    try testing.expectEqualStrings("425", p.status.?);
+    try testing.expectEqualStrings("GET /a [host=example.com] early\n", h.handler.log.items);
+    // After the handshake, the same POST is handled.
+    h.early_data = false;
+    const again = try h.request("POST", "/echo", &.{}, "hi");
+    try h.run(100);
+    var a = try h.response(again);
+    defer a.deinit();
+    try testing.expectEqualStrings("200", a.status.?);
+    try testing.expectEqualStrings("hi", a.body.items);
 }

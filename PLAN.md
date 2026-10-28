@@ -54,9 +54,9 @@ Design rules that apply to every layer:
 | M1. HTTP/1.1 core | ✅ done (streaming responses landed with the M5 handler API) |
 | M2. Throughput architecture | 🟡 io_uring works (opt-in, not yet faster than epoll); sendfile done (plaintext, and TLS with kTLS); NUMA open |
 | M3. WebSockets over HTTP/1.1 | ✅ reworked; permessage-deflate, Autobahn, benchmarks open |
-| M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; tables for P-256 and X25519, RSA-PSS, session tickets, kTLS and 0-RTT over TCP done; the rest of "faster handshakes" and QUIC 0-RTT open |
+| M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; tables for P-256 and X25519, RSA-PSS, session tickets, kTLS and 0-RTT done; the rest of "faster handshakes" open |
 | M5. HTTP/2 | ✅ h2 over TLS (ALPN) and h2c on every backend, h2spec 146/146 over TLS, fuzzed, benchmarked; streamed request bodies on every protocol; WebSockets over h2 (RFC 8441); RFC 9218 priorities |
-| M6. HTTP/3 and QUIC | 🟡 HTTP/3 over QUIC v1 on every backend, interop-tested (aioquic, curl/ngtcp2, h2load), benchmarked against nginx and Caddy; WebSockets over h3 (RFC 9220); migration, 0-RTT, pacing, ECN, PMTUD open |
+| M6. HTTP/3 and QUIC | 🟡 HTTP/3 over QUIC v1 on every backend, interop-tested (aioquic, curl/ngtcp2, h2load), benchmarked against nginx and Caddy; WebSockets over h3 (RFC 9220); 0-RTT; migration, pacing, ECN, PMTUD open |
 | M7. Verification and benchmarking | 🟡 ongoing for each milestone |
 
 Source layout:
@@ -509,8 +509,8 @@ Later in M4:
       the server fails first. Fuzzed with tickets (472a9d2, 25 min on
       Linux, ReleaseSafe, 6 instances): 1.84M runs, 522 corpus inputs,
       3719 PCs seen, no failures
-- [ ] **0-RTT (early data)**, RFC 8446 §4.2.10 and §8, RFC 8470. Done
-      over TCP for HTTP/1.1 and HTTP/2, off by default
+- [x] **0-RTT (early data)**, RFC 8446 §4.2.10 and §8, RFC 8470, RFC 9001
+      §4.6. HTTP/1.1, HTTP/2 and HTTP/3, off by default
       (`TlsOptions.max_early_data`, with `replay_guard_size`). TLS: a
       ticket issued with 0-RTT on carries a random per-process `instance`,
       the suite and the ALPN protocol, and NewSessionTicket carries
@@ -530,13 +530,19 @@ Later in M4:
       TRACE) are handled at once, with responses at 0.5-RTT; on HTTP/1.1 any
       other method waits for the handshake and is parsed again then (no
       round trip lost), on HTTP/2 it gets 425 Too Early (HPACK state can't
-      be rewound). `tls.Conn.readPlain` returns after the ClientHello that
+      be rewound), as on HTTP/3. QUIC: 0-RTT packets open with the early
+      key into the application space and streams flow before the
+      handshake completes (responses at 0.5-RTT); the early key goes at
+      the first 1-RTT packet; the ticket says max_early_data 0xffffffff
+      (flow control limits it). `tls.Conn.readPlain` returns after the ClientHello that
       accepts 0-RTT so the worker can pick the protocol by ALPN before the
       early data. Proof: handshake tests with the reference client (key
       schedule, EndOfEarlyData, the same ClientHello twice, every refusal
       reason, messages out of place), the guard's tests, the fuzz harness
       (predicts acceptance, sends early data) and an accepted session
-      through it for every suite, the HTTP/1.1 and HTTP/2 policies. Interop
+      through it for every suite, the HTTP/1.1, HTTP/2 and HTTP/3 policies;
+      the fuzz target with 0-RTT (e1e9ea8, 25 min, 6 instances: 2.56M
+      runs, 3889 PCs, no failures). Interop
       on epoll and io_uring (Linux, Docker): OpenSSL 3.3 `s_client
       -sess_in -early_data` with and without ALPN (early GET answered
       early, a later GET normally, an early POST after the handshake);
@@ -545,13 +551,22 @@ Later in M4:
       (GET answered early, POST 425); a proxy that records a client's
       first flight (ClientHello and early data) and replays it: the first
       gets the 0.5-RTT response, both replays only a resumed flight
-      without early_data. Interop found two worker bugs, fixed: io_uring
+      without early_data. HTTP/3: aioquic 1.3 resumes with a GET and a
+      POST in 0-RTT (GET answered early, POST 425, the same POST after the
+      handshake 200); a UDP proxy records aioquic's first datagrams
+      (Initial, 0-RTT) and replays them once the connection is gone: a
+      handshake answer and no 1-RTT packets. h3spec 77/77 and h2spec
+      146/146 (TLS) still. Interop found two worker bugs, fixed: io_uring
       encrypted output only once established (a response at 0.5-RTT
       waited forever), and the epoll HTTP/2 path left decrypted input
       behind our queued SETTINGS until the next read (also a wait for the
       client's next packet on every new h2-over-TLS connection whose first
-      flight carried requests). To do: QUIC 0-RTT packets and HTTP/3
-      (aioquic, ngtcp2), a 0-RTT TLS client in the Zig tests
+      flight carried requests). Not done: a 0-RTT client in the Zig tests
+      (the in-memory QUIC test client and std's TLS client don't resume),
+      so 0-RTT end to end is covered by the interop runs only; ngtcp2 (this
+      curl can't export sessions between runs); buffering 0-RTT packets
+      that arrive before the ClientHello completes (they are dropped and
+      the client resends them as 1-RTT)
 - [ ] Several certificates selected by SNI; OCSP stapling
 - [x] **kTLS on Linux** (`TlsOptions.ktls`, on by default): the sending side of
       an HTTP/1.1 connection goes to the kernel (TCP_ULP "tls", TLS_TX with the
@@ -888,7 +903,7 @@ Done on the `m6-h3` branch, as I/O-free layers like the rest:
 - [ ] Connection migration: NEW_CONNECTION_ID, path validation (we
       advertise `disable_active_migration`; NAT rebinding is followed
       without validation)
-- [ ] 0-RTT (needs TLS session tickets, M4)
+- [x] 0-RTT: see M4
 - [x] WebSockets over h3 (RFC 9220): see M5
 - [x] Priorities (RFC 9218): see M5
 - [ ] DATAGRAM (RFC 9221)

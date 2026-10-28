@@ -74,14 +74,16 @@ pub const TlsOptions = struct {
     /// How long a ticket is valid (at most 7 days), and how often the key
     /// derived from `ticket_key` changes.
     ticket_lifetime_s: u32 = 24 * 3600,
-    /// 0-RTT (TLS early data, RFC 8446 §4.2.10) over TCP: a client
-    /// resuming a ticket from this process may send up to this many bytes
-    /// of requests with its first flight, saving a round trip. 0: off.
+    /// 0-RTT (TLS early data, RFC 8446 §4.2.10; RFC 9001 §4.6 for HTTP/3):
+    /// a client resuming a ticket from this process may send up to this
+    /// many bytes of requests with its first flight (over QUIC, as much as
+    /// flow control allows), saving a round trip. 0: off.
     /// Early data can be replayed by an attacker, so each ClientHello is
     /// admitted once (`replay_guard_size`), and only requests with safe
     /// methods (GET, HEAD, OPTIONS) are handled before the handshake
     /// completes, with `Request.early_data` set; others wait for it
-    /// (HTTP/1.1) or get 425 Too Early (HTTP/2). Needs session tickets.
+    /// (HTTP/1.1) or get 425 Too Early (HTTP/2, HTTP/3). Needs session
+    /// tickets.
     /// Tickets from other servers sharing `ticket_key` resume without it.
     max_early_data: u32 = 0,
     /// 0-RTT ClientHellos remembered (24 bytes each, a power of two): for
@@ -328,13 +330,17 @@ pub fn Server(comptime Handler: type) type {
                 srv.tls_tickets.lifetime_s = t.ticket_lifetime_s;
                 const tickets: ?*const TicketKeys = if (t.session_tickets) &srv.tls_tickets else null;
                 srv.tls_config = .{ .credentials = &srv.tls_credentials.?, .alpn = t.alpn, .tickets = tickets };
+                srv.quic_tls_config = .{ .credentials = &srv.tls_credentials.?, .alpn = &.{"h3"}, .quic = true, .tickets = tickets };
                 if (t.max_early_data > 0) {
                     srv.tls_tickets.newInstance();
                     srv.tls_replay = try .init(allocator, t.replay_guard_size);
                     srv.tls_config.max_early_data = t.max_early_data;
                     srv.tls_config.replay = &srv.tls_replay.?;
+                    // QUIC limits 0-RTT by flow control; any nonzero value
+                    // turns it on (the ticket says 0xffffffff).
+                    srv.quic_tls_config.max_early_data = t.max_early_data;
+                    srv.quic_tls_config.replay = &srv.tls_replay.?;
                 }
-                srv.quic_tls_config = .{ .credentials = &srv.tls_credentials.?, .alpn = &.{"h3"}, .quic = true, .tickets = tickets };
                 srv.cfg.tls = null; // the PEM data may be freed after init
             }
             errdefer if (srv.tls_credentials) |*c| c.deinit();

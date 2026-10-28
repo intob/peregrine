@@ -10,7 +10,13 @@
 //! has released it; frame records name a slot and its generation, so acks
 //! and losses for an old stream are ignored.
 //!
-//! Not yet: connection migration and NEW_CONNECTION_ID, 0-RTT, Retry tokens
+//! 0-RTT (RFC 9001 §4.6): when the handshake accepts early data, 0-RTT
+//! packets open with the client's early key into the application space
+//! (shared with 1-RTT, §12.3 of RFC 9000), and streams are read and
+//! written before the handshake completes (`inEarlyData`). The early key
+//! goes once a 1-RTT packet arrives (RFC 9001 §4.9.3).
+//!
+//! Not yet: connection migration and NEW_CONNECTION_ID, Retry tokens
 //! (the worker's job), pacing, ECN, PMTU discovery, DATAGRAM frames.
 const std = @import("std");
 const packet = @import("./packet.zig");
@@ -263,6 +269,8 @@ pub const Conn = struct {
     our_params_buf: [tp.max_encoded_len]u8 = undefined,
     peer: tp.Params = .{},
     handshake_complete: bool = false,
+    /// The client's 0-RTT key, while 0-RTT packets may still come.
+    zero_rtt_rx: ?Keys = null,
     handshake_done_pending: bool = false,
     address_validated: bool = false,
     bytes_received: u64 = 0,
@@ -407,6 +415,7 @@ pub const Conn = struct {
         self.events.deinit(a);
         if (self.rx_prev) |*k| k.wipe();
         if (self.rx_next) |*k| k.wipe();
+        if (self.zero_rtt_rx) |*k| k.wipe();
         std.crypto.secureZero(u8, &self.rx_secret);
         std.crypto.secureZero(u8, &self.tx_secret);
     }
@@ -423,6 +432,13 @@ pub const Conn = struct {
     /// The handshake completed (1-RTT data flows).
     pub fn isEstablished(self: *const Self) bool {
         return self.state == .established;
+    }
+
+    /// 0-RTT was accepted and the handshake isn't complete: stream data
+    /// read now may be a replay (RFC 9001 §9.2).
+    pub fn inEarlyData(self: *const Self) bool {
+        const hs = self.hs orelse return false;
+        return hs.early_accepted and self.state == .handshake;
     }
 
     /// Negotiated ALPN protocol.
@@ -498,20 +514,21 @@ pub const Conn = struct {
         const space: Space = switch (h.type) {
             .initial => .initial,
             .handshake => .handshake,
-            .one_rtt => .application,
-            // No 0-RTT (no session resumption); others never reach here.
+            // 0-RTT and 1-RTT share the application space.
+            .one_rtt, .zero_rtt => .application,
             else => return,
         };
         const sp = &self.spaces[@backingInt(space)];
         if (sp.discarded) return;
-        const keys = sp.rx orelse return;
+        // 0-RTT: only with the early key (accepted, and not yet dropped).
+        const keys = if (h.type == .zero_rtt) self.zero_rtt_rx orelse return else sp.rx orelse return;
         const pn_info = keys.header.unprotect(pkt, h.pn_offset) catch return;
         const pn = packet.decodePn(sp.largest_rx, pn_info.truncated, pn_info.len);
         const header_len = h.pn_offset + pn_info.len;
 
         var key: *const PacketKey = &keys.packet;
         var phase_change = false;
-        if (space == .application) {
+        if (h.type == .one_rtt) {
             const phase: u1 = @intCast((pkt[0] >> 2) & 1);
             if (phase != self.rx_phase) {
                 if (pn < self.rx_phase_start) {
@@ -529,6 +546,12 @@ pub const Conn = struct {
         if (pn < sp.rx_floor or sp.rx_ranges.contains(pn)) return; // duplicate
         self.packets_received += 1;
         if (phase_change) self.commitKeyUpdate(pn, now);
+        if (h.type == .one_rtt) {
+            // The client has 1-RTT keys: no more 0-RTT (§4.9.3 allows a
+            // short wait for reordered ones; they would be retransmitted).
+            if (self.zero_rtt_rx) |*k| k.wipe();
+            self.zero_rtt_rx = null;
+        }
 
         if (space == .handshake and !self.spaces[0].discarded) {
             // RFC 9001 §4.9.1; and a Handshake packet proves the address.
@@ -710,9 +733,11 @@ pub const Conn = struct {
         }
 
         pub fn readSecret(self: *TlsSink, level: handshake.Level, suite: Suite, secret: []const u8) Error!void {
-            // 0-RTT isn't enabled over QUIC yet (Config.max_early_data is 0).
-            std.debug.assert(level != .early);
             const c = self.conn;
+            if (level == .early) {
+                c.zero_rtt_rx = .init(suite, secret);
+                return;
+            }
             c.spaces[@backingInt(level)].rx = .init(suite, secret);
             if (level == .application) {
                 @memcpy(c.rx_secret[0..secret.len], secret);
@@ -1646,7 +1671,8 @@ pub const Conn = struct {
         if (data or probing) {
             if (space == .application) try self.writeControl(&fw);
             try self.writeCrypto(sp, &fw);
-            if (space == .application and self.handshake_complete) try self.writeStreams(&fw);
+            // Responses to 0-RTT requests go out at 0.5-RTT.
+            if (space == .application and (self.handshake_complete or self.inEarlyData())) try self.writeStreams(&fw);
         }
         var eliciting = sp.sent.recordMark() != mark and self.recordsElicit(sp, mark);
         if (!eliciting and probing) {

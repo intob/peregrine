@@ -194,6 +194,7 @@ pub fn Endpoint(comptime Handler: type) type {
                 .conn_gen = self.slots[slot].gen,
                 .pool = self.pool,
                 .fd = self.fd,
+                .early_data = if (self.slots[slot].q) |q| q.inEarlyData() else false,
             };
         }
 

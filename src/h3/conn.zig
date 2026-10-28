@@ -89,6 +89,9 @@ pub fn Context(comptime Handler: type) type {
         pool: *BufferPool,
         /// The UDP socket, for `ws.Conn.fd` (identification only).
         fd: sys.fd_t = -1,
+        /// Stream data is 0-RTT (the handshake isn't complete): requests
+        /// may be replays.
+        early_data: bool = false,
     };
 }
 
@@ -290,7 +293,8 @@ pub const Conn = struct {
             while (q.nextEvent()) |_| {}
             return;
         }
-        if (!q.isEstablished()) return;
+        // With 0-RTT accepted, requests come before the handshake ends.
+        if (!q.isEstablished() and !q.inEarlyData()) return;
         if (!self.started) {
             self.start(ctx.now_us);
             if (self.failed) return;
@@ -722,12 +726,32 @@ pub const Conn = struct {
         self.dispatch(Handler, ctx, slot);
     }
 
+    /// The worker's Request from the stream's fields. False for an unknown
+    /// method.
+    fn fill(ctx: anytype, s: *const Stream) bool {
+        if (!s.fields.fill(ctx.req)) return false;
+        ctx.req.early_data = ctx.early_data;
+        return true;
+    }
+
+    /// RFC 8470 §5.2: a request in 0-RTT data whose method isn't safe is
+    /// answered 425 Too Early (the client retries once the handshake is
+    /// done). Sets the response if so.
+    fn tooEarly(ctx: anytype) bool {
+        if (!ctx.early_data or ctx.req.method.isSafe()) return false;
+        ctx.resp.reset();
+        ctx.resp.status = .too_early;
+        ctx.resp.body = "";
+        return true;
+    }
+
     /// handleHead on a complete field section. An unknown method is left
     /// to dispatch (501).
     fn checkHead(self: *Self, comptime Handler: type, ctx: *const Context(Handler), slot: u32) exchange.BodyMode {
         const s = &self.streams[slot];
-        if (!s.fields.fill(ctx.req)) return .buffer;
+        if (!fill(ctx, s)) return .buffer;
         s.is_head = ctx.req.method == .HEAD;
+        if (tooEarly(ctx)) return .reject;
         ctx.resp.reset();
         const mode = ctx.handler.handleHead(ctx.req, ctx.resp);
         if (mode == .stream and !@hasDecl(Handler, "handleBody")) return .buffer;
@@ -742,7 +766,7 @@ pub const Conn = struct {
         const s = &self.streams[slot];
         s.dispatched = true;
         ctx.resp.reset();
-        _ = s.fields.fill(ctx.req);
+        _ = fill(ctx, s);
         ctx.handler.handleRequest(ctx.req, ctx.resp);
         if (ctx.resp.mode == .sync) return self.respondSync(Handler, ctx, slot);
         s.body_stream = true;
@@ -836,11 +860,12 @@ pub const Conn = struct {
             resp.body = "";
             return self.respondSync(Handler, ctx, slot);
         }
-        if (!s.fields.fill(req)) {
+        if (!fill(ctx, s)) {
             resp.status = .not_implemented;
             return self.respondSync(Handler, ctx, slot);
         }
         s.is_head = req.method == .HEAD;
+        if (tooEarly(ctx)) return self.respondSync(Handler, ctx, slot);
         ctx.handler.handleRequest(req, resp);
         if (s.tunnel and resp.is_ws_upgrade) return self.startWebSocket(Handler, ctx, slot);
         if (resp.mode != .sync) return self.bindExchange(Handler, ctx, slot);
