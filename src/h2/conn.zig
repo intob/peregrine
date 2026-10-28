@@ -680,13 +680,17 @@ pub const Conn = struct {
         self.deliver(Handler, ctx, s, d.data, if (d.end_stream) &.{} else null);
     }
 
-    /// Calls handleBody, and returns the window for the bytes.
+    /// Calls handleBody, returns the window for the bytes, and sends what
+    /// the handler queued in the call (a response given there goes out in
+    /// this pass, not after the next mailbox drain). The stream may be
+    /// closed when this returns.
     fn deliver(self: *Self, comptime Handler: type, ctx: *const Context(Handler), s: *Stream, chunk: []const u8, end: ?[]const Header) void {
         if (!@hasDecl(Handler, "handleBody")) unreachable;
         if (end != null) s.body_stream = false;
         const action = ctx.exchanges.handle(s.exchange).deliverBody(ctx.handler, chunk, end, ctx.now);
         if (end == null and action == .pause) s.body_paused = true;
         self.creditStream(s, @intCast(chunk.len));
+        self.pumpStream(Handler, ctx, s);
     }
 
     /// Delivers what was kept while the body was paused, and the end once
@@ -2396,6 +2400,31 @@ test "streamed bodies: a pause holds the window back, resume delivers what was k
     try h.data(3, "x", false);
     try h.rst(3, .cancel);
     try testing.expectEqual(@as(usize, 1), h.handler.aborts);
+}
+
+test "streamed bodies: a response given in handleBody goes out in the same pass" {
+    // Found by the fuzzer: one read with the whole request, then a
+    // connection error. The response is sent before the GOAWAY, as it
+    // would be if the bytes arrived one at a time.
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    try h.preface();
+    h.events.clearRetainingCapacity();
+    var block: [256]u8 = undefined;
+    var bn: usize = 0;
+    for ([_][2][]const u8{ .{ ":method", "POST" }, .{ ":scheme", "https" }, .{ ":path", "/up" } }) |f|
+        bn += try h.enc.encode(block[bn..], f[0], f[1], .{});
+    var input: [512]u8 = undefined;
+    var n = try frame.writeHeaders(&input, 1, frame.flag.end_headers, block[0..bn]);
+    n += try frame.writeData(input[n..], 1, true, "body");
+    n += try frame.writeData(input[n..], 3, false, "idle"); // a connection error
+    try h.feed(input[0..n]);
+    try h.expectEvents(
+        \\headers 1 end=false [:status=200] [content-length=5] [date]
+        \\data 1 len=5 end=true
+        \\goaway last=1 protocol_error
+        \\
+    );
 }
 
 test "defence: rapid reset" {

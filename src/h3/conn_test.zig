@@ -766,6 +766,8 @@ fn fuzzH3(_: void, smith: *std.testing.Smith) anyerror!void {
                     ids[nids] = try h.client.openBidi();
                     nids += 1;
                 }
+                // With every slot used, the last stream may have ended.
+                if ((try h.client.getStream(ids[nids - 1])).send.fin) continue;
                 try h.client.write(ids[nids - 1], bytes, op & 0x80 != 0);
             },
             2 => {

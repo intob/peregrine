@@ -564,13 +564,16 @@ pub const Conn = struct {
         self.bindExchange(Handler, ctx, slot);
     }
 
-    /// Calls handleBody; the end turns streaming off.
+    /// Calls handleBody (the end turns streaming off), then sends what the
+    /// handler queued in the call. The request may be over when this
+    /// returns.
     fn deliver(self: *Self, comptime Handler: type, ctx: *const Context(Handler), slot: u32, chunk: []const u8, end: ?[]const Header) void {
         if (!@hasDecl(Handler, "handleBody")) unreachable;
         const s = &self.streams[slot];
         if (end != null) s.body_stream = false;
         const action = ctx.exchanges.handle(s.exchange).deliverBody(ctx.handler, chunk, end, ctx.now);
         if (end == null and action == .pause) s.body_paused = true;
+        self.pumpStream(Handler, ctx, slot);
     }
 
     /// A stream error: reset both directions with `code`.
