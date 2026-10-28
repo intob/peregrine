@@ -337,6 +337,19 @@ const Hello = struct {
     }
 };
 
+/// The host_name in server_name, as the server reads it (null if absent
+/// or malformed).
+fn sniHost(h: *const Hello) ?[]const u8 {
+    var r: Reader = .{ .data = h.ext(ext_server_name) orelse return null };
+    var list: Reader = .{ .data = r.vec(u16) catch return null };
+    while (!list.done()) {
+        const t = list.int(u8) catch return null;
+        const name = list.vec(u16) catch return null;
+        if (t == 0) return name;
+    }
+    return null;
+}
+
 /// Replaces each key share for a group this harness supports with its own.
 fn substituteShares(a: Allocator, fx: *const Fixtures, h: *Hello) !void {
     var list: [16]KeyShare = undefined;
@@ -1236,6 +1249,7 @@ const View = struct {
                 var r: Reader = .{ .data = msg[4..] };
                 var e: Reader = .{ .data = try r.vec(u16) };
                 var early = false;
+                var sni = false;
                 while (!e.done()) {
                     const t = try e.int(u16);
                     var b: Reader = .{ .data = try e.vec(u16) };
@@ -1249,6 +1263,10 @@ const View = struct {
                             if (!b.done()) return error.BadEarlyData;
                             early = true;
                         },
+                        ext_server_name => {
+                            if (!b.done()) return error.BadServerName;
+                            sni = true;
+                        },
                         else => return error.UnexpectedEncryptedExtension,
                     }
                 }
@@ -1256,6 +1274,10 @@ const View = struct {
                 const want = v.early_candidate and v.offer.?.entries[0].alpn == v.alpnIndex();
                 if (early != want) return error.EarlyDataMismatch;
                 v.early_accepted = early;
+                // Every fixture certificate has the same names, so whether
+                // the name chose it doesn't depend on which one is used.
+                const named = if (v.hello) |h| if (sniHost(&h)) |name| v.fx.creds[0].matchesHost(name) else false else false;
+                if (sni != (named and v.psk_index == null)) return error.ServerNameMismatch;
             },
             // A resumed handshake has no Certificate or CertificateVerify.
             11, 15 => v.saw_certificate = true,

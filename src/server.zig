@@ -54,13 +54,26 @@ pub const Http3Options = struct {
     alt_svc_max_age: u32 = 86400,
 };
 
+/// A certificate chain and its key, in PEM (see `TlsOptions.cert_pem`).
+pub const TlsCertificate = struct {
+    cert_pem: []const u8,
+    key_pem: []const u8,
+};
+
 pub const TlsOptions = struct {
-    /// PEM certificate chain, leaf first.
+    /// PEM certificate chain, leaf first: the default certificate.
     cert_pem: []const u8,
     /// PEM private key: PKCS#8 ("PRIVATE KEY"), SEC1 ("EC PRIVATE KEY") or
     /// PKCS#1 ("RSA PRIVATE KEY"). ECDSA P-256/P-384, Ed25519 and RSA
     /// (2048-4096 bits, signing with RSA-PSS) keys are supported.
     key_pem: []const u8,
+    /// More certificates, chosen by the host name a client sends (SNI, RFC
+    /// 6066): the first whose subject alternative names cover it (one
+    /// wildcard label, as in "*.example.com"), the default one first; the
+    /// default when none does or no name is sent. Up to 254. Over TCP and
+    /// QUIC; a session ticket only resumes under the certificate it was
+    /// issued with.
+    certificates: []const TlsCertificate = &.{},
     /// ALPN protocol names offered, in preference order.
     alpn: []const []const u8 = &.{"http/1.1"},
     /// Session tickets (RFC 8446 §4.6.1): a ticket after each handshake,
@@ -268,6 +281,7 @@ pub fn Server(comptime Handler: type) type {
         cfg: Config,
         port: u16,
         tls_credentials: ?Credentials = null,
+        tls_sni_credentials: []Credentials = &.{},
         tls_tickets: TicketKeys = undefined,
         tls_replay: ?ReplayGuard = null,
         tls_config: tls_conn.Config = undefined,
@@ -324,13 +338,24 @@ pub fn Server(comptime Handler: type) type {
                     if (!t.session_tickets) return error.EarlyDataNeedsTickets;
                     if (!std.math.isPowerOfTwo(t.replay_guard_size) or t.replay_guard_size < 8) return error.InvalidReplayGuardSize;
                 }
+                if (t.certificates.len > 254) return error.TooManyCertificates;
                 srv.tls_credentials = try Credentials.fromPem(allocator, t.cert_pem, t.key_pem);
                 errdefer srv.tls_credentials.?.deinit();
+                srv.tls_sni_credentials = try allocator.alloc(Credentials, t.certificates.len);
+                var loaded: usize = 0;
+                errdefer {
+                    for (srv.tls_sni_credentials[0..loaded]) |*c| c.deinit();
+                    allocator.free(srv.tls_sni_credentials);
+                }
+                for (t.certificates, srv.tls_sni_credentials) |pem, *c| {
+                    c.* = try Credentials.fromPem(allocator, pem.cert_pem, pem.key_pem);
+                    loaded += 1;
+                }
                 srv.tls_tickets = if (t.ticket_key) |k| .init(k) else .random();
                 srv.tls_tickets.lifetime_s = t.ticket_lifetime_s;
                 const tickets: ?*const TicketKeys = if (t.session_tickets) &srv.tls_tickets else null;
-                srv.tls_config = .{ .credentials = &srv.tls_credentials.?, .alpn = t.alpn, .tickets = tickets };
-                srv.quic_tls_config = .{ .credentials = &srv.tls_credentials.?, .alpn = &.{"h3"}, .quic = true, .tickets = tickets };
+                srv.tls_config = .{ .credentials = &srv.tls_credentials.?, .sni_credentials = srv.tls_sni_credentials, .alpn = t.alpn, .tickets = tickets };
+                srv.quic_tls_config = .{ .credentials = &srv.tls_credentials.?, .sni_credentials = srv.tls_sni_credentials, .alpn = &.{"h3"}, .quic = true, .tickets = tickets };
                 if (t.max_early_data > 0) {
                     srv.tls_tickets.newInstance();
                     srv.tls_replay = try .init(allocator, t.replay_guard_size);
@@ -343,7 +368,11 @@ pub fn Server(comptime Handler: type) type {
                 }
                 srv.cfg.tls = null; // the PEM data may be freed after init
             }
-            errdefer if (srv.tls_credentials) |*c| c.deinit();
+            errdefer if (srv.tls_credentials) |*c| {
+                c.deinit();
+                for (srv.tls_sni_credentials) |*sc| sc.deinit();
+                allocator.free(srv.tls_sni_credentials);
+            };
             errdefer if (srv.tls_replay) |*g| g.deinit();
             if (cfg.http3 != null and srv.tls_credentials == null) return error.Http3NeedsTls;
             // Linux steers each connection's datagrams to its worker
@@ -574,7 +603,11 @@ pub fn Server(comptime Handler: type) type {
                 -1;
             for (self.workers) |*w| w.deinit();
             if (shared_listener >= 0) sys.close(shared_listener);
-            if (self.tls_credentials) |*c| c.deinit();
+            if (self.tls_credentials) |*c| {
+                c.deinit();
+                for (self.tls_sni_credentials) |*sc| sc.deinit();
+                self.allocator.free(self.tls_sni_credentials);
+            }
             if (self.tls_replay) |*g| g.deinit();
             self.handler.deinit();
             self.allocator.free(self.workers);

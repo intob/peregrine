@@ -50,7 +50,13 @@ const Sha384 = std.crypto.hash.sha2.Sha384;
 pub const Level = enum(u2) { initial, handshake, application, early };
 
 pub const Config = struct {
+    /// The default certificate.
     credentials: *const Credentials,
+    /// More certificates, chosen by the ClientHello's server_name (RFC
+    /// 6066): the first, the default included, whose names match it
+    /// (`Credentials.matchesHost`); the default when none does or no name
+    /// is sent. At most 254.
+    sni_credentials: []const Credentials = &.{},
     /// ALPN protocol names in server preference order. Empty: no ALPN.
     alpn: []const []const u8 = &.{},
     /// In preference order.
@@ -148,6 +154,11 @@ pub const Handshake = struct {
 
     /// Negotiated ALPN protocol (points into the config), if any.
     alpn: ?[]const u8 = null,
+    /// The certificate for this handshake, its index (0: the default, i:
+    /// `sni_credentials[i - 1]`), and whether server_name chose it.
+    creds: *const Credentials = undefined,
+    creds_index: u8 = 0,
+    sni_matched: bool = false,
     /// QUIC: our transport parameters, as the sink returned them; sent in
     /// EncryptedExtensions.
     transport_params: []const u8 = &.{},
@@ -281,6 +292,7 @@ pub const Handshake = struct {
             self.session_id_len = @intCast(hello.session_id.len);
             @memcpy(self.session_id_buf[0..hello.session_id.len], hello.session_id);
             self.early_data_offered = hello.early_data;
+            self.chooseCredentials(hello.server_name);
         }
 
         // Without a PSK the certificate must be usable (checked again once
@@ -361,8 +373,29 @@ pub const Handshake = struct {
 
     fn checkSignatureScheme(self: *const Self, hello: ClientHello) Error!void {
         const sig_algs = hello.signature_algorithms orelse return error.MissingExtension;
-        if (!listHas(u16, sig_algs, @backingInt(self.config.credentials.key.scheme())))
+        if (!listHas(u16, sig_algs, @backingInt(self.creds.key.scheme())))
             return error.HandshakeFailure;
+    }
+
+    /// The certificate server_name asks for (see `Config.sni_credentials`).
+    fn chooseCredentials(self: *Self, server_name: ?[]const u8) void {
+        self.creds = self.config.credentials;
+        self.creds_index = 0;
+        self.sni_matched = false;
+        const name = server_name orelse return;
+        if (self.config.credentials.matchesHost(name)) {
+            self.sni_matched = true;
+            return;
+        }
+        for (self.config.sni_credentials, 0..) |*c, i| {
+            if (i >= 254) break;
+            if (c.matchesHost(name)) {
+                self.creds = c;
+                self.creds_index = @intCast(i + 1);
+                self.sni_matched = true;
+                return;
+            }
+        }
     }
 
     /// RFC 8446 §4.2.11: the first identity that is one of our tickets,
@@ -383,6 +416,8 @@ pub const Handshake = struct {
             if (index >= 8) return; // look at a few, not every one offered
             const state = keys.open(identity) orelse continue;
             if (state.quic != self.config.quic) continue;
+            // Authenticated with another certificate (another name).
+            if (state.cert != self.creds_index) continue;
             const suite: Suite = @fromBackingInt(state.suite);
             if (suite.hashLen() != self.suite.hashLen() or state.psk_len != self.suite.hashLen()) continue;
             // The binder covers the ClientHello up to the binders.
@@ -571,7 +606,7 @@ pub const Handshake = struct {
         // Over TCP, early data comes first (see `handleEndOfEarlyData`).
         if (!self.early_accepted or self.config.quic) try sink.readSecret(.handshake, suite, &c_hs);
 
-        const creds = self.config.credentials;
+        const creds = self.creds;
         var chain_len: usize = 0;
         for (creds.chain) |c| chain_len += 3 + c.len + 2;
         const flight_len = 64 + 300 + self.transport_params.len + chain_len + credentials.max_signature_len + record.max_hash_len;
@@ -597,6 +632,11 @@ pub const Handshake = struct {
         }
         if (self.early_accepted) {
             w.int(u16, @backingInt(ExtensionType.early_data));
+            w.int(u16, 0);
+        }
+        if (self.sni_matched and !self.resumed) {
+            // RFC 6066 §3: the name chose the certificate.
+            w.int(u16, @backingInt(ExtensionType.server_name));
             w.int(u16, 0);
         }
         w.end(u16, exts);
@@ -632,7 +672,7 @@ pub const Handshake = struct {
 
     /// Certificate and CertificateVerify.
     fn writeCertificate(self: *Self, w: *Writer, hash_buf: *[record.max_hash_len]u8) Error!void {
-        const creds = self.config.credentials;
+        const creds = self.creds;
         var start = w.pos;
         var hdr = w.beginMessage(.certificate);
         w.int(u8, 0); // certificate_request_context
@@ -699,6 +739,7 @@ pub const Handshake = struct {
             .early = self.config.earlyData(),
             .instance = keys.instance,
             .alpn = self.alpnIndex(),
+            .cert = self.creds_index,
             .psk_len = @intCast(self.suite.hashLen()),
             .psk = @splat(0),
         };
@@ -870,6 +911,8 @@ const ClientHello = struct {
     key_shares: ?[]const u8 = null,
     /// The ProtocolNameList contents.
     alpn: ?[]const u8 = null,
+    /// The host_name in server_name (RFC 6066 §3).
+    server_name: ?[]const u8 = null,
     /// The quic_transport_parameters extension's contents.
     quic_transport_params: ?[]const u8 = null,
     tls13: bool = false,
@@ -939,6 +982,19 @@ const ClientHello = struct {
                     hello.alpn = protos;
                 },
                 .early_data => hello.early_data = true,
+                .server_name => {
+                    // ServerNameList: name_type, then a host_name; one of
+                    // each type at most, others ignored.
+                    var list: Reader = .{ .data = try e.vector(u16) };
+                    if (list.data.len == 0) return error.DecodeError;
+                    while (list.pos < list.data.len) {
+                        const name_type = try list.int(u8);
+                        const name = try list.vector(u16);
+                        if (name_type != 0) continue;
+                        if (name.len == 0 or hello.server_name != null) return error.IllegalParameter;
+                        hello.server_name = name;
+                    }
+                },
                 .quic_transport_parameters => {
                     hello.quic_transport_params = ext;
                     continue;
@@ -1961,5 +2017,130 @@ test "0-RTT: EndOfEarlyData is the only handshake message under the early key" {
         try hs.feed(.initial, hello, &sink);
         try std.testing.expect(hs.early_accepted);
         try std.testing.expectError(case.err, hs.feed(case.level, case.bytes, &sink));
+    }
+}
+
+/// A server_name extension for `host`.
+fn sniExt(comptime host: []const u8) []const u8 {
+    const n = host.len;
+    return .{ 0, 0, 0, n + 5, 0, n + 3, 0, 0, n } ++ host;
+}
+
+/// The leaf certificate and whether EncryptedExtensions acknowledged
+/// server_name, from the server's encrypted flight.
+fn flightFacts(sink: *const TestSink) !struct { leaf: ?[]const u8, sni_ack: bool } {
+    var leaf: ?[]const u8 = null;
+    var ack = false;
+    for (sink.events.items) |ev| {
+        const d = switch (ev) {
+            .data => |d| d,
+            else => continue,
+        };
+        if (d.level != .handshake) continue;
+        var r: Reader = .{ .data = d.bytes };
+        while (r.pos < d.bytes.len) {
+            const t = (try r.take(1))[0];
+            const body = try r.take(try r.int(u24));
+            var b: Reader = .{ .data = body };
+            switch (t) {
+                8 => {
+                    var exts: Reader = .{ .data = try b.vector(u16) };
+                    while (exts.pos < exts.data.len) {
+                        const et = try exts.int(u16);
+                        _ = try exts.vector(u16);
+                        if (et == @backingInt(ExtensionType.server_name)) ack = true;
+                    }
+                },
+                11 => {
+                    _ = try b.vector(u8); // certificate_request_context
+                    var list: Reader = .{ .data = try b.vector(u24) };
+                    leaf = try list.vector(u24);
+                },
+                else => {},
+            }
+        }
+    }
+    return .{ .leaf = leaf, .sni_ack = ack };
+}
+
+test "SNI: the certificate whose names match, else the default; server_name acknowledged when it chose" {
+    const td = credentials.testdata;
+    var default = try testCredentials();
+    defer default.deinit();
+    var more = [_]Credentials{
+        try .fromPem(std.testing.allocator, td.sni_a_cert, td.sni_a_key),
+        try .fromPem(std.testing.allocator, td.sni_wild_cert, td.sni_wild_key),
+    };
+    defer for (&more) |*c| c.deinit();
+    var entropy: [entropy_len]u8 = undefined;
+    for (&entropy, 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+    const config: Config = .{ .credentials = &default, .sni_credentials = &more, .groups = &.{.x25519} };
+    const cases = [_]struct { extra: []const u8, want: *const Credentials, ack: bool }{
+        .{ .extra = comptime sniExt("a.example"), .want = &more[0], .ack = true },
+        .{ .extra = comptime sniExt("A.EXAMPLE"), .want = &more[0], .ack = true },
+        .{ .extra = comptime sniExt("www.b.example"), .want = &more[1], .ack = true },
+        .{ .extra = comptime sniExt("b.example"), .want = &more[1], .ack = true },
+        .{ .extra = comptime sniExt("localhost"), .want = &default, .ack = true },
+        .{ .extra = comptime sniExt("x.www.b.example"), .want = &default, .ack = false },
+        .{ .extra = "", .want = &default, .ack = false },
+    };
+    for (cases) |case| {
+        var buf: [4096]u8 = undefined;
+        var c = RefClient(.aes_128_gcm_sha256).init();
+        var hs = Handshake.init(std.testing.allocator, &config, &entropy);
+        defer hs.deinit();
+        var sink: TestSink = .{ .allocator = std.testing.allocator };
+        defer sink.deinit();
+        try hs.feed(.initial, c.hello(&buf, case.extra, null, true), &sink);
+        const facts = try flightFacts(&sink);
+        try std.testing.expectEqualSlices(u8, case.want.chain[0], facts.leaf.?);
+        try std.testing.expectEqual(case.ack, facts.sni_ack);
+    }
+    // A malformed or doubled host_name.
+    for ([_][]const u8{ &.{ 0, 0, 0, 2, 0, 0 }, &.{ 0, 0, 0, 5, 0, 3, 0, 0, 0 }, &.{ 0, 0, 0, 12, 0, 10, 0, 0, 2, 'a', 'b', 0, 0, 2, 'c', 'd' } }) |bad| {
+        var buf: [4096]u8 = undefined;
+        var c = RefClient(.aes_128_gcm_sha256).init();
+        var hs = Handshake.init(std.testing.allocator, &config, &entropy);
+        defer hs.deinit();
+        var sink: TestSink = .{ .allocator = std.testing.allocator };
+        defer sink.deinit();
+        try std.testing.expect(std.meta.isError(hs.feed(.initial, c.hello(&buf, bad, null, true), &sink)));
+    }
+}
+
+test "SNI: a ticket resumes only for a name that selects the same certificate" {
+    const td = credentials.testdata;
+    var default = try testCredentials();
+    defer default.deinit();
+    var more = [_]Credentials{
+        try .fromPem(std.testing.allocator, td.sni_a_cert, td.sni_a_key),
+        try .fromPem(std.testing.allocator, td.sni_wild_cert, td.sni_wild_key),
+    };
+    defer for (&more) |*c| c.deinit();
+    var keys = ticket.Keys.init(@splat(9));
+    keys.now = resumeTestClock;
+    var entropy: [entropy_len]u8 = undefined;
+    for (&entropy, 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+    const suite = Suite.aes_128_gcm_sha256;
+    var config = resumeConfig(&default, &keys, &.{suite});
+    config.sni_credentials = &more;
+    const t = try issueTicket(suite, &config, &entropy, comptime pskModes(&.{1}) ++ sniExt("www.b.example"));
+    const cases = [_]struct { extra: []const u8, resumed: bool }{
+        .{ .extra = comptime pskModes(&.{1}) ++ sniExt("other.b.example"), .resumed = true },
+        .{ .extra = comptime pskModes(&.{1}) ++ sniExt("a.example"), .resumed = false },
+        .{ .extra = comptime pskModes(&.{1}) ++ sniExt("localhost"), .resumed = false },
+        .{ .extra = comptime pskModes(&.{1}), .resumed = false },
+    };
+    for (cases) |case| {
+        var buf: [4096]u8 = undefined;
+        var c = RefClient(suite).init();
+        var hs = Handshake.init(std.testing.allocator, &config, &entropy);
+        defer hs.deinit();
+        var sink: TestSink = .{ .allocator = std.testing.allocator };
+        defer sink.deinit();
+        try hs.feed(.initial, c.hello(&buf, case.extra, &t, true), &sink);
+        try std.testing.expectEqual(case.resumed, hs.resumed);
+        // No acknowledgement on a resumed handshake.
+        try std.testing.expectEqual(!case.resumed and case.extra.len > 6, (try flightFacts(&sink)).sni_ack);
     }
 }

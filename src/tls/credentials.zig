@@ -81,6 +81,8 @@ pub const Credentials = struct {
     /// DER certificates, leaf first.
     chain: []const []const u8,
     key: PrivateKey,
+    /// The leaf, parsed (points into `chain`): its names, for SNI.
+    leaf: Certificate.Parsed,
 
     /// Loads a PEM certificate chain (leaf first) and a PEM private key
     /// (PKCS#8 "PRIVATE KEY", or SEC1 "EC PRIVATE KEY"). Checks that the key
@@ -116,11 +118,22 @@ pub const Credentials = struct {
         const parsed = leaf.parse() catch return error.InvalidCertificate;
         if (!key.publicKeyMatches(parsed)) return error.KeyCertificateMismatch;
 
+        const owned = try chain.toOwnedSlice(allocator);
         return .{
             .allocator = allocator,
-            .chain = try chain.toOwnedSlice(allocator),
+            .chain = owned,
             .key = key,
+            // Parsed again so it points into the owned chain.
+            .leaf = (Certificate{ .buffer = owned[0], .index = 0 }).parse() catch unreachable,
         };
+    }
+
+    /// The leaf certificate is for `host` (an SNI host name): one of its
+    /// subject alternative names matches it, wildcards included (RFC 6125;
+    /// the common name only without them).
+    pub fn matchesHost(self: *const Self, host: []const u8) bool {
+        self.leaf.verifyHostName(host) catch return false;
+        return true;
     }
 
     pub fn deinit(self: *Self) void {
@@ -283,7 +296,23 @@ pub const testdata = struct {
     pub const rsa4096_cert = @embedFile("testdata/rsa4096.pem");
     /// PKCS#1 ("RSA PRIVATE KEY").
     pub const rsa4096_key = @embedFile("testdata/rsa4096.rsa.key");
+    /// P-256, for "a.example"; and for "*.b.example" and "b.example".
+    pub const sni_a_cert = @embedFile("testdata/sni-a.pem");
+    pub const sni_a_key = @embedFile("testdata/sni-a.key");
+    pub const sni_wild_cert = @embedFile("testdata/sni-wild.pem");
+    pub const sni_wild_key = @embedFile("testdata/sni-wild.key");
 };
+
+test "matchesHost: subject alternative names, wildcards one label deep, any case" {
+    var a = try Credentials.fromPem(std.testing.allocator, testdata.sni_a_cert, testdata.sni_a_key);
+    defer a.deinit();
+    var wild = try Credentials.fromPem(std.testing.allocator, testdata.sni_wild_cert, testdata.sni_wild_key);
+    defer wild.deinit();
+    try std.testing.expect(a.matchesHost("a.example") and a.matchesHost("A.Example"));
+    try std.testing.expect(!a.matchesHost("b.example") and !a.matchesHost("x.a.example") and !a.matchesHost(""));
+    try std.testing.expect(wild.matchesHost("b.example") and wild.matchesHost("www.b.example"));
+    try std.testing.expect(!wild.matchesHost("x.www.b.example") and !wild.matchesHost("a.example"));
+}
 
 test "load every supported key type and sign" {
     const cases = [_]struct { cert: []const u8, key: []const u8, scheme: SignatureScheme }{

@@ -54,7 +54,7 @@ Design rules that apply to every layer:
 | M1. HTTP/1.1 core | ✅ done (streaming responses landed with the M5 handler API) |
 | M2. Throughput architecture | 🟡 io_uring works (opt-in, not yet faster than epoll); sendfile done (plaintext, and TLS with kTLS); NUMA open |
 | M3. WebSockets over HTTP/1.1 | ✅ reworked; permessage-deflate, Autobahn, benchmarks open |
-| M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; tables for P-256 and X25519, RSA-PSS, session tickets, kTLS and 0-RTT done; the rest of "faster handshakes" open |
+| M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; tables for P-256 and X25519, RSA-PSS, session tickets, kTLS, 0-RTT and SNI certificates done; the rest of "faster handshakes" open |
 | M5. HTTP/2 | ✅ h2 over TLS (ALPN) and h2c on every backend, h2spec 146/146 over TLS, fuzzed, benchmarked; streamed request bodies on every protocol; WebSockets over h2 (RFC 8441); RFC 9218 priorities |
 | M6. HTTP/3 and QUIC | 🟡 HTTP/3 over QUIC v1 on every backend, interop-tested (aioquic, curl/ngtcp2, h2load), benchmarked against nginx and Caddy; WebSockets over h3 (RFC 9220); 0-RTT; migration, pacing, ECN, PMTUD open |
 | M7. Verification and benchmarking | 🟡 ongoing for each milestone |
@@ -567,7 +567,22 @@ Later in M4:
       curl can't export sessions between runs); buffering 0-RTT packets
       that arrive before the ClientHello completes (they are dropped and
       the client resends them as 1-RTT)
-- [ ] Several certificates selected by SNI; OCSP stapling
+- [x] **Several certificates selected by SNI** (`TlsOptions.certificates`,
+      RFC 6066 §3), over TCP and QUIC: the first certificate, the default
+      first, whose subject alternative names cover the ClientHello's
+      host_name (std's RFC 6125 matching: any case, one wildcard label);
+      the default for an unknown name or none. An empty server_name in
+      EncryptedExtensions when the name chose the certificate (full
+      handshakes only); a malformed or doubled host_name fails. Tickets
+      record the certificate index and resume (and take 0-RTT) only when
+      the name selects the same certificate, so a session authenticated
+      for one name never resumes as another. Proof: handshake tests (exact,
+      any case, wildcard, its apex listed too, too deep, unknown, none,
+      malformed; resumption across names); end to end on every backend with
+      std's client, which checks the name; OpenSSL 3.5 `-servername` and
+      aioquic over HTTP/3 on epoll and io_uring (`bench-server ... sni`).
+      Linear in the number of certificates
+- [ ] OCSP stapling
 - [x] **kTLS on Linux** (`TlsOptions.ktls`, on by default): the sending side of
       an HTTP/1.1 connection goes to the kernel (TCP_ULP "tls", TLS_TX with the
       current key, IV split into salt and the rest, and record sequence number)

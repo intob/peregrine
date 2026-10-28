@@ -4,7 +4,7 @@
 //! plaintext HTTP/1.1), and `/ws`, a WebSocket echo (HTTP/1.1 Upgrade, or
 //! extended CONNECT on HTTP/2 and HTTP/3); request bodies are read and
 //! discarded.
-//! Usage: bench-server [workers] [auto|epoll|io_uring] [port] [tls|h3|plain] [stream] [rsa] [noktls] [0rtt]
+//! Usage: bench-server [workers] [auto|epoll|io_uring] [port] [tls|h3|plain] [stream] [rsa] [noktls] [0rtt] [sni]
 //! With `tls`, serves TLS 1.3 with the self-signed P-256 certificate in
 //! this directory (`rsa`: the RSA-2048 one), with ALPN "h2" and
 //! "http/1.1"; `h3` adds HTTP/3 on the
@@ -13,7 +13,9 @@
 //! handler (handleHead, handleBody) and the response follows its end, for
 //! conformance and interop runs of that path. With `0rtt`, TLS clients may
 //! send up to 16 KiB of early data when resuming; responses to requests
-//! handled in it carry `x-early-data: 1`.
+//! handled in it carry `x-early-data: 1`. With `sni`, two more
+//! certificates are chosen by SNI: for a.example, and for *.b.example and
+//! b.example.
 const std = @import("std");
 const per = @import("peregrine");
 
@@ -114,7 +116,9 @@ fn serve(comptime H: type, args: []const [:0]const u8) !void {
     var use_rsa = false;
     var ktls = true;
     var max_early: u32 = 0;
+    var sni = false;
     for (args[@min(args.len, 5)..]) |arg| {
+        sni = sni or std.mem.eql(u8, arg, "sni");
         use_rsa = use_rsa or std.mem.eql(u8, arg, "rsa");
         if (std.mem.eql(u8, arg, "noktls")) ktls = false;
         if (std.mem.eql(u8, arg, "0rtt")) max_early = 16384;
@@ -129,6 +133,10 @@ fn serve(comptime H: type, args: []const [:0]const u8) !void {
             .alpn = &.{ "h2", "http/1.1" },
             .ktls = ktls,
             .max_early_data = max_early,
+            .certificates = if (sni) &.{
+                .{ .cert_pem = @embedFile("sni-a.pem"), .key_pem = @embedFile("sni-a.key") },
+                .{ .cert_pem = @embedFile("sni-wild.pem"), .key_pem = @embedFile("sni-wild.key") },
+            } else &.{},
         } else null,
         .http3 = if (use_h3) .{} else null,
     });

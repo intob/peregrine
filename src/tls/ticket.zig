@@ -24,9 +24,9 @@ pub const max_psk_len = 48;
 /// The largest ticket `seal` makes.
 pub const max_len = header_len + plain_max + Aes256Gcm.tag_length;
 
-const version: u8 = 2;
+const version: u8 = 3;
 const header_len = 1 + 8 + Aes256Gcm.nonce_length;
-const plain_fixed = 2 + 8 + 4 + 1 + 1 + 1 + 8 + 1;
+const plain_fixed = 2 + 8 + 4 + 1 + 1 + 1 + 8 + 1 + 1;
 const plain_max = plain_fixed + max_psk_len;
 
 pub const State = struct {
@@ -45,6 +45,10 @@ pub const State = struct {
     early: bool = false,
     instance: u64 = 0,
     alpn: u8 = 0,
+    /// The certificate the session was authenticated with (an index into
+    /// the server's, 0 for the default): resumed only for a ClientHello
+    /// whose SNI selects the same one.
+    cert: u8 = 0,
     psk_len: u8,
     psk: [max_psk_len]u8,
 
@@ -109,7 +113,8 @@ pub const Keys = struct {
         plain[15] = @intFromBool(state.early);
         std.mem.writeInt(u64, plain[16..24], state.instance, .big);
         plain[24] = state.alpn;
-        plain[25] = state.psk_len;
+        plain[25] = state.cert;
+        plain[26] = state.psk_len;
         @memcpy(plain[plain_fixed..][0..state.psk_len], state.pskSlice());
         const len = plain_fixed + @as(usize, state.psk_len);
         defer std.crypto.secureZero(u8, &plain);
@@ -152,7 +157,8 @@ pub const Keys = struct {
             .early = plain[15] == 1,
             .instance = std.mem.readInt(u64, plain[16..24], .big),
             .alpn = plain[24],
-            .psk_len = plain[25],
+            .cert = plain[25],
+            .psk_len = plain[26],
             .psk = @splat(0),
         };
         if (state.psk_len != len - plain_fixed) return null;
@@ -234,7 +240,7 @@ test "ticket: seal, open, expiry, rotation, tampering, other keys" {
     keys.now = testClock;
     keys.lifetime_s = 1000;
     test_now = 1_000_500;
-    var state: State = .{ .suite = 0x1302, .issued = test_now, .age_add = 0xdeadbeef, .quic = true, .early = true, .instance = 0x0102030405060708, .alpn = 3, .psk_len = 48, .psk = undefined };
+    var state: State = .{ .suite = 0x1302, .issued = test_now, .age_add = 0xdeadbeef, .quic = true, .early = true, .instance = 0x0102030405060708, .alpn = 3, .cert = 2, .psk_len = 48, .psk = undefined };
     for (&state.psk, 0..) |*b, i| b.* = @truncate(i);
     var buf: [max_len]u8 = undefined;
     const ticket = keys.seal(&state, @splat(3), &buf);
@@ -246,6 +252,7 @@ test "ticket: seal, open, expiry, rotation, tampering, other keys" {
     try testing.expect(got.early);
     try testing.expectEqual(state.instance, got.instance);
     try testing.expectEqual(state.alpn, got.alpn);
+    try testing.expectEqual(state.cert, got.cert);
     try testing.expectEqualSlices(u8, state.pskSlice(), got.pskSlice());
     // Still valid in the next period, until it is lifetime_s old.
     test_now = 1_001_400;

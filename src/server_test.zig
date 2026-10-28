@@ -2041,6 +2041,11 @@ const TlsClient = struct {
     client: StdTls = undefined,
 
     fn connect(port: u16) !*TlsClient {
+        return connectHost(port, "localhost");
+    }
+
+    /// With `host` as SNI; the certificate must be for it.
+    fn connectHost(port: u16, host: []const u8) !*TlsClient {
         const raw = try Client.connect(port);
         errdefer sys.close(raw.fd);
         const self = try testing.allocator.create(TlsClient);
@@ -2056,7 +2061,7 @@ const TlsClient = struct {
         var entropy: [StdTls.Options.entropy_len]u8 = undefined;
         sys.randomBytes(&entropy);
         self.client = try StdTls.init(&self.file_reader.interface, &self.file_writer.interface, .{
-            .host = .{ .explicit = "localhost" },
+            .host = .{ .explicit = host },
             .ca = .self_signed,
             .read_buffer = &self.read_buf,
             .write_buffer = &self.write_buf,
@@ -2117,6 +2122,29 @@ const TlsClient = struct {
 
 fn tlsConfig() Config {
     return .{ .tls = .{ .cert_pem = tls_testdata.p256_cert, .key_pem = tls_testdata.p256_key } };
+}
+
+test "tls: SNI chooses the certificate" {
+    try forEachBackend(testTlsSni);
+}
+
+fn testTlsSni(backend: Backend) !void {
+    var cfg = tlsConfig();
+    cfg.tls.?.certificates = &.{
+        .{ .cert_pem = tls_testdata.sni_a_cert, .key_pem = tls_testdata.sni_a_key },
+        .{ .cert_pem = tls_testdata.sni_wild_cert, .key_pem = tls_testdata.sni_wild_key },
+    };
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    // std's client checks the certificate is for the name it sent.
+    for ([_][]const u8{ "a.example", "www.b.example", "b.example", "localhost" }) |host| {
+        const c = try TlsClient.connectHost(r.port, host);
+        defer c.close();
+        try c.send("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        try testing.expectEqual(@as(u16, 200), (try c.readResponse(null)).status);
+    }
+    // No certificate for this name: the default, which isn't for it.
+    try testing.expectError(error.CertificateHostMismatch, TlsClient.connectHost(r.port, "c.example"));
 }
 
 test "tls: keep-alive, pipelining, large responses and close_notify" {
