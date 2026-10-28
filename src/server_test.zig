@@ -2329,6 +2329,8 @@ const H3Client = struct {
         var seen_headers = false;
         while (data.len > 0) {
             const fh = h3frame.parseHeader(data) orelse return error.Truncated;
+            // A frame still arriving (waitBody tries again).
+            if (data.len < fh.size + fh.len) return error.Truncated;
             const payload = data[fh.size..][0..@intCast(fh.len)];
             data = data[fh.size + payload.len ..];
             switch (fh.type) {
