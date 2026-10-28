@@ -2536,6 +2536,9 @@ const H3Client = struct {
 
     fn response(self: *H3Client, id: u64) !Resp {
         var r: Resp = .{};
+        // waitBody polls while frames are still arriving: a DATA frame
+        // read whole, then one cut short, must not leak the first.
+        errdefer r.body.deinit(testing.allocator);
         var data = self.c.readAll(id);
         var dec = try qpack.Decoder.init(testing.allocator, .{});
         defer dec.deinit();

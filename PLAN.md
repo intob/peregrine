@@ -886,12 +886,13 @@ connection, for every server), so compare CPU/req there.
 - [ ] Protocol suites: Autobahn (WebSockets), tlsfuzzer/BoGo (TLS), h2spec (h2),
       quic-interop-runner (QUIC/h3)
 - [ ] Response correctness (REDbot)
-- [ ] **Unexplained leak report, not reproduced.** On 2026-10-28 two consecutive
-      Linux test runs in Docker (epoll, then io_uring; the binary of the kTLS
-      work, before the KeyUpdate gate) ended with "1 tests leaked memory"; the
-      output was cut to the summary line, so which test is unknown. The same
-      binary then passed 16 more runs (alone and under load) with no leak.
-      Look for a test whose cleanup races a server thread
+- [x] **The occasional "1 tests leaked memory" on Linux** (seen twice on
+      2026-10-28, never reproduced on demand): caught with the full log in a
+      loop of io_uring runs (1 in 4). The HTTP/3 test client's `response`
+      appended each whole DATA frame to the body, then returned
+      error.Truncated for a frame still arriving without freeing it;
+      `waitBody` polls it, so a read ending just inside a second DATA
+      frame leaked the first. Test-only; `response` now frees on error
 - [ ] Soak: hours at high concurrency, steady RSS and fd count
 - [ ] Adversarial load: slowloris (basic test exists), oversized headers, half-open
       connections, connection floods, TLS handshake floods

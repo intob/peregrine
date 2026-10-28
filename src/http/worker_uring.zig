@@ -128,10 +128,14 @@ fn bufferGroup(ring: *IoUring, allocator: std.mem.Allocator, group: u16, size: u
     return .{ .ring = ring, .group_id = group, .br = br, .buffers = buffers, .heads = heads, .buffer_size = size, .buffers_count = count };
 }
 
+/// `IoUring.BufferGroup.deinit` without its second unregistration, whose
+/// ENOENT std reports with a stack trace in debug builds.
 fn freeBufferGroup(g: *IoUring.BufferGroup, allocator: std.mem.Allocator) void {
     registerBufRing(g.ring.fd, .UNREGISTER_PBUF_RING, 0, 0, g.group_id) catch {};
-    // Unregisters again (ENOENT, ignored), then unmaps and frees.
-    g.deinit(allocator);
+    const map: [*]align(std.heap.page_size_min) u8 = @ptrCast(g.br);
+    std.posix.munmap(map[0 .. @as(usize, g.buffers_count) * @sizeOf(linux.io_uring_buf)]);
+    allocator.free(g.buffers);
+    allocator.free(g.heads);
 }
 
 pub fn Worker(comptime Handler: type) type {
