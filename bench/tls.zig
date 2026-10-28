@@ -1,5 +1,6 @@
 //! Micro-benchmarks for TLS record protection. Run with `zig build bench-tls`
-//! (always built with -O fast).
+//! (always built with -O fast). `zig build bench-tls -- handshake` times the
+//! server's side of full handshakes instead (see `handshakes`).
 //!
 //! "std AEAD" seals and opens each record the way record.zig did before it
 //! kept expanded keys: std's AEAD API with the raw key, which expands the
@@ -43,7 +44,14 @@ fn nonce(p: *const Protection) [12]u8 {
     return n;
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
+    var args = init.args.iterate();
+    _ = args.next();
+    if (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "handshake")) return handshakes();
+        std.debug.print("unknown argument: {s}\n", .{arg});
+        return error.InvalidArgument;
+    }
     var buf: [record.max_record]u8 = undefined;
     var out: [record.max_plaintext + 1]u8 = undefined;
     const secret: [48]u8 = @splat(7);
@@ -98,5 +106,244 @@ pub fn main() !void {
                 report(@tagName(suite) ++ " openInto", size, iterations, t_into);
             }
         }
+    }
+}
+
+// -- Handshakes ---------------------------------------------------------------
+
+const handshake = per.internal.tls_handshake;
+const credentials = per.internal.tls_credentials;
+const p256 = per.internal.tls_p256;
+const x25519 = per.internal.tls_x25519;
+const tls = std.crypto.tls;
+const X25519 = std.crypto.dh.X25519;
+const P256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+const P384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
+const Ed25519 = std.crypto.sign.Ed25519;
+const MLKem768 = std.crypto.kem.ml_kem.MLKem768;
+
+/// Drops the handshake's output: only the server's CPU time is measured.
+const NullSink = struct {
+    pub const Error = error{};
+    pub fn handshakeData(_: *NullSink, _: handshake.Level, _: []const u8) Error!void {}
+    pub fn changeCipherSpec(_: *NullSink) Error!void {}
+    pub fn writeSecret(_: *NullSink, _: handshake.Level, _: record.Suite, _: []const u8) Error!void {}
+    pub fn readSecret(_: *NullSink, _: handshake.Level, _: record.Suite, _: []const u8) Error!void {}
+};
+
+/// A browser-like ClientHello offering one group, with a key share for it.
+fn clientHello(buf: []u8, group: tls.NamedGroup, share: []const u8) []const u8 {
+    var w: Writer = .{ .buf = buf };
+    w.int(u8, 1);
+    const msg = w.begin(u24);
+    w.int(u16, 0x0303);
+    w.fill(32, 0x11); // random
+    w.int(u8, 32);
+    w.fill(32, 0x22); // legacy_session_id (middlebox compatibility)
+    w.int(u16, 2);
+    w.int(u16, 0x1301);
+    w.int(u8, 1);
+    w.int(u8, 0);
+    const exts = w.begin(u16);
+    w.int(u16, @backingInt(tls.ExtensionType.supported_versions));
+    w.int(u16, 3);
+    w.int(u8, 2);
+    w.int(u16, 0x0304);
+    w.int(u16, @backingInt(tls.ExtensionType.supported_groups));
+    w.int(u16, 4);
+    w.int(u16, 2);
+    w.int(u16, @backingInt(group));
+    w.int(u16, @backingInt(tls.ExtensionType.signature_algorithms));
+    w.int(u16, 8);
+    w.int(u16, 6);
+    for ([_]u16{ 0x0403, 0x0503, 0x0807 }) |sa| w.int(u16, sa);
+    w.int(u16, @backingInt(tls.ExtensionType.key_share));
+    w.int(u16, @intCast(share.len + 6));
+    w.int(u16, @intCast(share.len + 4));
+    w.int(u16, @backingInt(group));
+    w.int(u16, @intCast(share.len));
+    w.bytes(share);
+    w.int(u16, @backingInt(tls.ExtensionType.application_layer_protocol_negotiation));
+    w.int(u16, 5);
+    w.int(u16, 3);
+    w.int(u8, 2);
+    w.bytes("h2");
+    w.end(u16, exts);
+    w.end(u24, msg);
+    return w.buf[0..w.pos];
+}
+
+const Writer = struct {
+    buf: []u8,
+    pos: usize = 0,
+
+    fn bytes(w: *Writer, b: []const u8) void {
+        @memcpy(w.buf[w.pos..][0..b.len], b);
+        w.pos += b.len;
+    }
+
+    fn fill(w: *Writer, n: usize, v: u8) void {
+        @memset(w.buf[w.pos..][0..n], v);
+        w.pos += n;
+    }
+
+    fn int(w: *Writer, comptime T: type, v: T) void {
+        std.mem.writeInt(T, w.buf[w.pos..][0..@divExact(@bitSizeOf(T), 8)], v, .big);
+        w.pos += @divExact(@bitSizeOf(T), 8);
+    }
+
+    fn begin(w: *Writer, comptime T: type) usize {
+        const at = w.pos;
+        w.pos += @divExact(@bitSizeOf(T), 8);
+        return at;
+    }
+
+    fn end(w: *Writer, comptime T: type, at: usize) void {
+        std.mem.writeInt(T, w.buf[at..][0..@divExact(@bitSizeOf(T), 8)], @intCast(w.pos - at - @divExact(@bitSizeOf(T), 8)), .big);
+    }
+};
+
+fn reportOp(name: []const u8, iterations: usize, ns: u64) void {
+    const us = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(iterations)) / 1000.0;
+    std.debug.print("{s:<44} {d:>9.1} µs  {d:>9.0} /s\n", .{ name, us, 1_000_000.0 / us });
+}
+
+/// The server's side of a full handshake (ClientHello in, its flight
+/// out: key exchange, key schedule, CertificateVerify signature), for each
+/// group and certificate type; then the primitives that dominate it.
+fn handshakes() !void {
+    const gpa = std.heap.smp_allocator;
+    const td = credentials.testdata;
+    var seeds: [64 * 6]u8 = undefined;
+    sys.randomBytes(&seeds);
+    const x_kp = X25519.KeyPair.generateDeterministic(seeds[0..32].*);
+    const p_kp = try P256.KeyPair.generateDeterministic(seeds[32..64].*);
+    const m_kp = try MLKem768.KeyPair.generateDeterministic(seeds[64..128].*);
+    var hybrid: [MLKem768.PublicKey.encoded_length + X25519.public_length]u8 = undefined;
+    hybrid[0..MLKem768.PublicKey.encoded_length].* = m_kp.public_key.toBytes();
+    hybrid[MLKem768.PublicKey.encoded_length..].* = x_kp.public_key;
+    const p_share = p_kp.public_key.toUncompressedSec1();
+    const groups = [_]struct { tls.NamedGroup, []const u8 }{
+        .{ .x25519, &x_kp.public_key },
+        .{ .secp256r1, &p_share },
+        .{ .x25519_ml_kem768, &hybrid },
+    };
+    const certs = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "ECDSA P-256", td.p256_cert, td.p256_key },
+        .{ "ECDSA P-384", td.p384_cert, td.p384_key },
+        .{ "Ed25519", td.ed25519_cert, td.ed25519_key },
+    };
+    var entropy: [handshake.entropy_len]u8 = undefined;
+    sys.randomBytes(&entropy);
+    var hello_buf: [2048]u8 = undefined;
+    for (certs) |c| {
+        var creds = try credentials.Credentials.fromPem(gpa, c[1], c[2]);
+        defer creds.deinit();
+        for (groups) |g| {
+            const config: handshake.Config = .{ .credentials = &creds, .alpn = &.{"h2"} };
+            const hello = clientHello(&hello_buf, g[0], g[1]);
+            const iterations = 2000;
+            const start = sys.nanoTimestamp();
+            for (0..iterations) |_| {
+                var hs = handshake.Handshake.init(gpa, &config, &entropy);
+                defer hs.deinit();
+                var sink: NullSink = .{};
+                try hs.feed(.initial, hello, &sink);
+                if (!hs.isRetrying() and hs.isDone()) unreachable;
+            }
+            var name_buf: [64]u8 = undefined;
+            reportOp(try std.fmt.bufPrint(&name_buf, "handshake {s}, {s}", .{ c[0], @tagName(g[0]) }), iterations, sys.nanoTimestamp() - start);
+        }
+    }
+    std.debug.print("\n", .{});
+    const n = 2000;
+    var seed: [32]u8 = @splat(5);
+    {
+        const start = sys.nanoTimestamp();
+        for (0..n) |i| {
+            seed[0] = @truncate(i);
+            const kp = X25519.KeyPair.generateDeterministic(seed);
+            std.mem.doNotOptimizeAway(try X25519.scalarmult(kp.secret_key, x_kp.public_key));
+        }
+        reportOp("X25519 key pair + shared secret (std)", n, sys.nanoTimestamp() - start);
+    }
+    {
+        const start = sys.nanoTimestamp();
+        for (0..n) |i| {
+            seed[0] = @truncate(i);
+            std.mem.doNotOptimizeAway(x25519.publicKey(seed));
+            std.mem.doNotOptimizeAway(try X25519.scalarmult(seed, x_kp.public_key));
+        }
+        reportOp("X25519 key pair (table) + shared secret", n, sys.nanoTimestamp() - start);
+    }
+    {
+        const start = sys.nanoTimestamp();
+        for (0..n) |i| {
+            seed[0] = @truncate(i);
+            const pk = try P256.PublicKey.fromSec1(&p_share);
+            const kp = try P256.KeyPair.generateDeterministic(seed);
+            const point = try pk.p.mulPublic(kp.secret_key.bytes, .big);
+            std.mem.doNotOptimizeAway(point.affineCoordinates().x.toBytes(.big));
+            std.mem.doNotOptimizeAway(kp.public_key.toUncompressedSec1());
+        }
+        reportOp("P-256 key pair + shared secret (std)", n, sys.nanoTimestamp() - start);
+    }
+    {
+        const start = sys.nanoTimestamp();
+        for (0..n) |i| {
+            seed[0] = @truncate(i);
+            const pk = try P256.PublicKey.fromSec1(&p_share);
+            const kp = try p256.keyPair(seed);
+            const point = try pk.p.mul(kp.secret_key, .big);
+            std.mem.doNotOptimizeAway(point.affineCoordinates().x.toBytes(.big));
+        }
+        reportOp("P-256 key pair (table) + shared secret (ct)", n, sys.nanoTimestamp() - start);
+    }
+    {
+        const start = sys.nanoTimestamp();
+        for (0..n) |i| {
+            seed[0] = @truncate(i);
+            const ek = try MLKem768.PublicKey.fromBytes(hybrid[0..MLKem768.PublicKey.encoded_length]);
+            std.mem.doNotOptimizeAway(ek.encapsDeterministic(&seed));
+        }
+        reportOp("ML-KEM-768 encapsulation (with key decoding)", n, sys.nanoTimestamp() - start);
+    }
+    const msg: [130]u8 = @splat(0x20);
+    {
+        const kp = try P256.KeyPair.generateDeterministic(seeds[128..160].*);
+        const start = sys.nanoTimestamp();
+        for (0..n) |i| {
+            seed[0] = @truncate(i);
+            std.mem.doNotOptimizeAway(try kp.sign(&msg, seed));
+        }
+        reportOp("ECDSA P-256 sign (std)", n, sys.nanoTimestamp() - start);
+    }
+    {
+        const kp = try P256.KeyPair.generateDeterministic(seeds[128..160].*);
+        const start = sys.nanoTimestamp();
+        for (0..n) |i| {
+            seed[0] = @truncate(i);
+            std.mem.doNotOptimizeAway(try p256.sign(kp, &msg, seed));
+        }
+        reportOp("ECDSA P-256 sign (table)", n, sys.nanoTimestamp() - start);
+    }
+    {
+        const kp = try P384.KeyPair.generateDeterministic(seeds[160..208].*);
+        var noise: [P384.noise_length]u8 = @splat(5);
+        const start = sys.nanoTimestamp();
+        for (0..n) |i| {
+            noise[0] = @truncate(i);
+            std.mem.doNotOptimizeAway(try kp.sign(&msg, noise));
+        }
+        reportOp("ECDSA P-384 sign", n, sys.nanoTimestamp() - start);
+    }
+    {
+        const kp = try Ed25519.KeyPair.generateDeterministic(seeds[208..240].*);
+        const start = sys.nanoTimestamp();
+        for (0..n) |i| {
+            seed[0] = @truncate(i);
+            std.mem.doNotOptimizeAway(try kp.sign(&msg, seed));
+        }
+        reportOp("Ed25519 sign", n, sys.nanoTimestamp() - start);
     }
 }

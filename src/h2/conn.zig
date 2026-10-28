@@ -3640,11 +3640,13 @@ fn fuzzConn(_: void, smith: *std.testing.Smith) anyerror!void {
 test "fuzz: h2 connection" {
     const script = try buildScript();
     defer testing.allocator.free(script);
-    try std.testing.fuzz({}, fuzzConn, .{ .corpus = &.{
-        script[frame.preface.len + frame.header_len ..],
-        &[_]u8{ 0, 0, 5, 1, 5, 0, 0, 0, 1, 0x82, 0x87, 0x84, 0x41, 0x00 },
-        &[_]u8{ 0, 0, 8, 6, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8 },
-        // Found by the fuzzer.
-        @embedFile("testdata/fuzz/split-1.bin"),
-    } });
+    try std.testing.fuzz({}, fuzzConn, .{
+        .corpus = &.{
+            script[frame.preface.len + frame.header_len ..],
+            &[_]u8{ 0, 0, 5, 1, 5, 0, 0, 0, 1, 0x82, 0x87, 0x84, 0x41, 0x00 },
+            &[_]u8{ 0, 0, 8, 6, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8 },
+            // Found by the fuzzer.
+            @embedFile("testdata/fuzz/split-1.bin"),
+        },
+    });
 }

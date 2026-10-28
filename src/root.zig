@@ -32,6 +32,10 @@ pub const internal = struct {
     pub const date = @import("./http/date.zig");
     pub const sys = @import("./sys.zig");
     pub const tls_record = @import("./tls/record.zig");
+    pub const tls_handshake = @import("./tls/handshake.zig");
+    pub const tls_credentials = @import("./tls/credentials.zig");
+    pub const tls_p256 = @import("./tls/p256.zig");
+    pub const tls_x25519 = @import("./tls/x25519.zig");
 };
 
 /// Websocket helpers
@@ -51,6 +55,8 @@ test {
     _ = @import("./tls/key_schedule.zig");
     _ = @import("./tls/record.zig");
     _ = @import("./tls/credentials.zig");
+    _ = @import("./tls/p256.zig");
+    _ = @import("./tls/x25519.zig");
     _ = @import("./tls/handshake.zig");
     _ = @import("./tls/conn.zig");
     _ = @import("./tls/fuzz.zig");

@@ -243,6 +243,7 @@ Ed25519, `std.crypto.tls` enums and `hkdfExpandLabel`.
 | `record.zig` | Record protection: AEAD with per-record nonce (IV xor sequence number), record header as AAD, inner content type and padding removal, record size limits |
 | `conn.zig` | `tls.Conn`: one TLS-over-TCP connection. Buffers ciphertext like `Session` does (pooled, held only while unprocessed), drives the handshake, decrypts application data for the HTTP/WebSocket layers and encrypts their output into a wire buffer |
 | `credentials.zig` | PEM/DER loading of the certificate chain and private key; signing CertificateVerify |
+| `p256.zig`, `x25519.zig` | Base-point tables: ECDSA P-256 signing, P-256 ECDHE key pairs, X25519 public keys |
 | `fuzz.zig` | Fuzz target over `tls.Conn`: a scripted client (see the checklist) |
 
 The handshake keeps a running transcript hash, not the transcript, and its state is
@@ -375,8 +376,35 @@ Later in M4:
       copied and borrowed, with the borrowed buffer poisoned afterwards. The gain
       was within noise: the copy wasn't what made uploads slower on io_uring,
       because plaintext uploads have the same gap (see M2)
-- [ ] Faster handshakes: measure on Linux; candidates are P-256 signing, ML-KEM
-      encapsulation, and the per-handshake allocations (handshake state, flight buffer)
+- [x] **Faster handshakes**, step 1: precomputed base-point tables.
+      `zig build bench-tls -- handshake` times the server's side of a full
+      handshake (ClientHello in, flight out) per group and certificate, and
+      the primitives. On Linux (one core of the M2 Pro, two rounds), a
+      P-256 certificate with X25519MLKEM768 (what browsers send) took
+      197-208 µs, of which ECDSA P-256 signing was 114 µs, X25519 60 µs and
+      ML-KEM-768 25 µs. The fixed-base multiplications were std's 4-bit
+      window (P-256: 64 additions and 252 doublings) and the Montgomery
+      ladder (X25519 key generation). `src/tls/p256.zig` and `x25519.zig`
+      hold tables of 1..8 × 16^i × G for each of 65 signed 4-bit digits
+      (P-256 in affine coordinates, 33 KB; Curve25519 as Edwards
+      (y+x, y−x, 2dxy), 62 KB; built once on first use, one inversion
+      each), so k × G is 65 mixed additions with a whole-row constant-time
+      scan per digit. The X25519 public key is the u-coordinate of the
+      Edwards result. Everything else is std's (fields, scalars, formulas,
+      the hedged deterministic nonce), so signatures, key pairs and X25519
+      public keys equal std's byte for byte (tested on 300+ random inputs,
+      edge scalars, RFC 7748's vectors). The P-256 ECDHE shared secret now
+      uses std's constant-time `mul`; it used the variable-time `mulPublic`
+      on our ephemeral secret. Results (µs per handshake, before → after):
+      P-256 cert with X25519MLKEM768 197-208 → 112-117 (1.8x), with X25519
+      174-188 → 85 (2.1x), with P-256 310-317 → 178-204; ECDSA P-256 sign
+      114 → 40, X25519 key pair + shared secret 60 → 41. Interop: OpenSSL
+      3.5 verifies the CertificateVerify with each group, curl over HTTP/2
+      and HTTP/3
+- [ ] Faster handshakes, next: the X25519 shared secret (std's ladder,
+      ~30 µs), P-256's variable-base `mul` for ECDHE, ML-KEM-768
+      encapsulation (25 µs), the per-handshake allocations (handshake state,
+      flight buffer); P-384 signing (315 µs) if P-384 certificates matter
 - [x] Send KeyUpdate before the AES-GCM record limit: after 2^24 records under one
       key (the power of two below §5.5's 2^24.5), for every suite (only AES-GCM needs
       it, one rule is simpler), `update_not_requested`, only when the wire buffer has

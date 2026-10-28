@@ -5,6 +5,7 @@ const SignatureScheme = std.crypto.tls.SignatureScheme;
 const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const EcdsaP384Sha384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 const Ed25519 = std.crypto.sign.Ed25519;
+const p256 = @import("./p256.zig");
 
 pub const max_signature_len = EcdsaP384Sha384.Signature.der_encoded_length_max;
 pub const noise_len = EcdsaP384Sha384.noise_length;
@@ -27,8 +28,10 @@ pub const PrivateKey = union(enum) {
     /// `noise` hardens the deterministic nonce against fault attacks.
     pub fn sign(self: *const PrivateKey, msg: []const u8, noise: [noise_len]u8, out: *[max_signature_len]u8) ![]const u8 {
         switch (self.*) {
-            inline .ecdsa_p256, .ecdsa_p384 => |kp| {
-                const sig = try kp.sign(msg, noise[0..@TypeOf(kp.secret_key).encoded_length].*);
+            inline .ecdsa_p256, .ecdsa_p384 => |kp, tag| {
+                // P-256 with the base point table (the same signature as
+                // std's, about 3x faster).
+                const sig = if (tag == .ecdsa_p256) try p256.sign(kp, msg, noise[0..32].*) else try kp.sign(msg, noise[0..@TypeOf(kp.secret_key).encoded_length].*);
                 var der: [@TypeOf(sig).der_encoded_length_max]u8 = undefined;
                 const enc = sig.toDer(&der);
                 @memcpy(out[0..enc.len], enc);

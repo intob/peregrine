@@ -24,6 +24,8 @@ const tls = std.crypto.tls;
 const record = @import("./record.zig");
 const errors = @import("./errors.zig");
 const credentials = @import("./credentials.zig");
+const p256_base = @import("./p256.zig");
+const x25519_base = @import("./x25519.zig");
 const Credentials = credentials.Credentials;
 const Error = errors.Error;
 const Suite = record.Suite;
@@ -569,9 +571,10 @@ const KeyExchange = struct {
 
     fn x25519(self: *KeyExchange, client: []const u8, seed: *const [32]u8) Error!void {
         if (client.len != X25519.public_length) return error.IllegalParameter;
-        const kp = X25519.KeyPair.generateDeterministic(seed.*);
-        const shared = X25519.scalarmult(kp.secret_key, client[0..32].*) catch return error.IllegalParameter;
-        @memcpy(self.share_buf[self.share_len..][0..32], &kp.public_key);
+        // The public key from a table (std's ladder gives the same).
+        const public = x25519_base.publicKey(seed.*);
+        const shared = X25519.scalarmult(seed.*, client[0..32].*) catch return error.IllegalParameter;
+        @memcpy(self.share_buf[self.share_len..][0..32], &public);
         self.share_len += 32;
         @memcpy(self.shared_buf[self.shared_len..][0..32], &shared);
         self.shared_len += 32;
@@ -584,10 +587,11 @@ const KeyExchange = struct {
                 // Only the uncompressed form is allowed (RFC 8446 §4.2.8.2).
                 if (share.key_exchange.len != 65 or share.key_exchange[0] != 4) return error.IllegalParameter;
                 const pk = EcdsaP256Sha256.PublicKey.fromSec1(share.key_exchange) catch return error.IllegalParameter;
-                const kp = EcdsaP256Sha256.KeyPair.generateDeterministic(entropy[64..96].*) catch return error.InternalError;
-                const point = pk.p.mulPublic(kp.secret_key.bytes, .big) catch return error.IllegalParameter;
+                const kp = p256_base.keyPair(entropy[64..96].*) catch return error.InternalError;
+                // Constant time: the scalar is our secret.
+                const point = pk.p.mul(kp.secret_key, .big) catch return error.IllegalParameter;
                 const shared = point.affineCoordinates().x.toBytes(.big);
-                const public = kp.public_key.toUncompressedSec1();
+                const public = kp.public_key;
                 @memcpy(self.share_buf[0..public.len], &public);
                 self.share_len = public.len;
                 @memcpy(self.shared_buf[0..shared.len], &shared);

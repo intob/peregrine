@@ -68,8 +68,10 @@ pub fn build(b: *std.Build) !void {
             .imports = &.{.{ .name = "peregrine", .module = lib }},
         }),
     });
-    const bench_tls_step = b.step("bench-tls", "Run TLS record micro-benchmarks");
-    bench_tls_step.dependOn(&b.addRunArtifact(bench_tls).step);
+    const bench_tls_step = b.step("bench-tls", "Run TLS micro-benchmarks (`-- handshake` for handshakes)");
+    const bench_tls_run = b.addRunArtifact(bench_tls);
+    bench_tls_run.addPassthruArgs();
+    bench_tls_step.dependOn(&bench_tls_run.step);
 
     // Load-test target: zig build bench-server [-Dtarget=...]
     const bench_server = b.addExecutable(.{
