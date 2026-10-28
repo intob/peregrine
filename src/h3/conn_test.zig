@@ -178,6 +178,8 @@ const Harness = struct {
     qdec: qpack.Decoder,
     h3_opts: h3.Options = .{},
     pool: BufferPool,
+    /// The client's control stream (after `startClient`).
+    control: u64 = 0,
 
     fn init() !*Harness {
         const a = testing.allocator;
@@ -318,6 +320,7 @@ const Harness = struct {
     fn startClient(h: *Harness) !void {
         try h.run(10);
         const control = try h.client.openUni();
+        h.control = control;
         try h.client.write(control, &.{ 0x00, 0x04, 0x03, 0x06, 0x50, 0x00 }, false);
         const enc = try h.client.openUni();
         try h.client.write(enc, &.{0x02}, false);
@@ -935,6 +938,162 @@ test "HTTP/3: unknown stream types and frame types are ignored" {
     try testing.expect(h.client.closed == null);
 }
 
+/// A PRIORITY_UPDATE frame (RFC 9218 §7.2), for the control stream.
+fn priorityUpdate(buf: []u8, t: frame.FrameType, id: u64, value: []const u8) []const u8 {
+    var w: packet.Writer = .{ .buf = buf };
+    frame.writeHeader(&w, t, packet.varintLen(id) + value.len);
+    w.varint(id);
+    w.bytes(value);
+    return w.written();
+}
+
+fn serverUrgency(h: *Harness, id: u64) struct { u3, bool } {
+    const s = &h.server.?.streams[h.server.?.stream_map.get(id).?];
+    return .{ s.urgency, s.incremental };
+}
+
+test "HTTP/3 priorities (RFC 9218): urgency first, incremental streams share" {
+    const h = try Harness.init();
+    defer h.deinit();
+    const big = try testing.allocator.alloc(u8, 200_000);
+    defer testing.allocator.free(big);
+    @memset(big, 'b');
+    h.handler.big = big;
+    try h.startClient();
+    try h.run(10);
+    // All dispatched before the server sends: the congestion window then
+    // limits each round, and QUIC picks what goes in each packet.
+    const lazy = try h.request("GET", "/big", &.{.{ .name = "priority", .value = "u=7" }}, "");
+    const first = try h.request("GET", "/big", &.{.{ .name = "priority", .value = "u=0" }}, "");
+    const normal = try h.request("GET", "/big", &.{}, "");
+    const inc1 = try h.request("GET", "/big", &.{.{ .name = "priority", .value = "u=1, i" }}, "");
+    const inc2 = try h.request("GET", "/big", &.{.{ .name = "priority", .value = "u=1, i" }}, "");
+    var shared = false;
+    for (0..2000) |_| {
+        try h.run(1);
+        const got = struct {
+            fn f(c: *Client, id: u64) usize {
+                return c.readAll(id).len;
+            }
+        }.f;
+        const done = struct {
+            fn f(c: *Client, id: u64) bool {
+                return c.finished(id);
+            }
+        }.f;
+        // Nothing for a stream while a more urgent one is unfinished.
+        if (!done(h.client, first)) try testing.expectEqual(@as(usize, 0), got(h.client, inc1) + got(h.client, inc2) + got(h.client, normal) + got(h.client, lazy));
+        if (!done(h.client, inc1) or !done(h.client, inc2)) try testing.expectEqual(@as(usize, 0), got(h.client, normal) + got(h.client, lazy));
+        if (!done(h.client, normal)) try testing.expectEqual(@as(usize, 0), got(h.client, lazy));
+        // The incremental pair is part-sent together at some point.
+        if (got(h.client, inc1) > 0 and got(h.client, inc2) > 0 and !done(h.client, inc1) and !done(h.client, inc2)) shared = true;
+        if (done(h.client, lazy)) break;
+    }
+    try testing.expect(shared);
+    for ([_]u64{ lazy, first, normal, inc1, inc2 }) |id| {
+        var r = try h.response(id);
+        defer r.deinit();
+        try testing.expectEqual(big.len, r.body.items.len);
+    }
+}
+
+test "HTTP/3 priorities: PRIORITY_UPDATE before and after the request, header parsing" {
+    const h = try Harness.init();
+    defer h.deinit();
+    try h.startClient();
+    try h.run(10);
+    var buf: [64]u8 = undefined;
+    // For idle stream 4 (stream 0 comes first): it wins over the header.
+    try h.client.write(h.control, priorityUpdate(&buf, .priority_update_request, 4, "u=6, i"), false);
+    try h.client.write(h.control, priorityUpdate(&buf, .priority_update_request, 4, "u=5, i"), false);
+    try h.client.write(h.control, priorityUpdate(&buf, .priority_update_request, 4, "u=x="), false); // ignored
+    try h.run(10);
+    const a = try h.request("GET", "/later", &.{.{ .name = "priority", .value = "u=2" }}, "");
+    const b = try h.request("GET", "/later", &.{.{ .name = "priority", .value = "u=0" }}, "");
+    const c = try h.request("GET", "/later", &.{ .{ .name = "priority", .value = "u=1" }, .{ .name = "priority", .value = "i" } }, "");
+    const d = try h.request("GET", "/later", &.{.{ .name = "priority", .value = "u=1;" }}, "");
+    try h.run(10);
+    try testing.expectEqual(.{ 2, false }, serverUrgency(h, a));
+    try testing.expectEqual(.{ 5, true }, serverUrgency(h, b));
+    try testing.expectEqual(.{ 1, true }, serverUrgency(h, c));
+    try testing.expectEqual(.{ 3, false }, serverUrgency(h, d));
+    // An open stream.
+    try h.client.write(h.control, priorityUpdate(&buf, .priority_update_request, a, "u=0"), false);
+    try h.run(10);
+    try testing.expectEqual(.{ 0, false }, serverUrgency(h, a));
+    try testing.expect(h.client.closed == null);
+}
+
+test "HTTP/3 priorities: PRIORITY_UPDATE errors" {
+    // A push ID: we never push.
+    try expectConnectionError(0x108, struct {
+        fn f(h: *Harness) !void {
+            try h.startClient();
+            var buf: [32]u8 = undefined;
+            try h.client.write(h.control, priorityUpdate(&buf, .priority_update_push, 0, "u=1"), false);
+        }
+    }.f);
+    // Not a request stream.
+    try expectConnectionError(0x108, struct {
+        fn f(h: *Harness) !void {
+            try h.startClient();
+            var buf: [32]u8 = undefined;
+            try h.client.write(h.control, priorityUpdate(&buf, .priority_update_request, 2, "u=1"), false);
+        }
+    }.f);
+    // Beyond the stream limit.
+    try expectConnectionError(0x108, struct {
+        fn f(h: *Harness) !void {
+            try h.startClient();
+            var buf: [32]u8 = undefined;
+            try h.client.write(h.control, priorityUpdate(&buf, .priority_update_request, 4 * 1000, "u=1"), false);
+        }
+    }.f);
+    // On a request stream.
+    try expectConnectionError(0x105, struct {
+        fn f(h: *Harness) !void {
+            try h.startClient();
+            var buf: [32]u8 = undefined;
+            const id = try h.client.openBidi();
+            try h.client.write(id, priorityUpdate(&buf, .priority_update_request, id, "u=1"), false);
+        }
+    }.f);
+    // Before SETTINGS.
+    try expectConnectionError(0x10a, struct {
+        fn f(h: *Harness) !void {
+            var buf: [32]u8 = undefined;
+            const c = try h.client.openUni();
+            try h.client.write(c, &.{0x00}, false);
+            try h.client.write(c, priorityUpdate(&buf, .priority_update_request, 0, "u=1"), false);
+        }
+    }.f);
+}
+
+test "HTTP/3 priorities: an exchange waiting behind other streams doesn't time out" {
+    const h = try Harness.init();
+    defer h.deinit();
+    const big = try testing.allocator.alloc(u8, 500_000);
+    defer testing.allocator.free(big);
+    @memset(big, 'b');
+    h.handler.big = big;
+    try h.startClient();
+    try h.run(10);
+    _ = try h.request("GET", "/big", &.{.{ .name = "priority", .value = "u=0" }}, "");
+    const waiting = try h.request("GET", "/stream", &.{.{ .name = "priority", .value = "u=7" }}, "");
+    try h.run(1);
+    const ex = h.handler.exchanges.items[0];
+    try ex.write("behind");
+    h.drainMailbox();
+    const c = h.ctx();
+    h.h3c.?.onExchangeTimeout(TestHandler, &c, ex.slot);
+    try testing.expect(ex.isOpen());
+    try testing.expectEqual(h.now + 11, h.slab.entry(ex.slot).deadline);
+    try h.run(400);
+    var r = try h.response(waiting);
+    defer r.deinit();
+    try testing.expectEqualStrings("behind", r.body.items);
+}
+
 test "HTTP/3: GOAWAY finishes requests in flight, then closes" {
     const h = try Harness.init();
     defer h.deinit();
@@ -978,7 +1137,7 @@ fn fuzzH3(_: void, smith: *std.testing.Smith) anyerror!void {
         const op = smith.value(u8);
         const n = smith.slice(data[0..@min(data.len, 1 + @as(usize, smith.value(u8)) * 2)]);
         const bytes = data[0..n];
-        switch (op % 6) {
+        switch (op % 7) {
             0 => try h.client.injectFrames(bytes),
             1 => {
                 if (nids < ids.len) {
@@ -1003,7 +1162,7 @@ fn fuzzH3(_: void, smith: *std.testing.Smith) anyerror!void {
             4 => {
                 // A well-formed request, or a WebSocket.
                 if (nids < ids.len) {
-                    ids[nids] = if (op & 0x40 != 0) try connectWs(h, "/ws") else try h.request("GET", "/", &.{}, "");
+                    ids[nids] = if (op & 0x40 != 0) try connectWs(h, "/ws") else try h.request("GET", "/", &.{.{ .name = "priority", .value = bytes[0..@min(bytes.len, 32)] }}, "");
                     nids += 1;
                 }
             },
@@ -1013,6 +1172,12 @@ fn fuzzH3(_: void, smith: *std.testing.Smith) anyerror!void {
                 const id = ids[smith.value(u8) % nids];
                 if ((try h.client.getStream(id)).send.fin) continue;
                 try wsSend(h, id, @fromBackingInt(@as(u4, @truncate(op >> 3))), bytes, op & 0x80 != 0);
+            },
+            6 => {
+                // PRIORITY_UPDATE for one of our streams, or any ID.
+                const id = if (nids > 0 and op & 0x80 != 0) ids[smith.value(u8) % nids] else smith.value(u16);
+                var buf: [600]u8 = undefined;
+                try h.client.write(h.control, priorityUpdate(&buf, if (op & 0x40 != 0) .priority_update_push else .priority_update_request, id, bytes), false);
             },
             else => {},
         }

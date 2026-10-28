@@ -19,6 +19,7 @@ const quic = @import("../quic/conn.zig");
 const packet = @import("../quic/packet.zig");
 const frame = @import("./frame.zig");
 const qpack = @import("./qpack.zig");
+const Priority = @import("../http/priority.zig").Priority;
 const fields_mod = @import("../http/fields.zig");
 const parser = @import("../http/parser.zig");
 const date = @import("../http/date.zig");
@@ -90,6 +91,8 @@ pub fn Context(comptime Handler: type) type {
     };
 }
 
+const IdlePriority = struct { id: u64, prio: Priority };
+
 const UniKind = enum(u8) { unknown, control, qpack_encoder, qpack_decoder, ignored };
 
 const Phase = enum(u8) {
@@ -136,6 +139,10 @@ const Stream = struct {
     ws_held: bool = false,
     /// The client finished its side (FIN), all of it read.
     ws_peer_done: bool = false,
+    /// RFC 9218: from the `priority` header, or PRIORITY_UPDATE.
+    prio: Priority = .{},
+    /// A PRIORITY_UPDATE set `prio`: it overrides the header.
+    prio_frame: bool = false,
 
     fn clear(s: *Stream) void {
         s.fields.clear();
@@ -167,6 +174,9 @@ pub const Conn = struct {
     failed: bool = false,
     /// Request streams with an exchange (a scan hint for pumping).
     exchanges: u32 = 0,
+    /// PRIORITY_UPDATEs for request streams not opened yet (RFC 9218 §7).
+    idle_prio: []IdlePriority,
+    idle_prio_len: u32 = 0,
 
     pub fn init(allocator: Allocator, opts: Options, q: *quic.Conn) !*Self {
         const self = try allocator.create(Self);
@@ -174,9 +184,11 @@ pub const Conn = struct {
         const streams = try allocator.alloc(Stream, q.streams.len);
         errdefer allocator.free(streams);
         @memset(streams, .{});
+        const idle_prio = try allocator.alloc(IdlePriority, q.streams.len);
+        errdefer allocator.free(idle_prio);
         var decoder = try qpack.Decoder.init(allocator, opts.qpack);
         errdefer decoder.deinit();
-        self.* = .{ .allocator = allocator, .opts = opts, .quic = q, .streams = streams, .decoder = decoder };
+        self.* = .{ .allocator = allocator, .opts = opts, .quic = q, .streams = streams, .decoder = decoder, .idle_prio = idle_prio };
         try self.enc_buf.ensureTotalCapacity(allocator, 1024);
         return self;
     }
@@ -184,6 +196,7 @@ pub const Conn = struct {
     pub fn deinit(self: *Self) void {
         for (self.streams) |*s| s.fields.deinit(self.allocator);
         self.allocator.free(self.streams);
+        self.allocator.free(self.idle_prio);
         self.decoder.deinit();
         self.enc_buf.deinit(self.allocator);
         self.allocator.destroy(self);
@@ -317,7 +330,77 @@ pub const Conn = struct {
             return;
         }
         self.active_requests += 1;
+        if (self.takeIdlePriority(id)) |p| {
+            s.prio = p;
+            s.prio_frame = true;
+            self.syncPriority(slot);
+        }
         _ = now_us;
+    }
+
+    /// RFC 9218 §7.2, on the control stream.
+    fn onPriorityUpdate(self: *Self, t: frame.FrameType, payload: []const u8, now_us: u64) void {
+        var r: packet.Reader = .{ .data = payload };
+        const id = r.varint() catch return self.fail(.frame_error, "", now_us);
+        // We never push, so no push ID can be valid.
+        if (t == .priority_update_push) return self.fail(.id_error, "PRIORITY_UPDATE for a push", now_us);
+        if (id & 3 != 0) return self.fail(.id_error, "PRIORITY_UPDATE for a non-request stream", now_us);
+        var p: Priority = .{};
+        if (!p.apply(payload[r.pos..])) return; // ignored
+        switch (self.quic.requestStream(id)) {
+            .over_limit => return self.fail(.id_error, "PRIORITY_UPDATE beyond the stream limit", now_us),
+            .closed => {},
+            .open => |slot| {
+                const s = &self.streams[slot];
+                // Opened by QUIC, its event not yet seen: kept like an
+                // idle stream's.
+                if (!s.active) return self.keepIdlePriority(id, p);
+                if (!s.request) return;
+                s.prio = p;
+                s.prio_frame = true;
+                self.syncPriority(slot);
+            },
+            .idle => self.keepIdlePriority(id, p),
+        }
+    }
+
+    fn keepIdlePriority(self: *Self, id: u64, p: Priority) void {
+        for (self.idle_prio[0..self.idle_prio_len]) |*e| {
+            if (e.id == id) {
+                e.prio = p;
+                return;
+            }
+        }
+        // Full (as many as there are stream slots): the oldest goes.
+        if (self.idle_prio_len == self.idle_prio.len) {
+            std.mem.copyForwards(IdlePriority, self.idle_prio[0 .. self.idle_prio.len - 1], self.idle_prio[1..]);
+            self.idle_prio_len -= 1;
+        }
+        self.idle_prio[self.idle_prio_len] = .{ .id = id, .prio = p };
+        self.idle_prio_len += 1;
+    }
+
+    /// The update kept for a stream that opened. Those for lower IDs are
+    /// dropped: the streams opened before it, or were never used.
+    fn takeIdlePriority(self: *Self, id: u64) ?Priority {
+        var found: ?Priority = null;
+        var kept: u32 = 0;
+        for (self.idle_prio[0..self.idle_prio_len]) |e| {
+            if (e.id == id) found = e.prio;
+            if (e.id <= id) continue;
+            self.idle_prio[kept] = e;
+            kept += 1;
+        }
+        self.idle_prio_len = kept;
+        return found;
+    }
+
+    /// Hands the stream's priority to QUIC, which orders what it sends by
+    /// it. A tunnel never ends, so it shares rather than holding back later
+    /// streams (RFC 9218 §10.1).
+    fn syncPriority(self: *Self, slot: u32) void {
+        const s = &self.streams[slot];
+        self.quic.streamSetPriority(slot, s.prio.urgency, s.prio.incremental or s.fields.isExtendedConnect());
     }
 
     /// Frees a non-request stream (the peer's unidirectional ones).
@@ -421,7 +504,7 @@ pub const Conn = struct {
             const t = h.type;
             if (!s.settings_seen and t != .settings) return self.fail(.missing_settings, "", now_us);
             switch (t) {
-                .settings, .goaway, .max_push_id, .cancel_push => {
+                .settings, .goaway, .max_push_id, .cancel_push, .priority_update_request, .priority_update_push => {
                     if (h.len > self.opts.max_control_frame) return self.fail(.excessive_load, "control frame too large", now_us);
                     if (data.len < h.size + h.len) break;
                     const payload = data[h.size..][0..@intCast(h.len)];
@@ -433,6 +516,10 @@ pub const Conn = struct {
                                 error.Settings => .settings_error,
                                 error.Frame => .frame_error,
                             }, "", now_us);
+                        },
+                        .priority_update_request, .priority_update_push => {
+                            self.onPriorityUpdate(t, payload, now_us);
+                            if (self.failed) return;
                         },
                         else => {
                             // GOAWAY (a push ID: we never push), MAX_PUSH_ID,
@@ -544,6 +631,10 @@ pub const Conn = struct {
                         s.fields.endHead(self.allocator) catch return self.fail(.internal_error, "", ctx.now_us);
                         q.streamConsume(slot, h.size + section.len);
                         s.phase = .body;
+                        // A PRIORITY_UPDATE sent before the request is the
+                        // newer signal.
+                        if (!s.prio_frame) s.prio = s.fields.priority();
+                        self.syncPriority(slot);
                         if (s.fields.isExtendedConnect()) {
                             // Answered now; DATA is the tunnel's.
                             s.tunnel = true;
@@ -590,7 +681,7 @@ pub const Conn = struct {
                     s.frame_type = .data;
                     s.frame_left = h.len;
                 },
-                .cancel_push, .settings, .goaway, .max_push_id, .push_promise => return self.fail(.frame_unexpected, "on a request stream", ctx.now_us),
+                .cancel_push, .settings, .goaway, .max_push_id, .push_promise, .priority_update_request, .priority_update_push => return self.fail(.frame_unexpected, "on a request stream", ctx.now_us),
                 _ => {
                     if (h.type.reservedH2()) return self.fail(.frame_unexpected, "HTTP/2 frame type", ctx.now_us);
                     q.streamConsume(slot, h.size);
@@ -877,6 +968,9 @@ pub const Conn = struct {
         if (stream_slot >= self.streams.len) return;
         const s = &self.streams[stream_slot];
         if (!s.active or s.exchange != slot) return;
+        // Its output waits behind other streams (or for the congestion
+        // window), not for the client's flow control.
+        if (self.quic.streamWaiting(stream_slot)) return ctx.exchanges.postpone(slot, ctx.now);
         // A WebSocket's output stalled, or the peer never answered our
         // close frame.
         if (s.ws != null) return self.streamError(ctx, stream_slot, .request_cancelled);

@@ -1464,7 +1464,7 @@ const H2Client = struct {
                             r.rst = rs.code;
                             r.done = true;
                         },
-                        .window_update, .continuation, .priority, .unknown => {},
+                        .window_update, .continuation, .priority, .priority_update, .unknown => {},
                     },
                 }
             }

@@ -312,6 +312,13 @@ pub const Slab = struct {
         e.tunnel_timed = stalled or closing;
     }
 
+    /// Worker thread: the exchange's output waits behind other streams of
+    /// its connection (HTTP/2 and HTTP/3 priorities), not for the client.
+    /// Its expired deadline moves on by the request timeout.
+    pub fn postpone(self: *Self, slot: u32, now: u32) void {
+        self.entries[slot].deadline = now +% self.opts.request_timeout_s +% 1;
+    }
+
     /// Worker thread, for `resp.stream()`: the head goes out with the
     /// session's response, so the body may be written at once.
     pub fn beginStream(self: *Self, slot: u32, content_length: ?usize) void {

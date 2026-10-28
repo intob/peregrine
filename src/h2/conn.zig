@@ -20,6 +20,7 @@ const parser = @import("../http/parser.zig");
 const date = @import("../http/date.zig");
 const exchange = @import("../http/exchange.zig");
 const fields_mod = @import("../http/fields.zig");
+const Priority = @import("../http/priority.zig").Priority;
 const BufferPool = @import("../http/session.zig").BufferPool;
 const ws = @import("../ws/conn.zig");
 const sys = @import("../sys.zig");
@@ -167,6 +168,14 @@ const Stream = struct {
     ws: ?*ws.Conn = null,
     /// The WebSocket has output the windows (or `out_limit`) held back.
     ws_pending: bool = false,
+    /// RFC 9218: from the `priority` header, or PRIORITY_UPDATE.
+    prio: Priority = .{},
+    /// A PRIORITY_UPDATE set `prio`: it overrides the header.
+    prio_frame: bool = false,
+    /// Has output that waits for room in `out` or for the connection
+    /// window (not for its own window), or behind more urgent streams.
+    /// Less urgent streams wait for it (see `pumpStream`).
+    blocked: bool = false,
 
     fn clear(s: *Stream) void {
         s.req.clearRetainingCapacity();
@@ -181,6 +190,40 @@ const Stream = struct {
 
     inline fn hasOutput(s: *const Stream) bool {
         return s.pending_pos < s.pending.items.len or s.pending_end or s.exchange != NIL;
+    }
+
+    /// The priority output is scheduled by. A tunnel never ends, so it
+    /// shares rather than holding back later streams (RFC 9218 §10.1).
+    fn schedPriority(s: *const Stream) Priority {
+        var p = s.prio;
+        if (s.tunnel) p.incremental = true;
+        return p;
+    }
+
+    /// Sending order (RFC 9218 §10): more urgent first; at one urgency,
+    /// non-incremental streams in stream order, then incremental ones.
+    fn sendsBefore(a: *const Stream, b: *const Stream) bool {
+        const pa = a.schedPriority();
+        const pb = b.schedPriority();
+        if (pa.before(pb) or pb.before(pa)) return pa.before(pb);
+        return a.id < b.id;
+    }
+
+    /// The `priority` header lines (names are lowercase by now).
+    fn headerPriority(s: *const Stream) Priority {
+        const Lines = struct {
+            s: *const Stream,
+            i: usize = 0,
+            pub fn next(it: *@This()) ?[]const u8 {
+                while (it.i < it.s.hdr_count) {
+                    const h = it.s.hdr[it.i];
+                    it.i += 1;
+                    if (std.mem.eql(u8, it.s.req.items[h.name_off..][0..h.name_len], "priority")) return it.s.slice(h);
+                }
+                return null;
+            }
+        };
+        return Priority.fromLines(Lines{ .s = s });
     }
 
     fn slice(s: *const Stream, ref: HeaderRef) []const u8 {
@@ -219,6 +262,11 @@ const State = enum(u8) {
 /// how it closed: frames after END_STREAM are a connection error, after
 /// the peer's RST_STREAM a stream error, after our RST_STREAM ignored.
 const Closed = struct { id: u31 = 0, how: How = .ended };
+const IdlePriority = struct { id: u31, prio: Priority };
+
+/// DATA bytes an incremental stream sends before the next one of its
+/// urgency takes a turn.
+const share_quantum = 16 * 1024;
 const How = enum(u8) { ended, peer_reset, we_reset };
 
 pub const Conn = struct {
@@ -275,6 +323,17 @@ pub const Conn = struct {
     conn_stalled_since: u32 = 0,
     conn_stalled: bool = false,
 
+    /// Streams with `blocked` set.
+    blocked_count: u32 = 0,
+    /// Scratch for `pumpAll`: stream slots in sending order.
+    order: []u32,
+    /// Per urgency: the incremental stream served last, so the next pass
+    /// starts after it.
+    rr_last: [8]u31 = @splat(0),
+    /// PRIORITY_UPDATEs for streams not yet opened (RFC 9218 §7).
+    idle_prio: []IdlePriority,
+    idle_prio_len: u32 = 0,
+
     pub fn init(allocator: std.mem.Allocator, opts: Options) !Self {
         var decoder = try hpack.Decoder.init(allocator, opts.hpack);
         errdefer decoder.deinit();
@@ -283,6 +342,10 @@ pub const Conn = struct {
         const streams = try allocator.alloc(Stream, opts.max_concurrent_streams);
         errdefer allocator.free(streams);
         @memset(streams, .{});
+        const order = try allocator.alloc(u32, opts.max_concurrent_streams);
+        errdefer allocator.free(order);
+        const idle_prio = try allocator.alloc(IdlePriority, opts.max_concurrent_streams);
+        errdefer allocator.free(idle_prio);
         var self: Self = .{
             .allocator = allocator,
             .opts = opts,
@@ -290,6 +353,8 @@ pub const Conn = struct {
             .decoder = decoder,
             .encoder = encoder,
             .streams = streams,
+            .order = order,
+            .idle_prio = idle_prio,
         };
         errdefer self.out.deinit(allocator);
         // Our preface: SETTINGS, then a larger connection window.
@@ -299,6 +364,8 @@ pub const Conn = struct {
             .{ .id = .initial_window_size, .value = @min(opts.initial_window_size, frame.max_window_size) },
             .{ .id = .max_frame_size, .value = opts.max_frame_size },
             .{ .id = .max_header_list_size, .value = opts.hpack.max_header_list_size },
+            // RFC 9218 replaces RFC 7540's priority tree.
+            .{ .id = .no_rfc7540_priorities, .value = 1 },
             .{ .id = .enable_connect_protocol, .value = 1 },
         };
         var n = try frame.writeSettings(&buf, settings[0 .. settings.len - @intFromBool(!opts.enable_connect_protocol)]);
@@ -319,6 +386,8 @@ pub const Conn = struct {
         self.reader.deinit(pool);
         for (self.streams) |*s| s.free(self.allocator);
         self.allocator.free(self.streams);
+        self.allocator.free(self.order);
+        self.allocator.free(self.idle_prio);
         self.decoder.deinit();
         self.encoder.deinit();
         self.out.deinit(self.allocator);
@@ -459,6 +528,7 @@ pub const Conn = struct {
             self.hb_stream = 0;
             self.hb_slot = NIL;
         }
+        self.setBlocked(s, false);
         self.closed_ring[self.closed_pos] = .{ .id = s.id, .how = how };
         self.closed_pos = (self.closed_pos + 1) % self.closed_ring.len;
         s.active = false;
@@ -596,6 +666,7 @@ pub const Conn = struct {
                 _ = g;
             },
             .window_update => |w| self.onWindowUpdate(Handler, ctx, w),
+            .priority_update => |u| self.onPriorityUpdate(u),
             .unknown => self.countControl(),
         }
     }
@@ -625,6 +696,50 @@ pub const Conn = struct {
         _ = frame.writeSettingsAck(&buf) catch unreachable;
         self.out.appendSlice(self.allocator, &buf) catch {};
         self.pumpAll(Handler, ctx);
+    }
+
+    /// RFC 9218 §7.1. A value that doesn't parse is ignored.
+    fn onPriorityUpdate(self: *Self, u: anytype) void {
+        self.countControl();
+        // We never push: an even ID names a push stream that is idle.
+        if (u.prioritized_id % 2 == 0) return self.fail(.protocol_error);
+        var p: Priority = .{};
+        if (!p.apply(u.value)) return;
+        if (u.prioritized_id > self.last_stream_id) {
+            // Kept until the stream opens.
+            for (self.idle_prio[0..self.idle_prio_len]) |*e| {
+                if (e.id == u.prioritized_id) {
+                    e.prio = p;
+                    return;
+                }
+            }
+            // Idle prioritised streams and open ones together stay within
+            // SETTINGS_MAX_CONCURRENT_STREAMS.
+            if (self.idle_prio_len + self.stream_count >= self.opts.max_concurrent_streams) return self.fail(.protocol_error);
+            self.idle_prio[self.idle_prio_len] = .{ .id = u.prioritized_id, .prio = p };
+            self.idle_prio_len += 1;
+            return;
+        }
+        // Applies from the next pass of `pumpAll`. Closed: ignored.
+        if (self.findStream(u.prioritized_id)) |s| {
+            s.prio = p;
+            s.prio_frame = true;
+        }
+    }
+
+    /// A stream with this ID is opening: the update kept for it, if any.
+    /// Updates for lower IDs are dropped, those streams can't open now.
+    fn takeIdlePriority(self: *Self, id: u31) ?Priority {
+        var found: ?Priority = null;
+        var kept: u32 = 0;
+        for (self.idle_prio[0..self.idle_prio_len]) |e| {
+            if (e.id == id) found = e.prio;
+            if (e.id <= id) continue;
+            self.idle_prio[kept] = e;
+            kept += 1;
+        }
+        self.idle_prio_len = kept;
+        return found;
     }
 
     fn onWindowUpdate(self: *Self, comptime Handler: type, ctx: *const Context(Handler), w: anytype) void {
@@ -791,11 +906,16 @@ pub const Conn = struct {
         self.hb_trailers = false;
         if (h.stream_id > self.last_stream_id) {
             self.last_stream_id = h.stream_id;
+            const prio = if (self.idle_prio_len > 0) self.takeIdlePriority(h.stream_id) else null;
             if (self.goaway_sent or self.goaway_received) {
                 // Not accepted after GOAWAY: decode to stay in sync, then refuse.
                 self.hb_discard = .refused_stream;
                 self.hb_slot = NIL;
             } else if (self.openStream(h.stream_id)) |s| {
+                if (prio) |p| {
+                    s.prio = p;
+                    s.prio_frame = true;
+                }
                 self.hb_slot = @intCast((@intFromPtr(s) - @intFromPtr(self.streams.ptr)) / @sizeOf(Stream));
             } else {
                 // §5.1.2: over SETTINGS_MAX_CONCURRENT_STREAMS.
@@ -901,6 +1021,8 @@ pub const Conn = struct {
         }
         s.body_start = s.req.items.len;
         if (s.fault == null) self.validateRequest(s);
+        // A PRIORITY_UPDATE sent before the request is the newer signal.
+        if (!s.prio_frame) s.prio = s.headerPriority();
         if (s.protocol != null and s.fault == null) {
             // Extended CONNECT: answered now, DATA is the tunnel's.
             s.tunnel = true;
@@ -1086,11 +1208,13 @@ pub const Conn = struct {
         self.writeHead(ctx, s, resp.status, resp.headerBytes(), content_length, !has_body);
         s.head_sent = true;
         if (!has_body) return self.finishStream(ctx, s);
-        const sent = self.writeData(s, resp.body, true);
+        const yield = self.blocked_count > 0 and self.mustYield(s);
+        const sent = if (yield) 0 else self.writeData(s, resp.body, true);
         if (sent < resp.body.len) {
             s.pending.appendSlice(self.allocator, resp.body[sent..]) catch return self.fail(.internal_error);
             s.pending_end = true;
             self.output_streams += 1;
+            self.setBlocked(s, yield or s.send_window > 0);
             return;
         }
         self.finishStream(ctx, s);
@@ -1233,9 +1357,15 @@ pub const Conn = struct {
     /// The worker's exchange deadline scan found this exchange expired.
     pub fn onExchangeTimeout(self: *Self, comptime Handler: type, ctx: *const Context(Handler), slot: u32) void {
         for (self.streams) |*s| {
+            if (!s.active or s.exchange != slot) continue;
+            if (s.blocked) {
+                // Its output waits behind other streams (the worker times
+                // out a connection whose output doesn't drain at all).
+                return ctx.exchanges.postpone(slot, ctx.now);
+            }
             // A WebSocket's output stalled, or the peer never answered our
             // close frame.
-            if (s.active and s.exchange == slot) return self.resetStream(ctx, s, if (s.ws != null) .cancel else .internal_error);
+            return self.resetStream(ctx, s, if (s.ws != null) .cancel else .internal_error);
         }
     }
 
@@ -1244,25 +1374,115 @@ pub const Conn = struct {
         self.pumpAll(Handler, ctx);
     }
 
+    /// Sends for every stream with output, in priority order (RFC 9218
+    /// §10), until `out` is full.
     fn pumpAll(self: *Self, comptime Handler: type, ctx: *const Context(Handler)) void {
         if (self.output_streams == 0 or self.failed) return;
-        for (self.streams) |*s| {
-            if (!s.active or !s.hasOutput()) continue;
-            // A WebSocket with nothing held back is pumped when it posts.
-            if (s.ws != null and !s.ws_pending) continue;
-            if (self.unsent() > self.opts.out_limit) return;
-            self.pumpStream(Handler, ctx, s);
-            if (self.failed) return;
+        var n: usize = 0;
+        for (self.streams, 0..) |*s, slot| {
+            if (!self.wantsPump(s)) continue;
+            self.order[n] = @intCast(slot);
+            n += 1;
+        }
+        const order = self.order[0..n];
+        std.mem.sort(u32, order, self.streams, struct {
+            fn less(streams: []Stream, a: u32, b: u32) bool {
+                return streams[a].sendsBefore(&streams[b]);
+            }
+        }.less);
+        var i: usize = 0;
+        while (i < order.len) {
+            const p = self.streams[order[i]].schedPriority();
+            if (!p.incremental) {
+                if (self.unsent() > self.opts.out_limit) return self.holdBack(order[i..]);
+                const s = &self.streams[order[i]];
+                if (self.wantsPump(s)) self.sendStream(Handler, ctx, s, std.math.maxInt(usize));
+                if (self.failed) return;
+                i += 1;
+                continue;
+            }
+            // Incremental streams of one urgency share: a quantum each in
+            // turn, starting after the one served last.
+            var end = i + 1;
+            while (end < order.len and self.streams[order[end]].schedPriority().urgency == p.urgency) end += 1;
+            const group = order[i..end];
+            var first: usize = 0;
+            while (first < group.len and self.streams[group[first]].id <= self.rr_last[p.urgency]) first += 1;
+            while (true) {
+                var progressed = false;
+                for (0..group.len) |k| {
+                    const s = &self.streams[group[(first + k) % group.len]];
+                    if (!self.wantsPump(s)) continue;
+                    if (self.unsent() > self.opts.out_limit) return self.holdBack(order[i..]);
+                    const before = self.out.items.len;
+                    self.sendStream(Handler, ctx, s, share_quantum);
+                    if (self.failed) return;
+                    if (self.out.items.len != before) {
+                        progressed = true;
+                        self.rr_last[p.urgency] = s.id;
+                    }
+                }
+                if (!progressed) break;
+            }
+            i = end;
         }
     }
 
-    /// Sends what a stream has queued (its pending buffer or exchange).
+    fn wantsPump(_: *const Self, s: *const Stream) bool {
+        if (!s.active or !s.hasOutput()) return false;
+        // A WebSocket with nothing held back is pumped when it posts.
+        return s.ws == null or s.ws_pending;
+    }
+
+    /// `out` is full: the streams not reached wait for room.
+    fn holdBack(self: *Self, slots: []const u32) void {
+        for (slots) |slot| {
+            const s = &self.streams[slot];
+            if (self.wantsPump(s)) self.setBlocked(s, s.send_window > 0);
+        }
+    }
+
+    fn setBlocked(self: *Self, s: *Stream, blocked: bool) void {
+        if (s.blocked == blocked) return;
+        s.blocked = blocked;
+        if (blocked) self.blocked_count += 1 else self.blocked_count -= 1;
+    }
+
+    /// A stream waits for room, or for the connection window, that `s`
+    /// would otherwise take first.
+    fn mustYield(self: *const Self, s: *const Stream) bool {
+        for (self.streams) |*t| {
+            if (!t.blocked or t == s) continue;
+            // An incremental stream yields to its peers too: `pumpAll`
+            // shares between them.
+            if (t.sendsBefore(s) or (s.schedPriority().incremental and !s.schedPriority().before(t.schedPriority()))) return true;
+        }
+        return false;
+    }
+
+    /// Sends what a stream has queued, unless more urgent streams are
+    /// waiting for room: then it waits too, for the next `pumpAll` (the
+    /// worker's once `out` drains, or a WINDOW_UPDATE's).
     fn pumpStream(self: *Self, comptime Handler: type, ctx: *const Context(Handler), s: *Stream) void {
         if (self.failed) return;
-        if (s.ws != null) return self.pumpWebSocket(Handler, ctx, s);
+        if (self.blocked_count > 0 and self.mustYield(s)) {
+            if (!s.hasOutput()) return;
+            if (s.ws != null) s.ws_pending = true;
+            return self.setBlocked(s, true);
+        }
+        self.sendStream(Handler, ctx, s, std.math.maxInt(usize));
+    }
+
+    /// Sends up to `budget` DATA bytes of what a stream has queued (its
+    /// pending buffer, exchange or WebSocket).
+    fn sendStream(self: *Self, comptime Handler: type, ctx: *const Context(Handler), s: *Stream, budget: usize) void {
+        if (self.failed) return;
+        self.setBlocked(s, false);
+        if (s.ws != null) return self.pumpWebSocket(Handler, ctx, s, budget);
         if (s.pending_end or s.pending_pos < s.pending.items.len) {
             const rest = s.pending.items[s.pending_pos..];
-            const n = self.writeData(s, rest, true);
+            const k = @min(rest.len, budget);
+            const n = self.writeData(s, rest[0..k], k == rest.len);
             s.pending_pos += n;
             if (s.pending_pos == s.pending.items.len) {
                 self.output_streams -= 1;
@@ -1271,6 +1491,7 @@ pub const Conn = struct {
                 s.pending_pos = 0;
                 return self.finishStream(ctx, s);
             }
+            if (n < k) self.setBlocked(s, s.send_window > 0);
             self.noteStall(ctx, s, n > 0);
             return;
         }
@@ -1278,8 +1499,10 @@ pub const Conn = struct {
         const ex = ctx.exchanges.handle(s.exchange);
         const e = ctx.exchanges.entry(s.exchange);
         const is_head = e.is_head;
+        var sent: usize = 0;
         while (true) {
-            if (self.unsent() > self.opts.out_limit) return;
+            if (self.unsent() > self.opts.out_limit) return self.setBlocked(s, s.send_window > 0);
+            if (sent >= budget) return;
             // The head, if any, must precede the data: fetch it first.
             var r = exchange.h2Poll(ex, &.{}, ctx.now);
             if (r.aborted) return self.resetStream(ctx, s, .internal_error);
@@ -1293,9 +1516,10 @@ pub const Conn = struct {
             }
             const window = @min(s.send_window, self.send_window);
             const room = self.opts.out_limit + 2 * self.opts.max_frame_size -| self.unsent();
-            var max = @min(@as(usize, if (window > 0) @intCast(window) else 0), self.peer_max_frame_size, room -| frame.header_len);
+            var max = @min(@as(usize, if (window > 0) @intCast(window) else 0), self.peer_max_frame_size, room -| frame.header_len, budget - sent);
             if (is_head) max = self.peer_max_frame_size;
             if (max == 0) {
+                self.setBlocked(s, s.send_window > 0);
                 self.noteStall(ctx, s, false);
                 if (r.notify) self.notifyWritable(Handler, ctx, ex);
                 return;
@@ -1320,6 +1544,7 @@ pub const Conn = struct {
                 self.out.items.len = start + frame.header_len + r.n;
                 s.send_window -= @intCast(r.n);
                 self.send_window -= @intCast(r.n);
+                sent += r.n;
             }
             self.noteStall(ctx, s, r.n > 0);
             if (r.notify) self.notifyWritable(Handler, ctx, ex);
@@ -1345,16 +1570,26 @@ pub const Conn = struct {
     /// everything is written and the WebSocket is over (the close
     /// handshake, a failure, or the client's END_STREAM, which is a TCP
     /// FIN to it), END_STREAM ends our side and the stream closes.
-    fn pumpWebSocket(self: *Self, comptime Handler: type, ctx: *const Context(Handler), s: *Stream) void {
+    fn pumpWebSocket(self: *Self, comptime Handler: type, ctx: *const Context(Handler), s: *Stream, budget: usize) void {
         const w = s.ws.?;
         var progressed = false;
-        while (self.unsent() <= self.opts.out_limit) {
+        var sent: usize = 0;
+        while (sent < budget) {
+            if (self.unsent() > self.opts.out_limit) {
+                self.setBlocked(s, s.send_window > 0);
+                break;
+            }
             const bytes = w.wireBytes();
             if (bytes.len == 0) break;
-            const n = self.writeData(s, bytes, false);
+            const k = @min(bytes.len, budget - sent);
+            const n = self.writeData(s, bytes[0..k], false);
             w.advance(n);
+            sent += n;
             progressed = progressed or n > 0;
-            if (n < bytes.len) break;
+            if (n < k) {
+                self.setBlocked(s, s.send_window > 0);
+                break;
+            }
         }
         s.ws_pending = w.hasOutput();
         self.noteStall(ctx, s, progressed or !s.ws_pending);
@@ -1410,7 +1645,11 @@ pub const Conn = struct {
             self.conn_stalled = false;
             return;
         }
-        if (!s.stalled) {
+        // Only a zero window is the client's doing: waiting for room in
+        // `out`, or behind more urgent streams, is not.
+        if (s.send_window > 0) {
+            s.stalled = false;
+        } else if (!s.stalled) {
             s.stalled = true;
             s.stalled_since = ctx.now;
         }
@@ -1855,7 +2094,7 @@ const Harness = struct {
                         stream = w.stream_id;
                         try line.print(a, "window {d} +{d}", .{ w.stream_id, w.increment });
                     },
-                    .priority, .unknown => try line.print(a, "?", .{}),
+                    .priority, .priority_update, .unknown => try line.print(a, "?", .{}),
                 },
             }
             try h.events.appendSlice(a, line.items);
@@ -1902,6 +2141,18 @@ const Harness = struct {
                 const c = h.ctx();
                 if (e.kind == .exchange) h.conn.onExchangePosted(TestHandler, &c, e.slot);
             }
+        }
+    }
+
+    /// The worker's part once output drains: pump, until nothing more
+    /// goes out.
+    fn flushAll(h: *Harness) !void {
+        while (true) {
+            const c = h.ctx();
+            h.conn.pump(TestHandler, &c);
+            const before = h.out.items.len;
+            try h.collect();
+            if (h.out.items.len == before) break;
         }
     }
 
@@ -1987,7 +2238,7 @@ const Harness = struct {
     }
 };
 
-const server_preface = "settings ack=false max_concurrent_streams=128 initial_window_size=1048576 max_frame_size=16384 max_header_list_size=16384\nwindow 0 +4128769\n";
+const server_preface = "settings ack=false max_concurrent_streams=128 initial_window_size=1048576 max_frame_size=16384 max_header_list_size=16384 no_rfc7540_priorities=1\nwindow 0 +4128769\n";
 
 test "preface and settings exchange" {
     const h = try Harness.init(.{});
@@ -2313,7 +2564,7 @@ test "flow control: windows limit DATA, WINDOW_UPDATE resumes, uploads replenish
     // a 100 KB body goes out as 16384 + 16384 + 16384 + 16383 and waits.
     try h.get(1, "/big");
     try h.expectEvents(
-        \\settings ack=false max_concurrent_streams=128 initial_window_size=65535 max_frame_size=16384 max_header_list_size=16384
+        \\settings ack=false max_concurrent_streams=128 initial_window_size=65535 max_frame_size=16384 max_header_list_size=16384 no_rfc7540_priorities=1
         \\settings ack=true
         \\headers 1 end=false [:status=200] [content-type=text/plain] [content-length=100000] [date]
         \\data 1 len=16384 end=false
@@ -2820,6 +3071,227 @@ test "output backpressure: process stops parsing above out_limit" {
     try testing.expectEqual(@as(u32, 0), h.conn.activeStreams());
 }
 
+/// A GET with an optional `priority` header, as frame bytes.
+fn appendGet(h: *Harness, out: *std.ArrayList(u8), stream: u31, path: []const u8, priority: ?[]const u8) !void {
+    var fields: [5]hpack.Field = .{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = path },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = "priority", .value = priority orelse "" },
+    };
+    const block = try h.encodeFields(fields[0..if (priority != null) 5 else 4]);
+    defer testing.allocator.free(block);
+    var buf: [256]u8 = undefined;
+    const n = try frame.writeHeaders(&buf, stream, frame.flag.end_stream | frame.flag.end_headers, block);
+    try out.appendSlice(testing.allocator, buf[0..n]);
+}
+
+fn priorityUpdate(h: *Harness, stream: u32, value: []const u8) !void {
+    var buf: [frame.header_len + 4 + 64]u8 = undefined;
+    try h.feed(buf[0..try frame.writePriorityUpdate(&buf, stream, value)]);
+}
+
+/// The DATA frames in `events` as "stream:len" ("!" on END_STREAM),
+/// clearing them.
+fn dataSequence(h: *Harness) ![]u8 {
+    const a = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, h.events.items, '\n');
+    while (lines.next()) |line| {
+        var it = std.mem.tokenizeScalar(u8, line, ' ');
+        if (!std.mem.eql(u8, it.next().?, "data")) continue;
+        const id = it.next().?;
+        const len = it.next().?["len=".len..];
+        const end = std.mem.eql(u8, it.next().?, "end=true");
+        if (out.items.len > 0) try out.append(a, ' ');
+        try out.print(a, "{s}:{s}{s}", .{ id, len, if (end) "!" else "" });
+    }
+    h.events.clearRetainingCapacity();
+    return out.toOwnedSlice(a);
+}
+
+fn expectData(h: *Harness, expected: []const u8) !void {
+    const got = try dataSequence(h);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings(expected, got);
+}
+
+/// The streams in the order their DATA went out, repeats collapsed.
+fn expectDataRuns(h: *Harness, expected: []const u8) !void {
+    const a = testing.allocator;
+    var runs: std.ArrayList(u8) = .empty;
+    defer runs.deinit(a);
+    var lines = std.mem.tokenizeScalar(u8, h.events.items, '\n');
+    var last: []const u8 = "";
+    while (lines.next()) |line| {
+        var it = std.mem.tokenizeScalar(u8, line, ' ');
+        if (!std.mem.eql(u8, it.next().?, "data")) continue;
+        const id = it.next().?;
+        if (std.mem.eql(u8, id, last)) continue;
+        last = id;
+        if (runs.items.len > 0) try runs.append(a, ' ');
+        try runs.appendSlice(a, id);
+    }
+    h.events.clearRetainingCapacity();
+    try testing.expectEqualStrings(expected, runs.items);
+}
+
+test "priorities (RFC 9218): urgency first, incremental streams share, PRIORITY_UPDATE reorders" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    const big = try testing.allocator.alloc(u8, 100_000);
+    defer testing.allocator.free(big);
+    @memset(big, 'b');
+    h.handler.big = big;
+    try h.preface();
+    // Large stream windows; the connection window stays at 65535.
+    try h.settings(&.{.{ .id = .initial_window_size, .value = 1 << 20 }});
+    h.events.clearRetainingCapacity();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try appendGet(h, &frames, 1, "/big", "u=5");
+    try appendGet(h, &frames, 3, "/big", "u=1");
+    try appendGet(h, &frames, 5, "/big", null);
+    try appendGet(h, &frames, 7, "/big", "u=2, i");
+    try appendGet(h, &frames, 9, "/big", "u=2;x=1, i=?1, y=(a b)");
+    try h.feed(frames.items);
+    // The first stream takes the connection window as it arrives.
+    try expectData(h, "1:16384 1:16384 1:16384 1:16383");
+    // Then the most urgent goes first: 3 (u=1), then 7 and 9 (u=2,
+    // incremental) in turns, then 5 (u=3), then 1 (u=5).
+    try h.window(0, 3 * 16384);
+    try expectData(h, "3:16384 3:16384 3:16384");
+    try h.window(0, 60_000);
+    try expectData(h, "3:16384 3:16384 3:16384 3:1696! 7:9152");
+    try h.window(0, 4 * 16384);
+    try expectData(h, "9:16384 7:16384 9:16384 7:16384");
+    // PRIORITY_UPDATE: stream 1 becomes the most urgent.
+    try priorityUpdate(h, 1, "u=0");
+    try h.window(0, 40_000);
+    try expectData(h, "1:16384 1:16384 1:1697! 9:5535");
+    try h.window(0, 1_000_000);
+    try expectDataRuns(h, "7 9 7 9 7 9 7 9 5");
+    try testing.expectEqual(@as(u32, 0), h.conn.activeStreams());
+    try testing.expectEqual(@as(u32, 0), h.conn.blocked_count);
+}
+
+test "priorities: urgency orders streams waiting for room in out_limit" {
+    const h = try Harness.init(.{ .out_limit = 1024 });
+    defer h.deinit();
+    const big = try testing.allocator.alloc(u8, 100_000);
+    defer testing.allocator.free(big);
+    @memset(big, 'b');
+    h.handler.big = big;
+    try h.preface();
+    try h.settings(&.{.{ .id = .initial_window_size, .value = 1 << 20 }});
+    try h.window(0, 1 << 20);
+    h.events.clearRetainingCapacity();
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try appendGet(h, &frames, 1, "/big", "u=7");
+    try appendGet(h, &frames, 3, "/big", "u=0");
+    try appendGet(h, &frames, 5, "/big", "u=0");
+    try h.feed(frames.items);
+    try h.flushAll();
+    // 1 starts before the others arrive; 3 overtakes it, 5 waits for 3
+    // (non-incremental, in stream order), then 1 finishes.
+    try expectDataRuns(h, "1 3 5 1");
+    try testing.expectEqual(@as(u32, 0), h.conn.activeStreams());
+    try testing.expectEqual(@as(u32, 0), h.conn.blocked_count);
+}
+
+test "priorities: PRIORITY_UPDATE before the request, limits, errors" {
+    {
+        const h = try Harness.init(.{ .max_concurrent_streams = 2 });
+        defer h.deinit();
+        try h.preface();
+        try h.get(1, "/later");
+        // Kept for idle stream 3, replaced, a bad value ignored; it wins
+        // over the request's header.
+        try priorityUpdate(h, 3, "u=6");
+        try priorityUpdate(h, 3, "u=0, i");
+        try priorityUpdate(h, 3, "u=");
+        try h.get(3, "/later");
+        try testing.expectEqual(Priority{ .urgency = 0, .incremental = true }, h.conn.findStream(3).?.prio);
+        var frames: std.ArrayList(u8) = .empty;
+        defer frames.deinit(testing.allocator);
+        try appendGet(h, &frames, 5, "/later", "u=4");
+        try h.feed(frames.items); // refused: two streams are open
+        // Updates for open and closed streams.
+        try priorityUpdate(h, 1, "i");
+        try testing.expectEqual(Priority{ .incremental = true }, h.conn.findStream(1).?.prio);
+        try priorityUpdate(h, 5, "u=1");
+        try testing.expectEqual(Action.need_more, h.last);
+        // Idle prioritised streams plus open ones over the limit.
+        try h.handler.exchanges.items[0].respond(.{}, "x");
+        try h.drainMailbox();
+        try priorityUpdate(h, 7, "u=1");
+        try testing.expectEqual(Action.need_more, h.last);
+        h.events.clearRetainingCapacity();
+        try priorityUpdate(h, 9, "u=1");
+        try h.expectEvents("goaway last=5 protocol_error\n");
+        try testing.expectEqual(Action.close, h.last);
+    }
+    {
+        // An even ID: a push stream, idle since we never push.
+        const h = try Harness.init(.{});
+        defer h.deinit();
+        try h.preface();
+        h.events.clearRetainingCapacity();
+        try priorityUpdate(h, 2, "u=1");
+        try h.expectEvents("goaway last=0 protocol_error\n");
+    }
+    {
+        // The header alone.
+        const h = try Harness.init(.{});
+        defer h.deinit();
+        try h.preface();
+        var frames: std.ArrayList(u8) = .empty;
+        defer frames.deinit(testing.allocator);
+        try appendGet(h, &frames, 1, "/later", "u=6, i");
+        try appendGet(h, &frames, 3, "/later", "u=6, i, u=");
+        try h.feed(frames.items);
+        try testing.expectEqual(Priority{ .urgency = 6, .incremental = true }, h.conn.findStream(1).?.prio);
+        try testing.expectEqual(Priority{}, h.conn.findStream(3).?.prio);
+    }
+}
+
+test "priorities: an exchange waiting behind other streams doesn't time out" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    const big = try testing.allocator.alloc(u8, 100_000);
+    defer testing.allocator.free(big);
+    @memset(big, 'b');
+    h.handler.big = big;
+    try h.preface();
+    try h.settings(&.{.{ .id = .initial_window_size, .value = 1 << 20 }});
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try appendGet(h, &frames, 1, "/big", "u=0");
+    try appendGet(h, &frames, 3, "/stream", "u=7");
+    try h.feed(frames.items);
+    const ex = h.handler.exchanges.items[0];
+    try ex.write("waiting");
+    try h.drainMailbox();
+    try h.collect();
+    // The connection window is spent on stream 1: 3 waits, and its
+    // deadline moves instead of resetting it.
+    h.events.clearRetainingCapacity();
+    h.now += 100;
+    const c = h.ctx();
+    h.conn.onExchangeTimeout(TestHandler, &c, ex.slot);
+    try h.collect();
+    try h.expectEvents("");
+    try testing.expectEqual(h.now + 11, h.slab.entry(ex.slot).deadline);
+    try h.window(0, 1 << 20);
+    try expectDataRuns(h, "1 3");
+    // Not waiting: reset as before.
+    h.conn.onExchangeTimeout(TestHandler, &c, ex.slot);
+    try h.collect();
+    try h.expectEvents("rst 3 internal_error\n");
+}
+
 // Any split of the same client bytes gives the same frames per stream.
 fn connectWs(h: *Harness, stream: u31, path: []const u8) !void {
     try h.headers(.{ .stream = stream, .end_stream = false, .fields = &.{
@@ -2849,7 +3321,7 @@ test "WebSocket over HTTP/2 (RFC 8441): the setting, and extended CONNECT valida
 
     const h = try Harness.init(.{ .enable_connect_protocol = true });
     defer h.deinit();
-    try h.expectEvents("settings ack=false max_concurrent_streams=128 initial_window_size=1048576 max_frame_size=16384 max_header_list_size=16384 enable_connect_protocol=1\nwindow 0 +4128769\n");
+    try h.expectEvents("settings ack=false max_concurrent_streams=128 initial_window_size=1048576 max_frame_size=16384 max_header_list_size=16384 no_rfc7540_priorities=1 enable_connect_protocol=1\nwindow 0 +4128769\n");
     try h.preface();
     try h.expectEvents("settings ack=true\n");
     // :protocol on another method, and an extended CONNECT without :path.
@@ -3059,6 +3531,14 @@ fn buildScript() ![]u8 {
         const path = if (i % 6 == 0) "/up" else if (i % 3 == 0) "/echo" else if (i == 4) "/reject" else if (i % 3 == 1) "/" else "/big";
         bn += try enc.encode(block[bn..], ":path", path, .{});
         bn += try enc.encode(block[bn..], "x-req", &(@as([3]u8, @splat('a' + @as(u8, @intCast(i))))), .{});
+        // Priorities: urgencies 0-7, half incremental; updates for this
+        // stream (open) and the next (idle).
+        const prio = [_][]const u8{ "u=0", "u=1, i", "u=2", "u=3, i", "u=4", "u=5, i", "u=6", "u=7, i" };
+        if (i % 4 != 3) bn += try enc.encode(block[bn..], "priority", prio[i % 8], .{});
+        if (i % 5 == 1) {
+            n = try frame.writePriorityUpdate(&buf, stream + 2, prio[(i + 3) % 8]);
+            try s.appendSlice(a, buf[0..n]);
+        }
         if (i % 3 == 0) {
             n = try frame.writeHeaders(&buf, stream, frame.flag.end_headers, block[0..bn]);
             try s.appendSlice(a, buf[0..n]);
@@ -3075,6 +3555,10 @@ fn buildScript() ![]u8 {
             }
         } else {
             n = try frame.writeHeaders(&buf, stream, frame.flag.end_headers | frame.flag.end_stream, block[0..bn]);
+            try s.appendSlice(a, buf[0..n]);
+        }
+        if (i % 4 == 1) {
+            n = try frame.writePriorityUpdate(&buf, stream, prio[(i + 5) % 8]);
             try s.appendSlice(a, buf[0..n]);
         }
         if (i % 4 == 2) {

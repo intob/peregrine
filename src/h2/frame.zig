@@ -28,6 +28,8 @@ pub const FrameType = enum(u8) {
     goaway = 7,
     window_update = 8,
     continuation = 9,
+    /// RFC 9218 §7.1.
+    priority_update = 0x10,
     _,
 };
 
@@ -66,6 +68,8 @@ pub const SettingId = enum(u16) {
     max_header_list_size = 6,
     /// RFC 8441 §3: extended CONNECT (WebSockets over HTTP/2).
     enable_connect_protocol = 8,
+    /// RFC 9218 §2.1: RFC 7540 priorities are not used.
+    no_rfc7540_priorities = 9,
     _,
 };
 
@@ -106,8 +110,10 @@ pub const Frame = union(enum) {
     goaway: struct { last_stream_id: u31, code: ErrorCode, debug: []const u8 },
     window_update: struct { stream_id: u31, increment: u31 },
     continuation: struct { stream_id: u31, end_headers: bool, fragment: []const u8 },
-    /// A type this implementation doesn't know, including RFC 9218
-    /// PRIORITY_UPDATE: ignored (§4.1), unless it interrupts a field block.
+    /// RFC 9218 §7.1: reprioritises a request stream. Sent on stream 0.
+    priority_update: struct { prioritized_id: u31, value: []const u8 },
+    /// A type this implementation doesn't know: ignored (§4.1), unless it
+    /// interrupts a field block.
     unknown: struct { type: u8, stream_id: u31 },
 };
 
@@ -293,7 +299,7 @@ fn parse(ty: u8, flags: u8, stream_id: u31, payload: []const u8) Result {
                 const id: SettingId = @fromBackingInt(std.mem.readInt(u16, payload[i..][0..2], .big));
                 const value = std.mem.readInt(u32, payload[i + 2 ..][0..4], .big);
                 switch (id) {
-                    .enable_push, .enable_connect_protocol => if (value > 1) return conn_err(.protocol_error),
+                    .enable_push, .enable_connect_protocol, .no_rfc7540_priorities => if (value > 1) return conn_err(.protocol_error),
                     .initial_window_size => if (value > max_window_size) return conn_err(.flow_control_error),
                     .max_frame_size => if (value < min_max_frame_size or value > max_max_frame_size) return conn_err(.protocol_error),
                     else => {},
@@ -332,6 +338,13 @@ fn parse(ty: u8, flags: u8, stream_id: u31, payload: []const u8) Result {
                 .end_headers = flags & flag.end_headers != 0,
                 .fragment = payload,
             } } };
+        },
+        .priority_update => {
+            if (stream_id != 0) return conn_err(.protocol_error);
+            if (payload.len < 4) return conn_err(.frame_size_error);
+            const id: u31 = @truncate(std.mem.readInt(u32, payload[0..4], .big));
+            if (id == 0) return conn_err(.protocol_error);
+            return .{ .frame = .{ .priority_update = .{ .prioritized_id = id, .value = payload[4..] } } };
         },
         _ => return .{ .frame = .{ .unknown = .{ .type = ty, .stream_id = stream_id } } },
     }
@@ -415,6 +428,16 @@ pub fn writeWindowUpdate(out: []u8, stream_id: u31, increment: u31) error{NoSpac
     return header_len + 4;
 }
 
+/// RFC 9218 §7.1 (clients send it; for tests).
+pub fn writePriorityUpdate(out: []u8, prioritized_id: u32, value: []const u8) error{NoSpace}!usize {
+    const n = header_len + 4 + value.len;
+    const o = try reserve(out, n);
+    writeHeader(o[0..header_len], @intCast(4 + value.len), .priority_update, 0, 0);
+    std.mem.writeInt(u32, o[header_len..][0..4], prioritized_id, .big);
+    @memcpy(o[header_len + 4 ..][0..value.len], value);
+    return n;
+}
+
 /// A DATA frame with a copied payload (the connection layer writes large
 /// bodies by reference).
 pub fn writeData(out: []u8, stream_id: u31, end_stream: bool, data: []const u8) error{NoSpace}!usize {
@@ -496,6 +519,7 @@ const Harness = struct {
                     .goaway => |g| try h.log.print(a, "goaway last={d} {s} '{s}'\n", .{ g.last_stream_id, @tagName(g.code), g.debug }),
                     .window_update => |w| try h.log.print(a, "window {d} +{d}\n", .{ w.stream_id, w.increment }),
                     .continuation => |c| try h.log.print(a, "continuation {d} eh={} '{s}'\n", .{ c.stream_id, c.end_headers, c.fragment }),
+                    .priority_update => |u| try h.log.print(a, "priority_update {d} '{s}'\n", .{ u.prioritized_id, u.value }),
                     .unknown => |u| try h.log.print(a, "unknown type {d} on {d}\n", .{ u.type, u.stream_id }),
                 },
             }
@@ -535,7 +559,8 @@ test "every frame type parses, with padding and flags" {
     try h.feed(&raw(4, 8, 0, 0, "\x00\x01\x00\x00"));
     try h.feed(&raw(4, 8, 0, 3, "\x80\x00\x00\x01")); // reserved bit ignored
     try h.feed(&raw(2, 9, flag.end_headers, 7, "zz"));
-    try h.feed(&raw(3, 0x10, 0, 0, "u=3")); // PRIORITY_UPDATE
+    try h.feed(&raw(8, 0x10, 0, 0, "\x80\x00\x00\x05u=3i")); // PRIORITY_UPDATE, reserved bit
+    try h.feed(&raw(4, 0x10, 0, 0, "\x00\x00\x00\x07")); // empty value
     try h.feed(&raw(1, 0xfe, 0xff, 99, "?"));
     try testing.expectEqualStrings(
         \\data 1 end=true flow=5 'hello'
@@ -553,7 +578,8 @@ test "every frame type parses, with padding and flags" {
         \\window 0 +65536
         \\window 3 +1
         \\continuation 7 eh=true 'zz'
-        \\unknown type 16 on 0
+        \\priority_update 5 'u=3i'
+        \\priority_update 7 ''
         \\unknown type 254 on 99
         \\
     , h.log.items);
@@ -606,6 +632,12 @@ test "malformed frames map to the RFC's error codes" {
         .{ .bytes = &raw(4, 8, 0, 5, "\x80\x00\x00\x00"), .expect = "fail protocol_error on 5\n" },
         // §6.10 CONTINUATION on stream 0.
         .{ .bytes = &raw(1, 9, flag.end_headers, 0, "x"), .expect = "fail protocol_error on 0\n" },
+        // RFC 9218 §2.1 NO_RFC7540_PRIORITIES 2; §7.1 PRIORITY_UPDATE on a
+        // stream, too short, prioritising stream 0.
+        .{ .bytes = &raw(6, 4, 0, 0, "\x00\x09\x00\x00\x00\x02"), .expect = "fail protocol_error on 0\n" },
+        .{ .bytes = &raw(4, 0x10, 0, 1, "\x00\x00\x00\x01"), .expect = "fail protocol_error on 0\n" },
+        .{ .bytes = &raw(3, 0x10, 0, 0, "\x00\x00\x01"), .expect = "fail frame_size_error on 0\n" },
+        .{ .bytes = &raw(4, 0x10, 0, 0, "\x80\x00\x00\x00"), .expect = "fail protocol_error on 0\n" },
     };
     for (cases) |case| {
         const h = try Harness.init(4096);

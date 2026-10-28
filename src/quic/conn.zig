@@ -175,6 +175,10 @@ pub const Stream = struct {
     /// Emit stream_writable once unacknowledged bytes fall to this.
     writable_at: ?usize = null,
     released: bool = false,
+    /// Sending order (RFC 9218 priorities, set by HTTP/3): lower urgency
+    /// first; incremental streams of one urgency take turns per packet.
+    urgency: u3 = 3,
+    incremental: bool = false,
 
     fn hasRecv(s: *const Stream) bool {
         return s.kind != .server_uni;
@@ -193,6 +197,31 @@ pub const Stream = struct {
         if (s.reset_code != null) return s.reset_acked;
         return s.send.allAcked();
     }
+
+    /// Send queue order: our own streams (HTTP/3 control and QPACK) first,
+    /// then by urgency; at one urgency non-incremental streams in stream
+    /// order, then incremental ones in the order they were queued.
+    fn sendsBefore(a: *const Stream, b: *const Stream) bool {
+        const a_ours = a.kind == .server_uni;
+        if (a_ours != (b.kind == .server_uni)) return a_ours;
+        if (a.urgency != b.urgency) return a.urgency < b.urgency;
+        if (a.incremental != b.incremental) return !a.incremental;
+        return !a.incremental and a.id < b.id;
+    }
+
+    fn sharesWith(a: *const Stream, b: *const Stream) bool {
+        return a.incremental and b.incremental and a.urgency == b.urgency and a.kind == b.kind;
+    }
+};
+
+/// Where a client request stream ID stands.
+pub const RequestStream = union(enum) {
+    open: u32,
+    /// Not opened yet, within the stream limit.
+    idle,
+    closed,
+    /// Beyond the limit we advertised.
+    over_limit,
 };
 
 pub const Conn = struct {
@@ -1232,7 +1261,15 @@ pub const Conn = struct {
         const s = &self.streams[slot];
         if (s.queued) return;
         s.queued = true;
-        self.send_queue.appendAssumeCapacity(slot);
+        self.insertQueued(slot);
+    }
+
+    /// Inserts into the send queue at its place.
+    fn insertQueued(self: *Self, slot: u32) void {
+        const s = &self.streams[slot];
+        var j: usize = 0;
+        while (j < self.send_queue.items.len and !s.sendsBefore(&self.streams[self.send_queue.items[j]])) j += 1;
+        self.send_queue.insertAssumeCapacity(j, slot);
     }
 
     fn creditConnection(self: *Self, n: u64) void {
@@ -1350,6 +1387,36 @@ pub const Conn = struct {
     /// Ask for a stream_writable event once buffered bytes fall to `level`.
     pub fn streamWantWritable(self: *Self, slot: u32, level: usize) void {
         self.streams[slot].writable_at = level;
+    }
+
+    /// Sets the stream's priority, moving it in the send queue.
+    pub fn streamSetPriority(self: *Self, slot: u32, urgency: u3, incremental: bool) void {
+        const s = &self.streams[slot];
+        if (s.urgency == urgency and s.incremental == incremental) return;
+        s.urgency = urgency;
+        s.incremental = incremental;
+        if (!s.queued) return;
+        const i = std.mem.indexOfScalar(u32, self.send_queue.items, slot).?;
+        _ = self.send_queue.orderedRemove(i);
+        self.insertQueued(slot);
+    }
+
+    /// Whether the stream has data to send that waits for other streams
+    /// (or the congestion window), not for its own or the connection's
+    /// flow control limit.
+    pub fn streamWaiting(self: *const Self, slot: u32) bool {
+        const s = &self.streams[slot];
+        return s.queued and s.reset_code == null and s.send.hasPending() and self.tx_data < self.tx_max_data;
+    }
+
+    /// Classifies a client-initiated bidirectional stream ID.
+    pub fn requestStream(self: *const Self, id: u64) RequestStream {
+        std.debug.assert(id & 3 == 0);
+        if (self.stream_map.get(id)) |slot| return .{ .open = slot };
+        const index = id >> 2;
+        if (index < self.bidi_opened) return .closed;
+        if (index >= self.max_bidi) return .over_limit;
+        return .idle;
     }
 
     /// Abandons our sending side (RESET_STREAM).
@@ -1699,6 +1766,7 @@ pub const Conn = struct {
                 s.max_data_pending = false;
             }
             // Data.
+            var rotated = false;
             if (s.reset_code == null) {
                 while (true) {
                     const hdr = frame.streamHeaderLen(s.id, s.send.writeOff(), 1 << 14, true);
@@ -1711,8 +1779,20 @@ pub const Conn = struct {
                     if (!chunk.retransmit) self.tx_data += chunk.data.len;
                     try s.send.onSent(a, chunk);
                     if (chunk.data.len == 0) break;
+                    // Incremental streams of one urgency take turns: this
+                    // one goes behind the others.
+                    if (s.send.hasPending() and i + 1 < self.send_queue.items.len and s.sharesWith(&self.streams[self.send_queue.items[i + 1]])) {
+                        _ = self.send_queue.orderedRemove(i);
+                        var j = i;
+                        while (j < self.send_queue.items.len and s.sharesWith(&self.streams[self.send_queue.items[j]])) j += 1;
+                        self.send_queue.insertAssumeCapacity(j, slot);
+                        rotated = true;
+                        break;
+                    }
                 }
             }
+            // The next stream of the group is at `i` now.
+            if (rotated) continue;
             const control = (s.reset_code != null and !s.reset_sent) or
                 (s.stop_code != null and !s.stop_sent) or s.max_data_pending;
             const data_left = s.reset_code == null and s.send.hasPending();

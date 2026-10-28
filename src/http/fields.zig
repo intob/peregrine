@@ -7,6 +7,7 @@ const Request = @import("../request.zig").Request;
 const Header = @import("../header.zig").Header;
 const Method = @import("../method.zig").Method;
 const MAX_HEADERS = @import("../request.zig").MAX_HEADERS;
+const Priority = @import("./priority.zig").Priority;
 
 pub const HeaderRef = struct { name_off: u32, name_len: u32, value_len: u32 };
 
@@ -162,6 +163,23 @@ pub const Fields = struct {
     }
 
     /// Fills the worker's Request. Returns false for an unknown method.
+    /// RFC 9218: from the `priority` lines (names are lowercase).
+    pub fn priority(self: *const Self) Priority {
+        const Lines = struct {
+            f: *const Self,
+            i: usize = 0,
+            pub fn next(it: *@This()) ?[]const u8 {
+                while (it.i < it.f.hdr_count) {
+                    const h = it.f.hdr[it.i];
+                    it.i += 1;
+                    if (std.mem.eql(u8, it.f.buf.items[h.name_off..][0..h.name_len], "priority")) return it.f.value(h);
+                }
+                return null;
+            }
+        };
+        return Priority.fromLines(Lines{ .f = self });
+    }
+
     pub fn fill(self: *const Self, req: *Request) bool {
         req.reset();
         req.version = .@"HTTP/1.1";

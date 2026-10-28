@@ -14,6 +14,10 @@ pub const FrameType = enum(u64) {
     push_promise = 0x05,
     goaway = 0x07,
     max_push_id = 0x0d,
+    /// RFC 9218 §7.2: on the control stream, for a request stream or a
+    /// push.
+    priority_update_request = 0xf0700,
+    priority_update_push = 0xf0701,
     _,
 
     /// HTTP/2 frame types with no HTTP/3 meaning (§7.2.8): an error.

@@ -33,6 +33,7 @@ Note: This project has just started, and is not yet a complete HTTP server imple
 - Streaming and deferred responses: `resp.stream()` writes a body over time (chunked on HTTP/1.1, DATA frames on HTTP/2 and HTTP/3), `resp.later()` answers from any thread
 - Streamed request bodies: `handleHead` accepts, rejects (before `100 Continue`) or streams a request on its headers; `handleBody` gets the body as it arrives, with no size limit and with trailers, and can pause it (flow control holds the client back)
 - WebSockets over HTTP/1.1 (Upgrade), HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220), with the same handler hooks
+- Response priorities (RFC 9218) on HTTP/2 and HTTP/3: the client's `priority` header and PRIORITY_UPDATE frames decide which responses get the bandwidth first
 - TLS 1.3, written from scratch on top of `std.crypto` (no OpenSSL)
     - X25519MLKEM768 (post-quantum hybrid), X25519 and P-256 key exchange, HelloRetryRequest
     - AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305
@@ -168,6 +169,8 @@ const srv = try per.Server(Handler).init(gpa, 443, .{
 });
 ```
 Handlers need no changes: a request on an HTTP/2 stream arrives as the same `Request`, with `host` taken from `:authority`.
+
+On HTTP/2 and HTTP/3, when responses compete for the connection, they go out in the order the client's RFC 9218 priorities ask for: more urgent ones (`u=0` to `u=7`) first; at one urgency, non-incremental responses one after another in request order, then incremental ones (`i`) sharing the bandwidth. Browsers send these signals themselves. A response held back this way is not timed out. WebSockets share bandwidth rather than holding later responses back.
 
 ### Serve HTTP/3
 Set `http3` alongside `tls`: each worker then also serves HTTP/3 on a UDP socket (the TLS port by default), with the same certificate and handler, and every response carries `Alt-Svc: h3=":443"` so browsers switch over.
@@ -377,11 +380,10 @@ Until these things are done, I don't think that this project can possibly be con
 
 See [PLAN.md](PLAN.md) for the full checklist. In order:
 
-1. TLS 1.3 follow-ups: io_uring support, fuzzing, faster handshakes, RSA certificates, resumption, kTLS on Linux
-2. HTTP/2 follow-ups: RFC 9218 priorities
-3. HTTP/3 follow-ups: connection migration, 0-RTT, pacing, ECN, PMTU discovery, GRO, the QPACK dynamic table, DATAGRAM (RFC 9221)
-4. Throughout: `sendfile`, tuning io_uring until it beats epoll, WebSocket `permessage-deflate`, and verification with Autobahn, h2spec, quic-interop-runner, soak, adversarial and differential (HTTP Garden) testing
-5. API reference
+1. TLS 1.3 follow-ups: faster handshakes, RSA certificates, resumption, kTLS on Linux
+2. HTTP/3 follow-ups: connection migration, 0-RTT, pacing, ECN, PMTU discovery, GRO, the QPACK dynamic table, DATAGRAM (RFC 9221)
+3. Throughout: `sendfile`, tuning io_uring until it beats epoll, WebSocket `permessage-deflate`, and verification with Autobahn, h2spec, quic-interop-runner, soak, adversarial and differential (HTTP Garden) testing
+4. API reference
 
 ## Nice to have
 - Windows support

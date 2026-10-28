@@ -55,7 +55,7 @@ Design rules that apply to every layer:
 | M2. Throughput architecture | 🟡 io_uring works (opt-in, not yet faster than epoll); sendfile, NUMA open |
 | M3. WebSockets over HTTP/1.1 | ✅ reworked; permessage-deflate, Autobahn, benchmarks open |
 | M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; faster handshakes, resumption and kTLS are listed under "Later in M4" |
-| M5. HTTP/2 | ✅ h2 over TLS (ALPN) and h2c on every backend, h2spec 146/146 over TLS, fuzzed, benchmarked; streamed request bodies on every protocol; WebSockets over h2 (RFC 8441) |
+| M5. HTTP/2 | ✅ h2 over TLS (ALPN) and h2c on every backend, h2spec 146/146 over TLS, fuzzed, benchmarked; streamed request bodies on every protocol; WebSockets over h2 (RFC 8441); RFC 9218 priorities |
 | M6. HTTP/3 and QUIC | 🟡 HTTP/3 over QUIC v1 on every backend, interop-tested (aioquic, curl/ngtcp2, h2load), benchmarked against nginx and Caddy; WebSockets over h3 (RFC 9220); migration, 0-RTT, pacing, ECN, PMTUD open |
 | M7. Verification and benchmarking | 🟡 ongoing for each milestone |
 
@@ -71,6 +71,7 @@ Source layout:
 | `src/http/worker_uring.zig` | io_uring event loop (Linux, opt-in) |
 | `src/http/date.zig` | Cached IMF-fixdate `Date` header |
 | `src/http/exchange.zig` | `Exchange`: a request answered or streamed after `handleRequest` returns (per-worker slab, value handles, HTTP/1.1 framing) |
+| `src/http/priority.zig` | RFC 9218 priority parameters, from the `priority` header or PRIORITY_UPDATE |
 | `src/mailbox.zig` | How other threads tell a worker that a WebSocket or an exchange has output |
 | `src/h2/hpack.zig` | HPACK (RFC 7541): tables, Huffman coding, strict limits |
 | `src/h2/frame.zig` | HTTP/2 framing (RFC 9113): I/O-free parser and serialiser |
@@ -469,8 +470,8 @@ which RFC 9113 deprecated).
       the synchronous path serialises HEADERS+DATA when `handleRequest` returns
       with no allocation in steady state (a body the windows don't allow is copied
       to the stream's pending buffer); `later()`/`stream()` exchanges are drained
-      per stream, trailers as a trailing HEADERS. Priorities (RFC 7540 and RFC
-      9218) are accepted and ignored. Output backpressure: parsing stops above
+      per stream, trailers as a trailing HEADERS. RFC 7540 priorities are
+      ignored; RFC 9218 ones order the output (below). Output backpressure: parsing stops above
       `out_limit` until the worker has written.
       Defences, each with a test: rapid reset (RST_STREAM budget per second),
       CONTINUATION flood (block bounded by `max_header_bytes`, and a block that
@@ -495,9 +496,46 @@ which RFC 9113 deprecated).
       Interop (curl --http2 and --http2-prior-knowledge, nghttp, OpenSSL s_client
       ALPN): all pass on macOS, Linux epoll and Linux io_uring (std's TLS client
       has no ALPN, so TLS+h2 is covered by interop rather than Zig tests)
-- [ ] Priorities: RFC 9218 `priority` header is not parsed (ignored like the rest)
-- [x] **WebSockets over h2 (RFC 8441) and h3 (RFC 9220)**, branch
-      `ws-h2-h3`. With a handler that has `handleWSFrame`, both send
+- [x] **Priorities (RFC 9218)** on HTTP/2 and HTTP/3. `src/http/priority.zig`
+      parses the `priority` field and PRIORITY_UPDATE values as a Structured
+      Fields dictionary (RFC 9651): `u` (0-7) and `i`; unknown members, out of
+      range and wrongly typed values ignored; a field that fails to parse
+      ignored whole. h2: SETTINGS_NO_RFC7540_PRIORITIES=1 sent (the client's
+      value validated); PRIORITY_UPDATE (0x10) with the §7.1 errors (on a
+      stream, prioritising stream 0 or a push stream, idle prioritised
+      streams plus open ones over MAX_CONCURRENT_STREAMS); an update for an
+      idle stream is kept until it opens and wins over its header. `pumpAll`
+      sends in priority order: by urgency, non-incremental streams in stream
+      order, then the incremental ones of that urgency in turns of 16 KB. A
+      stream that would send directly (a post, a window update, a synchronous
+      response) yields while a more urgent one waits for room in `out_limit`
+      or for the connection window. h3: PRIORITY_UPDATE (0xf0700, 0xf0701)
+      on the control stream only (H3_FRAME_UNEXPECTED elsewhere; H3_ID_ERROR
+      for a push ID, a non-request stream, or one beyond the stream limit);
+      the priority goes to QUIC, whose send queue is ordered the same way
+      (incremental streams take turns per packet; our control and QPACK
+      streams first). A tunnel (WebSocket) counts as incremental, so it never
+      holds later responses back (§10.1). Starvation is not a timeout: h2's
+      stall reset now counts only a zero window, and an exchange whose output
+      waits behind other streams has its deadline postponed instead of being
+      reset (the worker's write timeout still covers a client that reads
+      nothing). Proof: parser tests; h2 tests (the exact DATA order under the
+      connection window and under `out_limit`, PRIORITY_UPDATE before and
+      after a request, each error, a waiting exchange kept); h3 tests (the
+      order across packets with an incremental pair interleaved, which fails
+      with a FIFO send queue; updates before and after a request, each error,
+      a waiting exchange kept); `priority` headers and PRIORITY_UPDATEs in the
+      h2 split-invariance script and both connection fuzz targets. Interop on
+      Linux: nghttp 1.69 `--extpri` over h2c (u=0 first, the `u=1,i` pair
+      alternating frame by frame, then u=5, then the rest of a u=7 stream that
+      had started first), aioquic 1.3 over HTTP/3 with `priority` headers and
+      a raw PRIORITY_UPDATE (the same order; the client's receive path drops
+      30-40 of ~290 packets, and retransmissions reorder only the tail).
+      h2spec (146/146 TLS, 145/146 h2c) and h3spec (77/77) unchanged; h2load
+      before and after within noise.
+      Not done: server-driven priorities (§8: a handler adjusting a
+      response's priority)
+- [x] **WebSockets over h2 (RFC 8441) and h3 (RFC 9220)**. With a handler that has `handleWSFrame`, both send
       SETTINGS_ENABLE_CONNECT_PROTOCOL; `:protocol` is otherwise an unknown
       pseudo-header (malformed), is only valid on CONNECT, and an extended
       CONNECT needs `:scheme` and `:path` like any request (a proxy's
@@ -643,6 +681,7 @@ Done on the `m6-h3` branch, as I/O-free layers like the rest:
       without validation)
 - [ ] 0-RTT (needs TLS session tickets, M4)
 - [x] WebSockets over h3 (RFC 9220): see M5
+- [x] Priorities (RFC 9218): see M5
 - [ ] DATAGRAM (RFC 9221)
 - [ ] QPACK dynamic table (better request header compression)
 - [x] Verification: RFC 9001 vectors; in-memory tests of both layers with a
