@@ -502,6 +502,20 @@ which RFC 9113 deprecated).
       cleartext port answering it as an HTTP/1.1 request (501, then close) rather
       than closing silently, inherent to serving both on one port. Split
       invariance and fuzz targets per layer (see above)
+- [ ] **Unexplained h2spec result, not reproduced.** On 2026-10-28 (commit
+      a51305d), one h2c run reported 144/146 (two failures) where 145/146 is
+      expected. Setup: one `peregrine-test` container (io_uring seccomp
+      profile) running `bench-server 2 io_uring 8443 tls stream` and
+      `bench-server 2 io_uring 8080 plain stream` side by side, started 1.5 s
+      before `summerwind/h2spec -h 127.0.0.1 -p 8080` (run right after the
+      TLS pass on 8443, which gave 146/146). Only the summary line was kept,
+      so the failing case names are unknown. Not seen again in 50+ reruns:
+      the same two-server setup 5 times, and one server alone 15 times each
+      for new/streamed, new/buffered and the base commit 9a3c182. Those
+      reruns showed timing effects: 3.5/2 occasionally passes, and one run
+      printed no summary at all. Likely a timing flake, but unproven. To
+      retry: rerun that setup in a loop and keep the full output (every
+      `×` line), e.g. 50 runs per backend, and with the host under load
 - [x] Benchmark against nginx with h2load (h2o has no Alpine package; still to do).
       Docker on the M2 Pro, Linux 6.12, host under other load (load average 5-12,
       so ±10%): each server with 6 workers on CPUs 0-5, `h2load -t6` on CPUs 6-11,
