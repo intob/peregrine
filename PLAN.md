@@ -506,9 +506,34 @@ Later in M4:
       opens the NewSessionTicket against the resumption secret. It found
       that a Finished sharing its record with more handshake bytes (a key
       change mid-record, §5.1) failed only after the ticket went out; now
-      the server fails first
-- [ ] 0-RTT (early data): needs replay protection (a single-use ticket
-      store or strike register) and the 0-RTT keys in both transports
+      the server fails first. Fuzzed with tickets (472a9d2, 25 min on
+      Linux, ReleaseSafe, 6 instances): 1.84M runs, 522 corpus inputs,
+      3719 PCs seen, no failures
+- [ ] **0-RTT (early data)**, RFC 8446 §4.2.10 and §8, RFC 8470. Done, in
+      the TLS layer over TCP (not yet switched on in the server):
+      `Config.max_early_data` with a `ticket.ReplayGuard`. A ticket issued
+      with 0-RTT on carries a random per-process `instance`, the suite and
+      the ALPN protocol, and NewSessionTicket carries early_data with
+      max_early_data_size; servers sharing a ticket key still resume each
+      other's tickets, but early data only reaches the process that issued
+      the ticket, so one guard per process sees every replay. Accepted when
+      the first PSK resumes, with the ticket's exact suite and ALPN, no
+      HelloRetryRequest, a ticket age within 10 s of the client's, and a
+      first binder the guard hasn't seen (entries kept 22 s, after which
+      the age check refuses a replay; a full table refuses 0-RTT, never
+      admits). Over TCP the early key reads until EndOfEarlyData, which the
+      client's Finished covers; more than max_early_data bytes is
+      unexpected_message; `tls.Conn.inEarlyData` says whether data read
+      now may be a replay. Proof: handshake tests with the reference client
+      (key schedule, EndOfEarlyData, the same ClientHello twice, every
+      refusal reason, messages out of place), the replay guard's tests, the
+      fuzz harness (predicts acceptance, sends early data) and an accepted
+      session through it for every suite, within and past the limit. To
+      do: HTTP over 0-RTT (requests that complete before the handshake
+      are early: safe methods served, others answered 425 Too Early, a
+      flag for handlers), switching it on (`TlsOptions`), QUIC 0-RTT
+      packets and HTTP/3, interop (OpenSSL `-early_data`, curl
+      `--tls-earlydata`, aioquic, ngtcp2)
 - [ ] Several certificates selected by SNI; OCSP stapling
 - [x] **kTLS on Linux** (`TlsOptions.ktls`, on by default): the sending side of
       an HTTP/1.1 connection goes to the kernel (TCP_ULP "tls", TLS_TX with the

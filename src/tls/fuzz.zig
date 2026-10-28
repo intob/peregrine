@@ -17,7 +17,11 @@
 //! over the transcript so far. The harness predicts which identity the
 //! server resumes and checks the resumed key schedule, or the
 //! decrypt_error for a bad binder, and opens the NewSessionTicket the
-//! server sends after a complete handshake.
+//! server sends after a complete handshake. Half of those enable 0-RTT:
+//! the harness predicts acceptance (first identity, ticket fields, ticket
+//! age, no retry) against EncryptedExtensions, and when accepted sends
+//! early data under the early key, past max_early_data or not, then
+//! EndOfEarlyData. Each replay of an input gets its own replay guard.
 //!
 //! The client's bytes are then replayed into fresh connections with other
 //! read splits and record boundaries. Checked:
@@ -66,6 +70,8 @@ const ct_ccs: u8 = 20;
 const ct_alert: u8 = 21;
 const ct_handshake: u8 = 22;
 const ct_app: u8 = 23;
+
+const end_of_early_data = [_]u8{ 5, 0, 0, 0 };
 
 /// Early data the server skips; mirrors `max_skipped_early_data` in conn.zig.
 const early_budget = 64 * 1024;
@@ -158,6 +164,7 @@ fn fixtures() !*const Fixtures {
     @memcpy(f.hybrid_share[ek.len..], &f.x25519.public_key);
     f.tickets = .init(@splat(21));
     f.tickets.now = ticketClock;
+    f.tickets.instance = 99;
     f.foreign_tickets = .init(@splat(22));
     f.foreign_tickets.now = ticketClock;
     fixtures_ready = true;
@@ -653,6 +660,20 @@ const PskEntry = struct {
     /// The ticket's suite: resumable in suites with its hash.
     suite: Suite,
     psk: [ticket.max_psk_len]u8,
+    // What 0-RTT depends on: the ticket allows it, from this server's
+    // instance, for this ALPN index; the age the client claims.
+    early: bool = false,
+    instance_ok: bool = false,
+    alpn: u8 = 0,
+    issued: i64 = 0,
+    age_add: u32 = 0,
+    obfuscated_age: u32 = 0,
+
+    /// The server's age check (ticket.ReplayGuard.max_age_skew_s).
+    fn ageOk(e: PskEntry) bool {
+        const client_age_s: i64 = (e.obfuscated_age -% e.age_add) / 1000;
+        return @abs(ticket_now - e.issued - client_age_s) <= ticket.ReplayGuard.max_age_skew_s;
+    }
 
     /// A ticket the server opens and resumes, if its binder verifies.
     fn opens(e: PskEntry) bool {
@@ -704,19 +725,33 @@ fn buildOffer(a: Allocator, smith: *Smith, fx: *const Fixtures) !*const PskOffer
             fill(smith, b);
             break :blk b;
         } else blk: {
+            e.early = smith.boolWeighted(3, 1);
+            e.instance_ok = smith.boolWeighted(7, 1);
+            e.alpn = if (smith.boolWeighted(3, 1)) 0 else smith.valueRangeAtMost(u8, 0, 3);
+            e.issued = if (kind == .expired) ticket_now - fx.tickets.lifetime_s - 1 else ticket_now - smith.valueRangeAtMost(u16, 0, 3600);
+            e.age_add = smith.value(u32);
             const state: ticket.State = .{
                 .suite = @backingInt(e.suite),
-                .issued = if (kind == .expired) ticket_now - fx.tickets.lifetime_s - 1 else ticket_now - smith.valueRangeAtMost(u16, 0, 3600),
-                .age_add = smith.value(u32),
+                .issued = e.issued,
+                .age_add = e.age_add,
                 .quic = kind == .quic,
+                .early = e.early,
+                .instance = if (e.instance_ok) fx.tickets.instance else fx.tickets.instance +% 1,
+                .alpn = e.alpn,
                 .psk_len = hash_len,
                 .psk = e.psk,
             };
             const keys = if (kind == .foreign) &fx.foreign_tickets else &fx.tickets;
             break :blk keys.seal(&state, @splat(smith.value(u8)), try a.alloc(u8, ticket.max_len));
         };
+        // The ticket age in milliseconds, obfuscated: mostly about right
+        // (within the server's skew or just past it), otherwise anything.
+        e.obfuscated_age = if (kind != .junk and smith.boolWeighted(3, 1)) blk: {
+            const age_ms = (ticket_now - e.issued) * 1000 + @as(i64, smith.valueRangeAtMost(u16, 0, 24000)) - 12000;
+            break :blk @as(u32, @truncate(@as(u64, @bitCast(age_ms)))) +% e.age_add;
+        } else smith.value(u32);
         try putVec(&ids, a, u16, identity, 0);
-        try putInt(&ids, a, u32, smith.value(u32)); // obfuscated_ticket_age
+        try putInt(&ids, a, u32, e.obfuscated_age);
         const binder_len: u8 = switch (kind) {
             .good, .bad_binder => hash_len,
             .binder_len => if (hash_len == 32) 48 else 32,
@@ -813,6 +848,8 @@ const Rec = struct {
     inner: ?[]const u8 = null,
     corrupt: bool = false,
     legacy_version: u16 = 0x0303,
+    /// Sealed under the client's early traffic key (accepted 0-RTT).
+    early: bool = false,
     /// Fragment sizes for the fragmented serialisation. Only set where
     /// record boundaries must not matter.
     frags: []const u16 = &.{},
@@ -820,6 +857,7 @@ const Rec = struct {
 
 const Keys = struct {
     suite: Suite,
+    c_e: [record.max_hash_len]u8 = undefined,
     c_hs: [record.max_hash_len]u8 = undefined,
     c_ap: [record.max_hash_len]u8 = undefined,
     have_ap: bool = false,
@@ -828,12 +866,17 @@ const Keys = struct {
 /// Turns records into bytes, tracking the client's sequence numbers.
 const Serializer = struct {
     keys: *const ?Keys,
+    early: ?Protection = null,
     hs: ?Protection = null,
     ap: ?Protection = null,
     ap_epoch: u32 = 0,
 
-    fn protection(self: *Serializer, epoch: u32) *Protection {
+    fn protection(self: *Serializer, epoch: u32, early: bool) *Protection {
         const keys = self.keys.*.?;
+        if (early) {
+            if (self.early == null) self.early = .init(keys.suite, keys.c_e[0..keys.suite.hashLen()]);
+            return &self.early.?;
+        }
         if (epoch == 0) {
             if (self.hs == null) self.hs = .init(keys.suite, keys.c_hs[0..keys.suite.hashLen()]);
             return &self.hs.?;
@@ -875,7 +918,7 @@ const Serializer = struct {
                         @memset(buf[piece.len + 1 ..], 0);
                         break :blk buf;
                     };
-                    try seal(self.protection(rec.epoch), a, out, inner, rec.corrupt);
+                    try seal(self.protection(rec.epoch, rec.early), a, out, inner, rec.corrupt);
                 },
                 .raw => unreachable,
             }
@@ -943,6 +986,14 @@ const View = struct {
     saw_certificate: bool = false,
     res_master: [record.max_hash_len]u8 = undefined,
     tickets_received: u32 = 0,
+    /// The server's max_early_data (0: 0-RTT off) and ALPN list.
+    max_early: u32 = 0,
+    alpn_list: []const []const u8 = &.{},
+    /// The resumed ticket allows 0-RTT for this ClientHello, unless the
+    /// ALPN protocol differs (known at EncryptedExtensions).
+    early_candidate: bool = false,
+    /// The server accepted 0-RTT (early_data in EncryptedExtensions).
+    early_accepted: bool = false,
 
     fn sentHello(v: *View, bytes: []const u8) !void {
         // The message as the server frames it: by its length field, which
@@ -1135,6 +1186,13 @@ const View = struct {
             return;
         }
         v.psk_index = selected;
+        if (selected) |i| {
+            const entry = v.offer.?.entries[i];
+            const offered = if (v.hello) |h| h.find(ext_early_data) != null else false;
+            // Early data under the first PSK only, never after a retry.
+            v.early_candidate = i == 0 and offered and v.max_early > 0 and v.hrr_group == null and
+                entry.early and entry.instance_ok and entry.suite == suite and entry.ageOk();
+        }
 
         // Derive keys if the share the server used is ours.
         var list: [16]KeyShare = undefined;
@@ -1155,6 +1213,12 @@ const View = struct {
             inline else => |s| {
                 const ks = s.Schedule();
                 const early = if (v.psk_index) |i| ks.earlySecretPsk(v.offer.?.entries[i].psk[0..ks.hash_len]) else ks.earlySecret();
+                if (v.early_candidate) {
+                    // client_early_traffic_secret: over ClientHello alone.
+                    var ch: [ks.hash_len]u8 = undefined;
+                    ks.Hash.hash(v.transcript.items[0 .. v.transcript.items.len - msg.len], &ch, .{});
+                    v.keys.?.c_e[0..ks.hash_len].* = ks.deriveSecret(early, "c e traffic", &ch);
+                }
                 const hs = ks.handshakeSecret(early, shared);
                 v.hs_secret[0..ks.hash_len].* = hs;
                 v.s_hs[0..ks.hash_len].* = ks.deriveSecret(hs, "s hs traffic", hello_hash);
@@ -1171,14 +1235,27 @@ const View = struct {
             8 => {
                 var r: Reader = .{ .data = msg[4..] };
                 var e: Reader = .{ .data = try r.vec(u16) };
+                var early = false;
                 while (!e.done()) {
                     const t = try e.int(u16);
                     var b: Reader = .{ .data = try e.vec(u16) };
-                    if (t != ext_alpn) return error.UnexpectedEncryptedExtension;
-                    var list: Reader = .{ .data = try b.vec(u16) };
-                    v.alpn = try list.vec(u8);
-                    if (!list.done() or !b.done()) return error.BadAlpn;
+                    switch (t) {
+                        ext_alpn => {
+                            var list: Reader = .{ .data = try b.vec(u16) };
+                            v.alpn = try list.vec(u8);
+                            if (!list.done() or !b.done()) return error.BadAlpn;
+                        },
+                        ext_early_data => {
+                            if (!b.done()) return error.BadEarlyData;
+                            early = true;
+                        },
+                        else => return error.UnexpectedEncryptedExtension,
+                    }
                 }
+                // 0-RTT needs the ALPN protocol the ticket was issued for.
+                const want = v.early_candidate and v.offer.?.entries[0].alpn == v.alpnIndex();
+                if (early != want) return error.EarlyDataMismatch;
+                v.early_accepted = early;
             },
             // A resumed handshake has no Certificate or CertificateVerify.
             11, 15 => v.saw_certificate = true,
@@ -1196,9 +1273,13 @@ const View = struct {
                         const s_ap = ks.deriveSecret(master, "s ap traffic", fin_hash);
                         v.keys.?.c_ap[0..ks.hash_len].* = ks.deriveSecret(master, "c ap traffic", fin_hash);
                         v.keys.?.have_ap = true;
+                        // The client's Finished covers its EndOfEarlyData.
+                        var cf_buf: [record.max_hash_len]u8 = undefined;
+                        if (v.early_accepted) try v.transcript.appendSlice(v.a, &end_of_early_data);
+                        const cf_hash = if (v.early_accepted) v.hash(&cf_buf) else fin_hash;
                         const fin = try v.a.alloc(u8, 4 + ks.hash_len);
                         fin[0..4].* = .{ 20, 0, 0, ks.hash_len };
-                        fin[4..][0..ks.hash_len].* = ks.finishedVerifyData(v.keys.?.c_hs[0..ks.hash_len].*, fin_hash);
+                        fin[4..][0..ks.hash_len].* = ks.finishedVerifyData(v.keys.?.c_hs[0..ks.hash_len].*, cf_hash);
                         v.client_finished = fin;
                         v.read = .init(suite, &s_ap);
                         try v.transcript.appendSlice(v.a, fin);
@@ -1213,6 +1294,13 @@ const View = struct {
         try v.transcript.appendSlice(v.a, msg);
     }
 
+    /// The negotiated protocol as tickets record it (index plus one, or 0).
+    fn alpnIndex(v: *const View) u8 {
+        const proto = v.alpn orelse return 0;
+        for (v.alpn_list, 0..) |p, i| if (std.mem.eql(u8, p, proto)) return @intCast(i + 1);
+        return 0;
+    }
+
     /// One NewSessionTicket after the client's Finished (§4.6.1): a ticket
     /// sealed under the server's key, holding this session's resumption PSK.
     fn onTicket(v: *View, msg: []const u8) !void {
@@ -1224,7 +1312,11 @@ const View = struct {
         const nonce = try r.vec(u8);
         const identity = try r.vec(u16);
         const exts = try r.vec(u16);
-        if (!r.done() or exts.len != 0 or lifetime != v.fx.tickets.lifetime_s) return error.BadTicket;
+        if (!r.done() or lifetime != v.fx.tickets.lifetime_s) return error.BadTicket;
+        // early_data with max_early_data_size when 0-RTT is on.
+        var want_exts: [8]u8 = .{ 0, ext_early_data, 0, 4, 0, 0, 0, 0 };
+        std.mem.writeInt(u32, want_exts[4..8], v.max_early, .big);
+        if (!std.mem.eql(u8, exts, if (v.max_early > 0) &want_exts else "")) return error.BadTicketExtensions;
         const state = v.fx.tickets.open(identity) orelse return error.TicketDoesNotOpen;
         const suite = v.suite.?;
         if (state.suite != @backingInt(suite) or state.quic or state.age_add != age_add) return error.BadTicketState;
@@ -1335,7 +1427,7 @@ const Run = struct {
         while (true) {
             const k = r.conn.readPlain(buf[0..r.plain_buf_len]);
             if (k == 0) break;
-            if (r.conn.hs != null) return error.PlaintextBeforeHandshake;
+            if (r.conn.hs != null and !r.conn.inEarlyData()) return error.PlaintextBeforeHandshake;
             try r.result.plain.appendSlice(testing.allocator, buf[0..k]);
         }
         if (r.conn.failed and r.conn.hasBufferedInput()) return error.InputAfterFailure;
@@ -1438,22 +1530,31 @@ fn fuzzOne(_: void, smith: *Smith) anyerror!void {
     for (suites_buf[0..n_suites]) |*s| s.* = all_suites[smith.index(3)];
     for (groups_buf[0..n_groups]) |*g| g.* = all_groups[smith.index(3)];
     const creds = &fx.creds[if (as_recorded) 0 else smith.valueRangeAtMost(u8, 0, 2)];
-    // Session tickets in half the scripts.
+    // Session tickets in half the scripts, 0-RTT in half of those.
     const tickets = scripted and smith.boolWeighted(1, 1);
+    const max_early: u32 = if (tickets and smith.boolWeighted(1, 1)) smith.valueRangeAtMost(u32, 1, 3 * record.max_plaintext) else 0;
     const config: conn_mod.Config = .{
         .credentials = creds,
         .suites = if (n_suites == 0) handshake.default_suites else suites_buf[0..n_suites],
         .groups = if (n_groups == 0) &all_groups else groups_buf[0..n_groups],
         .alpn = alpn_choices[if (as_recorded) 1 else smith.valueRangeAtMost(u8, 0, 3)],
         .tickets = if (tickets) &fx.tickets else null,
+        .max_early_data = max_early,
     };
+    // Each run of the input gets its own replay guard, or the guard would
+    // refuse 0-RTT the second time.
+    var guards: [3]ticket.ReplayGuard = undefined;
+    for (&guards) |*g| g.* = try .init(testing.allocator, 8);
+    defer for (&guards) |*g| g.deinit();
+    var configs: [3]conn_mod.Config = @splat(config);
+    for (&configs, &guards) |*c, *g| c.replay = g;
 
     var pools = try conn_mod.Pools.init(testing.allocator, 2);
     defer pools.deinit();
 
-    var probe = try Run.init(&pools, &config, record.max_plaintext);
+    var probe = try Run.init(&pools, &configs[0], record.max_plaintext);
     defer probe.deinit();
-    var view: View = .{ .fx = fx, .a = a, .tickets = tickets };
+    var view: View = .{ .fx = fx, .a = a, .tickets = tickets, .max_early = max_early, .alpn_list = config.alpn };
     var exp: Expect = .{};
     var script: Script = .{ .a = a, .ser = .{ .keys = &view.keys }, .probe = &probe, .view = &view };
 
@@ -1477,6 +1578,7 @@ fn fuzzOne(_: void, smith: *Smith) anyerror!void {
             const offer = try buildOffer(a, smith, fx);
             try hello.setExt(a, ext_psk_modes, offer.modes);
             try hello.setExt(a, ext_pre_shared_key, offer.body);
+            if (smith.boolWeighted(1, 1)) try hello.setExt(a, ext_early_data, "");
             view.offer = offer;
         }
     }
@@ -1522,7 +1624,7 @@ fn fuzzOne(_: void, smith: *Smith) anyerror!void {
     const n_sizes = smith.valueRangeAtMost(u8, 1, read_sizes.len);
     for (read_sizes[0..n_sizes]) |*s| s.* = if (smith.boolWeighted(1, 1)) smith.valueRangeAtMost(u16, 1, 32) else smith.valueRangeAtMost(u16, 1, 20000);
     {
-        var run = try Run.init(&pools, &config, smith.valueRangeAtMost(u16, 1, record.max_plaintext));
+        var run = try Run.init(&pools, &configs[1], smith.valueRangeAtMost(u16, 1, record.max_plaintext));
         defer run.deinit();
         try run.feed(script.stream.items, read_sizes[0..n_sizes]);
         var res = run.finish();
@@ -1535,7 +1637,7 @@ fn fuzzOne(_: void, smith: *Smith) anyerror!void {
         var frag_stream: std.ArrayList(u8) = .empty;
         var ser: Serializer = .{ .keys = &view.keys };
         for (script.recs.items) |rec| try ser.write(a, &frag_stream, rec, true);
-        var run = try Run.init(&pools, &config, 1 + smith.valueRangeAtMost(u16, 0, 15));
+        var run = try Run.init(&pools, &configs[2], 1 + smith.valueRangeAtMost(u16, 0, 15));
         defer run.deinit();
         try run.feed(frag_stream.items, &.{1});
         var res = run.finish();
@@ -1667,7 +1769,8 @@ fn runScript(
         if (mres.benign and psk == .rejected) exp.fail(@src().line, .decrypt_error);
         if (mres.benign and (scheme_ok or psk == .resumed) and exp.live() and view.alert != null) return error.ValidHelloRejected;
     } else if (view.state == .connected) {
-        for (0..early_records) |_| try sendEarly(a, smith, s, exp, offered_early, false);
+        if (view.early_accepted) try sendAcceptedEarly(a, smith, s, view, exp);
+        for (0..early_records) |_| try sendEarly(a, smith, s, exp, offered_early and !view.early_accepted, false);
     }
 
     if (view.state != .connected) {
@@ -1696,7 +1799,7 @@ fn runScript(
                 exp.fail(@src().line, .unexpected_message);
             },
             // After a HelloRetryRequest, early data ended with ClientHello2.
-            2 => try sendEarly(a, smith, s, exp, offered_early and view.hrr_group == null and !hs_decrypted, false),
+            2 => try sendEarly(a, smith, s, exp, offered_early and view.hrr_group == null and !hs_decrypted and !view.early_accepted, false),
             3 => {
                 const desc = smith.value(u8);
                 try s.send(.{ .kind = .plain, .ct = ct_alert, .data = try a.dupe(u8, &.{ smith.valueRangeAtMost(u8, 1, 2), desc }) });
@@ -1896,6 +1999,42 @@ fn runScript(
     }
 }
 
+/// Accepted 0-RTT: application data under the early key, within the
+/// server's max_early_data or past it, then EndOfEarlyData (or a fault in
+/// its place).
+fn sendAcceptedEarly(a: Allocator, smith: *Smith, s: *Script, view: *const View, exp: *Expect) !void {
+    var total: usize = 0;
+    var seed: usize = 1 << 20;
+    for (0..smith.valueRangeAtMost(u8, 0, 4)) |_| {
+        const len: usize = if (smith.boolWeighted(3, 1)) smith.valueRangeAtMost(u16, 0, 512) else smith.valueRangeAtMost(u16, 513, record.max_plaintext);
+        const data = try appBytes(a, len, seed);
+        seed += len;
+        total += len;
+        const over = total > view.max_early;
+        // The record that goes over stays whole in every serialisation,
+        // so what arrives before the alert is the same.
+        try s.send(.{ .kind = .sealed, .early = true, .ct = ct_app, .data = data, .frags = if (over) &.{} else try fragSizes(a, smith) });
+        if (over) return exp.fail(@src().line, .unexpected_message);
+        if (exp.live()) try exp.app.appendSlice(a, data);
+    }
+    switch (smith.valueRangeAtMost(u8, 0, 15)) {
+        0 => {
+            // Finished before EndOfEarlyData.
+            try s.send(.{ .kind = .sealed, .early = true, .ct = ct_handshake, .data = view.client_finished.? });
+            exp.fail(@src().line, .unexpected_message);
+        },
+        1 => {
+            try s.send(.{ .kind = .sealed, .early = true, .ct = ct_handshake, .data = &.{ 5, 0, 0, 1, 0 } });
+            exp.fail(@src().line, .decode_error);
+        },
+        2 => {
+            try s.send(.{ .kind = .sealed, .early = true, .ct = ct_app, .data = "corrupt", .corrupt = true });
+            exp.fail(@src().line, .bad_record_mac);
+        },
+        else => try s.send(.{ .kind = .sealed, .early = true, .ct = ct_handshake, .data = &end_of_early_data, .frags = try fragSizes(a, smith) }),
+    }
+}
+
 /// An undecryptable 0-RTT record. Skipped while the server may still be
 /// receiving rejected early data, a fault otherwise.
 fn sendEarly(a: Allocator, smith: *Smith, s: *Script, exp: *Expect, skippable: bool, before_keys: bool) !void {
@@ -1941,6 +2080,92 @@ const corpus = [_][]const u8{
 
 test "fuzz: tls.Conn handshake and record mutations" {
     try std.testing.fuzz({}, fuzzOne, .{ .corpus = &corpus });
+}
+
+/// One accepted 0-RTT session through the harness: early data of `early`
+/// bytes (the limit is 1000), EndOfEarlyData, Finished, more data. Random
+/// inputs rarely line up everything 0-RTT needs, so this walks it
+/// directly, with the same checks.
+fn earlySession(comptime suite: Suite, early: usize) !void {
+    const fx = try fixtures();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var zeros: [64]u64 = @splat(0);
+    var smith: Smith = .{ .in = std.mem.sliceAsBytes(&zeros) };
+    var guard = try ticket.ReplayGuard.init(testing.allocator, 8);
+    defer guard.deinit();
+    const config: conn_mod.Config = .{
+        .credentials = &fx.creds[0],
+        .suites = &.{suite},
+        .groups = &.{.x25519},
+        .tickets = &fx.tickets,
+        .max_early_data = 1000,
+        .replay = &guard,
+    };
+    var pools = try conn_mod.Pools.init(testing.allocator, 2);
+    defer pools.deinit();
+    var probe = try Run.init(&pools, &config, record.max_plaintext);
+    defer probe.deinit();
+    var view: View = .{ .fx = fx, .a = a, .tickets = true, .max_early = config.max_early_data };
+    var script: Script = .{ .a = a, .ser = .{ .keys = &view.keys }, .probe = &probe, .view = &view };
+
+    // A ticket this server issued 5 s ago, offered with a matching age.
+    const hash_len: u8 = @intCast(suite.hashLen());
+    const entry: PskEntry = .{ .kind = .good, .suite = suite, .psk = @splat(7), .early = true, .instance_ok = true, .issued = ticket_now - 5, .age_add = 1234, .obfuscated_age = 5000 +% 1234 };
+    const state: ticket.State = .{ .suite = @backingInt(suite), .issued = entry.issued, .age_add = entry.age_add, .quic = false, .early = true, .instance = fx.tickets.instance, .psk_len = hash_len, .psk = entry.psk };
+    var sealed: [ticket.max_len]u8 = undefined;
+    const identity = fx.tickets.seal(&state, @splat(1), &sealed);
+    var body: std.ArrayList(u8) = .empty;
+    try putInt(&body, a, u16, @intCast(2 + identity.len + 4));
+    try putVec(&body, a, u16, identity, 0);
+    try putInt(&body, a, u32, entry.obfuscated_age);
+    try putInt(&body, a, u16, 1 + hash_len);
+    try body.append(a, hash_len);
+    try body.appendNTimes(a, 0, hash_len);
+    const offer: PskOffer = .{ .entries = &.{entry}, .body = body.items, .binders_len = 3 + hash_len, .modes = "\x01\x01", .dhe = true };
+
+    var hello = try Hello.parse(a, fx.hello);
+    try substituteShares(a, fx, &hello);
+    try hello.setExt(a, ext_psk_modes, offer.modes);
+    try hello.setExt(a, ext_early_data, "");
+    try hello.setExt(a, ext_pre_shared_key, offer.body);
+    view.offer = &offer;
+    const ch = try hello.encode(a);
+    view.offer_intact = offerIntact(&hello, &offer);
+    try testing.expect(view.offer_intact);
+    patchBinders(&offer, &smith, "", ch);
+    try view.sentHello(ch);
+    try script.send(.{ .kind = .plain, .ct = ct_handshake, .data = ch, .legacy_version = 0x0301 });
+    try testing.expect(view.early_accepted and probe.conn.inEarlyData());
+
+    const data = try appBytes(a, early, 0);
+    try script.send(.{ .kind = .sealed, .early = true, .ct = ct_app, .data = data });
+    if (early > config.max_early_data) {
+        try testing.expect(probe.conn.failed);
+        try testing.expectEqual(@as(?[2]u8, .{ 2, @backingInt(Description.unexpected_message) }), view.alert);
+        return;
+    }
+    try script.send(.{ .kind = .sealed, .early = true, .ct = ct_handshake, .data = &end_of_early_data });
+    try testing.expect(probe.conn.inEarlyData());
+    try script.send(.{ .kind = .sealed, .ct = ct_handshake, .data = view.client_finished.? });
+    try testing.expect(probe.conn.isEstablished() and !probe.conn.inEarlyData());
+    try script.send(.{ .kind = .sealed, .ct = ct_app, .epoch = 1, .data = "after" });
+    try view.pump(probe.result.wire.items);
+    var res = probe.finish();
+    defer res.deinit();
+    try checkStructure(&res);
+    try testing.expect(!res.failed and res.established);
+    try testing.expectEqualSlices(u8, try std.mem.concat(a, u8, &.{ data, "after" }), res.plain.items);
+    try testing.expectEqual(1, view.tickets_received);
+}
+
+test "tls harness: accepted 0-RTT, within and past max_early_data" {
+    inline for (.{ Suite.aes_128_gcm_sha256, Suite.aes_256_gcm_sha384, Suite.chacha20_poly1305_sha256 }) |suite| {
+        try earlySession(suite, 0);
+        try earlySession(suite, 1000);
+        try earlySession(suite, 1001);
+    }
 }
 
 test "tls fuzz harness over pseudo-random inputs" {

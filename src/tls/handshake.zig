@@ -17,9 +17,14 @@
 //! EncryptedExtensions; ALPN is required; the legacy session ID must be
 //! empty, so no change_cipher_spec is ever sent.
 //!
-//! Scope: full handshakes with certificate authentication, and resumption
-//! with session tickets (`Config.tickets`, PSK with (EC)DHE only); no
-//! 0-RTT, no client certificates.
+//! Scope: full handshakes with certificate authentication, resumption
+//! with session tickets (`Config.tickets`, PSK with (EC)DHE only), and
+//! 0-RTT on resumption (`Config.max_early_data`); no client certificates.
+//!
+//! 0-RTT: with early data accepted the client's early traffic secret goes
+//! to the sink (`.early`) right after ClientHello. Over TCP the
+//! handshake read key follows only at EndOfEarlyData; over QUIC both are
+//! installed at once (QUIC has no EndOfEarlyData, RFC 9001 §8.3).
 const std = @import("std");
 const tls = std.crypto.tls;
 const record = @import("./record.zig");
@@ -40,8 +45,9 @@ const MLKem768 = std.crypto.kem.ml_kem.MLKem768;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha384 = std.crypto.hash.sha2.Sha384;
 
-/// Encryption levels (QUIC epochs, without 0-RTT).
-pub const Level = enum(u2) { initial, handshake, application };
+/// Encryption levels: QUIC's packet number spaces, then 0-RTT (which QUIC
+/// sends in the application space).
+pub const Level = enum(u2) { initial, handshake, application, early };
 
 pub const Config = struct {
     credentials: *const Credentials,
@@ -57,6 +63,16 @@ pub const Config = struct {
     /// Session tickets: one is sent after each handshake, and a ClientHello
     /// offering a valid one resumes without certificate authentication.
     tickets: ?*const ticket.Keys = null,
+    /// 0-RTT (RFC 8446 §4.2.10): with tickets and `replay`, tickets allow
+    /// up to this many bytes of early data, accepted from a client that
+    /// resumes one this process issued (see `ticket`). 0: off, and early
+    /// data offered is skipped.
+    max_early_data: u32 = 0,
+    replay: ?*ticket.ReplayGuard = null,
+
+    fn earlyData(self: *const Config) bool {
+        return self.max_early_data > 0 and self.replay != null and self.tickets != null;
+    }
 };
 
 const has_aes = switch (@import("builtin").cpu.arch) {
@@ -81,7 +97,7 @@ const entropy_ticket = 32 + 32 + 32 + 32 + credentials.noise_len;
 /// Largest handshake message accepted from a client.
 pub const max_message_len = 1 << 16;
 
-const State = enum { client_hello, client_hello_retry, client_finished, done };
+const State = enum { client_hello, client_hello_retry, end_of_early_data, client_finished, done };
 
 const Transcript = union(enum) {
     sha256: Sha256,
@@ -135,9 +151,11 @@ pub const Handshake = struct {
     /// QUIC: our transport parameters, as the sink returned them; sent in
     /// EncryptedExtensions.
     transport_params: []const u8 = &.{},
-    /// The client offered 0-RTT data; it is rejected, so the record layer
+    /// The client offered 0-RTT data. Unless accepted, the record layer
     /// must skip it.
     early_data_offered: bool = false,
+    /// 0-RTT accepted: early data is coming under the early traffic key.
+    early_accepted: bool = false,
 
     /// A session ticket was accepted (the resumption PSK is in `psk`).
     resumed: bool = false,
@@ -216,7 +234,15 @@ pub const Handshake = struct {
             .client_hello, .client_hello_retry => {
                 if (level != .initial or msg_type != .client_hello) return error.UnexpectedMessage;
                 try self.handleClientHello(msg, sink);
-                return self.state == .client_finished;
+                return self.state == .client_finished or self.state == .end_of_early_data;
+            },
+            .end_of_early_data => {
+                if (level != .early or msg_type != .end_of_early_data) return error.UnexpectedMessage;
+                if (msg.len != 4) return error.DecodeError;
+                if (more) return error.UnexpectedMessage;
+                self.handleEndOfEarlyData(msg);
+                try sink.readSecret(.handshake, self.suite, self.client_handshake_secret[0..self.suite.hashLen()]);
+                return true;
             },
             .client_finished => {
                 if (level != .handshake or msg_type != .finished) return error.UnexpectedMessage;
@@ -329,6 +355,7 @@ pub const Handshake = struct {
         if (hello.psk) try self.choosePsk(&hello, msg);
         if (!self.resumed) try self.checkSignatureScheme(hello);
         self.transcript.update(msg);
+        if (self.early_accepted) try self.sendEarlySecret(sink);
         try self.sendServerFlight(chosen.?, sink);
     }
 
@@ -351,7 +378,7 @@ pub const Handshake = struct {
         var index: u16 = 0;
         while (ids.pos < ids.data.len) : (index += 1) {
             const identity = try ids.vector(u16);
-            _ = try ids.int(u32); // obfuscated_ticket_age: only 0-RTT needs it
+            const obfuscated_age = try ids.int(u32);
             const binder = try binders.vector(u8);
             if (index >= 8) return; // look at a few, not every one offered
             const state = keys.open(identity) orelse continue;
@@ -378,8 +405,63 @@ pub const Handshake = struct {
             self.resumed = true;
             self.psk_identity = index;
             @memcpy(self.psk[0..state.psk_len], state.pskSlice());
+            // Early data is under the first PSK offered (§4.2.10).
+            self.early_accepted = index == 0 and hello.early_data and self.acceptEarly(keys, &state, obfuscated_age, binder);
             return;
         }
+    }
+
+    /// 0-RTT with a resumed ticket (§4.2.10): it allows early data and
+    /// was issued by this process, for the same suite and ALPN protocol;
+    /// the client's ticket age is close to ours (§8.3); and this
+    /// ClientHello wasn't seen before (§8.2).
+    fn acceptEarly(self: *const Self, keys: *const ticket.Keys, state: *const ticket.State, obfuscated_age: u32, binder: []const u8) bool {
+        if (!self.config.earlyData() or !state.early or state.instance != keys.instance) return false;
+        if (state.suite != @backingInt(self.suite) or state.alpn != self.alpnIndex()) return false;
+        const now = keys.now();
+        const client_age_s: i64 = (obfuscated_age -% state.age_add) / 1000;
+        if (@abs(now - state.issued - client_age_s) > ticket.ReplayGuard.max_age_skew_s) return false;
+        return self.config.replay.?.admit(binder, now);
+    }
+
+    /// The negotiated protocol as a ticket records it: its index in the
+    /// configuration plus one, or 0.
+    fn alpnIndex(self: *const Self) u8 {
+        const proto = self.alpn orelse return 0;
+        for (self.config.alpn, 0..) |p, i| {
+            if (std.mem.eql(u8, p, proto)) return @intCast(@min(i + 1, 255));
+        }
+        return 0;
+    }
+
+    /// client_early_traffic_secret, over the ClientHello (§7.1).
+    fn sendEarlySecret(self: *Self, sink: anytype) !void {
+        var hash_buf: [record.max_hash_len]u8 = undefined;
+        const hello_hash = self.transcript.current(&hash_buf);
+        switch (self.suite) {
+            inline else => |s| {
+                const ks = s.Schedule();
+                var early = ks.earlySecretPsk(self.psk[0..ks.hash_len]);
+                defer std.crypto.secureZero(u8, &early);
+                var c_e = ks.deriveSecret(early, "c e traffic", hello_hash);
+                defer std.crypto.secureZero(u8, &c_e);
+                try sink.readSecret(.early, s, &c_e);
+            },
+        }
+    }
+
+    /// The end of early data over TCP: the client's Finished covers it.
+    fn handleEndOfEarlyData(self: *Self, msg: []const u8) void {
+        self.transcript.update(msg);
+        var hash_buf: [record.max_hash_len]u8 = undefined;
+        const hash = self.transcript.current(&hash_buf);
+        switch (self.suite) {
+            inline else => |s| {
+                const ks = s.Schedule();
+                self.expected_finished[0..ks.hash_len].* = ks.finishedVerifyData(self.client_handshake_secret[0..ks.hash_len].*, hash);
+            },
+        }
+        self.state = .client_finished;
     }
 
     fn sendHelloRetryRequest(self: *Self, client_hello: []const u8, group: NamedGroup, sink: anytype) !void {
@@ -469,7 +551,7 @@ pub const Handshake = struct {
         switch (self.suite) {
             inline else => |s| try self.sendEncryptedFlight(s, kx.sharedSecret(), sink),
         }
-        self.state = .client_finished;
+        self.state = if (self.early_accepted and !self.config.quic) .end_of_early_data else .client_finished;
     }
 
     fn sendEncryptedFlight(self: *Self, comptime suite: Suite, shared_secret: []const u8, sink: anytype) !void {
@@ -486,7 +568,8 @@ pub const Handshake = struct {
         defer std.crypto.secureZero(u8, &s_hs);
         defer std.crypto.secureZero(u8, &c_hs);
         try sink.writeSecret(.handshake, suite, &s_hs);
-        try sink.readSecret(.handshake, suite, &c_hs);
+        // Over TCP, early data comes first (see `handleEndOfEarlyData`).
+        if (!self.early_accepted or self.config.quic) try sink.readSecret(.handshake, suite, &c_hs);
 
         const creds = self.config.credentials;
         var chain_len: usize = 0;
@@ -511,6 +594,10 @@ pub const Handshake = struct {
             w.int(u16, @backingInt(ExtensionType.quic_transport_parameters));
             w.int(u16, @intCast(self.transport_params.len));
             w.bytes(self.transport_params);
+        }
+        if (self.early_accepted) {
+            w.int(u16, @backingInt(ExtensionType.early_data));
+            w.int(u16, 0);
         }
         w.end(u16, exts);
         w.endMessage(hdr);
@@ -609,6 +696,9 @@ pub const Handshake = struct {
             .issued = keys.now(),
             .age_add = std.mem.readInt(u32, self.entropy[entropy_ticket + 12 ..][0..4], .big),
             .quic = self.config.quic,
+            .early = self.config.earlyData(),
+            .instance = keys.instance,
+            .alpn = self.alpnIndex(),
             .psk_len = @intCast(self.suite.hashLen()),
             .psk = @splat(0),
         };
@@ -632,7 +722,14 @@ pub const Handshake = struct {
         w.bytes(&nonce);
         w.int(u16, @intCast(sealed.len));
         w.bytes(sealed);
-        w.int(u16, 0); // no extensions (no early_data: 0-RTT isn't offered)
+        const exts = w.begin(u16);
+        if (state.early) {
+            // QUIC limits 0-RTT by flow control instead (RFC 9001 §4.6.1).
+            w.int(u16, @backingInt(ExtensionType.early_data));
+            w.int(u16, 4);
+            w.int(u32, if (self.config.quic) 0xffffffff else self.config.max_early_data);
+        }
+        w.end(u16, exts);
         w.endMessage(hdr);
         try sink.handshakeData(.application, w.written());
     }
@@ -1351,7 +1448,7 @@ fn pskModes(comptime modes: []const u8) []const u8 {
 fn RefClient(comptime suite: Suite) type {
     const ks = suite.Schedule();
     return struct {
-        const Ticket = struct { identity: [ticket.max_len]u8, identity_len: usize, age_add: u32, psk: ks.Secret };
+        const Ticket = struct { identity: [ticket.max_len]u8, identity_len: usize, age_add: u32, psk: ks.Secret, max_early: ?u32 = null };
 
         kp: X25519.KeyPair,
         transcript: ks.Hash = ks.Hash.init(.{}),
@@ -1359,6 +1456,9 @@ fn RefClient(comptime suite: Suite) type {
         /// Sent in the same record as Finished: `finish` then checks the
         /// server fails on it, sending nothing, and returns FinishedRejected.
         after_finished: []const u8 = "",
+        /// `finish` expects 0-RTT accepted: the early traffic secret first,
+        /// and EndOfEarlyData before Finished.
+        early: bool = false,
 
         fn init() @This() {
             return .{ .kp = X25519.KeyPair.generateDeterministic(@splat(21)) };
@@ -1418,8 +1518,22 @@ fn RefClient(comptime suite: Suite) type {
         /// Runs the rest of the handshake from the server's events (from
         /// `first` on); `resumed` says whether the flight must skip the
         /// certificate. Returns the ticket the server sent afterwards.
-        fn finish(c: *@This(), hs: *Handshake, sink: *TestSink, hello_msg: []const u8, first: usize, resumed: bool) !Ticket {
+        fn finish(c: *@This(), hs: *Handshake, sink: *TestSink, hello_msg: []const u8, first_event: usize, resumed: bool) !Ticket {
             const ev = sink.events.items;
+            var first = first_event;
+            try std.testing.expectEqual(c.early, hs.early_accepted);
+            if (c.early) {
+                // client_early_traffic_secret over the ClientHello.
+                var th = c.transcript;
+                th.update(hello_msg);
+                var h: ks.Secret = undefined;
+                th.final(&h);
+                const c_e = ks.deriveSecret(ks.earlySecretPsk(&c.psk.?), "c e traffic", &h);
+                const rs = ev[first].read_secret;
+                try std.testing.expectEqual(Level.early, rs.level);
+                try std.testing.expectEqualSlices(u8, &c_e, rs.secret);
+                first += 1;
+            }
             const sh = ev[first].data.bytes;
             var r: Reader = .{ .data = sh[4..] };
             _ = try r.take(2 + 32);
@@ -1451,14 +1565,30 @@ fn RefClient(comptime suite: Suite) type {
             const s_hs = ks.deriveSecret(hs_secret, "s hs traffic", &h);
             const c_hs = ks.deriveSecret(hs_secret, "c hs traffic", &h);
             try std.testing.expectEqualSlices(u8, &s_hs, ev[first + 1].write_secret.secret);
-            // EncryptedExtensions, then the certificate unless resumed.
-            const flight = ev[first + 3].data.bytes;
+            // With 0-RTT the handshake read key waits for EndOfEarlyData.
+            if (!c.early) try std.testing.expectEqualSlices(u8, &c_hs, ev[first + 2].read_secret.secret);
+            // EncryptedExtensions (early_data if accepted), then the
+            // certificate unless resumed.
+            const flight = ev[first + @as(usize, if (c.early) 2 else 3)].data.bytes;
             var fr: Reader = .{ .data = flight };
             var types: [4]u8 = undefined;
             var n: usize = 0;
             while (fr.pos < flight.len) : (n += 1) {
                 types[n] = (try fr.take(1))[0];
-                _ = try fr.take(try fr.int(u24));
+                const body = try fr.take(try fr.int(u24));
+                if (types[n] != 8) continue;
+                var er: Reader = .{ .data = body };
+                var ee_exts: Reader = .{ .data = try er.vector(u16) };
+                var early_ext = false;
+                while (ee_exts.pos < ee_exts.data.len) {
+                    const t = try ee_exts.int(u16);
+                    const e = try ee_exts.vector(u16);
+                    if (t == @backingInt(ExtensionType.early_data)) {
+                        try std.testing.expectEqual(0, e.len);
+                        early_ext = true;
+                    }
+                }
+                try std.testing.expectEqual(c.early, early_ext);
             }
             const expect_types: []const u8 = if (resumed) &.{ 8, 20 } else &.{ 8, 11, 15, 20 };
             try std.testing.expectEqualSlices(u8, expect_types, types[0..n]);
@@ -1468,6 +1598,15 @@ fn RefClient(comptime suite: Suite) type {
             t3.final(&h);
             try std.testing.expectEqualSlices(u8, &ks.finishedVerifyData(s_hs, &h), flight[fin_at + 4 ..]);
             c.transcript.update(flight[fin_at..]);
+            if (c.early) {
+                const eoed = [_]u8{ @backingInt(HandshakeType.end_of_early_data), 0, 0, 0 };
+                const at = sink.events.items.len;
+                try hs.feed(.early, &eoed, sink);
+                const rs = sink.events.items[at].read_secret;
+                try std.testing.expectEqual(Level.handshake, rs.level);
+                try std.testing.expectEqualSlices(u8, &c_hs, rs.secret);
+                c.transcript.update(&eoed);
+            }
             var t4 = c.transcript;
             t4.final(&h);
             const master = ks.masterSecret(hs_secret);
@@ -1498,7 +1637,14 @@ fn RefClient(comptime suite: Suite) type {
             var out: Ticket = .{ .identity = undefined, .identity_len = 0, .age_add = try nr.int(u32), .psk = undefined };
             const nonce = try nr.vector(u8);
             const id = try nr.vector(u16);
-            try std.testing.expectEqualSlices(u8, "", try nr.vector(u16));
+            const nst_exts = try nr.vector(u16);
+            if (nst_exts.len > 0) {
+                // early_data, with max_early_data_size.
+                try std.testing.expectEqual(8, nst_exts.len);
+                try std.testing.expectEqual(@backingInt(ExtensionType.early_data), std.mem.readInt(u16, nst_exts[0..2], .big));
+                try std.testing.expectEqual(4, std.mem.readInt(u16, nst_exts[2..4], .big));
+                out.max_early = std.mem.readInt(u32, nst_exts[4..8], .big);
+            }
             @memcpy(out.identity[0..id.len], id);
             out.identity_len = id.len;
             out.psk = ks.resumptionPsk(res, nonce);
@@ -1652,5 +1798,168 @@ test "resumption: bad binders fail; unusable tickets get a full handshake" {
         c2.psk = null;
         _ = try c2.finish(&hs2, &sink2, hello2, 0, false);
         tk = undefined;
+    }
+}
+
+/// The early_data extension, empty (in a ClientHello).
+const early_data_ext = [_]u8{ 0, 42, 0, 0 };
+
+/// A full handshake, then a ticket from it.
+fn issueTicket(comptime suite: Suite, config: *const Config, entropy: *const [entropy_len]u8, extra: []const u8) !RefClient(suite).Ticket {
+    var buf: [4096]u8 = undefined;
+    var c = RefClient(suite).init();
+    var hs = Handshake.init(std.testing.allocator, config, entropy);
+    defer hs.deinit();
+    var sink: TestSink = .{ .allocator = std.testing.allocator };
+    defer sink.deinit();
+    const hello = c.hello(&buf, extra, null, true);
+    try hs.feed(.initial, hello, &sink);
+    return c.finish(&hs, &sink, hello, 0, false);
+}
+
+test "0-RTT: accepted once per ClientHello, with EndOfEarlyData before Finished" {
+    var creds = try testCredentials();
+    defer creds.deinit();
+    var keys = ticket.Keys.init(@splat(9));
+    keys.now = resumeTestClock;
+    keys.instance = 77;
+    var guard = try ticket.ReplayGuard.init(std.testing.allocator, 64);
+    defer guard.deinit();
+    var entropy: [entropy_len]u8 = undefined;
+    for (&entropy, 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+    inline for (.{ Suite.aes_128_gcm_sha256, Suite.aes_256_gcm_sha384 }) |suite| {
+        const C = RefClient(suite);
+        var config = resumeConfig(&creds, &keys, &.{suite});
+        config.max_early_data = 16384;
+        config.replay = &guard;
+        const t = try issueTicket(suite, &config, &entropy, pskModes(&.{1}));
+        try std.testing.expectEqual(@as(?u32, 16384), t.max_early);
+
+        var buf: [4096]u8 = undefined;
+        var c = C.init();
+        c.early = true;
+        var hs = Handshake.init(std.testing.allocator, &config, &entropy);
+        defer hs.deinit();
+        var sink: TestSink = .{ .allocator = std.testing.allocator };
+        defer sink.deinit();
+        const hello = c.hello(&buf, comptime pskModes(&.{1}) ++ early_data_ext, &t, true);
+        try hs.feed(.initial, hello, &sink);
+        const t2 = try c.finish(&hs, &sink, hello, 0, true);
+        // A ticket from a resumed session allows 0-RTT too.
+        try std.testing.expectEqual(@as(?u32, 16384), t2.max_early);
+
+        // The same ClientHello again: resumed, without early data.
+        var c2 = C.init();
+        var hs2 = Handshake.init(std.testing.allocator, &config, &entropy);
+        defer hs2.deinit();
+        var sink2: TestSink = .{ .allocator = std.testing.allocator };
+        defer sink2.deinit();
+        c2.psk = c.psk;
+        try hs2.feed(.initial, hello, &sink2);
+        try std.testing.expect(hs2.resumed and hs2.early_data_offered and !hs2.early_accepted);
+        _ = try c2.finish(&hs2, &sink2, hello, 0, true);
+    }
+}
+
+test "0-RTT: refused unless this process issued the ticket for this suite and protocol, at about the age claimed" {
+    var creds = try testCredentials();
+    defer creds.deinit();
+    var keys = ticket.Keys.init(@splat(9));
+    keys.now = resumeTestClock;
+    keys.instance = 77;
+    resume_test_now = 5_000_000;
+    defer resume_test_now = 5_000_000;
+    var guard = try ticket.ReplayGuard.init(std.testing.allocator, 64);
+    defer guard.deinit();
+    var entropy: [entropy_len]u8 = undefined;
+    for (&entropy, 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+    const suite = Suite.aes_128_gcm_sha256;
+    const C = RefClient(suite);
+    var config = resumeConfig(&creds, &keys, &.{ suite, .chacha20_poly1305_sha256 });
+    config.alpn = &.{ "a", "b" };
+    config.max_early_data = 16384;
+    config.replay = &guard;
+    const alpn_a = [_]u8{ 0, 16, 0, 4, 0, 2, 1, 'a' };
+    const alpn_b = [_]u8{ 0, 16, 0, 4, 0, 2, 1, 'b' };
+    const t = try issueTicket(suite, &config, &entropy, comptime pskModes(&.{1}) ++ alpn_a);
+    var no_early = config;
+    no_early.max_early_data = 0;
+    const t_off = try issueTicket(suite, &no_early, &entropy, comptime pskModes(&.{1}) ++ alpn_a);
+    try std.testing.expectEqual(@as(?u32, null), t_off.max_early);
+
+    const Case = enum { off_at_issue, off_now, other_instance, other_alpn, other_suite, client_age_ahead, client_age_behind, ok };
+    for (std.enums.values(Case)) |case| {
+        var cfg = config;
+        var other = keys;
+        other.instance = 78;
+        var tk = if (case == .off_at_issue) t_off else t;
+        var extra: []const u8 = comptime pskModes(&.{1}) ++ early_data_ext ++ alpn_a;
+        switch (case) {
+            .off_now => cfg.max_early_data = 0,
+            .other_instance => cfg.tickets = &other,
+            .other_alpn => extra = comptime pskModes(&.{1}) ++ early_data_ext ++ alpn_b,
+            .other_suite => cfg.suites = &.{.chacha20_poly1305_sha256},
+            // The client says 1 s; ours is 1 + 11 s, or the client's is.
+            .client_age_ahead => tk.age_add -%= 11_000,
+            .client_age_behind => resume_test_now += 12,
+            else => {},
+        }
+        defer resume_test_now = 5_000_000;
+        var buf: [4096]u8 = undefined;
+        var hs = Handshake.init(std.testing.allocator, &cfg, &entropy);
+        defer hs.deinit();
+        var sink: TestSink = .{ .allocator = std.testing.allocator };
+        defer sink.deinit();
+        if (case == .other_suite) {
+            // The ticket's hash, another suite: resumable, but not 0-RTT.
+            const Cc = RefClient(.chacha20_poly1305_sha256);
+            var cc = Cc.init();
+            const tc: Cc.Ticket = .{ .identity = tk.identity, .identity_len = tk.identity_len, .age_add = tk.age_add, .psk = tk.psk };
+            try hs.feed(.initial, cc.hello(&buf, extra, &tc, true), &sink);
+        } else {
+            var c = C.init();
+            try hs.feed(.initial, c.hello(&buf, extra, &tk, true), &sink);
+        }
+        try std.testing.expect(hs.resumed and hs.early_data_offered);
+        try std.testing.expectEqual(case == .ok, hs.early_accepted);
+    }
+}
+
+test "0-RTT: EndOfEarlyData is the only handshake message under the early key" {
+    var creds = try testCredentials();
+    defer creds.deinit();
+    var keys = ticket.Keys.init(@splat(9));
+    keys.now = resumeTestClock;
+    var guard = try ticket.ReplayGuard.init(std.testing.allocator, 64);
+    defer guard.deinit();
+    var entropy: [entropy_len]u8 = undefined;
+    for (&entropy, 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+    const suite = Suite.aes_128_gcm_sha256;
+    var config = resumeConfig(&creds, &keys, &.{suite});
+    config.max_early_data = 100;
+    config.replay = &guard;
+    const t = try issueTicket(suite, &config, &entropy, pskModes(&.{1}));
+    const fin = [_]u8{ 20, 0, 0, 32 } ++ @as([32]u8, @splat(0));
+    const cases = [_]struct { level: Level, bytes: []const u8, err: anyerror }{
+        .{ .level = .early, .bytes = &fin, .err = error.UnexpectedMessage },
+        .{ .level = .early, .bytes = &.{ 5, 0, 0, 1, 0 }, .err = error.DecodeError },
+        .{ .level = .early, .bytes = &.{ 5, 0, 0, 0, 20 }, .err = error.UnexpectedMessage },
+        .{ .level = .handshake, .bytes = &.{ 5, 0, 0, 0 }, .err = error.UnexpectedMessage },
+        .{ .level = .handshake, .bytes = &fin, .err = error.UnexpectedMessage },
+    };
+    for (cases, 0..) |case, i| {
+        var buf: [4096]u8 = undefined;
+        var c = RefClient(suite).init();
+        var hs = Handshake.init(std.testing.allocator, &config, &entropy);
+        defer hs.deinit();
+        var sink: TestSink = .{ .allocator = std.testing.allocator };
+        defer sink.deinit();
+        // A fresh binder each time (the guard admits each once).
+        var tk = t;
+        tk.age_add +%= @intCast(i);
+        const hello = c.hello(&buf, comptime pskModes(&.{1}) ++ early_data_ext, &tk, true);
+        try hs.feed(.initial, hello, &sink);
+        try std.testing.expect(hs.early_accepted);
+        try std.testing.expectError(case.err, hs.feed(case.level, case.bytes, &sink));
     }
 }

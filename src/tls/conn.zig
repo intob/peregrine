@@ -86,6 +86,8 @@ pub const Conn = struct {
     wire_end: usize = 0,
 
     early_data_left: usize = 0,
+    /// Accepted 0-RTT data received so far (`Config.max_early_data`).
+    early_received: usize = 0,
     /// Negotiated ALPN protocol (points into the config), once established.
     alpn: ?[]const u8 = null,
     /// A fatal alert was queued: flush the wire, then close.
@@ -138,6 +140,18 @@ pub const Conn = struct {
 
     pub fn isHandshaking(self: *const Self) bool {
         return self.hs != null;
+    }
+
+    /// 0-RTT was accepted and the handshake isn't complete: application
+    /// data read now may be a replay (RFC 8446 §8). It arrives under the
+    /// ALPN protocol `earlyAlpn` returns.
+    pub fn inEarlyData(self: *const Self) bool {
+        const hs = self.hs orelse return false;
+        return hs.early_accepted and !self.failed;
+    }
+
+    pub fn earlyAlpn(self: *const Self) ?[]const u8 {
+        return if (self.hs) |hs| hs.alpn else self.alpn;
     }
 
     // -- Input --------------------------------------------------------------
@@ -341,7 +355,12 @@ pub const Conn = struct {
                 self.early_data_left = 0;
                 switch (opened.content_type) {
                     .application_data => {
-                        if (self.hs != null) return error.UnexpectedMessage;
+                        if (self.hs) |hs| {
+                            // Only accepted 0-RTT data, within its limit.
+                            if (self.read_level != .early) return error.UnexpectedMessage;
+                            self.early_received += opened.data.len;
+                            if (self.early_received > hs.config.max_early_data) return error.UnexpectedMessage;
+                        }
                         if (direct) return opened.data.len;
                         self.plain = opened.data;
                     },
@@ -374,7 +393,7 @@ pub const Conn = struct {
             // Rejected 0-RTT data is skipped (§4.2.10) from ClientHello1
             // until the first record that decrypts, or, after a
             // HelloRetryRequest, until ClientHello2 starts.
-            self.early_data_left = if (hs.early_data_offered and !retrying) max_skipped_early_data else 0;
+            self.early_data_left = if (hs.early_data_offered and !retrying and !hs.early_accepted) max_skipped_early_data else 0;
         }
         if (hs.isDone()) {
             self.alpn = hs.alpn;

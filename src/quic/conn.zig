@@ -710,6 +710,8 @@ pub const Conn = struct {
         }
 
         pub fn readSecret(self: *TlsSink, level: handshake.Level, suite: Suite, secret: []const u8) Error!void {
+            // 0-RTT isn't enabled over QUIC yet (Config.max_early_data is 0).
+            std.debug.assert(level != .early);
             const c = self.conn;
             c.spaces[@backingInt(level)].rx = .init(suite, secret);
             if (level == .application) {
