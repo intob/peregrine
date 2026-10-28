@@ -496,8 +496,17 @@ Later in M4:
       (io_uring). The TLS fuzz target (25 min on Linux, ReleaseSafe, 6
       instances: about 2.6M runs, 444 corpus inputs, no failures, after a
       harness fix in 110b869) covers the new handshake code and the
-      pre_shared_key parsing, but runs without tickets, so the PSK choice
-      itself isn't fuzzed
+      pre_shared_key parsing. Since then the harness also runs half its
+      scripts with tickets: it offers PSKs (tickets it seals under the
+      server's key, valid, expired, for QUIC, under another key, with bad
+      binders or binders of the wrong length, junk, up to 10 identities,
+      with and without a HelloRetryRequest), predicts the identity the
+      server resumes or the decrypt_error, follows the resumed key
+      schedule, checks there is no certificate in a resumed flight, and
+      opens the NewSessionTicket against the resumption secret. It found
+      that a Finished sharing its record with more handshake bytes (a key
+      change mid-record, §5.1) failed only after the ticket went out; now
+      the server fails first
 - [ ] 0-RTT (early data): needs replay protection (a single-use ticket
       store or strike register) and the 0-RTT keys in both transports
 - [ ] Several certificates selected by SNI; OCSP stapling

@@ -11,6 +11,14 @@
 //! early-data records. Mode 0 instead replays the recorded session itself
 //! with only its ClientHello mutated.
 //!
+//! Half the scripts run the server with session tickets and offer PSKs:
+//! tickets the harness seals under the server's ticket key (valid, expired,
+//! for QUIC, under another key) and junk identities, with binders computed
+//! over the transcript so far. The harness predicts which identity the
+//! server resumes and checks the resumed key schedule, or the
+//! decrypt_error for a bad binder, and opens the NewSessionTicket the
+//! server sends after a complete handshake.
+//!
 //! The client's bytes are then replayed into fresh connections with other
 //! read splits and record boundaries. Checked:
 //! - no crash, leak or out-of-bounds access (runtime safety is on);
@@ -27,6 +35,7 @@ const conn_mod = @import("./conn.zig");
 const record = @import("./record.zig");
 const handshake = @import("./handshake.zig");
 const credentials = @import("./credentials.zig");
+const ticket = @import("./ticket.zig");
 const Conn = conn_mod.Conn;
 const Protection = record.Protection;
 const Suite = record.Suite;
@@ -74,6 +83,9 @@ const Fixtures = struct {
     mlkem: MLKem768.KeyPair,
     p256_share: [65]u8,
     hybrid_share: [MLKem768.PublicKey.encoded_length + 32]u8,
+    /// The server's ticket key, and another server's.
+    tickets: ticket.Keys,
+    foreign_tickets: ticket.Keys,
 
     fn share(self: *const Fixtures, group: u16) ?[]const u8 {
         return switch (group) {
@@ -144,6 +156,10 @@ fn fixtures() !*const Fixtures {
     const ek = f.mlkem.public_key.toBytes();
     @memcpy(f.hybrid_share[0..ek.len], &ek);
     @memcpy(f.hybrid_share[ek.len..], &f.x25519.public_key);
+    f.tickets = .init(@splat(21));
+    f.tickets.now = ticketClock;
+    f.foreign_tickets = .init(@splat(22));
+    f.foreign_tickets.now = ticketClock;
     fixtures_ready = true;
     return f;
 }
@@ -608,6 +624,179 @@ fn mutateHello(a: Allocator, smith: *Smith, fx: *const Fixtures, h: *Hello, res:
     }
 }
 
+// -- Offered PSKs -------------------------------------------------------------
+
+/// The fixed clock tickets are issued and checked against.
+const ticket_now: i64 = 1_000_000_000;
+
+fn ticketClock() i64 {
+    return ticket_now;
+}
+
+const PskKind = enum(u8) {
+    /// A valid ticket with its binder.
+    good,
+    /// A valid ticket, its binder wrong in one byte.
+    bad_binder,
+    /// A valid ticket, its binder the other hash's length.
+    binder_len,
+    /// Issued over QUIC.
+    quic,
+    expired,
+    /// Sealed under another server's key.
+    foreign,
+    junk,
+};
+
+const PskEntry = struct {
+    kind: PskKind,
+    /// The ticket's suite: resumable in suites with its hash.
+    suite: Suite,
+    psk: [ticket.max_psk_len]u8,
+
+    /// A ticket the server opens and resumes, if its binder verifies.
+    fn opens(e: PskEntry) bool {
+        return switch (e.kind) {
+            .good, .bad_binder, .binder_len => true,
+            else => false,
+        };
+    }
+};
+
+/// A pre_shared_key extension and its psk_key_exchange_modes.
+const PskOffer = struct {
+    entries: []const PskEntry,
+    /// The extension body, binders zeroed (`patchBinders` fills them in).
+    body: []const u8,
+    /// The binders vector at the end of `body`, length included.
+    binders_len: usize,
+    modes: []const u8,
+    /// psk_dhe_ke is among the modes.
+    dhe: bool,
+
+    /// The identity the server picks in a handshake with `suite` (the
+    /// first of 8 that opens with the suite's hash), whatever its binder.
+    fn choice(o: *const PskOffer, suite: Suite) ?u16 {
+        if (!o.dhe) return null;
+        for (o.entries[0..@min(o.entries.len, 8)], 0..) |e, i| {
+            if (e.opens() and e.suite.hashLen() == suite.hashLen()) return @intCast(i);
+        }
+        return null;
+    }
+};
+
+fn buildOffer(a: Allocator, smith: *Smith, fx: *const Fixtures) !*const PskOffer {
+    // A few identities, or enough that the server stops looking.
+    const n: usize = if (smith.boolWeighted(7, 1)) smith.valueRangeAtMost(u8, 1, 4) else smith.valueRangeAtMost(u8, 8, 10);
+    const entries = try a.alloc(PskEntry, n);
+    const ticket_suites = [_]Suite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 };
+    var ids: std.ArrayList(u8) = .empty;
+    var binders: std.ArrayList(u8) = .empty;
+    try putInt(&ids, a, u16, 0);
+    try putInt(&binders, a, u16, 0);
+    for (entries) |*e| {
+        const kind: PskKind = if (smith.boolWeighted(1, 1)) .good else @fromBackingInt(smith.valueRangeAtMost(u8, 0, @typeInfo(PskKind).@"enum".field_names.len - 1));
+        e.* = .{ .kind = kind, .suite = ticket_suites[smith.index(ticket_suites.len)], .psk = undefined };
+        fill(smith, &e.psk);
+        const hash_len: u8 = @intCast(e.suite.hashLen());
+        const identity: []const u8 = if (kind == .junk) blk: {
+            const b = try a.alloc(u8, smith.valueRangeAtMost(u16, 1, 64));
+            fill(smith, b);
+            break :blk b;
+        } else blk: {
+            const state: ticket.State = .{
+                .suite = @backingInt(e.suite),
+                .issued = if (kind == .expired) ticket_now - fx.tickets.lifetime_s - 1 else ticket_now - smith.valueRangeAtMost(u16, 0, 3600),
+                .age_add = smith.value(u32),
+                .quic = kind == .quic,
+                .psk_len = hash_len,
+                .psk = e.psk,
+            };
+            const keys = if (kind == .foreign) &fx.foreign_tickets else &fx.tickets;
+            break :blk keys.seal(&state, @splat(smith.value(u8)), try a.alloc(u8, ticket.max_len));
+        };
+        try putVec(&ids, a, u16, identity, 0);
+        try putInt(&ids, a, u32, smith.value(u32)); // obfuscated_ticket_age
+        const binder_len: u8 = switch (kind) {
+            .good, .bad_binder => hash_len,
+            .binder_len => if (hash_len == 32) 48 else 32,
+            else => if (smith.boolWeighted(1, 1)) 32 else 48,
+        };
+        try binders.append(a, binder_len);
+        try binders.appendNTimes(a, 0, binder_len);
+    }
+    std.mem.writeInt(u16, ids.items[0..2], @intCast(ids.items.len - 2), .big);
+    std.mem.writeInt(u16, binders.items[0..2], @intCast(binders.items.len - 2), .big);
+    const modes: []const u8 = switch (smith.valueRangeAtMost(u8, 0, 5)) {
+        4 => "\x01\x00", // psk_ke only: a full handshake
+        5 => "\x02\x00\x01",
+        else => "\x01\x01",
+    };
+    const offer = try a.create(PskOffer);
+    offer.* = .{
+        .entries = entries,
+        .body = try std.mem.concat(a, u8, &.{ ids.items, binders.items }),
+        .binders_len = binders.items.len,
+        .modes = modes,
+        .dhe = std.mem.indexOfScalar(u8, modes[1..], 1) != null,
+    };
+    return offer;
+}
+
+/// The offer reaches the server as built: its binders are where
+/// `patchBinders` writes them, and the server's choice is `choice`.
+fn offerIntact(h: *const Hello, o: *const PskOffer) bool {
+    const exts = h.exts.items;
+    if (exts.len == 0 or !wellFormedExtensions(h)) return false;
+    const last = exts[exts.len - 1];
+    const modes = h.ext(ext_psk_modes) orelse return false;
+    return last.type == ext_pre_shared_key and last.body.ptr == o.body.ptr and last.len_delta == 0 and
+        modes.ptr == o.modes.ptr and h.sid_delta == 0 and h.exts_delta == 0 and h.msg_delta == 0 and
+        h.trailing.len == 0 and h.cut == 0;
+}
+
+/// Writes each ticket's binder into the ClientHello `msg`: over the
+/// transcript before it (`prefix`) and `msg` up to the binders, with the
+/// ticket's hash (§4.2.11.2).
+fn patchBinders(o: *const PskOffer, smith: *Smith, prefix: []const u8, msg: []u8) void {
+    const start = msg.len - o.binders_len;
+    var pos = start + 2;
+    for (o.entries) |e| {
+        const binder = msg[pos + 1 ..][0..msg[pos]];
+        pos += 1 + binder.len;
+        if (!e.opens()) continue;
+        switch (e.suite) {
+            inline else => |s| {
+                const ks = s.Schedule();
+                if (binder.len != ks.hash_len) continue;
+                var h = ks.Hash.init(.{});
+                h.update(prefix);
+                h.update(msg[0..start]);
+                var digest: ks.Secret = undefined;
+                h.final(&digest);
+                const key = ks.deriveSecret(ks.earlySecretPsk(e.psk[0..ks.hash_len]), "res binder", &ks.empty_hash);
+                @memcpy(binder, &ks.finishedVerifyData(key, &digest));
+            },
+        }
+        if (e.kind == .bad_binder) binder[smith.index(binder.len)] ^= smith.valueRangeAtMost(u8, 1, 255);
+    }
+}
+
+/// What the server must do with the offer in the ClientHello it just got,
+/// in a handshake with `suite` (null: no prediction).
+fn pskOutcome(v: *const View, suite: ?Suite) enum { none, resumed, rejected } {
+    const o = v.offer orelse return .none;
+    if (!v.offer_intact or !v.tickets) return .none;
+    const i = o.choice(suite orelse return .none) orelse return .none;
+    return if (o.entries[i].kind == .good) .resumed else .rejected;
+}
+
+/// The suite the server picks for a first ClientHello offering `offered`.
+fn predictSuite(config: *const conn_mod.Config, offered: []const u8) ?Suite {
+    for (config.suites) |s| if (listHas(offered, @backingInt(s))) return s;
+    return null;
+}
+
 // -- Client records -----------------------------------------------------------
 
 /// One record (or, with `frags`, several) the client sends.
@@ -744,6 +933,16 @@ const View = struct {
     alpn: ?[]const u8 = null,
     alert: ?[2]u8 = null,
     ku_received: u32 = 0,
+    /// The server has session tickets.
+    tickets: bool = false,
+    offer: ?*const PskOffer = null,
+    /// The offer in the latest ClientHello arrived as built.
+    offer_intact: bool = false,
+    /// The identity the server resumed.
+    psk_index: ?u16 = null,
+    saw_certificate: bool = false,
+    res_master: [record.max_hash_len]u8 = undefined,
+    tickets_received: u32 = 0,
 
     fn sentHello(v: *View, bytes: []const u8) !void {
         // The message as the server frames it: by its length field, which
@@ -844,6 +1043,7 @@ const View = struct {
             },
             .flight => try v.onFlight(msg),
             .connected => {
+                if (msg[0] == 4) return v.onTicket(msg);
                 // Only a KeyUpdate answering ours, never requesting one.
                 if (!std.mem.eql(u8, msg, &.{ 24, 0, 0, 1, 0 })) return error.UnexpectedPostHandshake;
                 v.ku_received += 1;
@@ -865,6 +1065,7 @@ const View = struct {
         var group: ?u16 = null;
         var share: []const u8 = "";
         var version_ok = false;
+        var selected: ?u16 = null;
         while (!e.done()) {
             const t = try e.int(u16);
             var b: Reader = .{ .data = try e.vec(u16) };
@@ -874,6 +1075,7 @@ const View = struct {
                     group = try b.int(u16);
                     if (!b.done()) share = try b.vec(u16);
                 },
+                ext_pre_shared_key => selected = try b.int(u16),
                 else => return error.UnexpectedServerHelloExtension,
             }
             if (!b.done()) return error.BadServerHello;
@@ -884,6 +1086,7 @@ const View = struct {
             else => return error.BadServerSuite,
         };
         const is_hrr = std.mem.eql(u8, random, &tls.hello_retry_request_sequence);
+        if (selected != null and (is_hrr or !v.tickets)) return error.UnexpectedPsk;
 
         // Checks against what the client offered, when it can parse that.
         if (v.hello) |h| {
@@ -920,6 +1123,19 @@ const View = struct {
         if (v.hrr_group) |g| if (g != group.?) return error.GroupChangedAfterRetry;
         try v.transcript.appendSlice(v.a, msg);
 
+        // The PSK resumed, if any: the one predicted for an offer that
+        // arrived as built.
+        if (v.offer_intact) {
+            const want = if (v.tickets) v.offer.?.choice(suite) else null;
+            if (want) |i| if (v.offer.?.entries[i].kind != .good) return error.BadBinderAccepted;
+            const ok = if (want) |i| (if (selected) |sel| sel == i else false) else selected == null;
+            if (!ok) return error.WrongPskChoice;
+        } else if (selected != null) {
+            v.state = .opaque_keys;
+            return;
+        }
+        v.psk_index = selected;
+
         // Derive keys if the share the server used is ours.
         var list: [16]KeyShare = undefined;
         const n = if (v.hello) |h| h.shares(&list) else 0;
@@ -938,7 +1154,8 @@ const View = struct {
         switch (suite) {
             inline else => |s| {
                 const ks = s.Schedule();
-                const hs = ks.handshakeSecret(ks.earlySecret(), shared);
+                const early = if (v.psk_index) |i| ks.earlySecretPsk(v.offer.?.entries[i].psk[0..ks.hash_len]) else ks.earlySecret();
+                const hs = ks.handshakeSecret(early, shared);
                 v.hs_secret[0..ks.hash_len].* = hs;
                 v.s_hs[0..ks.hash_len].* = ks.deriveSecret(hs, "s hs traffic", hello_hash);
                 v.keys.?.c_hs[0..ks.hash_len].* = ks.deriveSecret(hs, "c hs traffic", hello_hash);
@@ -963,8 +1180,10 @@ const View = struct {
                     if (!list.done() or !b.done()) return error.BadAlpn;
                 }
             },
-            11, 15 => {},
+            // A resumed handshake has no Certificate or CertificateVerify.
+            11, 15 => v.saw_certificate = true,
             20 => {
+                if (v.saw_certificate == (v.psk_index != null)) return error.CertificateMismatch;
                 var h: [record.max_hash_len]u8 = undefined;
                 switch (suite) {
                     inline else => |s| {
@@ -982,6 +1201,8 @@ const View = struct {
                         fin[4..][0..ks.hash_len].* = ks.finishedVerifyData(v.keys.?.c_hs[0..ks.hash_len].*, fin_hash);
                         v.client_finished = fin;
                         v.read = .init(suite, &s_ap);
+                        try v.transcript.appendSlice(v.a, fin);
+                        v.res_master[0..ks.hash_len].* = ks.deriveSecret(master, "res master", v.hash(&h));
                     },
                 }
                 v.state = .connected;
@@ -990,6 +1211,30 @@ const View = struct {
             else => return error.UnexpectedFlightMessage,
         }
         try v.transcript.appendSlice(v.a, msg);
+    }
+
+    /// One NewSessionTicket after the client's Finished (§4.6.1): a ticket
+    /// sealed under the server's key, holding this session's resumption PSK.
+    fn onTicket(v: *View, msg: []const u8) !void {
+        if (!v.tickets or v.tickets_received > 0) return error.UnexpectedTicket;
+        v.tickets_received += 1;
+        var r: Reader = .{ .data = msg[4..] };
+        const lifetime = try r.int(u32);
+        const age_add = try r.int(u32);
+        const nonce = try r.vec(u8);
+        const identity = try r.vec(u16);
+        const exts = try r.vec(u16);
+        if (!r.done() or exts.len != 0 or lifetime != v.fx.tickets.lifetime_s) return error.BadTicket;
+        const state = v.fx.tickets.open(identity) orelse return error.TicketDoesNotOpen;
+        const suite = v.suite.?;
+        if (state.suite != @backingInt(suite) or state.quic or state.age_add != age_add) return error.BadTicketState;
+        switch (suite) {
+            inline else => |s| {
+                const ks = s.Schedule();
+                const psk = ks.resumptionPsk(v.res_master[0..ks.hash_len].*, nonce);
+                if (!std.mem.eql(u8, state.pskSlice(), &psk)) return error.WrongResumptionPsk;
+            },
+        }
     }
 };
 
@@ -1193,11 +1438,14 @@ fn fuzzOne(_: void, smith: *Smith) anyerror!void {
     for (suites_buf[0..n_suites]) |*s| s.* = all_suites[smith.index(3)];
     for (groups_buf[0..n_groups]) |*g| g.* = all_groups[smith.index(3)];
     const creds = &fx.creds[if (as_recorded) 0 else smith.valueRangeAtMost(u8, 0, 2)];
+    // Session tickets in half the scripts.
+    const tickets = scripted and smith.boolWeighted(1, 1);
     const config: conn_mod.Config = .{
         .credentials = creds,
         .suites = if (n_suites == 0) handshake.default_suites else suites_buf[0..n_suites],
         .groups = if (n_groups == 0) &all_groups else groups_buf[0..n_groups],
         .alpn = alpn_choices[if (as_recorded) 1 else smith.valueRangeAtMost(u8, 0, 3)],
+        .tickets = if (tickets) &fx.tickets else null,
     };
 
     var pools = try conn_mod.Pools.init(testing.allocator, 2);
@@ -1205,7 +1453,7 @@ fn fuzzOne(_: void, smith: *Smith) anyerror!void {
 
     var probe = try Run.init(&pools, &config, record.max_plaintext);
     defer probe.deinit();
-    var view: View = .{ .fx = fx, .a = a };
+    var view: View = .{ .fx = fx, .a = a, .tickets = tickets };
     var exp: Expect = .{};
     var script: Script = .{ .a = a, .ser = .{ .keys = &view.keys }, .probe = &probe, .view = &view };
 
@@ -1224,17 +1472,32 @@ fn fuzzOne(_: void, smith: *Smith) anyerror!void {
         }
         // Offer 0-RTT (rejected) in a quarter of the scripts.
         if (smith.boolWeighted(3, 1)) try hello.setExt(a, ext_early_data, "");
+        // PSKs in half the scripts (the server ignores them without tickets).
+        if (smith.boolWeighted(1, 1)) {
+            const offer = try buildOffer(a, smith, fx);
+            try hello.setExt(a, ext_psk_modes, offer.modes);
+            try hello.setExt(a, ext_pre_shared_key, offer.body);
+            view.offer = offer;
+        }
     }
     var mres: MutationResult = .{};
     try mutateHello(a, smith, fx, &hello, &mres, smith.valueRangeAtMost(u8, 0, if (scripted) 3 else 6));
     const ch1 = try hello.encode(a);
+    if (view.offer) |o| {
+        view.offer_intact = offerIntact(&hello, o);
+        if (view.offer_intact) patchBinders(o, smith, "", ch1);
+    }
     try view.sentHello(ch1);
     try script.send(.{ .kind = .plain, .ct = ct_handshake, .data = ch1, .legacy_version = 0x0301, .frags = if (mres.framed) try fragSizes(a, smith) else &.{} });
 
     // The scheme our certificate signs with must be on offer, or the
-    // handshake can't complete whatever else the client does.
+    // handshake can't complete whatever else the client does (unless it
+    // resumes). PSKs are only looked at when there is no
+    // HelloRetryRequest; a bad binder fails the handshake.
     const scheme_ok = if (hello.ext(ext_signature_algorithms)) |b| b.len >= 2 and listHas(b[2..], @backingInt(creds.key.scheme())) else false;
-    if (mres.benign and scheme_ok and view.alert != null) return error.ValidHelloRejected;
+    const psk = if (view.state == .hrr) .none else pskOutcome(&view, predictSuite(&config, hello.suites));
+    if (mres.benign and psk == .rejected) exp.fail(@src().line, .decrypt_error);
+    if (mres.benign and (scheme_ok or psk == .resumed) and psk != .rejected and view.alert != null) return error.ValidHelloRejected;
 
     if (!scripted) {
         // The rest of the recorded session, as it was sent.
@@ -1300,6 +1563,8 @@ fn checkExpect(exp: *const Expect, res: *const Result, view: *const View) !void 
     }
     if (!std.mem.eql(u8, res.plain.items, exp.app.items)) return error.PlaintextMismatch;
     if (view.ku_received != exp.ku_requested) return error.KeyUpdateMismatch;
+    // A ticket follows the client's Finished.
+    if (view.tickets_received != @intFromBool(exp.finished and view.tickets)) return error.TicketMismatch;
 }
 
 /// After the first ClientHello: answer a HelloRetryRequest, then send the
@@ -1388,11 +1653,19 @@ fn runScript(
             if (mres.framed and !lying) exp.fail(@src().line, d);
         }
         const ch2 = try h2.encode(a);
+        if (view.offer) |o| {
+            // The binders now cover message_hash(ClientHello1) and the
+            // HelloRetryRequest too.
+            view.offer_intact = offerIntact(&h2, o);
+            if (view.offer_intact) patchBinders(o, smith, view.transcript.items, ch2);
+        }
         try view.sentHello(ch2);
         hello.* = h2;
         try s.send(.{ .kind = .plain, .ct = ct_handshake, .data = ch2, .frags = if (mres.framed) try fragSizes(a, smith) else &.{} });
         if (trace) std.debug.print("retry for group {x}: alert {any}\n", .{ g, view.alert });
-        if (mres.benign and scheme_ok and exp.live() and view.alert != null) return error.ValidHelloRejected;
+        const psk = pskOutcome(view, view.suite);
+        if (mres.benign and psk == .rejected) exp.fail(@src().line, .decrypt_error);
+        if (mres.benign and (scheme_ok or psk == .resumed) and exp.live() and view.alert != null) return error.ValidHelloRejected;
     } else if (view.state == .connected) {
         for (0..early_records) |_| try sendEarly(a, smith, s, exp, offered_early, false);
     }

@@ -179,7 +179,7 @@ pub const Handshake = struct {
         while (rest.len > 0) {
             if (self.partial.items.len == 0) {
                 if (try messageLen(rest)) |n| {
-                    const key_change = try self.handleMessage(level, rest[0..n], sink);
+                    const key_change = try self.handleMessage(level, rest[0..n], rest.len > n, sink);
                     rest = rest[n..];
                     // RFC 8446 §5.1: messages before a key change must end
                     // on a record boundary.
@@ -191,7 +191,7 @@ pub const Handshake = struct {
             self.partial.appendSlice(self.allocator, rest) catch return error.InternalError;
             rest = &.{};
             while (try messageLen(self.partial.items)) |n| {
-                const key_change = try self.handleMessage(level, self.partial.items[0..n], sink);
+                const key_change = try self.handleMessage(level, self.partial.items[0..n], self.partial.items.len > n, sink);
                 const left = self.partial.items.len - n;
                 std.mem.copyForwards(u8, self.partial.items[0..left], self.partial.items[n..]);
                 self.partial.shrinkRetainingCapacity(left);
@@ -208,8 +208,9 @@ pub const Handshake = struct {
         return if (data.len >= 4 + len) 4 + len else null;
     }
 
-    /// Returns true if the message caused a change of read keys.
-    fn handleMessage(self: *Self, level: Level, msg: []const u8, sink: anytype) !bool {
+    /// Returns true if the message caused a change of read keys. `more`:
+    /// bytes follow it in the same record.
+    fn handleMessage(self: *Self, level: Level, msg: []const u8, more: bool, sink: anytype) !bool {
         const msg_type: HandshakeType = @fromBackingInt(msg[0]);
         switch (self.state) {
             .client_hello, .client_hello_retry => {
@@ -219,6 +220,9 @@ pub const Handshake = struct {
             },
             .client_finished => {
                 if (level != .handshake or msg_type != .finished) return error.UnexpectedMessage;
+                // Finished always changes keys (§5.1): fail before acting
+                // on it, rather than after sending a session ticket.
+                if (more) return error.UnexpectedMessage;
                 try self.handleFinished(msg, sink);
                 return true;
             },
@@ -1352,6 +1356,9 @@ fn RefClient(comptime suite: Suite) type {
         kp: X25519.KeyPair,
         transcript: ks.Hash = ks.Hash.init(.{}),
         psk: ?ks.Secret = null,
+        /// Sent in the same record as Finished: `finish` then checks the
+        /// server fails on it, sending nothing, and returns FinishedRejected.
+        after_finished: []const u8 = "",
 
         fn init() @This() {
             return .{ .kp = X25519.KeyPair.generateDeterministic(@splat(21)) };
@@ -1468,6 +1475,14 @@ fn RefClient(comptime suite: Suite) type {
             fin[0..4].* = .{ 0x14, 0, 0, ks.hash_len };
             fin[4..].* = ks.finishedVerifyData(c_hs, &h);
             const before = sink.events.items.len;
+            if (c.after_finished.len > 0) {
+                var rec: [4 + ks.hash_len + 64]u8 = undefined;
+                @memcpy(rec[0..fin.len], &fin);
+                @memcpy(rec[fin.len..][0..c.after_finished.len], c.after_finished);
+                try std.testing.expectError(error.UnexpectedMessage, hs.feed(.handshake, rec[0 .. fin.len + c.after_finished.len], sink));
+                try std.testing.expectEqual(before, sink.events.items.len);
+                return error.FinishedRejected;
+            }
             try hs.feed(.handshake, &fin, sink);
             try std.testing.expect(hs.isDone());
             c.transcript.update(&fin);
@@ -1490,6 +1505,31 @@ fn RefClient(comptime suite: Suite) type {
             return out;
         }
     };
+}
+
+test "Finished sharing its record fails before keys or a ticket go out" {
+    // RFC 8446 §5.1: a message before a key change must end its record.
+    var creds = try testCredentials();
+    defer creds.deinit();
+    var keys = ticket.Keys.init(@splat(9));
+    keys.now = resumeTestClock;
+    var entropy: [entropy_len]u8 = undefined;
+    for (&entropy, 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+    const C = RefClient(.aes_128_gcm_sha256);
+    const config = resumeConfig(&creds, &keys, &.{.aes_128_gcm_sha256});
+    // A KeyUpdate, or the first bytes of one.
+    for ([_][]const u8{ &.{ 24, 0, 0, 1, 0 }, &.{24} }) |extra| {
+        var buf: [4096]u8 = undefined;
+        var c = C.init();
+        c.after_finished = extra;
+        var hs = Handshake.init(std.testing.allocator, &config, &entropy);
+        defer hs.deinit();
+        var sink: TestSink = .{ .allocator = std.testing.allocator };
+        defer sink.deinit();
+        const hello1 = c.hello(&buf, pskModes(&.{1}), null, true);
+        try hs.feed(.initial, hello1, &sink);
+        try std.testing.expectError(error.FinishedRejected, c.finish(&hs, &sink, hello1, 0, false));
+    }
 }
 
 fn resumeConfig(creds: *const Credentials, keys: *const ticket.Keys, suites: []const Suite) Config {
