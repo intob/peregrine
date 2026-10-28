@@ -21,6 +21,7 @@ const ws = @import("./ws/conn.zig");
 const tls_conn = @import("./tls/conn.zig");
 pub const H2Options = @import("./h2/conn.zig").Options;
 const Credentials = @import("./tls/credentials.zig").Credentials;
+const TicketKeys = @import("./tls/ticket.zig").Keys;
 const quic_conn = @import("./quic/conn.zig");
 const quic_endpoint = @import("./quic/endpoint.zig");
 const udp = @import("./quic/udp.zig");
@@ -55,11 +56,23 @@ pub const Http3Options = struct {
 pub const TlsOptions = struct {
     /// PEM certificate chain, leaf first.
     cert_pem: []const u8,
-    /// PEM private key: PKCS#8 ("PRIVATE KEY") or SEC1 ("EC PRIVATE KEY").
-    /// ECDSA P-256/P-384 and Ed25519 keys are supported.
+    /// PEM private key: PKCS#8 ("PRIVATE KEY"), SEC1 ("EC PRIVATE KEY") or
+    /// PKCS#1 ("RSA PRIVATE KEY"). ECDSA P-256/P-384, Ed25519 and RSA
+    /// (2048-4096 bits, signing with RSA-PSS) keys are supported.
     key_pem: []const u8,
     /// ALPN protocol names offered, in preference order.
     alpn: []const []const u8 = &.{"http/1.1"},
+    /// Session tickets (RFC 8446 §4.6.1): a ticket after each handshake,
+    /// and resumption (PSK with ECDHE, so still forward secret) without
+    /// the certificate signature. Over TCP and QUIC.
+    session_tickets: bool = true,
+    /// The key tickets are sealed with. Random per process by default, so
+    /// tickets don't survive a restart; servers that share one resume each
+    /// other's sessions. Whoever has it can open every ticket.
+    ticket_key: ?[32]u8 = null,
+    /// How long a ticket is valid (at most 7 days), and how often the key
+    /// derived from `ticket_key` changes.
+    ticket_lifetime_s: u32 = 24 * 3600,
     /// TLS record buffers preallocated per worker (input and output each).
     /// Like read buffers, only connections with unprocessed or unsent
     /// bytes hold one.
@@ -228,6 +241,7 @@ pub fn Server(comptime Handler: type) type {
         cfg: Config,
         port: u16,
         tls_credentials: ?Credentials = null,
+        tls_tickets: TicketKeys = undefined,
         tls_config: tls_conn.Config = undefined,
         quic_tls_config: tls_conn.Config = undefined,
         quic_port: u16 = 0,
@@ -278,8 +292,12 @@ pub fn Server(comptime Handler: type) type {
             }
             if (cfg.tls) |t| {
                 srv.tls_credentials = try Credentials.fromPem(allocator, t.cert_pem, t.key_pem);
-                srv.tls_config = .{ .credentials = &srv.tls_credentials.?, .alpn = t.alpn };
-                srv.quic_tls_config = .{ .credentials = &srv.tls_credentials.?, .alpn = &.{"h3"}, .quic = true };
+                if (t.ticket_lifetime_s == 0 or t.ticket_lifetime_s > 7 * 24 * 3600) return error.InvalidTicketLifetime;
+                srv.tls_tickets = if (t.ticket_key) |k| .init(k) else .random();
+                srv.tls_tickets.lifetime_s = t.ticket_lifetime_s;
+                const tickets: ?*const TicketKeys = if (t.session_tickets) &srv.tls_tickets else null;
+                srv.tls_config = .{ .credentials = &srv.tls_credentials.?, .alpn = t.alpn, .tickets = tickets };
+                srv.quic_tls_config = .{ .credentials = &srv.tls_credentials.?, .alpn = &.{"h3"}, .quic = true, .tickets = tickets };
                 srv.cfg.tls = null; // the PEM data may be freed after init
             }
             errdefer if (srv.tls_credentials) |*c| c.deinit();

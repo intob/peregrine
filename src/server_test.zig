@@ -2382,6 +2382,8 @@ fn testHttp3Uploads(backend: Backend) !void {
     }.f);
     try r.srv.handler.resumeHeld();
     try cl.waitFinished(&.{ up, held });
+    // One session ticket after the handshake (RFC 8446 §4.6.1).
+    try testing.expectEqual(@as(u32, 1), cl.c.tickets);
     var expected: [64]u8 = undefined;
     var a = try cl.response(up);
     defer a.body.deinit(testing.allocator);

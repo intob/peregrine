@@ -245,6 +245,7 @@ Ed25519, `std.crypto.tls` enums and `hkdfExpandLabel`.
 | `credentials.zig` | PEM/DER loading of the certificate chain and private key; signing CertificateVerify |
 | `p256.zig`, `x25519.zig` | Base-point tables: ECDSA P-256 signing, P-256 ECDHE key pairs, X25519 public keys |
 | `rsa.zig` | RSA private keys and RSASSA-PSS signing |
+| `ticket.zig` | Session tickets: resumption state sealed with a rotating key |
 | `fuzz.zig` | Fuzz target over `tls.Conn`: a scripted client (see the checklist) |
 
 The handshake keeps a running transcript hash, not the transcript, and its state is
@@ -436,7 +437,39 @@ Later in M4:
       and _sha512 (a client that doesn't offer _sha256 gets
       handshake_failure, and none should), rsa_pss_pss_* keys, faster modular
       exponentiation
-- [ ] Session tickets and resumption (PSK-DHE); 0-RTT only with replay protection
+- [x] **Session tickets and resumption** (`src/tls/ticket.zig`, RFC 8446
+      §4.6.1, §4.2.11), over TCP and QUIC, on by default
+      (`TlsOptions.session_tickets`). Stateless: one NewSessionTicket after
+      each handshake (resumed ones included) carries the resumption PSK,
+      suite, issue time, age offset and transport, sealed with AES-256-GCM
+      under a key derived from `ticket_key` (random per process unless set,
+      so servers sharing it resume each other's sessions) and the current
+      period of `ticket_lifetime_s` (default 1 day, at most 7); tickets from
+      the current or previous period are accepted while younger than the
+      lifetime. A ClientHello's pre_shared_key is parsed and checked (last
+      extension, identities and 32-255-byte binders in step); only
+      psk_dhe_ke is accepted (a resumed session keeps forward secrecy); the
+      first of up to 8 identities that opens, for this transport and the
+      suite's hash, is chosen and its binder must verify (over the
+      transcript and the ClientHello up to the binders, so after a
+      HelloRetryRequest too), or the handshake fails with decrypt_error;
+      anything else gets a full handshake. A resumed handshake sends
+      pre_shared_key in ServerHello and skips Certificate and
+      CertificateVerify, which saves the signature: about 40 µs with an
+      ECDSA P-256 certificate, 1 ms with RSA-2048. The obfuscated ticket age
+      isn't checked (only 0-RTT needs it). Proof: ticket tests (round
+      trip, expiry, rotation, every byte tampered, another key); a reference
+      client in the handshake tests (independent key schedule) resumes with
+      SHA-256 and SHA-384 suites, chains a second ticket, resumes after a
+      HelloRetryRequest, and gets decrypt_error for a bad binder and a full
+      handshake for psk_ke only, another key, expiry and a hash mismatch;
+      HTTP/3 end-to-end tests receive one ticket. Interop on Linux: OpenSSL
+      3.5 `s_client -sess_out/-sess_in` resumes ("Reused") with
+      X25519MLKEM768, X25519 and P-256; aioquic 1.3 resumes over HTTP/3
+      (io_uring). Not fuzzed yet: the TLS fuzz target runs without tickets
+      (the ClientHello parsing is fuzzed, the PSK choice isn't)
+- [ ] 0-RTT (early data): needs replay protection (a single-use ticket
+      store or strike register) and the 0-RTT keys in both transports
 - [ ] Several certificates selected by SNI; OCSP stapling
 - [ ] **kTLS on Linux**: handshake in userspace, record crypto in the kernel, so
       `sendfile` works over TLS

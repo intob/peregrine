@@ -17,8 +17,9 @@
 //! EncryptedExtensions; ALPN is required; the legacy session ID must be
 //! empty, so no change_cipher_spec is ever sent.
 //!
-//! Scope: full handshakes with certificate authentication, no PSK, no 0-RTT,
-//! no client certificates.
+//! Scope: full handshakes with certificate authentication, and resumption
+//! with session tickets (`Config.tickets`, PSK with (EC)DHE only); no
+//! 0-RTT, no client certificates.
 const std = @import("std");
 const tls = std.crypto.tls;
 const record = @import("./record.zig");
@@ -26,6 +27,7 @@ const errors = @import("./errors.zig");
 const credentials = @import("./credentials.zig");
 const p256_base = @import("./p256.zig");
 const x25519_base = @import("./x25519.zig");
+const ticket = @import("./ticket.zig");
 const Credentials = credentials.Credentials;
 const Error = errors.Error;
 const Suite = record.Suite;
@@ -52,6 +54,9 @@ pub const Config = struct {
     groups: []const NamedGroup = &.{ .x25519_ml_kem768, .x25519, .secp256r1 },
     /// QUIC (RFC 9001) rather than TLS over TCP.
     quic: bool = false,
+    /// Session tickets: one is sent after each handshake, and a ClientHello
+    /// offering a valid one resumes without certificate authentication.
+    tickets: ?*const ticket.Keys = null,
 };
 
 const has_aes = switch (@import("builtin").cpu.arch) {
@@ -69,7 +74,9 @@ else
 /// Random bytes the handshake consumes: server random, key exchange seeds
 /// and signature noise. Passed in so the handshake stays deterministic
 /// under test.
-pub const entropy_len = 32 + 32 + 32 + 32 + credentials.noise_len;
+pub const entropy_len = 32 + 32 + 32 + 32 + credentials.noise_len + 12 + 4;
+/// Where the session ticket's AEAD nonce and age offset are.
+const entropy_ticket = 32 + 32 + 32 + 32 + credentials.noise_len;
 
 /// Largest handshake message accepted from a client.
 pub const max_message_len = 1 << 16;
@@ -132,6 +139,13 @@ pub const Handshake = struct {
     /// must skip it.
     early_data_offered: bool = false,
 
+    /// A session ticket was accepted (the resumption PSK is in `psk`).
+    resumed: bool = false,
+    psk_identity: u16 = 0,
+    psk: [record.max_hash_len]u8 = undefined,
+    /// Kept until the client's Finished, for the resumption secret.
+    master_secret: [record.max_hash_len]u8 = undefined,
+
     client_handshake_secret: [record.max_hash_len]u8 = undefined,
     client_app_secret: [record.max_hash_len]u8 = undefined,
     /// The client's Finished, computed once the server flight is sent.
@@ -146,6 +160,8 @@ pub const Handshake = struct {
         std.crypto.secureZero(u8, &self.entropy);
         std.crypto.secureZero(u8, &self.client_handshake_secret);
         std.crypto.secureZero(u8, &self.client_app_secret);
+        std.crypto.secureZero(u8, &self.psk);
+        std.crypto.secureZero(u8, &self.master_secret);
     }
 
     pub fn isDone(self: *const Self) bool {
@@ -237,9 +253,9 @@ pub const Handshake = struct {
             self.early_data_offered = hello.early_data;
         }
 
-        const sig_algs = hello.signature_algorithms orelse return error.MissingExtension;
-        if (!listHas(u16, sig_algs, @backingInt(self.config.credentials.key.scheme())))
-            return error.HandshakeFailure;
+        // Without a PSK the certificate must be usable (checked again once
+        // a ticket was looked at).
+        if (!hello.psk) try self.checkSignatureScheme(hello);
         const groups = hello.supported_groups orelse return error.MissingExtension;
         const shares = hello.key_shares orelse return error.MissingExtension;
 
@@ -305,8 +321,61 @@ pub const Handshake = struct {
             self.transport_params = try sink.transportParameters(hello.quic_transport_params.?);
         }
 
+        self.resumed = false;
+        if (hello.psk) try self.choosePsk(&hello, msg);
+        if (!self.resumed) try self.checkSignatureScheme(hello);
         self.transcript.update(msg);
         try self.sendServerFlight(chosen.?, sink);
+    }
+
+    fn checkSignatureScheme(self: *const Self, hello: ClientHello) Error!void {
+        const sig_algs = hello.signature_algorithms orelse return error.MissingExtension;
+        if (!listHas(u16, sig_algs, @backingInt(self.config.credentials.key.scheme())))
+            return error.HandshakeFailure;
+    }
+
+    /// RFC 8446 §4.2.11: the first identity that is one of our tickets,
+    /// still valid, for this transport and with the suite's hash, is
+    /// resumed if its binder verifies (otherwise the handshake fails).
+    /// Anything else gets a full handshake. Only psk_dhe_ke is supported,
+    /// so a resumed session still has forward secrecy.
+    fn choosePsk(self: *Self, hello: *const ClientHello, msg: []const u8) Error!void {
+        const keys = self.config.tickets orelse return;
+        if (!hello.psk_dhe) return;
+        var ids: Reader = .{ .data = hello.psk_identities };
+        var binders: Reader = .{ .data = hello.psk_binders };
+        var index: u16 = 0;
+        while (ids.pos < ids.data.len) : (index += 1) {
+            const identity = try ids.vector(u16);
+            _ = try ids.int(u32); // obfuscated_ticket_age: only 0-RTT needs it
+            const binder = try binders.vector(u8);
+            if (index >= 8) return; // look at a few, not every one offered
+            const state = keys.open(identity) orelse continue;
+            if (state.quic != self.config.quic) continue;
+            const suite: Suite = @fromBackingInt(state.suite);
+            if (suite.hashLen() != self.suite.hashLen() or state.psk_len != self.suite.hashLen()) continue;
+            // The binder covers the ClientHello up to the binders.
+            var t = self.transcript;
+            t.update(msg[0 .. 4 + hello.binders_offset]);
+            var hash_buf: [record.max_hash_len]u8 = undefined;
+            const hash = t.current(&hash_buf);
+            switch (self.suite) {
+                inline else => |s| {
+                    const ks = s.Schedule();
+                    var early = ks.earlySecretPsk(state.pskSlice());
+                    defer std.crypto.secureZero(u8, &early);
+                    var binder_key = ks.deriveSecret(early, "res binder", &ks.empty_hash);
+                    defer std.crypto.secureZero(u8, &binder_key);
+                    const expected = ks.finishedVerifyData(binder_key, hash);
+                    if (binder.len != ks.hash_len or !std.crypto.timing_safe.eql([ks.hash_len]u8, binder[0..ks.hash_len].*, expected))
+                        return error.DecryptError;
+                },
+            }
+            self.resumed = true;
+            self.psk_identity = index;
+            @memcpy(self.psk[0..state.psk_len], state.pskSlice());
+            return;
+        }
     }
 
     fn sendHelloRetryRequest(self: *Self, client_hello: []const u8, group: NamedGroup, sink: anytype) !void {
@@ -379,6 +448,11 @@ pub const Handshake = struct {
         w.bytes(kx.publicShare());
         w.end(u16, kx_len);
         w.end(u16, ks);
+        if (self.resumed) {
+            w.int(u16, @backingInt(ExtensionType.pre_shared_key));
+            w.int(u16, 2);
+            w.int(u16, self.psk_identity);
+        }
         w.int(u16, @backingInt(ExtensionType.supported_versions));
         w.int(u16, 2);
         w.int(u16, 0x0304);
@@ -398,7 +472,8 @@ pub const Handshake = struct {
         const ks = suite.Schedule();
         var hash_buf: [record.max_hash_len]u8 = undefined;
 
-        const early = ks.earlySecret();
+        var early = if (self.resumed) ks.earlySecretPsk(self.psk[0..ks.hash_len]) else ks.earlySecret();
+        defer std.crypto.secureZero(u8, &early);
         var hs = ks.handshakeSecret(early, shared_secret);
         defer std.crypto.secureZero(u8, &hs);
         const hello_hash = self.transcript.current(&hash_buf);
@@ -437,9 +512,38 @@ pub const Handshake = struct {
         w.endMessage(hdr);
         self.transcript.update(w.buf[start..w.pos]);
 
-        // Certificate
+        // A resumed session is authenticated by the PSK.
+        if (!self.resumed) try self.writeCertificate(&w, &hash_buf);
+
+        // Finished
         start = w.pos;
-        hdr = w.beginMessage(.certificate);
+        const verify = ks.finishedVerifyData(s_hs, self.transcript.current(&hash_buf));
+        hdr = w.beginMessage(.finished);
+        w.bytes(&verify);
+        w.endMessage(hdr);
+        self.transcript.update(w.buf[start..w.pos]);
+
+        try sink.handshakeData(.handshake, w.written());
+
+        // Application secrets cover the transcript through server Finished.
+        var master = ks.masterSecret(hs);
+        defer std.crypto.secureZero(u8, &master);
+        @memcpy(self.master_secret[0..ks.hash_len], &master);
+        const fin_hash = self.transcript.current(&hash_buf);
+        var s_ap = ks.deriveSecret(master, "s ap traffic", fin_hash);
+        defer std.crypto.secureZero(u8, &s_ap);
+        const c_ap = ks.deriveSecret(master, "c ap traffic", fin_hash);
+        @memcpy(self.client_app_secret[0..ks.hash_len], &c_ap);
+        @memcpy(self.client_handshake_secret[0..ks.hash_len], &c_hs);
+        self.expected_finished[0..ks.hash_len].* = ks.finishedVerifyData(c_hs, fin_hash);
+        try sink.writeSecret(.application, suite, &s_ap);
+    }
+
+    /// Certificate and CertificateVerify.
+    fn writeCertificate(self: *Self, w: *Writer, hash_buf: *[record.max_hash_len]u8) Error!void {
+        const creds = self.config.credentials;
+        var start = w.pos;
+        var hdr = w.beginMessage(.certificate);
         w.int(u8, 0); // certificate_request_context
         const list = w.begin(u24);
         for (creds.chain) |c| {
@@ -453,7 +557,7 @@ pub const Handshake = struct {
 
         // CertificateVerify
         start = w.pos;
-        const cert_hash = self.transcript.current(&hash_buf);
+        const cert_hash = self.transcript.current(hash_buf);
         const context = "TLS 1.3, server CertificateVerify";
         var content: [64 + context.len + 1 + record.max_hash_len]u8 = undefined;
         @memset(content[0..64], 0x20);
@@ -472,28 +576,6 @@ pub const Handshake = struct {
         w.bytes(sig);
         w.endMessage(hdr);
         self.transcript.update(w.buf[start..w.pos]);
-
-        // Finished
-        start = w.pos;
-        const verify = ks.finishedVerifyData(s_hs, self.transcript.current(&hash_buf));
-        hdr = w.beginMessage(.finished);
-        w.bytes(&verify);
-        w.endMessage(hdr);
-        self.transcript.update(w.buf[start..w.pos]);
-
-        try sink.handshakeData(.handshake, w.written());
-
-        // Application secrets cover the transcript through server Finished.
-        var master = ks.masterSecret(hs);
-        defer std.crypto.secureZero(u8, &master);
-        const fin_hash = self.transcript.current(&hash_buf);
-        var s_ap = ks.deriveSecret(master, "s ap traffic", fin_hash);
-        defer std.crypto.secureZero(u8, &s_ap);
-        const c_ap = ks.deriveSecret(master, "c ap traffic", fin_hash);
-        @memcpy(self.client_app_secret[0..ks.hash_len], &c_ap);
-        @memcpy(self.client_handshake_secret[0..ks.hash_len], &c_hs);
-        self.expected_finished[0..ks.hash_len].* = ks.finishedVerifyData(c_hs, fin_hash);
-        try sink.writeSecret(.application, suite, &s_ap);
     }
 
     // -- Client Finished ----------------------------------------------------
@@ -508,7 +590,47 @@ pub const Handshake = struct {
         try sink.readSecret(.application, self.suite, self.client_app_secret[0..hash_len]);
         std.crypto.secureZero(u8, &self.client_app_secret);
         std.crypto.secureZero(u8, &self.client_handshake_secret);
+        if (self.config.tickets) |keys| try self.sendTicket(keys, sink);
+        std.crypto.secureZero(u8, &self.master_secret);
         self.state = .done;
+    }
+
+    /// NewSessionTicket (§4.6.1): the resumption PSK, sealed in the ticket.
+    fn sendTicket(self: *Self, keys: *const ticket.Keys, sink: anytype) !void {
+        var hash_buf: [record.max_hash_len]u8 = undefined;
+        const hash = self.transcript.current(&hash_buf);
+        const nonce = [_]u8{0}; // one ticket per connection
+        var state: ticket.State = .{
+            .suite = @backingInt(self.suite),
+            .issued = keys.now(),
+            .age_add = std.mem.readInt(u32, self.entropy[entropy_ticket + 12 ..][0..4], .big),
+            .quic = self.config.quic,
+            .psk_len = @intCast(self.suite.hashLen()),
+            .psk = @splat(0),
+        };
+        defer std.crypto.secureZero(u8, &state.psk);
+        switch (self.suite) {
+            inline else => |s| {
+                const ks = s.Schedule();
+                var res = ks.deriveSecret(self.master_secret[0..ks.hash_len].*, "res master", hash);
+                defer std.crypto.secureZero(u8, &res);
+                state.psk[0..ks.hash_len].* = ks.resumptionPsk(res, &nonce);
+            },
+        }
+        var sealed_buf: [ticket.max_len]u8 = undefined;
+        const sealed = keys.seal(&state, self.entropy[entropy_ticket..][0..12].*, &sealed_buf);
+        var buf: [32 + ticket.max_len]u8 = undefined;
+        var w: Writer = .{ .buf = &buf };
+        const hdr = w.beginMessage(.new_session_ticket);
+        w.int(u32, keys.lifetime_s);
+        w.int(u32, state.age_add);
+        w.int(u8, nonce.len);
+        w.bytes(&nonce);
+        w.int(u16, @intCast(sealed.len));
+        w.bytes(sealed);
+        w.int(u16, 0); // no extensions (no early_data: 0-RTT isn't offered)
+        w.endMessage(hdr);
+        try sink.handshakeData(.application, w.written());
     }
 
     fn padHash(h: []const u8) [record.max_hash_len]u8 {
@@ -653,6 +775,13 @@ const ClientHello = struct {
     early_data: bool = false,
     psk: bool = false,
     psk_modes: bool = false,
+    /// psk_dhe_ke offered (the only mode supported).
+    psk_dhe: bool = false,
+    /// The pre_shared_key extension's identities and binders vectors'
+    /// contents, and where the binders vector starts in the body.
+    psk_identities: []const u8 = "",
+    psk_binders: []const u8 = "",
+    binders_offset: usize = 0,
 
     fn parse(body: []const u8) Error!ClientHello {
         var r: Reader = .{ .data = body };
@@ -714,15 +843,29 @@ const ClientHello = struct {
                     continue;
                 },
                 .psk_key_exchange_modes => {
+                    const modes = try e.vector(u8);
+                    if (modes.len == 0) return error.DecodeError;
                     hello.psk_modes = true;
-                    continue;
+                    hello.psk_dhe = std.mem.indexOfScalar(u8, modes, 1) != null;
                 },
                 .pre_shared_key => {
-                    // Must be last (RFC 8446 §4.2.11). Ignored: PSKs are
-                    // not supported, so a full handshake follows.
+                    // Must be last (RFC 8446 §4.2.11).
                     if (exts.pos != exts_data.len) return error.IllegalParameter;
                     hello.psk = true;
-                    continue;
+                    hello.psk_identities = try e.vector(u16);
+                    hello.binders_offset = body.len - exts_data.len + exts.pos - ext.len + e.pos;
+                    hello.psk_binders = try e.vector(u16);
+                    // As many binders (32-255 bytes) as identities.
+                    var ids: Reader = .{ .data = hello.psk_identities };
+                    var bs: Reader = .{ .data = hello.psk_binders };
+                    if (ids.data.len == 0) return error.DecodeError;
+                    while (ids.pos < ids.data.len) {
+                        if ((try ids.vector(u16)).len == 0) return error.DecodeError;
+                        _ = try ids.int(u32);
+                        const b = try bs.vector(u8);
+                        if (b.len < 32) return error.DecodeError;
+                    }
+                    if (bs.pos != bs.data.len) return error.IllegalParameter;
                 },
                 else => continue,
             }
@@ -1000,7 +1143,7 @@ test "ClientHello negotiation failures" {
     // pre_shared_key not last.
     try expectHelloError(error.IllegalParameter, buildClientHello(&buf, .{ .shares = share, .extra = "\x00\x29\x00\x00\x00\x15\x00\x00" }), &config);
     // pre_shared_key without psk_key_exchange_modes (§4.2.9).
-    try expectHelloError(error.MissingExtension, buildClientHello(&buf, .{ .shares = share, .extra = "\x00\x29\x00\x00" }), &config);
+    try expectHelloError(error.MissingExtension, buildClientHello(&buf, .{ .shares = share, .extra = "\x00\x29\x00\x2c\x00\x07\x00\x01x\x00\x00\x00\x00\x00\x21\x20" ++ @as([32]u8, @splat(0)) }), &config);
     // Truncated.
     const hello = buildClientHello(&buf, .{ .shares = share });
     var cut: [2048]u8 = undefined;
@@ -1183,4 +1326,291 @@ test "every group and suite completes against a reference client computation" {
             },
         }
     };
+}
+
+// -- Resumption ---------------------------------------------------------------
+
+var resume_test_now: i64 = 5_000_000;
+
+fn resumeTestClock() i64 {
+    return resume_test_now;
+}
+
+/// psk_key_exchange_modes with the given modes.
+fn pskModes(comptime modes: []const u8) []const u8 {
+    return .{ 0x00, 0x2d, 0x00, modes.len + 1, modes.len } ++ modes;
+}
+
+/// The client side of a handshake over X25519, computed independently of
+/// the server: checks the server's flight (certificate or not) and returns
+/// the session ticket and its PSK.
+fn RefClient(comptime suite: Suite) type {
+    const ks = suite.Schedule();
+    return struct {
+        const Ticket = struct { identity: [ticket.max_len]u8, identity_len: usize, age_add: u32, psk: ks.Secret };
+
+        kp: X25519.KeyPair,
+        transcript: ks.Hash = ks.Hash.init(.{}),
+        psk: ?ks.Secret = null,
+
+        fn init() @This() {
+            return .{ .kp = X25519.KeyPair.generateDeterministic(@splat(21)) };
+        }
+
+        /// A ClientHello with `extra` extensions; with a ticket, the
+        /// pre_shared_key extension (last) and its binder. `share` false
+        /// sends no key share (a HelloRetryRequest follows).
+        fn hello(c: *@This(), buf: []u8, extra: []const u8, t: ?*const Ticket, share: bool) []const u8 {
+            var ext_buf: [1024]u8 = undefined;
+            var w: Writer = .{ .buf = &ext_buf };
+            w.bytes(extra);
+            if (t) |tk| {
+                w.int(u16, @backingInt(ExtensionType.pre_shared_key));
+                const e = w.begin(u16);
+                const ids = w.begin(u16);
+                w.int(u16, @intCast(tk.identity_len));
+                w.bytes(tk.identity[0..tk.identity_len]);
+                w.int(u32, 1000 +% tk.age_add);
+                w.end(u16, ids);
+                w.int(u16, 1 + ks.hash_len);
+                w.int(u8, ks.hash_len);
+                w.bytes(&@as(ks.Secret, @splat(0)));
+                w.end(u16, e);
+            }
+            const msg = buildClientHello(buf, .{
+                .suites = &.{@backingInt(suite)},
+                .shares = if (share) &.{.{ .group = .x25519, .key_exchange = &c.kp.public_key }} else &.{},
+                .extra = w.written(),
+            });
+            if (t) |tk| {
+                // The binder: over the transcript so far and this message
+                // up to the binders.
+                c.psk = tk.psk;
+                const early = ks.earlySecretPsk(&tk.psk);
+                const binder_key = ks.deriveSecret(early, "res binder", &ks.empty_hash);
+                var th = c.transcript;
+                th.update(msg[0 .. msg.len - 3 - ks.hash_len]);
+                var h: ks.Secret = undefined;
+                th.final(&h);
+                @memcpy(@constCast(msg[msg.len - ks.hash_len ..]), &ks.finishedVerifyData(binder_key, &h));
+            }
+            return msg;
+        }
+
+        /// After a HelloRetryRequest: the transcript restarts with
+        /// message_hash(ClientHello1) and the HelloRetryRequest.
+        fn retried(c: *@This(), hello1: []const u8, hrr: []const u8) void {
+            var h: ks.Secret = undefined;
+            ks.Hash.hash(hello1, &h, .{});
+            c.transcript = ks.Hash.init(.{});
+            c.transcript.update(&.{ @backingInt(HandshakeType.message_hash), 0, 0, ks.hash_len });
+            c.transcript.update(&h);
+            c.transcript.update(hrr);
+        }
+
+        /// Runs the rest of the handshake from the server's events (from
+        /// `first` on); `resumed` says whether the flight must skip the
+        /// certificate. Returns the ticket the server sent afterwards.
+        fn finish(c: *@This(), hs: *Handshake, sink: *TestSink, hello_msg: []const u8, first: usize, resumed: bool) !Ticket {
+            const ev = sink.events.items;
+            const sh = ev[first].data.bytes;
+            var r: Reader = .{ .data = sh[4..] };
+            _ = try r.take(2 + 32);
+            _ = try r.vector(u8);
+            try std.testing.expectEqual(@backingInt(suite), try r.int(u16));
+            _ = try r.take(1);
+            var exts: Reader = .{ .data = try r.vector(u16) };
+            var server_share: []const u8 = "";
+            var selected: ?u16 = null;
+            while (exts.pos < exts.data.len) {
+                const t = try exts.int(u16);
+                var e: Reader = .{ .data = try exts.vector(u16) };
+                if (t == @backingInt(ExtensionType.key_share)) {
+                    _ = try e.int(u16);
+                    server_share = try e.vector(u16);
+                } else if (t == @backingInt(ExtensionType.pre_shared_key)) {
+                    selected = try e.int(u16);
+                }
+            }
+            try std.testing.expectEqual(if (resumed) @as(?u16, 0) else null, selected);
+            const shared = try X25519.scalarmult(c.kp.secret_key, server_share[0..32].*);
+            c.transcript.update(hello_msg);
+            c.transcript.update(sh);
+            var h: ks.Secret = undefined;
+            var t2 = c.transcript;
+            t2.final(&h);
+            const early = if (resumed) ks.earlySecretPsk(&c.psk.?) else ks.earlySecret();
+            const hs_secret = ks.handshakeSecret(early, &shared);
+            const s_hs = ks.deriveSecret(hs_secret, "s hs traffic", &h);
+            const c_hs = ks.deriveSecret(hs_secret, "c hs traffic", &h);
+            try std.testing.expectEqualSlices(u8, &s_hs, ev[first + 1].write_secret.secret);
+            // EncryptedExtensions, then the certificate unless resumed.
+            const flight = ev[first + 3].data.bytes;
+            var fr: Reader = .{ .data = flight };
+            var types: [4]u8 = undefined;
+            var n: usize = 0;
+            while (fr.pos < flight.len) : (n += 1) {
+                types[n] = (try fr.take(1))[0];
+                _ = try fr.take(try fr.int(u24));
+            }
+            const expect_types: []const u8 = if (resumed) &.{ 8, 20 } else &.{ 8, 11, 15, 20 };
+            try std.testing.expectEqualSlices(u8, expect_types, types[0..n]);
+            const fin_at = flight.len - 4 - ks.hash_len;
+            c.transcript.update(flight[0..fin_at]);
+            var t3 = c.transcript;
+            t3.final(&h);
+            try std.testing.expectEqualSlices(u8, &ks.finishedVerifyData(s_hs, &h), flight[fin_at + 4 ..]);
+            c.transcript.update(flight[fin_at..]);
+            var t4 = c.transcript;
+            t4.final(&h);
+            const master = ks.masterSecret(hs_secret);
+            var fin: [4 + ks.hash_len]u8 = undefined;
+            fin[0..4].* = .{ 0x14, 0, 0, ks.hash_len };
+            fin[4..].* = ks.finishedVerifyData(c_hs, &h);
+            const before = sink.events.items.len;
+            try hs.feed(.handshake, &fin, sink);
+            try std.testing.expect(hs.isDone());
+            c.transcript.update(&fin);
+            c.transcript.final(&h);
+            const res = ks.deriveSecret(master, "res master", &h);
+            // read_secret(application), then the NewSessionTicket.
+            const nst = sink.events.items[before + 1].data;
+            try std.testing.expectEqual(Level.application, nst.level);
+            var nr: Reader = .{ .data = nst.bytes };
+            try std.testing.expectEqual(@backingInt(HandshakeType.new_session_ticket), (try nr.take(1))[0]);
+            _ = try nr.take(3);
+            try std.testing.expectEqual(@as(u32, 24 * 3600), try nr.int(u32));
+            var out: Ticket = .{ .identity = undefined, .identity_len = 0, .age_add = try nr.int(u32), .psk = undefined };
+            const nonce = try nr.vector(u8);
+            const id = try nr.vector(u16);
+            try std.testing.expectEqualSlices(u8, "", try nr.vector(u16));
+            @memcpy(out.identity[0..id.len], id);
+            out.identity_len = id.len;
+            out.psk = ks.resumptionPsk(res, nonce);
+            return out;
+        }
+    };
+}
+
+fn resumeConfig(creds: *const Credentials, keys: *const ticket.Keys, suites: []const Suite) Config {
+    return .{ .credentials = creds, .suites = suites, .groups = &.{.x25519}, .tickets = keys };
+}
+
+test "resumption: a ticket from a full handshake resumes, with or without a HelloRetryRequest" {
+    var creds = try testCredentials();
+    defer creds.deinit();
+    var keys = ticket.Keys.init(@splat(9));
+    keys.now = resumeTestClock;
+    var entropy: [entropy_len]u8 = undefined;
+    for (&entropy, 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+    inline for (.{ Suite.aes_128_gcm_sha256, Suite.aes_256_gcm_sha384 }) |suite| {
+        const C = RefClient(suite);
+        const config = resumeConfig(&creds, &keys, &.{suite});
+        var buf: [4096]u8 = undefined;
+        // Full handshake: a ticket.
+        var c = C.init();
+        var hs = Handshake.init(std.testing.allocator, &config, &entropy);
+        defer hs.deinit();
+        var sink: TestSink = .{ .allocator = std.testing.allocator };
+        defer sink.deinit();
+        const hello1 = c.hello(&buf, pskModes(&.{1}), null, true);
+        try hs.feed(.initial, hello1, &sink);
+        const t1 = try c.finish(&hs, &sink, hello1, 0, false);
+
+        // Resumed with it, and a new ticket that resumes too.
+        var t = t1;
+        for (0..2) |_| {
+            var c2 = C.init();
+            var hs2 = Handshake.init(std.testing.allocator, &config, &entropy);
+            defer hs2.deinit();
+            var sink2: TestSink = .{ .allocator = std.testing.allocator };
+            defer sink2.deinit();
+            const hello2 = c2.hello(&buf, pskModes(&.{ 0, 1 }), &t, true);
+            try hs2.feed(.initial, hello2, &sink2);
+            t = try c2.finish(&hs2, &sink2, hello2, 0, true);
+        }
+
+        // After a HelloRetryRequest (no key share at first): the binder
+        // covers message_hash(ClientHello1) and the HelloRetryRequest.
+        {
+            var c3 = C.init();
+            var hs3 = Handshake.init(std.testing.allocator, &config, &entropy);
+            defer hs3.deinit();
+            var sink3: TestSink = .{ .allocator = std.testing.allocator };
+            defer sink3.deinit();
+            var buf1: [4096]u8 = undefined;
+            const ch1 = c3.hello(&buf1, pskModes(&.{1}), &t1, false);
+            try hs3.feed(.initial, ch1, &sink3);
+            try std.testing.expect(hs3.isRetrying());
+            c3.retried(ch1, sink3.events.items[0].data.bytes);
+            const ch2 = c3.hello(&buf, pskModes(&.{1}), &t1, true);
+            try hs3.feed(.initial, ch2, &sink3);
+            _ = try c3.finish(&hs3, &sink3, ch2, 1, true);
+        }
+    }
+}
+
+test "resumption: bad binders fail; unusable tickets get a full handshake" {
+    var creds = try testCredentials();
+    defer creds.deinit();
+    var keys = ticket.Keys.init(@splat(9));
+    keys.now = resumeTestClock;
+    resume_test_now = 5_000_000;
+    defer resume_test_now = 5_000_000;
+    var entropy: [entropy_len]u8 = undefined;
+    for (&entropy, 0..) |*b, i| b.* = @truncate(i *% 17 +% 3);
+    const C = RefClient(.aes_128_gcm_sha256);
+    const config = resumeConfig(&creds, &keys, &.{.aes_128_gcm_sha256});
+    var buf: [4096]u8 = undefined;
+    var c = C.init();
+    var hs = Handshake.init(std.testing.allocator, &config, &entropy);
+    defer hs.deinit();
+    var sink: TestSink = .{ .allocator = std.testing.allocator };
+    defer sink.deinit();
+    const hello1 = c.hello(&buf, pskModes(&.{1}), null, true);
+    try hs.feed(.initial, hello1, &sink);
+    const t = try c.finish(&hs, &sink, hello1, 0, false);
+
+    const Case = enum { bad_binder, psk_ke_only, other_keys, expired, sha384 };
+    for ([_]Case{ .bad_binder, .psk_ke_only, .other_keys, .expired, .sha384 }) |case| {
+        var cfg = config;
+        var other = keys;
+        other.master[0] ^= 1;
+        var tk = t;
+        switch (case) {
+            .other_keys => cfg.tickets = &other,
+            .expired => resume_test_now += 24 * 3600 + 1,
+            .sha384 => cfg.suites = &.{.aes_256_gcm_sha384},
+            else => {},
+        }
+        defer resume_test_now = 5_000_000;
+        var c2 = C.init();
+        var hs2 = Handshake.init(std.testing.allocator, &cfg, &entropy);
+        defer hs2.deinit();
+        var sink2: TestSink = .{ .allocator = std.testing.allocator };
+        defer sink2.deinit();
+        const modes = if (case == .psk_ke_only) pskModes(&.{0}) else pskModes(&.{1});
+        var hello2: []const u8 = undefined;
+        if (case == .sha384) {
+            // A SHA-256 ticket offered in a SHA-384 handshake.
+            const C384 = RefClient(.aes_256_gcm_sha384);
+            var c384 = C384.init();
+            var t384: C384.Ticket = .{ .identity = tk.identity, .identity_len = tk.identity_len, .age_add = tk.age_add, .psk = @splat(1) };
+            hello2 = c384.hello(&buf, modes, &t384, true);
+            try hs2.feed(.initial, hello2, &sink2);
+            try std.testing.expect(!hs2.resumed);
+            continue;
+        }
+        hello2 = c2.hello(&buf, modes, &tk, true);
+        if (case == .bad_binder) {
+            @constCast(hello2)[hello2.len - 1] ^= 1;
+            try std.testing.expectError(error.DecryptError, hs2.feed(.initial, hello2, &sink2));
+            continue;
+        }
+        try hs2.feed(.initial, hello2, &sink2);
+        // A full handshake (the certificate is sent).
+        c2.psk = null;
+        _ = try c2.finish(&hs2, &sink2, hello2, 0, false);
+        tk = undefined;
+    }
 }

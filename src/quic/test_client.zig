@@ -68,6 +68,8 @@ pub const Client = struct {
     server_params: ?[]u8 = null,
     handshake_complete: bool = false,
     handshake_done: bool = false,
+    /// NewSessionTickets received (not used to resume).
+    tickets: u32 = 0,
     key_phase: u1 = 0,
     // Connection state.
     streams: std.AutoHashMapUnmanaged(u64, *Stream) = .empty,
@@ -393,6 +395,10 @@ pub const Client = struct {
                 self.spaces[2].rx = .init(.aes_128_gcm_sha256, &self.app_rx_secret);
                 self.spaces[2].tx = .init(.aes_128_gcm_sha256, &self.app_tx_secret);
                 self.handshake_complete = true;
+            },
+            4 => { // NewSessionTicket, after the handshake
+                if (idx != 2 or !self.handshake_complete) return error.UnexpectedMessage;
+                self.tickets += 1;
             },
             else => return error.UnexpectedMessage,
         }

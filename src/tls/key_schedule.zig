@@ -13,7 +13,7 @@ pub fn KeySchedule(comptime HashType: type) type {
         pub const Secret = [hash_len]u8;
 
         const zeros: Secret = @splat(0);
-        const empty_hash: Secret = blk: {
+        pub const empty_hash: Secret = blk: {
             @setEvalBranchQuota(10_000);
             break :blk tls.emptyHash(Hash);
         };
@@ -26,6 +26,16 @@ pub fn KeySchedule(comptime HashType: type) type {
         /// Early secret without a PSK.
         pub fn earlySecret() Secret {
             return Hkdf.extract(&.{0}, &zeros);
+        }
+
+        /// Early secret from a resumption PSK.
+        pub fn earlySecretPsk(psk: []const u8) Secret {
+            return Hkdf.extract(&.{0}, psk);
+        }
+
+        /// The PSK a NewSessionTicket carries (§4.6.1).
+        pub fn resumptionPsk(resumption_master: Secret, nonce: []const u8) Secret {
+            return tls.hkdfExpandLabel(Hkdf, resumption_master, "resumption", nonce, hash_len);
         }
 
         pub fn handshakeSecret(early: Secret, shared_secret: []const u8) Secret {
