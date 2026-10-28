@@ -42,6 +42,15 @@ pub const Method = enum(u4) {
         };
     }
 
+    /// RFC 9110 §9.2.1: methods that don't ask for a change on the
+    /// server, so a replay (of TLS early data, say) is harmless.
+    pub fn isSafe(self: Method) bool {
+        return switch (self) {
+            .GET, .HEAD, .OPTIONS, .TRACE => true,
+            else => false,
+        };
+    }
+
     pub fn toString(self: Method) []const u8 {
         return @tagName(self);
     }

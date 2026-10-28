@@ -22,6 +22,7 @@ const tls_conn = @import("./tls/conn.zig");
 pub const H2Options = @import("./h2/conn.zig").Options;
 const Credentials = @import("./tls/credentials.zig").Credentials;
 const TicketKeys = @import("./tls/ticket.zig").Keys;
+const ReplayGuard = @import("./tls/ticket.zig").ReplayGuard;
 const quic_conn = @import("./quic/conn.zig");
 const quic_endpoint = @import("./quic/endpoint.zig");
 const udp = @import("./quic/udp.zig");
@@ -73,6 +74,20 @@ pub const TlsOptions = struct {
     /// How long a ticket is valid (at most 7 days), and how often the key
     /// derived from `ticket_key` changes.
     ticket_lifetime_s: u32 = 24 * 3600,
+    /// 0-RTT (TLS early data, RFC 8446 §4.2.10) over TCP: a client
+    /// resuming a ticket from this process may send up to this many bytes
+    /// of requests with its first flight, saving a round trip. 0: off.
+    /// Early data can be replayed by an attacker, so each ClientHello is
+    /// admitted once (`replay_guard_size`), and only requests with safe
+    /// methods (GET, HEAD, OPTIONS) are handled before the handshake
+    /// completes, with `Request.early_data` set; others wait for it
+    /// (HTTP/1.1) or get 425 Too Early (HTTP/2). Needs session tickets.
+    /// Tickets from other servers sharing `ticket_key` resume without it.
+    max_early_data: u32 = 0,
+    /// 0-RTT ClientHellos remembered (24 bytes each, a power of two): for
+    /// 22 s each, so about this many / 22 per second get 0-RTT, and more
+    /// fall back to a full round trip.
+    replay_guard_size: usize = 1 << 16,
     /// Linux: before the first file body (`Response.sendFile`) on an
     /// HTTP/1.1 connection, hand the connection's sending side to the
     /// kernel (kTLS), so the file goes out with sendfile and the kernel
@@ -252,6 +267,7 @@ pub fn Server(comptime Handler: type) type {
         port: u16,
         tls_credentials: ?Credentials = null,
         tls_tickets: TicketKeys = undefined,
+        tls_replay: ?ReplayGuard = null,
         tls_config: tls_conn.Config = undefined,
         quic_tls_config: tls_conn.Config = undefined,
         quic_port: u16 = 0,
@@ -301,16 +317,28 @@ pub fn Server(comptime Handler: type) type {
                 allocator.free(srv.wakers);
             }
             if (cfg.tls) |t| {
-                srv.tls_credentials = try Credentials.fromPem(allocator, t.cert_pem, t.key_pem);
                 if (t.ticket_lifetime_s == 0 or t.ticket_lifetime_s > 7 * 24 * 3600) return error.InvalidTicketLifetime;
+                if (t.max_early_data > 0) {
+                    if (!t.session_tickets) return error.EarlyDataNeedsTickets;
+                    if (!std.math.isPowerOfTwo(t.replay_guard_size) or t.replay_guard_size < 8) return error.InvalidReplayGuardSize;
+                }
+                srv.tls_credentials = try Credentials.fromPem(allocator, t.cert_pem, t.key_pem);
+                errdefer srv.tls_credentials.?.deinit();
                 srv.tls_tickets = if (t.ticket_key) |k| .init(k) else .random();
                 srv.tls_tickets.lifetime_s = t.ticket_lifetime_s;
                 const tickets: ?*const TicketKeys = if (t.session_tickets) &srv.tls_tickets else null;
                 srv.tls_config = .{ .credentials = &srv.tls_credentials.?, .alpn = t.alpn, .tickets = tickets };
+                if (t.max_early_data > 0) {
+                    srv.tls_tickets.newInstance();
+                    srv.tls_replay = try .init(allocator, t.replay_guard_size);
+                    srv.tls_config.max_early_data = t.max_early_data;
+                    srv.tls_config.replay = &srv.tls_replay.?;
+                }
                 srv.quic_tls_config = .{ .credentials = &srv.tls_credentials.?, .alpn = &.{"h3"}, .quic = true, .tickets = tickets };
                 srv.cfg.tls = null; // the PEM data may be freed after init
             }
             errdefer if (srv.tls_credentials) |*c| c.deinit();
+            errdefer if (srv.tls_replay) |*g| g.deinit();
             if (cfg.http3 != null and srv.tls_credentials == null) return error.Http3NeedsTls;
             // Linux steers each connection's datagrams to its worker
             // (SO_REUSEPORT with a BPF program); elsewhere only the first
@@ -541,6 +569,7 @@ pub fn Server(comptime Handler: type) type {
             for (self.workers) |*w| w.deinit();
             if (shared_listener >= 0) sys.close(shared_listener);
             if (self.tls_credentials) |*c| c.deinit();
+            if (self.tls_replay) |*g| g.deinit();
             self.handler.deinit();
             self.allocator.free(self.workers);
             self.allocator.free(self.wakers);

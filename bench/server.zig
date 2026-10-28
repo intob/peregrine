@@ -4,14 +4,16 @@
 //! plaintext HTTP/1.1), and `/ws`, a WebSocket echo (HTTP/1.1 Upgrade, or
 //! extended CONNECT on HTTP/2 and HTTP/3); request bodies are read and
 //! discarded.
-//! Usage: bench-server [workers] [auto|epoll|io_uring] [port] [tls|h3|plain] [stream] [rsa] [noktls]
+//! Usage: bench-server [workers] [auto|epoll|io_uring] [port] [tls|h3|plain] [stream] [rsa] [noktls] [0rtt]
 //! With `tls`, serves TLS 1.3 with the self-signed P-256 certificate in
 //! this directory (`rsa`: the RSA-2048 one), with ALPN "h2" and
 //! "http/1.1"; `h3` adds HTTP/3 on the
 //! same UDP port. Plaintext serves HTTP/1.1 and HTTP/2 with prior
 //! knowledge (h2c). With `stream`, every request body is streamed to the
 //! handler (handleHead, handleBody) and the response follows its end, for
-//! conformance and interop runs of that path.
+//! conformance and interop runs of that path. With `0rtt`, TLS clients may
+//! send up to 16 KiB of early data when resuming; responses to requests
+//! handled in it carry `x-early-data: 1`.
 const std = @import("std");
 const per = @import("peregrine");
 
@@ -46,6 +48,7 @@ const Handler = struct {
             return;
         }
         resp.addNewHeader("content-type", "text/plain") catch {};
+        if (req.early_data) resp.addNewHeader("x-early-data", "1") catch {};
         const path = req.getPath();
         if (std.mem.eql(u8, path, "/64k")) {
             resp.setBodyBorrowed(big_body[0 .. 64 * 1024]);
@@ -110,9 +113,11 @@ fn serve(comptime H: type, args: []const [:0]const u8) !void {
     const use_tls = use_h3 or (args.len > 4 and std.mem.eql(u8, args[4], "tls"));
     var use_rsa = false;
     var ktls = true;
+    var max_early: u32 = 0;
     for (args[@min(args.len, 5)..]) |arg| {
         use_rsa = use_rsa or std.mem.eql(u8, arg, "rsa");
         if (std.mem.eql(u8, arg, "noktls")) ktls = false;
+        if (std.mem.eql(u8, arg, "0rtt")) max_early = 16384;
     }
     const srv = try per.Server(H).init(std.heap.smp_allocator, port, .{
         .worker_thread_count = workers,
@@ -123,6 +128,7 @@ fn serve(comptime H: type, args: []const [:0]const u8) !void {
             .key_pem = if (use_rsa) @embedFile("rsa.key") else @embedFile("key.pem"),
             .alpn = &.{ "h2", "http/1.1" },
             .ktls = ktls,
+            .max_early_data = max_early,
         } else null,
         .http3 = if (use_h3) .{} else null,
     });

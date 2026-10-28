@@ -28,6 +28,11 @@ const LISTENER_TOKEN: u64 = std.math.maxInt(u64);
 const WAKER_TOKEN: u64 = std.math.maxInt(u64) - 1;
 const UDP_TOKEN: u64 = std.math.maxInt(u64) - 2;
 const NIL: u32 = std.math.maxInt(u32);
+
+/// The ALPN protocol is HTTP/2.
+fn isH2(alpn: ?[]const u8) bool {
+    return if (alpn) |p| std.mem.eql(u8, p, "h2") else false;
+}
 /// Connections accepted per listener event, to stay fair to existing ones.
 const ACCEPT_BATCH = 64;
 /// TLS record content types (kTLS control records).
@@ -773,7 +778,13 @@ pub fn Worker(comptime Handler: type) type {
                 .conn_gen = c.gen,
                 .pool = &self.pool,
                 .fd = c.fd,
+                .early_data = earlyData(c),
             };
+        }
+
+        /// The connection's input is TLS early data (0-RTT).
+        fn earlyData(c: *const Conn) bool {
+            return if (c.tls) |t| t.inEarlyData() else false;
         }
 
         /// Switches the connection to HTTP/2, adopting any bytes the
@@ -806,10 +817,11 @@ pub fn Worker(comptime Handler: type) type {
                 // data from the same read may already sit in the session
                 // buffer; attachH2 adopts it.
                 // Nothing to decide yet: carry on (the handshake flight
-                // still has to be written), and look again later.
-                if (!t.isEstablished()) return true;
+                // still has to be written), and look again later. With
+                // 0-RTT accepted, ALPN is known before the handshake ends.
+                if (!t.isEstablished() and !t.inEarlyData()) return true;
                 c.proto_decided = true;
-                if (t.alpn != null and std.mem.eql(u8, t.alpn.?, "h2")) {
+                if (isH2(t.earlyAlpn())) {
                     if (!self.attachH2(c)) {
                         self.closeConn(c);
                         return false;
@@ -845,10 +857,16 @@ pub fn Worker(comptime Handler: type) type {
                 // Output drained: pending stream data and parsing resume.
                 if (!c.h2HasWire() and !self.h2Process(c)) return;
             }
-            if (c.read_ready and !c.h2HasWire()) self.h2Readable(c);
+            const tls_buffered = c.tls != null and c.tls.?.hasBufferedInput();
+            if ((c.read_ready or tls_buffered) and !c.h2HasWire()) self.h2Readable(c);
         }
 
         fn h2Readable(self: *Self, c: *Conn) void {
+            // Our SETTINGS, queued when the connection switched to
+            // HTTP/2, go out first: input already decrypted (the client's
+            // first requests, perhaps in 0-RTT data) mustn't wait behind
+            // them for another read event.
+            if (c.h2HasWire() and !self.h2Flush(c)) return;
             while (!c.h2HasWire()) {
                 const tls_buffered = c.tls != null and c.tls.?.hasBufferedInput();
                 if (!c.read_ready and !tls_buffered) break;
@@ -1065,6 +1083,7 @@ pub fn Worker(comptime Handler: type) type {
                 .resp = self.resp,
                 .date = &self.date_line,
                 .opts = self.opts.session,
+                .early_data = earlyData(c),
             };
             while (true) {
                 const action = session.process(Handler, &c.session, &ctx, &self.out);
@@ -1379,10 +1398,10 @@ pub fn Worker(comptime Handler: type) type {
         /// writes TLS output such as the handshake. Returns false if the
         /// connection was closed.
         fn tlsDecrypt(self: *Self, c: *Conn, t: *TlsConn) bool {
-            if (!c.proto_decided and t.isEstablished()) {
+            if (!c.proto_decided and (t.isEstablished() or t.inEarlyData())) {
                 // ALPN decided the protocol.
                 c.proto_decided = true;
-                if (t.alpn != null and std.mem.eql(u8, t.alpn.?, "h2")) {
+                if (isH2(t.earlyAlpn())) {
                     if (!self.attachH2(c)) {
                         self.closeConn(c);
                         return false;

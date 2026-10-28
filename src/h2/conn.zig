@@ -95,6 +95,8 @@ pub fn Context(comptime Handler: type) type {
         pool: *BufferPool,
         /// The socket, for `ws.Conn.fd` (identification only).
         fd: sys.fd_t = -1,
+        /// Input is TLS early data (0-RTT): requests may be replays.
+        early_data: bool = false,
     };
 }
 
@@ -1123,6 +1125,7 @@ pub const Conn = struct {
                 return self.respondSync(Handler, ctx, s, false);
             }
             is_head = req.method == .HEAD;
+            if (tooEarly(ctx)) return self.respondSync(Handler, ctx, s, is_head);
             ctx.handler.handleRequest(req, resp);
             if (s.tunnel and resp.is_ws_upgrade) return self.startWebSocket(Handler, ctx, s);
             if (resp.mode != .sync) return self.bindExchange(Handler, ctx, s, is_head);
@@ -1148,6 +1151,18 @@ pub const Conn = struct {
         req.headers_len = s.hdr_count;
         req.body = s.req.items[s.body_start..s.bodyEnd()];
         req.trailers = s.trailers(req.headers[s.hdr_count..]);
+        req.early_data = ctx.early_data;
+        return true;
+    }
+
+    /// RFC 8470 §5.2: a request in early data whose method isn't safe is
+    /// answered 425 Too Early (the client retries once the handshake is
+    /// done). Sets the response if so.
+    fn tooEarly(ctx: anytype) bool {
+        if (!ctx.early_data or ctx.req.method.isSafe()) return false;
+        ctx.resp.reset();
+        ctx.resp.status = .too_early;
+        ctx.resp.body = "";
         return true;
     }
 
@@ -1155,6 +1170,7 @@ pub const Conn = struct {
     /// to dispatch (501).
     fn checkHead(_: *Self, comptime Handler: type, ctx: *const Context(Handler), s: *Stream) exchange.BodyMode {
         if (!fillRequest(ctx, s)) return .buffer;
+        if (tooEarly(ctx)) return .reject;
         ctx.resp.reset();
         const mode = ctx.handler.handleHead(ctx.req, ctx.resp);
         if (mode == .stream and !@hasDecl(Handler, "handleBody")) return .buffer;
@@ -1951,6 +1967,7 @@ const TestHandler = struct {
         }
         if (req.body.len > 0) self.log.print(a, " body={d}:{s}", .{ req.body.len, req.body[0..@min(req.body.len, 12)] }) catch unreachable;
         for (req.trailers) |t| self.log.print(a, " trailer[{s}={s}]", .{ t.key, t.value }) catch unreachable;
+        if (req.early_data) self.log.appendSlice(a, " early") catch unreachable;
         self.log.append(a, '\n') catch unreachable;
         const path = req.getPath();
         if (std.mem.eql(u8, path, "/up-sync")) {
@@ -2016,6 +2033,8 @@ const Harness = struct {
     slab: exchange.Slab,
     date_line: [date.header_len]u8 = undefined,
     now: u32 = 1000,
+    /// Input is TLS early data, as the worker would say.
+    early_data: bool = false,
     /// Everything the server "wrote".
     out: std.ArrayList(u8) = .empty,
     last: Action = .need_more,
@@ -2096,6 +2115,7 @@ const Harness = struct {
             .conn_slot = 3,
             .conn_gen = 7,
             .pool = &h.pool,
+            .early_data = h.early_data,
         };
     }
 
@@ -3590,6 +3610,37 @@ test "WebSocket over HTTP/2: windows hold output, held output holds the client's
     try testing.expectEqual(@as(u32, 1), h.conn.activeStreams());
     try testing.expectEqual(@as(usize, 1), h.slab.active_count);
     try testing.expect(std.mem.endsWith(u8, h.handler.ws_log.items, "open;text:big;gone;"));
+}
+
+test "0-RTT: in early data, safe methods are handled and others get 425 Too Early" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    h.early_data = true;
+    try h.preface();
+    h.events.clearRetainingCapacity();
+    try h.get(1, "/a");
+    // A POST with its body to come, and one without a body.
+    const post = [_]hpack.Field{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/echo" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    try h.headers(.{ .stream = 3, .end_stream = false, .fields = &post });
+    try h.headers(.{ .stream = 5, .fields = &post });
+    try h.expectEvents(
+        \\headers 1 end=false [:status=200] [content-type=text/plain] [content-length=13] [date]
+        \\data 1 len=13 end=true
+        \\headers 3 end=true [:status=425] [content-length=0] [date]
+        \\rst 3 no_error
+        \\headers 5 end=true [:status=425] [content-length=0] [date]
+        \\
+    );
+    try h.expectLog("GET /a [host=example.com] early\n");
+    // After the handshake, the same POST is handled.
+    h.early_data = false;
+    try h.headers(.{ .stream = 7, .fields = &post });
+    try h.expectLog("POST /echo [host=example.com]\n");
 }
 
 test "split invariance" {

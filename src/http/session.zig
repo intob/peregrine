@@ -279,6 +279,8 @@ pub fn Context(comptime Handler: type) type {
         /// The current "date: ...\r\n" line, refreshed once per second.
         date: *const [date.header_len]u8,
         opts: Options,
+        /// Input is TLS early data (0-RTT): requests may be replays.
+        early_data: bool = false,
     };
 }
 
@@ -324,6 +326,14 @@ pub fn process(comptime Handler: type, s: *Session, ctx: *const Context(Handler)
         const head = parser.parseHead(data[0..head_len], ctx.req, opts.limits) catch |err| {
             return errorResponse(s, ctx, out, err);
         };
+        ctx.req.early_data = ctx.early_data;
+        if (ctx.early_data and !ctx.req.method.isSafe()) {
+            // A replay must not change anything (RFC 8470 §5): wait for
+            // the handshake, which a replay never completes, and parse
+            // the request again then.
+            s.head_scan = 0;
+            return .need_more;
+        }
         if (@hasDecl(Handler, "handleHead") and !s.head_checked) {
             ctx.resp.reset();
             var mode = ctx.handler.handleHead(ctx.req, ctx.resp);
@@ -643,6 +653,8 @@ fn HarnessFor(comptime H: type) type {
         date_line: [date.header_len]u8 = undefined,
         opts: Options,
         closed: bool = false,
+        /// Input is TLS early data, as the worker would say.
+        early_data: bool = false,
 
         fn init(opts: Options, pool_buf: usize, out_size: usize) !*Self {
             const h = try testing.allocator.create(Self);
@@ -714,6 +726,7 @@ fn HarnessFor(comptime H: type) type {
                 .resp = h.resp,
                 .date = &h.date_line,
                 .opts = h.opts,
+                .early_data = h.early_data,
             };
             while (!h.closed) {
                 const action = process(H, &h.session, &ctx, &h.out);
@@ -1142,4 +1155,40 @@ test "fuzz: streamed body split invariance" {
         "POST /stream-sync HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc",
         "POST /b HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\nA: 1\r\nB: 2\r\n\r\n",
     } });
+}
+
+const EarlyHandler = struct {
+    /// "M early|late" per call.
+    log: [4][]const u8 = undefined,
+    calls: usize = 0,
+
+    pub fn handleRequest(self: *EarlyHandler, req: *Request, resp: *Response) void {
+        self.log[self.calls] = switch (req.method) {
+            .GET => if (req.early_data) "GET early" else "GET late",
+            .POST => if (req.early_data) "POST early" else "POST late",
+            else => "?",
+        };
+        self.calls += 1;
+        _ = resp.setBody("ok") catch {};
+    }
+};
+
+test "0-RTT: safe methods are handled in early data, others wait for the handshake" {
+    const h = try HarnessFor(EarlyHandler).init(.{}, 4096, 4096);
+    defer h.deinit();
+    h.early_data = true;
+    // A GET, then a pipelined POST with its body, both in early data.
+    try h.feed("GET /a HTTP/1.1\r\nhost: x\r\n\r\nPOST /b HTTP/1.1\r\nhost: x\r\ncontent-length: 2\r\n\r\nhi");
+    try testing.expectEqual(1, h.handler.calls);
+    try testing.expectEqualStrings("GET early", h.handler.log[0]);
+    // Again (more input arrives, still early): the POST still waits.
+    try h.run();
+    try testing.expectEqual(1, h.handler.calls);
+    // The handshake completes: the POST is parsed again and handled.
+    h.early_data = false;
+    try h.run();
+    try testing.expectEqual(2, h.handler.calls);
+    try testing.expectEqualStrings("POST late", h.handler.log[1]);
+    try testing.expectEqual(2, std.mem.count(u8, h.written.items, "HTTP/1.1 200 OK"));
+    try testing.expect(!h.closed);
 }

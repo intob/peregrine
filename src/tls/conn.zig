@@ -258,9 +258,13 @@ pub const Conn = struct {
     /// fits is decrypted straight into `out`; others are decrypted in place
     /// and copied. Returns 0 when more input is needed, or when `failed` or
     /// `peer_closed` is set.
+    /// It also returns after the ClientHello that accepts 0-RTT, so the
+    /// caller can choose the protocol (`earlyAlpn`) before early data.
     pub fn readPlain(self: *Self, out: []u8) usize {
         var n: usize = 0;
+        const was_early = self.inEarlyData();
         while (n < out.len) {
+            if (!was_early and self.inEarlyData()) break;
             if (self.plain.len > 0) {
                 const k = @min(self.plain.len, out.len - n);
                 @memcpy(out[n..][0..k], self.plain[0..k]);
@@ -607,7 +611,8 @@ pub const Conn = struct {
     /// Encrypts as much of `parts` (taken in order, as one stream) as fits
     /// in the wire buffer. Returns the number of plaintext bytes consumed.
     pub fn encrypt(self: *Self, parts: []const []const u8) !usize {
-        std.debug.assert(self.isEstablished() and !self.kernel_tx);
+        // During 0-RTT data our application keys are already in use.
+        std.debug.assert((self.isEstablished() or self.inEarlyData()) and !self.kernel_tx);
         var total: usize = 0;
         for (parts) |p| total += p.len;
         var consumed: usize = 0;

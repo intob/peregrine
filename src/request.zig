@@ -31,6 +31,12 @@ pub const Request = struct {
     /// 8441) or HTTP/3 (RFC 9220), e.g. "websocket"; `method` is CONNECT.
     /// Null otherwise.
     protocol: ?[]const u8 = null,
+    /// The request arrived in TLS early data (0-RTT, `TlsOptions.max_early_data`)
+    /// and the handshake isn't complete: it may be a replay (RFC 8470).
+    /// Only safe methods (`Method.isSafe`) are handled this way; an
+    /// HTTP/1.1 request with another method waits for the handshake, and
+    /// on HTTP/2 it is answered 425 Too Early.
+    early_data: bool = false,
     /// Before accessing this directly, call parseQuery()
     query: std.StringHashMap([]const u8),
     allocator: std.mem.Allocator,
@@ -109,6 +115,7 @@ pub const Request = struct {
         self.trailers = &.{};
         self.keep_alive = true;
         self.protocol = null;
+        self.early_data = false;
     }
 };
 
