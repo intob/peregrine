@@ -32,7 +32,7 @@ Note: This project has just started, and is not yet a complete HTTP server imple
     - Interop-tested with aioquic, curl (ngtcp2) and h2load
 - Streaming and deferred responses: `resp.stream()` writes a body over time (chunked on HTTP/1.1, DATA frames on HTTP/2 and HTTP/3), `resp.later()` answers from any thread
 - Streamed request bodies: `handleHead` accepts, rejects (before `100 Continue`) or streams a request on its headers; `handleBody` gets the body as it arrives, with no size limit and with trailers, and can pause it (flow control holds the client back)
-- Support for WebSockets
+- WebSockets over HTTP/1.1 (Upgrade), HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220), with the same handler hooks
 - TLS 1.3, written from scratch on top of `std.crypto` (no OpenSSL)
     - X25519MLKEM768 (post-quantum hybrid), X25519 and P-256 key exchange, HelloRetryRequest
     - AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305
@@ -113,6 +113,7 @@ Note that these benchmarks simply measure serving static GET requests, and they 
 - No separate threads: after the upgrade a connection stays on the worker that accepted it, so WebSockets scale with cores like HTTP does
 - Frames are decoded by an I/O-free per-connection state machine (`src/ws/protocol.zig`): resumable across reads, several frames per read, fragments reassembled, pings answered, close handshake done by the server
 - Output is queued per connection and written as the socket allows; a peer that stops reading is closed after `request_timeout_s`
+- Over HTTP/2 and HTTP/3 a WebSocket is one stream of a multiplexed connection (extended CONNECT): its frames travel in DATA frames, many WebSockets and ordinary requests share the connection, and flow control is the backpressure (input is not credited while the WebSocket's output is held back). Interop-tested with python-hyper's h2 and aioquic
 
 ### Signal handling
 The server handles the following signals for graceful shutdown:
@@ -359,6 +360,8 @@ pub fn handleWSFrame(_: *Self, conn: *per.ws.Conn, frame: *per.ws.Frame) void {
 }
 ```
 
+The same handler serves WebSockets over HTTP/2 and HTTP/3. When the handler has `handleWSFrame`, the server advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`, and browsers then open `wss://` URLs as extended CONNECT requests (RFC 8441, RFC 9220) on their existing HTTP/2 or HTTP/3 connection. The request reaches `handleRequest` with `req.method == .CONNECT` and `req.protocol` set to `"websocket"` (no `Upgrade` or `Sec-WebSocket-Key` headers); `handleUpgrade` answers it with 200 instead of 101, and `per.ws.upgrader.isUpgrade(req)` recognises both forms. Over HTTP/2 `conn.fd` is the connection's socket, shared by every WebSocket on it, and over HTTP/3 the UDP socket, so key handler state by the `*per.ws.Conn` pointer rather than the fd. Each WebSocket over HTTP/2 or HTTP/3 takes one of the worker's `max_exchanges_per_worker` slots.
+
 The hooks run on the worker thread that owns the connection. A `*per.ws.Conn` is valid from `handleWSConn` until `handleWSDisconn` returns; `conn.send`, `conn.ping` and `conn.close(code, reason)` may be called from any thread in that window (for example to broadcast from another connection's handler), so a handler that keeps handles in a table must remove them in `handleWSDisconn` under its own lock. `conn.user` is free for per-connection state. Messages larger than `websocket_max_message_size` fail the connection with close code 1009; `send` fails with `SendQueueFull` once `websocket_max_send_queue_bytes` are unsent.
 
 ## I need your feedback
@@ -375,8 +378,8 @@ Until these things are done, I don't think that this project can possibly be con
 See [PLAN.md](PLAN.md) for the full checklist. In order:
 
 1. TLS 1.3 follow-ups: io_uring support, fuzzing, faster handshakes, RSA certificates, resumption, kTLS on Linux
-2. HTTP/2 follow-ups: RFC 9218 priorities, WebSockets over h2 (RFC 8441)
-3. HTTP/3 follow-ups: connection migration, 0-RTT, pacing, ECN, PMTU discovery, GRO, the QPACK dynamic table, WebSockets over h3 (RFC 9220)
+2. HTTP/2 follow-ups: RFC 9218 priorities
+3. HTTP/3 follow-ups: connection migration, 0-RTT, pacing, ECN, PMTU discovery, GRO, the QPACK dynamic table, DATAGRAM (RFC 9221)
 4. Throughout: `sendfile`, tuning io_uring until it beats epoll, WebSocket `permessage-deflate`, and verification with Autobahn, h2spec, quic-interop-runner, soak, adversarial and differential (HTTP Garden) testing
 5. API reference
 

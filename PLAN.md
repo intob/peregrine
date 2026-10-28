@@ -55,8 +55,8 @@ Design rules that apply to every layer:
 | M2. Throughput architecture | 🟡 io_uring works (opt-in, not yet faster than epoll); sendfile, NUMA open |
 | M3. WebSockets over HTTP/1.1 | ✅ reworked; permessage-deflate, Autobahn, benchmarks open |
 | M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; faster handshakes, resumption and kTLS are listed under "Later in M4" |
-| M5. HTTP/2 | ✅ h2 over TLS (ALPN) and h2c on every backend, h2spec 146/146 over TLS, fuzzed, benchmarked; streamed request bodies on every protocol; WebSockets over h2 open |
-| M6. HTTP/3 and QUIC | 🟡 HTTP/3 over QUIC v1 on every backend, interop-tested (aioquic, curl/ngtcp2, h2load), benchmarked against nginx and Caddy; migration, 0-RTT, pacing, ECN, PMTUD open |
+| M5. HTTP/2 | ✅ h2 over TLS (ALPN) and h2c on every backend, h2spec 146/146 over TLS, fuzzed, benchmarked; streamed request bodies on every protocol; WebSockets over h2 (RFC 8441) |
+| M6. HTTP/3 and QUIC | 🟡 HTTP/3 over QUIC v1 on every backend, interop-tested (aioquic, curl/ngtcp2, h2load), benchmarked against nginx and Caddy; WebSockets over h3 (RFC 9220); migration, 0-RTT, pacing, ECN, PMTUD open |
 | M7. Verification and benchmarking | 🟡 ongoing for each milestone |
 
 Source layout:
@@ -77,7 +77,7 @@ Source layout:
 | `src/h2/conn.zig` | One HTTP/2 connection: streams, flow control, request assembly, responses through the handler API, defences |
 | `src/ws/protocol.zig` | I/O-free WebSocket frame decoder and message assembler |
 | `src/ws/conn.zig` | Per-connection WebSocket state: send queue, close handshake, cross-thread mailbox |
-| `src/ws/upgrader.zig` | The HTTP upgrade response |
+| `src/ws/upgrader.zig` | Accepting a WebSocket: 101 for an HTTP/1.1 Upgrade, 200 for an extended CONNECT on HTTP/2 and HTTP/3 |
 | `src/tls/` | I/O-free TLS 1.3 server (M4): see below |
 | `src/server_test.zig` | End-to-end tests over real sockets, run once per available backend |
 | `bench/` | `zig build bench` (parser micro-benchmarks), `zig build bench-tls` (record protection), `zig build bench-server` (load-test target, plaintext or TLS) |
@@ -207,7 +207,7 @@ Still open:
 - [ ] io_uring: parse straight out of the provided buffer like the HTTP path does
 - [ ] Autobahn test suite, and a fuzz target over the decoder
 - [ ] Benchmark: messages/s per core vs. uWebSockets
-- [ ] WebSockets over HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220): M5 and M6
+- [x] WebSockets over HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220): see M5
 
 ---
 
@@ -496,7 +496,64 @@ which RFC 9113 deprecated).
       ALPN): all pass on macOS, Linux epoll and Linux io_uring (std's TLS client
       has no ALPN, so TLS+h2 is covered by interop rather than Zig tests)
 - [ ] Priorities: RFC 9218 `priority` header is not parsed (ignored like the rest)
-- [ ] WebSockets over h2 (RFC 8441 extended CONNECT)
+- [x] **WebSockets over h2 (RFC 8441) and h3 (RFC 9220)**, branch
+      `ws-h2-h3`. With a handler that has `handleWSFrame`, both send
+      SETTINGS_ENABLE_CONNECT_PROTOCOL; `:protocol` is otherwise an unknown
+      pseudo-header (malformed), is only valid on CONNECT, and an extended
+      CONNECT needs `:scheme` and `:path` like any request (a proxy's
+      CONNECT is still 501). The request reaches `handleHead` and
+      `handleRequest` at once with `req.method == .CONNECT` and
+      `req.protocol`; `ws.upgrader.handleUpgrade` answers 200 (101 on
+      HTTP/1.1), and the stream gets a `ws.Conn`, the same decoder, send
+      queue and close handshake as HTTP/1.1, so handlers are unchanged.
+      DATA carries the WebSocket bytes both ways (h3: DATA frames, unknown
+      frame types skipped). A handler that answers otherwise gets an
+      ordinary response, then RST_STREAM(NO_ERROR) / STOP_SENDING
+      (H3_NO_ERROR), and the client's DATA is dropped, never buffered.
+      Endings map like TCP: the close handshake, a failure (1002/1007/1009)
+      or the client's END_STREAM/FIN ends our side once the output is
+      written (END_STREAM/FIN, then a reset of the client's side if it is
+      still open); the client's RST_STREAM/RESET_STREAM/STOP_SENDING drops
+      it at once; `handleWSDisconn` follows in every case.
+      Cross-thread sends: a `ws.Conn` now posts a caller-chosen mailbox
+      entry; over h2/h3 that is a **tunnel slot** in the exchange slab
+      (bound to connection and stream, never handed out, no handleAbort),
+      so posts, mailbox overflow and the per-second deadline scan route to
+      the stream with no new machinery. Each such WebSocket takes one of
+      `max_exchanges_per_worker` (503 when none is free).
+      Backpressure as on HTTP/1.1, through flow control: h2 holds the
+      stream's WINDOW_UPDATE while the WebSocket's output is held back
+      (window, or `out_limit`), h3 leaves DATA unread in the QUIC stream
+      (no MAX_STREAM_DATA) while output exceeds `stream_buffer`. Timeouts
+      as on HTTP/1.1: `request_timeout_s` while output is stalled or our
+      close frame waits for the client's (the tunnel slot's deadline;
+      h2's zero-window stall reset also applies), none when idle.
+      Proof: in-memory h2 tests (the setting, validation, echo, ping,
+      both close handshakes, END_STREAM on HEADERS and DATA, RST_STREAM,
+      a 1002 failure, a refused CONNECT, a full slab (503), windows
+      holding output, held
+      output holding the client's window, a send from another thread, a
+      stalled stream reset) and h3 tests (the setting, validation, echo,
+      ping, both close handshakes, FIN, STOP_SENDING, a 1002 failure, a
+      refused CONNECT, a send from another thread, 200 KB through a 16 KB
+      stream buffer with input held behind it); WebSocket
+      streams (split DATA, a message larger than a read buffer, fragments
+      around a ping, both closes) in the h2 split-invariance script and
+      both connection fuzz targets (fuzzed together on Linux, Docker,
+      ReleaseSafe, 6 instances, 25 min: about 8.4M runs, 589 corpus
+      inputs kept, no failures; 17.9% of the test binary's instrumented
+      PCs seen); end-to-end over h2c and HTTP/3 on
+      kqueue, epoll and io_uring (two WebSockets and requests interleaved
+      on one connection, 100 KB echo, a send from another thread, both
+      close handshakes). Interop on Linux epoll and io_uring: python-hyper
+      h2 4.1 over TLS (ALPN) and h2c, aioquic 1.3 over HTTP/3 (three
+      WebSockets plus a GET on one connection, text, ping, 300 KiB binary,
+      a fragmented message, both close forms and a bare END_STREAM/FIN).
+      h2spec (146/146 TLS, 145/146 h2c as before) and h3spec (77/77) are
+      unchanged with the setting advertised. `bench-server` serves a
+      WebSocket echo on `/ws`.
+      Not done: browsers (Chrome and Firefox use RFC 8441; Firefox RFC
+      9220) untested; no WebSocket benchmark yet (M3)
 - [x] Verification: h2spec (all 146 cases): 146/146 over TLS, 145/146 over h2c,
       where the one failure (3.5/2, an invalid connection preface) is the
       cleartext port answering it as an HTTP/1.1 request (501, then close) rather
@@ -585,7 +642,8 @@ Done on the `m6-h3` branch, as I/O-free layers like the rest:
       advertise `disable_active_migration`; NAT rebinding is followed
       without validation)
 - [ ] 0-RTT (needs TLS session tickets, M4)
-- [ ] WebSockets over h3 (RFC 9220), DATAGRAM (RFC 9221)
+- [x] WebSockets over h3 (RFC 9220): see M5
+- [ ] DATAGRAM (RFC 9221)
 - [ ] QPACK dynamic table (better request header compression)
 - [x] Verification: RFC 9001 vectors; in-memory tests of both layers with a
       QUIC test client written for them (handshake, 40-60 concurrent

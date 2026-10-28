@@ -18,6 +18,7 @@ const udp = @import("./udp.zig");
 const handshake = @import("../tls/handshake.zig");
 const h3 = @import("../h3/conn.zig");
 const exchange = @import("../http/exchange.zig");
+const BufferPool = @import("../http/session.zig").BufferPool;
 const date = @import("../http/date.zig");
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
@@ -108,6 +109,7 @@ pub fn Endpoint(comptime Handler: type) type {
         date_line: *const [date.header_len]u8 = undefined,
         now_s: *const u32 = undefined,
         exchanges: *exchange.Slab = undefined,
+        pool: *BufferPool = undefined,
 
         pub fn init(allocator: Allocator, opts: Options, fd: sys.fd_t) !Self {
             const slots = try allocator.alloc(Slot, opts.max_connections);
@@ -146,15 +148,16 @@ pub fn Endpoint(comptime Handler: type) type {
             return self;
         }
 
-        /// The worker's request, response and exchange slab, which HTTP/3
-        /// shares with its TCP connections.
-        pub fn bindWorker(self: *Self, handler: *Handler, req: *Request, resp: *Response, date_line: *const [date.header_len]u8, now_s: *const u32, exchanges: *exchange.Slab) void {
+        /// The worker's request, response, exchange slab and read buffers,
+        /// which HTTP/3 shares with its TCP connections.
+        pub fn bindWorker(self: *Self, handler: *Handler, req: *Request, resp: *Response, date_line: *const [date.header_len]u8, now_s: *const u32, exchanges: *exchange.Slab, pool: *BufferPool) void {
             self.handler = handler;
             self.req = req;
             self.resp = resp;
             self.date_line = date_line;
             self.now_s = now_s;
             self.exchanges = exchanges;
+            self.pool = pool;
         }
 
         pub fn deinit(self: *Self) void {
@@ -189,6 +192,8 @@ pub fn Endpoint(comptime Handler: type) type {
                 .exchanges = self.exchanges,
                 .conn_slot = slot | exchange_slot_flag,
                 .conn_gen = self.slots[slot].gen,
+                .pool = self.pool,
+                .fd = self.fd,
             };
         }
 

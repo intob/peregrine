@@ -260,7 +260,7 @@ pub fn Worker(comptime Handler: type) type {
                 if (opts.quic) |qopts| {
                     self.udp = cfg.udp;
                     self.quic = try .init(allocator, qopts, cfg.udp);
-                    self.quic.?.bindWorker(self.handler, self.req, self.resp, &self.date_line, &self.now, &self.exchanges);
+                    self.quic.?.bindWorker(self.handler, self.req, self.resp, &self.date_line, &self.now, &self.exchanges, &self.pool);
                 }
             }
         }
@@ -564,7 +564,7 @@ pub fn Worker(comptime Handler: type) type {
         fn expireExchanges(self: *Self) void {
             if (self.exchanges.active_count == 0) return;
             for (self.exchanges.entries, 0..) |*e, slot| {
-                if (!e.active) continue;
+                if (!e.active or (e.tunnel and !e.tunnel_timed)) continue;
                 if (@as(i32, @bitCast(e.deadline -% self.now)) > 0) continue;
                 if (e.conn_slot & quic_endpoint.exchange_slot_flag != 0) {
                     if (self.quic) |*ep| ep.onExchangeTimeout(e.conn_slot, e.conn_gen, @intCast(slot), nowUs());
@@ -778,7 +778,7 @@ pub fn Worker(comptime Handler: type) type {
         /// this worker and speaks WebSocket from here on.
         fn upgradeConn(self: *Self, c: *Conn) void {
             if (!@hasDecl(Handler, "handleWSFrame")) return self.closeConn(c);
-            const w = WsConn.create(self.allocator, c.fd, self.opts.websocket, &self.mailbox, self.slotOf(c), c.gen) catch {
+            const w = WsConn.create(self.allocator, c.fd, self.opts.websocket, &self.mailbox, .{ .kind = .ws, .slot = self.slotOf(c), .gen = @intCast(c.gen & 0x7fffffff) }) catch {
                 return self.closeConn(c);
             };
             c.ws = w;
@@ -1043,6 +1043,8 @@ pub fn Worker(comptime Handler: type) type {
                 .exchanges = &self.exchanges,
                 .conn_slot = self.slotOf(c),
                 .conn_gen = c.gen,
+                .pool = &self.pool,
+                .fd = c.fd,
             };
         }
 

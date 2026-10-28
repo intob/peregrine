@@ -27,6 +27,10 @@ pub const Request = struct {
     /// Whether the connection stays open after this request, from the
     /// version and Connection header.
     keep_alive: bool = true,
+    /// The `:protocol` pseudo-header of an extended CONNECT on HTTP/2 (RFC
+    /// 8441) or HTTP/3 (RFC 9220), e.g. "websocket"; `method` is CONNECT.
+    /// Null otherwise.
+    protocol: ?[]const u8 = null,
     /// Before accessing this directly, call parseQuery()
     query: std.StringHashMap([]const u8),
     allocator: std.mem.Allocator,
@@ -104,6 +108,7 @@ pub const Request = struct {
         self.body = "";
         self.trailers = &.{};
         self.keep_alive = true;
+        self.protocol = null;
     }
 };
 

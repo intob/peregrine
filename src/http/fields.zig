@@ -16,7 +16,7 @@ pub const Fault = enum(u8) {
     protocol,
     /// Too many or too large headers: 431.
     headers_too_large,
-    /// Unknown method, or CONNECT: 501.
+    /// Unknown method, or a CONNECT that isn't extended: 501.
     not_implemented,
     /// Body over the limit: 413.
     body_too_large,
@@ -32,6 +32,8 @@ pub const Fields = struct {
     path: ?HeaderRef = null,
     scheme: ?HeaderRef = null,
     authority: ?HeaderRef = null,
+    /// Extended CONNECT (RFC 8441, RFC 9220), when the sink allowed it.
+    protocol: ?HeaderRef = null,
     has_host: bool = false,
     regular_seen: bool = false,
     body_start: usize = 0,
@@ -102,14 +104,28 @@ pub const Fields = struct {
         }
     }
 
+    /// A valid extended CONNECT: the stream carries the protocol named
+    /// by :protocol once the handler accepts it.
+    pub fn isExtendedConnect(self: *const Self) bool {
+        return self.protocol != null and self.fault == null;
+    }
+
     /// The required pseudo-header fields (RFC 9113 §8.3.1, RFC 9114 §4.3.1).
     fn validate(self: *Self) void {
         const method = self.method orelse {
             self.fault = .protocol;
             return;
         };
-        if (std.mem.eql(u8, self.value(method), "CONNECT")) {
-            // No :scheme or :path. Not supported (extended CONNECT later).
+        const connect = std.mem.eql(u8, self.value(method), "CONNECT");
+        if (self.protocol != null) {
+            // Extended CONNECT (RFC 8441 §4, RFC 9220 §3): only on
+            // CONNECT, which then has :scheme and :path like any request.
+            if (!connect) {
+                self.fault = .protocol;
+                return;
+            }
+        } else if (connect) {
+            // No :scheme or :path. A proxy's CONNECT: not supported.
             self.fault = if (self.scheme != null or self.path != null) .protocol else .not_implemented;
             return;
         }
@@ -151,6 +167,7 @@ pub const Fields = struct {
         req.version = .@"HTTP/1.1";
         req.method = Method.parse(self.value(self.method.?)) catch return false;
         req.path_and_query = self.value(self.path.?);
+        req.protocol = if (self.protocol) |p| self.value(p) else null;
         for (self.hdr[0..self.hdr_count], 0..) |h, i| {
             req.headers[i] = .{
                 .key = self.buf.items[h.name_off..][0..h.name_len],
@@ -168,6 +185,9 @@ pub const Fields = struct {
 pub const RequestSink = struct {
     fields: *Fields,
     allocator: std.mem.Allocator,
+    /// Accept :protocol (we sent SETTINGS_ENABLE_CONNECT_PROTOCOL);
+    /// otherwise it is an unknown pseudo-header field.
+    allow_protocol: bool = false,
 
     pub fn header(self: *RequestSink, name: []const u8, val: []const u8) !void {
         const s = self.fields;
@@ -204,6 +224,8 @@ pub const RequestSink = struct {
                 &s.scheme
             else if (std.mem.eql(u8, name, ":authority"))
                 &s.authority
+            else if (self.allow_protocol and std.mem.eql(u8, name, ":protocol"))
+                &s.protocol
             else {
                 s.fault = .protocol;
                 return;
@@ -383,6 +405,53 @@ test "request fields: valid, malformed, host synthesis" {
     try testing.expectEqual(@as(?Fault, null), f.fault);
     f.limitBody(1024);
     try testing.expectEqual(@as(?Fault, .body_too_large), f.fault);
+}
+
+test "extended CONNECT: :protocol only when allowed, only on CONNECT, with :scheme and :path" {
+    const a = testing.allocator;
+    var f: Fields = .{};
+    defer f.deinit(a);
+    var req = try Request.init(a);
+    defer req.deinit();
+    const ok = [_][2][]const u8{ .{ ":method", "CONNECT" }, .{ ":protocol", "websocket" }, .{ ":scheme", "https" }, .{ ":path", "/chat" }, .{ ":authority", "example.com" } };
+    var s = f.sink(a);
+    s.allow_protocol = true;
+    for (ok) |kv| try s.header(kv[0], kv[1]);
+    try f.endHead(a);
+    try testing.expect(f.isExtendedConnect());
+    try testing.expect(f.fill(req));
+    try testing.expectEqual(.CONNECT, req.method);
+    try testing.expectEqualStrings("websocket", req.protocol.?);
+    try testing.expectEqualStrings("/chat", req.path_and_query);
+    // Not allowed: an unknown pseudo-header field.
+    f.clear();
+    s = f.sink(a);
+    for (ok) |kv| try s.header(kv[0], kv[1]);
+    try f.endHead(a);
+    try testing.expectEqual(@as(?Fault, .protocol), f.fault);
+    const bad = [_][]const [2][]const u8{
+        &.{ .{ ":method", "GET" }, .{ ":protocol", "websocket" }, .{ ":scheme", "https" }, .{ ":path", "/" }, .{ ":authority", "a" } },
+        &.{ .{ ":method", "CONNECT" }, .{ ":protocol", "websocket" }, .{ ":scheme", "https" }, .{ ":authority", "a" } },
+        &.{ .{ ":method", "CONNECT" }, .{ ":protocol", "websocket" }, .{ ":path", "/" }, .{ ":authority", "a" } },
+        &.{ .{ ":method", "CONNECT" }, .{ ":protocol", "websocket" }, .{ ":protocol", "websocket" }, .{ ":scheme", "https" }, .{ ":path", "/" }, .{ ":authority", "a" } },
+    };
+    for (bad) |c| {
+        f.clear();
+        s = f.sink(a);
+        s.allow_protocol = true;
+        for (c) |kv| try s.header(kv[0], kv[1]);
+        try f.endHead(a);
+        try testing.expectEqual(@as(?Fault, .protocol), f.fault);
+        try testing.expect(!f.isExtendedConnect());
+    }
+    // A plain CONNECT is still 501, and leaves req.protocol null.
+    f.clear();
+    s = f.sink(a);
+    s.allow_protocol = true;
+    try s.header(":method", "CONNECT");
+    try s.header(":authority", "example.com:443");
+    try f.endHead(a);
+    try testing.expectEqual(@as(?Fault, .not_implemented), f.fault);
 }
 
 test "trailers: stored after the body, validated, extra ones dropped" {

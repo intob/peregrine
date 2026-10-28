@@ -16,6 +16,11 @@ const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
 const Header = @import("../header.zig").Header;
 const Mailbox = @import("../mailbox.zig").Mailbox;
+const BufferPool = @import("../http/session.zig").BufferPool;
+const ws = @import("../ws/conn.zig");
+const ws_protocol = @import("../ws/protocol.zig");
+const ws_upgrader = @import("../ws/upgrader.zig");
+const qframe = @import("../quic/frame.zig");
 const sys = @import("../sys.zig");
 const Client = test_client.Client;
 const testing = std.testing;
@@ -33,6 +38,37 @@ const TestHandler = struct {
     received: usize = 0,
     /// handleBody pauses after each chunk.
     pause: bool = false,
+    /// WebSockets: the last one opened, and what the hooks saw.
+    ws_conn: ?*ws.Conn = null,
+    ws_log: std.ArrayList(u8) = .empty,
+
+    pub fn handleWSConn(self: *TestHandler, conn: *ws.Conn) void {
+        self.ws_conn = conn;
+        self.ws_log.appendSlice(testing.allocator, "open;") catch unreachable;
+    }
+
+    pub fn handleWSDisconn(self: *TestHandler, conn: *ws.Conn) void {
+        if (self.ws_conn == conn) self.ws_conn = null;
+        self.ws_log.appendSlice(testing.allocator, "gone;") catch unreachable;
+    }
+
+    /// Echoes text and binary; "close-me" starts the close handshake,
+    /// "flood" sends 200 binary messages of 1000 bytes.
+    pub fn handleWSFrame(self: *TestHandler, conn: *ws.Conn, fr: *ws.Frame) void {
+        const p = fr.getPayload();
+        self.ws_log.print(testing.allocator, "{s}:{s};", .{ fr.opcode.toString(), p[0..@min(p.len, 16)] }) catch unreachable;
+        switch (fr.opcode) {
+            .text, .binary => {},
+            else => return,
+        }
+        if (std.mem.eql(u8, p, "close-me")) {
+            conn.close(1000, "bye") catch unreachable;
+        } else if (std.mem.eql(u8, p, "flood")) {
+            for (0..200) |i| conn.sendBinary(&(@as([1000]u8, @splat(@truncate(i))))) catch unreachable;
+        } else {
+            conn.send(p, fr.opcode == .binary) catch unreachable;
+        }
+    }
 
     pub fn handleHead(_: *TestHandler, req: *Request, resp: *Response) exchange.BodyMode {
         const path = req.getPath();
@@ -78,6 +114,12 @@ const TestHandler = struct {
         }
         if (std.mem.startsWith(u8, path, "/up")) {
             self.exchanges.append(a, resp.later() catch unreachable) catch unreachable;
+            return;
+        }
+        if (std.mem.eql(u8, path, "/ws")) {
+            ws_upgrader.handleUpgrade(undefined, req, resp) catch {
+                resp.status = .bad_request;
+            };
             return;
         }
         resp.addNewHeader("Content-Type", "text/plain") catch {};
@@ -135,6 +177,7 @@ const Harness = struct {
     now: u32 = 1000,
     qdec: qpack.Decoder,
     h3_opts: h3.Options = .{},
+    pool: BufferPool,
 
     fn init() !*Harness {
         const a = testing.allocator;
@@ -152,6 +195,7 @@ const Harness = struct {
             .mailbox = try Mailbox.init(a, 16, try sys.Waker.init()),
             .slab = undefined,
             .qdec = try qpack.Decoder.init(a, .{}),
+            .pool = try BufferPool.init(a, 1024, 2),
         };
         h.mailbox.bind();
         h.slab = try exchange.Slab.init(a, 8, &h.mailbox, .{});
@@ -177,9 +221,11 @@ const Harness = struct {
         h.req.deinit();
         h.resp.deinit();
         h.qdec.deinit();
+        h.pool.deinit();
         h.handler.log.deinit(h.a);
         h.handler.bodies.deinit(h.a);
         h.handler.exchanges.deinit(h.a);
+        h.handler.ws_log.deinit(h.a);
         h.a.destroy(h);
     }
 
@@ -194,6 +240,7 @@ const Harness = struct {
             .exchanges = &h.slab,
             .conn_slot = 3,
             .conn_gen = 7,
+            .pool = &h.pool,
         };
     }
 
@@ -597,6 +644,176 @@ fn expectConnectionError(code: u64, setup: anytype) !void {
     try testing.expectEqual(code, closed.code);
 }
 
+fn connectWs(h: *Harness, path: []const u8) !u64 {
+    const id = try h.client.openBidi();
+    try h.writeHeaders(id, &([_]qpack.Field{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = path },
+    }), &.{.{ .name = "sec-websocket-version", .value = "13" }}, false);
+    return id;
+}
+
+/// One masked WebSocket frame in a DATA frame.
+fn wsSend(h: *Harness, id: u64, op: ws_protocol.Opcode, payload: []const u8, fin: bool) !void {
+    var buf: [2048]u8 = undefined;
+    const f = ws_protocol.encodeFrame(&buf, true, op, payload, .{ 1, 2, 3, 4 });
+    var hdr: [16]u8 = undefined;
+    var w: packet.Writer = .{ .buf = &hdr };
+    frame.writeHeader(&w, .data, f.len);
+    try h.client.write(id, w.written(), false);
+    try h.client.write(id, f, fin);
+}
+
+/// The server's SETTINGS, from its control stream (stream 3).
+fn serverSettings(h: *Harness) !frame.Settings {
+    const data = h.client.readAll(3);
+    if (data.len < 1 or data[0] != 0x00) return error.NoControlStream;
+    const fh = frame.parseHeader(data[1..]) orelse return error.Truncated;
+    return frame.parseSettings(data[1 + fh.size ..][0..@intCast(fh.len)]);
+}
+
+test "WebSocket over HTTP/3 (RFC 9220): the setting, validation, echo, close both ways, FIN, STOP_SENDING" {
+    {
+        // Not advertised: :protocol is malformed.
+        const off = try Harness.init();
+        defer off.deinit();
+        try off.startClient();
+        const id = try connectWs(off, "/ws");
+        try off.run(30);
+        try testing.expect(!(try serverSettings(off)).enable_connect_protocol);
+        try testing.expectEqual(@as(?u64, @backingInt(frame.ErrorCode.message_error)), (try off.client.getStream(id)).reset_code);
+        try testing.expectEqualStrings("", off.handler.ws_log.items);
+    }
+    const h = try Harness.init();
+    defer h.deinit();
+    h.h3_opts.enable_connect_protocol = true;
+    try h.startClient();
+    const id = try connectWs(h, "/ws");
+    try h.run(30);
+    try testing.expect((try serverSettings(h)).enable_connect_protocol);
+    {
+        var r = try h.response(id);
+        defer r.deinit();
+        try testing.expectEqualStrings("200", r.status.?);
+        try testing.expect(std.mem.indexOf(u8, r.headers.items, "content-length") == null);
+    }
+    try wsSend(h, id, .text, "hello", false);
+    try wsSend(h, id, .ping, "p", false);
+    try h.run(30);
+    {
+        var r = try h.response(id);
+        defer r.deinit();
+        try testing.expectEqualSlices(u8, "\x81\x05hello\x8a\x01p", r.body.items);
+        try testing.expect(!h.client.finished(id));
+    }
+    // The client's close is echoed, then FIN and STOP_SENDING(H3_NO_ERROR)
+    // for the client's side, still open.
+    try wsSend(h, id, .close, "\x03\xe8", false);
+    try h.run(30);
+    {
+        var r = try h.response(id);
+        defer r.deinit();
+        try testing.expect(std.mem.endsWith(u8, r.body.items, "\x88\x02\x03\xe8"));
+        try testing.expect(h.client.finished(id));
+        try testing.expectEqual(@as(?u64, 0x100), (try h.client.getStream(id)).stop_code);
+    }
+    try testing.expectEqualStrings("open;text:hello;ping:p;close:\x03\xe8;gone;", h.handler.ws_log.items);
+    try testing.expect(std.mem.indexOf(u8, h.handler.log.items, "CONNECT /ws [host=example.com]\n") != null);
+    h.handler.ws_log.clearRetainingCapacity();
+
+    // Our close waits for the client's; the client's close with FIN ends it.
+    const ours = try connectWs(h, "/ws");
+    try wsSend(h, ours, .text, "close-me", false);
+    try h.run(30);
+    {
+        var r = try h.response(ours);
+        defer r.deinit();
+        try testing.expectEqualSlices(u8, "\x88\x05\x03\xe8bye", r.body.items);
+        try testing.expect(!h.client.finished(ours));
+    }
+    try wsSend(h, ours, .text, "late", false);
+    try wsSend(h, ours, .close, "\x03\xe8", true);
+    try h.run(30);
+    try testing.expect(h.client.finished(ours));
+    try testing.expectEqual(@as(?u64, null), (try h.client.getStream(ours)).stop_code);
+    try testing.expectEqualStrings("open;text:close-me;close:\x03\xe8;gone;", h.handler.ws_log.items);
+    h.handler.ws_log.clearRetainingCapacity();
+
+    // FIN without a close frame is a TCP FIN; STOP_SENDING drops it; a
+    // protocol violation fails it with 1002.
+    const fin = try connectWs(h, "/ws");
+    try h.client.write(fin, "", true);
+    const stop = try connectWs(h, "/ws");
+    const bad = try connectWs(h, "/ws");
+    var hdr: [16]u8 = undefined;
+    var w: packet.Writer = .{ .buf = &hdr };
+    frame.writeHeader(&w, .data, 3);
+    try h.client.write(bad, w.written(), false);
+    try h.client.write(bad, &.{ 0x81, 0x01, 'x' }, false);
+    try h.run(30);
+    var sw: packet.Writer = .{ .buf = &hdr };
+    qframe.writeStopSending(&sw, stop, 0x10c);
+    try h.client.injectFrames(sw.written());
+    try h.run(30);
+    try testing.expect(h.client.finished(fin));
+    {
+        var r = try h.response(bad);
+        defer r.deinit();
+        try testing.expectEqualSlices(u8, "\x88\x02\x03\xea", r.body.items);
+        try testing.expect(h.client.finished(bad));
+    }
+    try testing.expect((try h.client.getStream(stop)).reset_code != null);
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, h.handler.ws_log.items, "open;"));
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, h.handler.ws_log.items, "gone;"));
+
+    // A handler that doesn't take the WebSocket answers as usual.
+    const other = try connectWs(h, "/other");
+    try wsSend(h, other, .text, "ignored", false);
+    try h.run(30);
+    {
+        var r = try h.response(other);
+        defer r.deinit();
+        try testing.expectEqualStrings("Hello, World!", r.body.items);
+        try testing.expectEqual(@as(?u64, 0x100), (try h.client.getStream(other)).stop_code);
+    }
+    try testing.expectEqual(@as(u32, 0), h.h3c.?.activeRequests());
+    try testing.expectEqual(@as(usize, 0), h.slab.active_count);
+}
+
+test "WebSocket over HTTP/3: output beyond the stream buffer, sends from another thread" {
+    const h = try Harness.init();
+    defer h.deinit();
+    h.h3_opts.enable_connect_protocol = true;
+    // 200 KB of output through a 16 KB window of unacknowledged data.
+    h.h3_opts.stream_buffer = 16 * 1024;
+    try h.startClient();
+    const id = try connectWs(h, "/ws");
+    try wsSend(h, id, .text, "flood", false);
+    try wsSend(h, id, .text, "after", false);
+    try h.run(400);
+    const t = try std.Thread.spawn(.{}, struct {
+        fn run(c: *ws.Conn) void {
+            c.sendText("from elsewhere") catch unreachable;
+        }
+    }.run, .{h.handler.ws_conn.?});
+    t.join();
+    try h.run(30);
+    var r = try h.response(id);
+    defer r.deinit();
+    // 200 binary frames of 1004 bytes, the echo, the other thread's.
+    try testing.expectEqual(@as(usize, 200 * 1004 + 7 + 16), r.body.items.len);
+    for (0..200) |i| {
+        const f = r.body.items[i * 1004 ..][0..1004];
+        try testing.expectEqualSlices(u8, &.{ 0x82, 0x7e, 0x03, 0xe8 }, f[0..4]);
+        try testing.expect(std.mem.allEqual(u8, f[4..], @truncate(i)));
+    }
+    try testing.expectEqualSlices(u8, "\x81\x05after\x81\x0efrom elsewhere", r.body.items[200 * 1004 ..]);
+    try testing.expectEqualStrings("open;text:flood;text:after;", h.handler.ws_log.items);
+}
+
 test "HTTP/3: control and QPACK stream rules" {
     // DATA on the control stream.
     try expectConnectionError(0x105, struct {
@@ -750,6 +967,8 @@ fn fuzzH3(_: void, smith: *std.testing.Smith) anyerror!void {
     const h = try Harness.init();
     defer h.deinit();
     h.h3_opts.limits.max_body_size = 4096;
+    h.h3_opts.enable_connect_protocol = true;
+    h.h3_opts.websocket = .{ .max_message_size = 2048, .max_send_queue_bytes = 8192 };
     try h.startClient();
     var ids: [4]u64 = undefined;
     var nids: usize = 0;
@@ -782,11 +1001,18 @@ fn fuzzH3(_: void, smith: *std.testing.Smith) anyerror!void {
                 try h.client.write(id, bytes, op & 0x80 != 0);
             },
             4 => {
-                // A well-formed request.
+                // A well-formed request, or a WebSocket.
                 if (nids < ids.len) {
-                    ids[nids] = try h.request("GET", "/", &.{}, "");
+                    ids[nids] = if (op & 0x40 != 0) try connectWs(h, "/ws") else try h.request("GET", "/", &.{}, "");
                     nids += 1;
                 }
+            },
+            5 => {
+                // A WebSocket frame (any opcode) in a DATA frame.
+                if (nids == 0) continue;
+                const id = ids[smith.value(u8) % nids];
+                if ((try h.client.getStream(id)).send.fin) continue;
+                try wsSend(h, id, @fromBackingInt(@as(u4, @truncate(op >> 3))), bytes, op & 0x80 != 0);
             },
             else => {},
         }

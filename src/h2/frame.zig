@@ -64,6 +64,8 @@ pub const SettingId = enum(u16) {
     initial_window_size = 4,
     max_frame_size = 5,
     max_header_list_size = 6,
+    /// RFC 8441 §3: extended CONNECT (WebSockets over HTTP/2).
+    enable_connect_protocol = 8,
     _,
 };
 
@@ -291,7 +293,7 @@ fn parse(ty: u8, flags: u8, stream_id: u31, payload: []const u8) Result {
                 const id: SettingId = @fromBackingInt(std.mem.readInt(u16, payload[i..][0..2], .big));
                 const value = std.mem.readInt(u32, payload[i + 2 ..][0..4], .big);
                 switch (id) {
-                    .enable_push => if (value > 1) return conn_err(.protocol_error),
+                    .enable_push, .enable_connect_protocol => if (value > 1) return conn_err(.protocol_error),
                     .initial_window_size => if (value > max_window_size) return conn_err(.flow_control_error),
                     .max_frame_size => if (value < min_max_frame_size or value > max_max_frame_size) return conn_err(.protocol_error),
                     else => {},
@@ -580,11 +582,13 @@ test "malformed frames map to the RFC's error codes" {
         .{ .bytes = &raw(4, 3, 0, 0, "\x00\x00\x00\x00"), .expect = "fail protocol_error on 0\n" },
         .{ .bytes = &raw(3, 3, 0, 1, "\x00\x00\x00"), .expect = "fail frame_size_error on 0\n" },
         // §6.5 SETTINGS on a stream; ACK with payload; length not a multiple of 6;
-        // ENABLE_PUSH 2; INITIAL_WINDOW_SIZE 2^31; MAX_FRAME_SIZE too small and too large.
+        // ENABLE_PUSH 2; ENABLE_CONNECT_PROTOCOL 2 (RFC 8441 §3); INITIAL_WINDOW_SIZE
+        // 2^31; MAX_FRAME_SIZE too small and too large.
         .{ .bytes = &raw(0, 4, 0, 1, ""), .expect = "fail protocol_error on 0\n" },
         .{ .bytes = &raw(6, 4, flag.ack, 0, "\x00\x01\x00\x00\x10\x00"), .expect = "fail frame_size_error on 0\n" },
         .{ .bytes = &raw(5, 4, 0, 0, "\x00\x01\x00\x00\x10"), .expect = "fail frame_size_error on 0\n" },
         .{ .bytes = &raw(6, 4, 0, 0, "\x00\x02\x00\x00\x00\x02"), .expect = "fail protocol_error on 0\n" },
+        .{ .bytes = &raw(6, 4, 0, 0, "\x00\x08\x00\x00\x00\x02"), .expect = "fail protocol_error on 0\n" },
         .{ .bytes = &raw(6, 4, 0, 0, "\x00\x04\x80\x00\x00\x00"), .expect = "fail flow_control_error on 0\n" },
         .{ .bytes = &raw(6, 4, 0, 0, "\x00\x05\x00\x00\x3f\xff"), .expect = "fail protocol_error on 0\n" },
         .{ .bytes = &raw(6, 4, 0, 0, "\x00\x05\x01\x00\x00\x00"), .expect = "fail protocol_error on 0\n" },

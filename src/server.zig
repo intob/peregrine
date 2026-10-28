@@ -103,6 +103,9 @@ pub const Config = struct {
     /// 0 means unlimited.
     max_requests_per_connection: u32 = 0,
     /// WebSocket messages larger than this fail the connection (1009).
+    /// WebSockets are offered over HTTP/2 and HTTP/3 too (extended
+    /// CONNECT) when the handler has `handleWSFrame`; each one there takes
+    /// an exchange slot (`max_exchanges_per_worker`).
     websocket_max_message_size: usize = 16 * 1024 * 1024,
     /// Unsent WebSocket output per connection before `Conn.send` fails with
     /// SendQueueFull. A connection whose peer stops reading is closed after
@@ -304,6 +307,8 @@ pub fn Server(comptime Handler: type) type {
             h2_opts.limits = cfg.limits;
             h2_opts.hpack.max_header_list_size = @intCast(@min(cfg.limits.max_header_bytes, std.math.maxInt(u32)));
             h2_opts.request_timeout_s = cfg.request_timeout_s;
+            h2_opts.enable_connect_protocol = websockets;
+            h2_opts.websocket = srv.wsOptions();
             var bind_address = address;
             for (srv.workers, 0..) |*w, i| {
                 const listener = if (per_worker or shared < 0) blk: {
@@ -334,10 +339,7 @@ pub fn Server(comptime Handler: type) type {
                     .keep_alive_timeout_s = cfg.keep_alive_timeout_s,
                     .request_timeout_s = cfg.request_timeout_s,
                     .read_on_accept = sys.is_linux,
-                    .websocket = .{
-                        .max_message_size = cfg.websocket_max_message_size,
-                        .max_send_queue_bytes = cfg.websocket_max_send_queue_bytes,
-                    },
+                    .websocket = srv.wsOptions(),
                     .max_exchanges = cfg.max_exchanges_per_worker,
                     .exchange = .{
                         .max_queue_bytes = cfg.max_exchange_queue_bytes,
@@ -412,8 +414,23 @@ pub fn Server(comptime Handler: type) type {
             return srv;
         }
 
+        /// WebSockets over HTTP/2 and HTTP/3 (extended CONNECT) are offered
+        /// when the handler takes WebSocket frames.
+        const websockets = @hasDecl(Handler, "handleWSFrame");
+
+        fn wsOptions(srv: *const Self) ws.Options {
+            return .{
+                .max_message_size = srv.cfg.websocket_max_message_size,
+                .max_send_queue_bytes = srv.cfg.websocket_max_send_queue_bytes,
+            };
+        }
+
         fn quicOptions(srv: *Self, o: Http3Options, index: usize, count: usize) quic_endpoint.Options {
-            var h3_opts: h3.Options = .{ .limits = srv.cfg.limits };
+            var h3_opts: h3.Options = .{
+                .limits = srv.cfg.limits,
+                .enable_connect_protocol = websockets,
+                .websocket = srv.wsOptions(),
+            };
             h3_opts.qpack.max_field_section_size = @intCast(@min(srv.cfg.limits.max_header_bytes, std.math.maxInt(u32)));
             return .{
                 .quic = .{

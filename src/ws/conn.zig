@@ -37,11 +37,14 @@ pub const SendError = error{
 };
 
 pub const Mailbox = @import("../mailbox.zig").Mailbox;
+const MailboxEntry = @import("../mailbox.zig").Entry;
 
 pub const Conn = struct {
     const Self = @This();
 
-    /// The socket. Only for identification; never read or write it directly.
+    /// The socket. Only for identification (logging); never read or write
+    /// it directly. Every WebSocket on one HTTP/2 connection shares its
+    /// socket, and over HTTP/3 this is the worker's UDP socket.
     fd: sys.fd_t,
     /// For the handler's own per-connection state.
     user: ?*anyopaque = null,
@@ -50,8 +53,10 @@ pub const Conn = struct {
     opts: Options,
     decoder: protocol.Decoder,
     mailbox: *Mailbox,
-    slot: u32,
-    gen: u32,
+    /// What `send` posts to the mailbox: the worker's connection slot
+    /// (HTTP/1.1), or the exchange slot routing to an HTTP/2 or HTTP/3
+    /// stream.
+    post_entry: MailboxEntry,
 
     mutex: sys.Mutex = .{},
     /// Frames queued by send() from any thread. Guarded by `mutex`.
@@ -72,7 +77,7 @@ pub const Conn = struct {
     /// Worker only: the connection was failed (protocol error, limit).
     failed: bool = false,
 
-    pub fn create(allocator: std.mem.Allocator, fd: sys.fd_t, opts: Options, mailbox: *Mailbox, slot: u32, gen: u32) !*Self {
+    pub fn create(allocator: std.mem.Allocator, fd: sys.fd_t, opts: Options, mailbox: *Mailbox, post_entry: MailboxEntry) !*Self {
         const self = try allocator.create(Self);
         self.* = .{
             .fd = fd,
@@ -80,8 +85,7 @@ pub const Conn = struct {
             .opts = opts,
             .decoder = protocol.Decoder.init(allocator, opts.max_message_size),
             .mailbox = mailbox,
-            .slot = slot,
-            .gen = gen,
+            .post_entry = post_entry,
         };
         return self;
     }
@@ -151,7 +155,7 @@ pub const Conn = struct {
             self.posted = true;
             break :blk post;
         };
-        if (post) self.mailbox.post(.{ .kind = .ws, .slot = self.slot, .gen = @intCast(self.gen & 0x7fffffff) });
+        if (post) self.mailbox.post(self.post_entry);
     }
 
     // -- Worker side -------------------------------------------------------
@@ -300,7 +304,7 @@ const Harness = struct {
             .conn = undefined,
         };
         h.mailbox.bind();
-        h.conn = try Conn.create(testing.allocator, 7, opts, &h.mailbox, 0, 1);
+        h.conn = try Conn.create(testing.allocator, 7, opts, &h.mailbox, .{ .kind = .ws, .slot = 0, .gen = 1 });
         return h;
     }
 

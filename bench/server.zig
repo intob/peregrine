@@ -1,6 +1,7 @@
 //! Benchmark server. Every path answers "Hello, World!" (TechEmpower
-//! plaintext) except `/64k`, a 64 KiB body (four full TLS records); request
-//! bodies are read and discarded.
+//! plaintext) except `/64k`, a 64 KiB body (four full TLS records), and
+//! `/ws`, a WebSocket echo (HTTP/1.1 Upgrade, or extended CONNECT on HTTP/2
+//! and HTTP/3); request bodies are read and discarded.
 //! Usage: bench-server [workers] [auto|epoll|io_uring] [port] [tls|h3|plain] [stream]
 //! With `tls`, serves TLS 1.3 with the self-signed P-256 certificate in
 //! this directory, with ALPN "h2" and "http/1.1"; `h3` adds HTTP/3 on the
@@ -21,11 +22,24 @@ const Handler = struct {
     pub fn deinit(_: *Handler) void {}
 
     pub fn handleRequest(_: *Handler, req: *per.Request, resp: *per.Response) void {
+        if (std.mem.eql(u8, req.getPath(), "/ws")) {
+            per.ws.upgrader.handleUpgrade(undefined, req, resp) catch {
+                resp.status = .bad_request;
+            };
+            return;
+        }
         resp.addNewHeader("content-type", "text/plain") catch {};
         if (std.mem.eql(u8, req.getPath(), "/64k")) {
             resp.setBodyBorrowed(&big_body);
         } else {
             resp.setBodyBorrowed("Hello, World!");
+        }
+    }
+
+    pub fn handleWSFrame(_: *Handler, conn: *per.ws.Conn, frame: *per.ws.Frame) void {
+        switch (frame.opcode) {
+            .text, .binary => conn.send(frame.getPayload(), frame.opcode == .binary) catch {},
+            else => {},
         }
     }
 };

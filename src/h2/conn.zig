@@ -6,6 +6,11 @@
 //! handleRequest returns, without allocating in steady state; `later()`
 //! and `stream()` exchanges are drained per stream as the windows allow.
 //!
+//! WebSockets (RFC 8441): with `enable_connect_protocol`, an extended
+//! CONNECT whose handler accepts it (`ws.upgrader.handleUpgrade`) gets a
+//! 200 without END_STREAM, and the stream's DATA then carries the
+//! WebSocket both ways through a `ws.Conn`, flow-controlled like any body.
+//!
 //! Priorities (RFC 7540 and RFC 9218) are accepted and ignored. Server
 //! push is never used.
 const std = @import("std");
@@ -16,6 +21,8 @@ const date = @import("../http/date.zig");
 const exchange = @import("../http/exchange.zig");
 const fields_mod = @import("../http/fields.zig");
 const BufferPool = @import("../http/session.zig").BufferPool;
+const ws = @import("../ws/conn.zig");
+const sys = @import("../sys.zig");
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
 const Status = @import("../status.zig").Status;
@@ -51,6 +58,12 @@ pub const Options = struct {
     /// Seconds a stream may hold unsent output against a zero window, or a
     /// header block may stay incomplete, before it is reset.
     request_timeout_s: u32 = 10,
+    /// Advertise SETTINGS_ENABLE_CONNECT_PROTOCOL and accept extended
+    /// CONNECT (RFC 8441), for WebSockets. Set by the server when the
+    /// handler has WebSocket hooks.
+    enable_connect_protocol: bool = false,
+    /// Limits for WebSockets over this connection.
+    websocket: ws.Options = .{},
 };
 
 pub const Action = enum {
@@ -76,6 +89,10 @@ pub fn Context(comptime Handler: type) type {
         /// exchanges to find their way back.
         conn_slot: u32,
         conn_gen: u32,
+        /// The worker's read buffers, for WebSocket decoders.
+        pool: *BufferPool,
+        /// The socket, for `ws.Conn.fd` (identification only).
+        fd: sys.fd_t = -1,
     };
 }
 
@@ -107,6 +124,8 @@ const Stream = struct {
     path: ?HeaderRef = null,
     scheme: ?HeaderRef = null,
     authority: ?HeaderRef = null,
+    /// Extended CONNECT (RFC 8441): `:protocol`.
+    protocol: ?HeaderRef = null,
     has_host: bool = false,
     regular_seen: bool = false,
     body_start: usize = 0,
@@ -141,6 +160,13 @@ const Stream = struct {
     body_paused: bool = false,
     body_end: bool = false,
     body_pos: usize = 0,
+    /// An extended CONNECT: DATA is never buffered as a body. It goes to
+    /// `ws` once the handler accepted a WebSocket, and is dropped
+    /// otherwise.
+    tunnel: bool = false,
+    ws: ?*ws.Conn = null,
+    /// The WebSocket has output the windows (or `out_limit`) held back.
+    ws_pending: bool = false,
 
     fn clear(s: *Stream) void {
         s.req.clearRetainingCapacity();
@@ -176,7 +202,7 @@ const Fault = enum(u8) {
     protocol,
     /// Too many or too large headers: 431.
     headers_too_large,
-    /// Unknown method, or CONNECT: 501.
+    /// Unknown method, or a CONNECT that isn't extended: 501.
     not_implemented,
     /// Body over the limit: 413.
     body_too_large,
@@ -268,12 +294,14 @@ pub const Conn = struct {
         errdefer self.out.deinit(allocator);
         // Our preface: SETTINGS, then a larger connection window.
         var buf: [64]u8 = undefined;
-        var n = try frame.writeSettings(&buf, &.{
+        const settings = [_]frame.Setting{
             .{ .id = .max_concurrent_streams, .value = opts.max_concurrent_streams },
             .{ .id = .initial_window_size, .value = @min(opts.initial_window_size, frame.max_window_size) },
             .{ .id = .max_frame_size, .value = opts.max_frame_size },
             .{ .id = .max_header_list_size, .value = opts.hpack.max_header_list_size },
-        });
+            .{ .id = .enable_connect_protocol, .value = 1 },
+        };
+        var n = try frame.writeSettings(&buf, settings[0 .. settings.len - @intFromBool(!opts.enable_connect_protocol)]);
         if (opts.connection_window > 65535) {
             n += try frame.writeWindowUpdate(buf[n..], 0, @intCast(@min(opts.connection_window, frame.max_window_size) - 65535));
             self.recv_window = @min(opts.connection_window, frame.max_window_size);
@@ -418,6 +446,7 @@ pub const Conn = struct {
 
     /// Ends a stream, remembering how (see Closed).
     fn closeStream(self: *Self, ctx: anytype, s: *Stream, how: How, abort_exchange: bool) void {
+        dropWebSocket(ctx, s);
         if (s.exchange != NIL) {
             self.output_streams -= 1;
             if (abort_exchange) self.abortExchange(ctx, s.exchange);
@@ -435,6 +464,16 @@ pub const Conn = struct {
         s.active = false;
         s.clear();
         self.stream_count -= 1;
+    }
+
+    /// The stream is ending: handleWSDisconn, then the WebSocket is freed
+    /// (its tunnel slot goes with the stream's exchange).
+    fn dropWebSocket(ctx: anytype, s: *Stream) void {
+        const w = s.ws orelse return;
+        s.ws = null;
+        const Handler = @TypeOf(ctx.handler.*);
+        if (@hasDecl(Handler, "handleWSDisconn")) ctx.handler.handleWSDisconn(w);
+        w.destroy(ctx.pool);
     }
 
     fn abortExchange(_: *Self, ctx: anytype, slot: u32) void {
@@ -457,6 +496,7 @@ pub const Conn = struct {
     /// exchanges and release them.
     pub fn abortAll(self: *Self, ctx: anytype) void {
         for (self.streams) |*s| {
+            if (s.active) dropWebSocket(ctx, s);
             if (s.active and s.exchange != NIL) {
                 self.abortExchange(ctx, s.exchange);
                 ctx.exchanges.release(s.exchange);
@@ -624,6 +664,7 @@ pub const Conn = struct {
         if (s.state != .open) return self.resetStream(ctx, s, .stream_closed);
         if (d.flow_len > s.recv_window) return self.resetStream(ctx, s, .flow_control_error);
         s.recv_window -= d.flow_len;
+        if (s.tunnel) return self.tunnelData(Handler, ctx, s, d);
         if (s.body_stream) return self.streamData(Handler, ctx, s, d);
         if (s.fault == null) {
             s.body_received += d.data.len;
@@ -657,6 +698,28 @@ pub const Conn = struct {
         self.out.appendSlice(self.allocator, buf[0..len]) catch {};
         s.recv_window += s.consumed;
         s.consumed = 0;
+    }
+
+    /// DATA on an extended CONNECT stream: WebSocket bytes, run through
+    /// the stream's ws.Conn at once, or dropped if the handler didn't take
+    /// the tunnel. The window comes back once the WebSocket's output has
+    /// been written (backpressure, as HTTP/1.1 stops reading the socket
+    /// while output is stalled).
+    fn tunnelData(self: *Self, comptime Handler: type, ctx: *const Context(Handler), s: *Stream, d: anytype) void {
+        if (d.end_stream) s.state = .half_closed_remote;
+        const w = s.ws orelse return self.creditStream(s, d.flow_len);
+        var rest = d.data;
+        while (rest.len > 0 and !w.wantsClose()) {
+            const space = w.decoder.readSpace(ctx.pool) catch return self.resetStream(ctx, s, .internal_error);
+            const n = @min(space.len, rest.len);
+            @memcpy(space[0..n], rest[0..n]);
+            w.decoder.commitRead(n);
+            rest = rest[n..];
+            _ = w.process(Handler, ctx.handler);
+        }
+        w.decoder.releaseIfIdle(ctx.pool);
+        s.consumed += d.flow_len;
+        self.pumpStream(Handler, ctx, s);
     }
 
     /// DATA for a streamed body: handed to the handler at once, or kept
@@ -812,13 +875,15 @@ pub const Conn = struct {
                 if (s.body_received != cl and s.fault == null) return self.resetStream(ctx, s, .protocol_error);
             }
             s.state = .half_closed_remote;
+            // A tunnel's trailers end it like END_STREAM on DATA.
+            if (s.tunnel) return self.pumpStream(Handler, ctx, s);
             if (s.body_stream) {
                 s.body_end = true;
                 return self.drainBody(Handler, ctx, s);
             }
             return self.dispatch(Handler, ctx, s);
         }
-        var sink: RequestSink = .{ .stream = s, .allocator = self.allocator };
+        var sink: RequestSink = .{ .stream = s, .allocator = self.allocator, .allow_protocol = self.opts.enable_connect_protocol };
         self.decoder.decode(block, &sink) catch |err| switch (err) {
             error.HeaderListTooLarge => s.fault = s.fault orelse .headers_too_large,
             error.OutOfMemory => return self.fail(.internal_error),
@@ -836,6 +901,14 @@ pub const Conn = struct {
         }
         s.body_start = s.req.items.len;
         if (s.fault == null) self.validateRequest(s);
+        if (s.protocol != null and s.fault == null) {
+            // Extended CONNECT: answered now, DATA is the tunnel's.
+            s.tunnel = true;
+            if (end_stream) s.state = .half_closed_remote;
+            if (@hasDecl(Handler, "handleHead") and self.checkHead(Handler, ctx, s) == .reject)
+                return self.respondSync(Handler, ctx, s, false);
+            return self.dispatch(Handler, ctx, s);
+        }
         if (end_stream) {
             if (s.content_length) |cl| {
                 if (cl != 0 and s.fault == null) return self.resetStream(ctx, s, .protocol_error);
@@ -871,8 +944,17 @@ pub const Conn = struct {
             s.fault = .protocol;
             return;
         };
-        if (std.mem.eql(u8, s.slice(method), "CONNECT")) {
-            // RFC 9113 §8.5: no :scheme or :path. Not supported (RFC 8441 later).
+        const connect = std.mem.eql(u8, s.slice(method), "CONNECT");
+        if (s.protocol != null) {
+            // RFC 8441 §4: :protocol only on CONNECT, which then has
+            // :scheme and :path like any request.
+            if (!connect) {
+                s.fault = .protocol;
+                return;
+            }
+        } else if (connect) {
+            // RFC 9113 §8.5: no :scheme or :path. A proxy's CONNECT: not
+            // supported.
             if (s.scheme != null or s.path != null) s.fault = .protocol else s.fault = .not_implemented;
             return;
         }
@@ -910,6 +992,7 @@ pub const Conn = struct {
             }
             is_head = req.method == .HEAD;
             ctx.handler.handleRequest(req, resp);
+            if (s.tunnel and resp.is_ws_upgrade) return self.startWebSocket(Handler, ctx, s);
             if (resp.mode != .sync) return self.bindExchange(Handler, ctx, s, is_head);
         }
         self.respondSync(Handler, ctx, s, is_head);
@@ -923,6 +1006,7 @@ pub const Conn = struct {
         req.version = .@"HTTP/1.1";
         req.method = Method.parse(s.slice(s.method.?)) catch return false;
         req.path_and_query = s.slice(s.path.?);
+        req.protocol = if (s.protocol) |p| s.slice(p) else null;
         for (s.hdr[0..s.hdr_count], 0..) |h, i| {
             req.headers[i] = .{
                 .key = s.req.items[h.name_off..][0..h.name_len],
@@ -962,6 +1046,34 @@ pub const Conn = struct {
         self.bindExchange(Handler, ctx, s, is_head);
         // The exchange may have finished (and the stream closed) already.
         if (s.active and s.exchange != NIL) self.drainBody(Handler, ctx, s);
+    }
+
+    /// The handler accepted a WebSocket (RFC 8441 §5): a 2xx HEADERS
+    /// without END_STREAM, then the stream's DATA is the WebSocket's. A
+    /// tunnel slot in the exchange slab routes sends from other threads
+    /// back here.
+    fn startWebSocket(self: *Self, comptime Handler: type, ctx: *const Context(Handler), s: *Stream) void {
+        const resp = ctx.resp;
+        const code = @backingInt(resp.status);
+        if (!@hasDecl(Handler, "handleWSFrame") or code < 200 or code >= 300) {
+            resp.is_ws_upgrade = false;
+            return self.respondSync(Handler, ctx, s, false);
+        }
+        const ex = ctx.exchanges.createTunnel(ctx.conn_slot, ctx.conn_gen, s.id) catch {
+            resp.reset();
+            resp.status = .service_unavailable;
+            return self.respondSync(Handler, ctx, s, false);
+        };
+        s.ws = ws.Conn.create(self.allocator, ctx.fd, self.opts.websocket, ctx.exchanges.mailbox, ex.mailboxEntry()) catch {
+            ctx.exchanges.release(ex.slot);
+            return self.resetStream(ctx, s, .internal_error);
+        };
+        s.exchange = ex.slot;
+        self.output_streams += 1;
+        self.writeHead(ctx, s, resp.status, resp.headerBytes(), null, false);
+        s.head_sent = true;
+        if (@hasDecl(Handler, "handleWSConn")) ctx.handler.handleWSConn(s.ws.?);
+        self.pumpStream(Handler, ctx, s);
     }
 
     /// Serialises a complete response: HEADERS, then DATA as the windows
@@ -1105,6 +1217,10 @@ pub const Conn = struct {
     pub fn onExchangePosted(self: *Self, comptime Handler: type, ctx: *const Context(Handler), slot: u32) void {
         for (self.streams) |*s| {
             if (!s.active or s.exchange != slot) continue;
+            if (s.ws) |w| {
+                w.clearPosted();
+                return self.pumpStream(Handler, ctx, s);
+            }
             if (ctx.exchanges.handle(slot).takeResume() and s.body_paused) {
                 s.body_paused = false;
                 self.drainBody(Handler, ctx, s);
@@ -1117,7 +1233,9 @@ pub const Conn = struct {
     /// The worker's exchange deadline scan found this exchange expired.
     pub fn onExchangeTimeout(self: *Self, comptime Handler: type, ctx: *const Context(Handler), slot: u32) void {
         for (self.streams) |*s| {
-            if (s.active and s.exchange == slot) return self.resetStream(ctx, s, .internal_error);
+            // A WebSocket's output stalled, or the peer never answered our
+            // close frame.
+            if (s.active and s.exchange == slot) return self.resetStream(ctx, s, if (s.ws != null) .cancel else .internal_error);
         }
     }
 
@@ -1130,6 +1248,8 @@ pub const Conn = struct {
         if (self.output_streams == 0 or self.failed) return;
         for (self.streams) |*s| {
             if (!s.active or !s.hasOutput()) continue;
+            // A WebSocket with nothing held back is pumped when it posts.
+            if (s.ws != null and !s.ws_pending) continue;
             if (self.unsent() > self.opts.out_limit) return;
             self.pumpStream(Handler, ctx, s);
             if (self.failed) return;
@@ -1139,6 +1259,7 @@ pub const Conn = struct {
     /// Sends what a stream has queued (its pending buffer or exchange).
     fn pumpStream(self: *Self, comptime Handler: type, ctx: *const Context(Handler), s: *Stream) void {
         if (self.failed) return;
+        if (s.ws != null) return self.pumpWebSocket(Handler, ctx, s);
         if (s.pending_end or s.pending_pos < s.pending.items.len) {
             const rest = s.pending.items[s.pending_pos..];
             const n = self.writeData(s, rest, true);
@@ -1220,6 +1341,34 @@ pub const Conn = struct {
         }
     }
 
+    /// Sends what the WebSocket has queued as the windows allow. Once
+    /// everything is written and the WebSocket is over (the close
+    /// handshake, a failure, or the client's END_STREAM, which is a TCP
+    /// FIN to it), END_STREAM ends our side and the stream closes.
+    fn pumpWebSocket(self: *Self, comptime Handler: type, ctx: *const Context(Handler), s: *Stream) void {
+        const w = s.ws.?;
+        var progressed = false;
+        while (self.unsent() <= self.opts.out_limit) {
+            const bytes = w.wireBytes();
+            if (bytes.len == 0) break;
+            const n = self.writeData(s, bytes, false);
+            w.advance(n);
+            progressed = progressed or n > 0;
+            if (n < bytes.len) break;
+        }
+        s.ws_pending = w.hasOutput();
+        self.noteStall(ctx, s, progressed or !s.ws_pending);
+        ctx.exchanges.tunnelTimer(s.exchange, ctx.now, s.ws_pending, progressed, w.closeSent());
+        if (s.ws_pending) return;
+        // Written: the window for what was read comes back.
+        self.creditStream(s, 0);
+        if (!w.wantsClose() and s.state == .open) return;
+        var hdr: [frame.header_len]u8 = undefined;
+        frame.writeHeader(&hdr, 0, .data, frame.flag.end_stream, s.id);
+        self.out.appendSlice(self.allocator, &hdr) catch return self.fail(.internal_error);
+        self.finishStream(ctx, s);
+    }
+
     fn writeTrailers(self: *Self, s: *Stream, lines: []const u8) void {
         self.enc_buf.clearRetainingCapacity();
         var rest = lines;
@@ -1297,6 +1446,9 @@ fn statusText(status: Status) []const u8 {
 const RequestSink = struct {
     stream: *Stream,
     allocator: std.mem.Allocator,
+    /// Accept :protocol (we sent SETTINGS_ENABLE_CONNECT_PROTOCOL);
+    /// otherwise it is an unknown pseudo-header field.
+    allow_protocol: bool = false,
 
     pub fn header(self: *RequestSink, name: []const u8, value: []const u8) !void {
         const s = self.stream;
@@ -1333,6 +1485,8 @@ const RequestSink = struct {
                 &s.scheme
             else if (std.mem.eql(u8, name, ":authority"))
                 &s.authority
+            else if (self.allow_protocol and std.mem.eql(u8, name, ":protocol"))
+                &s.protocol
             else {
                 s.fault = .protocol;
                 return;
@@ -1410,7 +1564,8 @@ fn isTokenChar(c: u8) bool {
 
 const testing = std.testing;
 const Mailbox = @import("../mailbox.zig").Mailbox;
-const sys = @import("../sys.zig");
+const ws_protocol = @import("../ws/protocol.zig");
+const ws_upgrader = @import("../ws/upgrader.zig");
 
 const TestHandler = struct {
     /// "METHOD path\n" plus selected headers and the body, per request.
@@ -1425,6 +1580,37 @@ const TestHandler = struct {
     received: usize = 0,
     /// handleBody pauses after each chunk.
     pause: bool = false,
+    /// WebSockets: the last one opened, and what the hooks saw.
+    ws_conn: ?*ws.Conn = null,
+    ws_log: std.ArrayList(u8) = .empty,
+
+    pub fn handleWSConn(self: *TestHandler, conn: *ws.Conn) void {
+        self.ws_conn = conn;
+        self.ws_log.appendSlice(testing.allocator, "open;") catch unreachable;
+    }
+
+    pub fn handleWSDisconn(self: *TestHandler, conn: *ws.Conn) void {
+        if (self.ws_conn == conn) self.ws_conn = null;
+        self.ws_log.appendSlice(testing.allocator, "gone;") catch unreachable;
+    }
+
+    /// Echoes text and binary; "close-me" starts the close handshake,
+    /// "big" sends 1000 bytes.
+    pub fn handleWSFrame(self: *TestHandler, conn: *ws.Conn, fr: *ws.Frame) void {
+        const p = fr.getPayload();
+        self.ws_log.print(testing.allocator, "{s}:{s};", .{ fr.opcode.toString(), p[0..@min(p.len, 16)] }) catch unreachable;
+        switch (fr.opcode) {
+            .text, .binary => {},
+            else => return,
+        }
+        if (std.mem.eql(u8, p, "close-me")) {
+            conn.close(1000, "bye") catch unreachable;
+        } else if (std.mem.eql(u8, p, "big")) {
+            conn.sendBinary(&(@as([1000]u8, @splat('B')))) catch unreachable;
+        } else {
+            conn.send(p, fr.opcode == .binary) catch unreachable;
+        }
+    }
 
     pub fn handleHead(_: *TestHandler, req: *Request, resp: *Response) exchange.BodyMode {
         const path = req.getPath();
@@ -1470,6 +1656,12 @@ const TestHandler = struct {
         }
         if (std.mem.startsWith(u8, path, "/up")) {
             self.exchanges.append(a, resp.later() catch unreachable) catch unreachable;
+            return;
+        }
+        if (std.mem.eql(u8, path, "/ws")) {
+            ws_upgrader.handleUpgrade(undefined, req, resp) catch {
+                resp.status = .bad_request;
+            };
             return;
         }
         resp.addNewHeader("Content-Type", "text/plain") catch {};
@@ -1522,6 +1714,8 @@ const Harness = struct {
     creader: frame.Reader = .{},
     /// Server frames, one per line.
     events: std.ArrayList(u8) = .empty,
+    /// Every DATA payload the server sent, in order.
+    data_out: std.ArrayList(u8) = .empty,
     /// Server frames per stream (ordered within a stream), for comparing
     /// runs that may interleave streams differently.
     per_stream: std.AutoHashMap(u32, std.ArrayList(u8)),
@@ -1565,6 +1759,8 @@ const Harness = struct {
         h.handler.log.deinit(a);
         h.handler.bodies.deinit(a);
         h.handler.exchanges.deinit(a);
+        h.handler.ws_log.deinit(a);
+        h.data_out.deinit(a);
         h.out.deinit(a);
         h.enc.deinit();
         h.dec.deinit();
@@ -1587,6 +1783,7 @@ const Harness = struct {
             .exchanges = &h.slab,
             .conn_slot = 3,
             .conn_gen = 7,
+            .pool = &h.pool,
         };
     }
 
@@ -1620,6 +1817,7 @@ const Harness = struct {
                     .data => |d| {
                         stream = d.stream_id;
                         try line.print(a, "data {d} len={d} end={}", .{ d.stream_id, d.data.len, d.end_stream });
+                        try h.data_out.appendSlice(a, d.data);
                     },
                     .headers => |x| {
                         stream = x.stream_id;
@@ -2623,18 +2821,197 @@ test "output backpressure: process stops parsing above out_limit" {
 }
 
 // Any split of the same client bytes gives the same frames per stream.
+fn connectWs(h: *Harness, stream: u31, path: []const u8) !void {
+    try h.headers(.{ .stream = stream, .end_stream = false, .fields = &.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = path },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = "sec-websocket-version", .value = "13" },
+    } });
+}
+
+/// One masked WebSocket frame in a DATA frame.
+fn wsSend(h: *Harness, stream: u31, op: ws_protocol.Opcode, payload: []const u8, end: bool) !void {
+    var buf: [2048]u8 = undefined;
+    try h.data(stream, ws_protocol.encodeFrame(&buf, true, op, payload, .{ 1, 2, 3, 4 }), end);
+}
+
+test "WebSocket over HTTP/2 (RFC 8441): the setting, and extended CONNECT validation" {
+    const off = try Harness.init(.{});
+    defer off.deinit();
+    try off.preface();
+    off.events.clearRetainingCapacity();
+    // Not advertised: :protocol is an unknown pseudo-header field.
+    try connectWs(off, 1, "/ws");
+    try off.expectEvents("rst 1 protocol_error\n");
+
+    const h = try Harness.init(.{ .enable_connect_protocol = true });
+    defer h.deinit();
+    try h.expectEvents("settings ack=false max_concurrent_streams=128 initial_window_size=1048576 max_frame_size=16384 max_header_list_size=16384 enable_connect_protocol=1\nwindow 0 +4128769\n");
+    try h.preface();
+    try h.expectEvents("settings ack=true\n");
+    // :protocol on another method, and an extended CONNECT without :path.
+    try h.headers(.{ .stream = 1, .fields = &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/ws" },
+        .{ .name = ":authority", .value = "example.com" },
+    } });
+    try h.expectEvents("rst 1 protocol_error\n");
+    try h.headers(.{ .stream = 3, .end_stream = false, .fields = &.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+    } });
+    try h.expectEvents("rst 3 protocol_error\n");
+    // A proxy's CONNECT is still 501.
+    try h.headers(.{ .stream = 5, .fields = &.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.com:443" },
+    } });
+    try h.expectEvents("headers 5 end=true [:status=501] [content-length=0] [date]\n");
+    try h.expectLog("");
+    // A handler that doesn't take the WebSocket answers as usual; the
+    // client's side is then reset (NO_ERROR) and its DATA ignored.
+    try connectWs(h, 7, "/other");
+    try h.expectEvents("headers 7 end=false [:status=200] [content-type=text/plain] [content-length=13] [date]\ndata 7 len=13 end=true\nrst 7 no_error\n");
+    try wsSend(h, 7, .text, "ignored", false);
+    try h.expectEvents("");
+    try h.expectLog("CONNECT /other [host=example.com]\n");
+    try testing.expectEqualStrings("", h.handler.ws_log.items);
+}
+
+test "WebSocket over HTTP/2: echo, ping, the close handshake both ways, END_STREAM, RST_STREAM, errors" {
+    const h = try Harness.init(.{ .enable_connect_protocol = true });
+    defer h.deinit();
+    try h.preface();
+    h.events.clearRetainingCapacity();
+    try connectWs(h, 1, "/ws");
+    // 200 without END_STREAM or content-length.
+    try h.expectEvents("headers 1 end=false [:status=200] [date]\n");
+    try h.expectLog("CONNECT /ws [host=example.com]\n");
+    try wsSend(h, 1, .text, "hello", false);
+    try wsSend(h, 1, .ping, "p", false);
+    try h.expectEvents("data 1 len=7 end=false\ndata 1 len=3 end=false\n");
+    try testing.expectEqualSlices(u8, "\x81\x05hello\x8a\x01p", h.data_out.items);
+    // The client's close is echoed, then END_STREAM, then RST_STREAM
+    // (NO_ERROR): the client's side is still open.
+    try wsSend(h, 1, .close, "\x03\xe8", false);
+    try h.expectEvents("data 1 len=4 end=false\ndata 1 len=0 end=true\nrst 1 no_error\n");
+    try testing.expectEqualStrings("open;text:hello;ping:p;close:\x03\xe8;gone;", h.handler.ws_log.items);
+    h.handler.ws_log.clearRetainingCapacity();
+    h.data_out.clearRetainingCapacity();
+
+    // Our close waits for the client's (with a deadline), dropping data
+    // meanwhile; the client's close with END_STREAM ends the stream.
+    try connectWs(h, 3, "/ws");
+    try wsSend(h, 3, .text, "close-me", false);
+    try h.expectEvents("headers 3 end=false [:status=200] [date]\ndata 3 len=7 end=false\n");
+    try testing.expectEqualSlices(u8, "\x88\x05\x03\xe8bye", h.data_out.items);
+    try testing.expect(h.slab.entry(h.conn.findStream(3).?.exchange).tunnel_timed);
+    try wsSend(h, 3, .text, "late", false);
+    try h.expectEvents("");
+    try wsSend(h, 3, .close, "\x03\xe8", true);
+    try h.expectEvents("data 3 len=0 end=true\n");
+    try testing.expectEqualStrings("open;text:close-me;close:\x03\xe8;gone;", h.handler.ws_log.items);
+    h.handler.ws_log.clearRetainingCapacity();
+    h.data_out.clearRetainingCapacity();
+
+    // END_STREAM without a close frame is a TCP FIN: we end ours.
+    try connectWs(h, 5, "/ws");
+    try h.data(5, "", true);
+    try h.expectEvents("headers 5 end=false [:status=200] [date]\ndata 5 len=0 end=true\n");
+    // RST_STREAM is a TCP RST.
+    try connectWs(h, 7, "/ws");
+    try h.rst(7, .cancel);
+    try h.expectEvents("headers 7 end=false [:status=200] [date]\n");
+    // A protocol violation (an unmasked frame) fails the WebSocket: 1002.
+    try connectWs(h, 9, "/ws");
+    try h.data(9, &.{ 0x81, 0x01, 'x' }, false);
+    try h.expectEvents("headers 9 end=false [:status=200] [date]\ndata 9 len=4 end=false\ndata 9 len=0 end=true\nrst 9 no_error\n");
+    try testing.expectEqualSlices(u8, "\x88\x02\x03\xea", h.data_out.items);
+    try testing.expectEqualStrings("open;gone;open;gone;open;gone;", h.handler.ws_log.items);
+    try testing.expectEqual(@as(u32, 0), h.conn.activeStreams());
+    try testing.expectEqual(@as(usize, 0), h.slab.active_count);
+    // END_STREAM on the HEADERS: accepted, then ended at once.
+    try h.headers(.{ .stream = 11, .fields = &.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/ws" },
+        .{ .name = ":authority", .value = "example.com" },
+    } });
+    try h.expectEvents("headers 11 end=false [:status=200] [date]\ndata 11 len=0 end=true\n");
+    try testing.expectEqual(@as(usize, 0), h.slab.active_count);
+    // Each WebSocket takes an exchange slot (8 here); with none left, 503.
+    var id: u31 = 13;
+    while (id < 13 + 2 * 8) : (id += 2) try connectWs(h, id, "/ws");
+    h.events.clearRetainingCapacity();
+    try connectWs(h, id, "/ws");
+    try h.expectEvents("headers 29 end=true [:status=503] [content-length=0] [date]\nrst 29 no_error\n");
+    try testing.expectEqual(@as(u32, 8), h.conn.activeStreams());
+}
+
+test "WebSocket over HTTP/2: windows hold output, held output holds the client's window, sends from another thread, stalls time out" {
+    const h = try Harness.init(.{ .enable_connect_protocol = true, .initial_window_size = 2000 });
+    defer h.deinit();
+    try h.preface();
+    try h.settings(&.{.{ .id = .initial_window_size, .value = 300 }});
+    h.events.clearRetainingCapacity();
+    try connectWs(h, 1, "/ws");
+    // 1004 bytes queued, 300 allowed.
+    try wsSend(h, 1, .text, "big", false);
+    try h.expectEvents("headers 1 end=false [:status=200] [date]\ndata 1 len=300 end=false\n");
+    // With output held back, input isn't credited: 1017 bytes are past
+    // half our window, yet no WINDOW_UPDATE. The echo queues behind.
+    const msg: [1000]u8 = @splat('m');
+    try wsSend(h, 1, .binary, &msg, false);
+    try h.expectEvents("");
+    // Window: the rest, the echo, then our window comes back.
+    try h.window(1, 5000);
+    try h.expectEvents("data 1 len=704 end=false\ndata 1 len=1004 end=false\nwindow 1 +1017\n");
+    // A send from another thread goes through the mailbox.
+    const t = try std.Thread.spawn(.{}, struct {
+        fn run(c: *ws.Conn) void {
+            c.sendText("from elsewhere") catch unreachable;
+        }
+    }.run, .{h.handler.ws_conn.?});
+    t.join();
+    try h.drainMailbox();
+    try h.collect();
+    try h.expectEvents("data 1 len=16 end=false\n");
+    try testing.expect(std.mem.endsWith(u8, h.data_out.items, "\x81\x0efrom elsewhere"));
+    // A stream whose output waits on a zero window is reset after the
+    // request timeout; the other goes on.
+    try connectWs(h, 3, "/ws");
+    try wsSend(h, 3, .text, "big", false);
+    try h.expectEvents("headers 3 end=false [:status=200] [date]\ndata 3 len=300 end=false\n");
+    try testing.expect(h.slab.entry(h.conn.findStream(3).?.exchange).tunnel_timed);
+    try h.tick(11);
+    try h.expectEvents("rst 3 cancel\n");
+    try testing.expectEqual(@as(u32, 1), h.conn.activeStreams());
+    try testing.expectEqual(@as(usize, 1), h.slab.active_count);
+    try testing.expect(std.mem.endsWith(u8, h.handler.ws_log.items, "open;text:big;gone;"));
+}
+
 test "split invariance" {
     const script = try buildScript();
     defer testing.allocator.free(script);
-    const ref = try Harness.init(.{});
+    const ref = try Harness.init(.{ .enable_connect_protocol = true });
     defer ref.deinit();
     try ref.feed(script);
     try testing.expect(ref.per_stream.count() > 3);
     try testing.expect(std.mem.indexOf(u8, ref.handler.bodies.items, "END") != null);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, ref.handler.ws_log.items, "gone;"));
+    try testing.expect(std.mem.indexOf(u8, ref.handler.ws_log.items, "binary:") != null);
     var prng = std.Random.DefaultPrng.init(11);
     const random = prng.random();
     for (0..40) |iteration| {
-        const h = try Harness.init(.{});
+        const h = try Harness.init(.{ .enable_connect_protocol = true });
         defer h.deinit();
         var rest: []const u8 = script;
         while (rest.len > 0 and h.last != .close) {
@@ -2657,11 +3034,12 @@ fn expectSameStreams(a: *Harness, b: *Harness) !void {
     }
     try testing.expectEqualStrings(a.handler.log.items, b.handler.log.items);
     try testing.expectEqualStrings(a.handler.bodies.items, b.handler.bodies.items);
+    try testing.expectEqualStrings(a.handler.ws_log.items, b.handler.ws_log.items);
 }
 
 /// A conversation with requests, buffered and streamed bodies, trailers, a
-/// rejected request, window updates, pings, settings, a refused stream and
-/// finally a connection error.
+/// rejected request, window updates, pings, settings, two WebSockets, a
+/// refused stream and finally a connection error.
 fn buildScript() ![]u8 {
     const a = testing.allocator;
     var enc = try hpack.Encoder.init(a, 4096);
@@ -2707,6 +3085,37 @@ fn buildScript() ![]u8 {
         }
         stream += 2;
     }
+    // WebSockets: frames split across DATA frames, a message larger than
+    // a read buffer, fragments with a ping between; one closed by the
+    // client, one by the server.
+    var wsbuf: [4096]u8 = undefined;
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(a);
+    const key = [4]u8{ 9, 8, 7, 6 };
+    for ([_]u31{ stream, stream + 2 }) |ws_stream| {
+        var bn: usize = 0;
+        for ([_][2][]const u8{ .{ ":method", "CONNECT" }, .{ ":protocol", "websocket" }, .{ ":scheme", "https" }, .{ ":path", "/ws" }, .{ ":authority", "x" } }) |f|
+            bn += try enc.encode(block[bn..], f[0], f[1], .{});
+        n = try frame.writeHeaders(&buf, ws_stream, frame.flag.end_headers, block[0..bn]);
+        try s.appendSlice(a, buf[0..n]);
+    }
+    wire.clearRetainingCapacity();
+    try wire.appendSlice(a, ws_protocol.encodeFrame(&wsbuf, true, .text, "hello", key));
+    try wire.appendSlice(a, ws_protocol.encodeFrame(&wsbuf, false, .text, "frag", key));
+    try wire.appendSlice(a, ws_protocol.encodeFrame(&wsbuf, true, .ping, "pp", key));
+    try wire.appendSlice(a, ws_protocol.encodeFrame(&wsbuf, true, .continuation, "mented", key));
+    const big: [3000]u8 = @splat('w');
+    try wire.appendSlice(a, ws_protocol.encodeFrame(&wsbuf, true, .binary, &big, key));
+    for ([_][2]usize{ .{ 0, 7 }, .{ 7, 1500 }, .{ 1500, wire.items.len } }) |r| {
+        n = try frame.writeData(&wsbuf, stream, false, wire.items[r[0]..r[1]]);
+        try s.appendSlice(a, wsbuf[0..n]);
+    }
+    n = try frame.writeData(&buf, stream + 2, false, ws_protocol.encodeFrame(&wsbuf, true, .text, "close-me", key));
+    try s.appendSlice(a, buf[0..n]);
+    n = try frame.writeData(&buf, stream, false, ws_protocol.encodeFrame(&wsbuf, true, .close, "\x03\xe8", key));
+    try s.appendSlice(a, buf[0..n]);
+    n = try frame.writeData(&buf, stream + 2, true, ws_protocol.encodeFrame(&wsbuf, true, .close, "\x03\xe8", key));
+    try s.appendSlice(a, buf[0..n]);
     n = try frame.writeRstStream(&buf, 1, .cancel);
     try s.appendSlice(a, buf[0..n]);
     n = try frame.writeData(&buf, 99, false, "idle"); // connection error at the end
@@ -2725,7 +3134,7 @@ fn fuzzConn(_: void, smith: *std.testing.Smith) anyerror!void {
     const n = try frame.writeSettings(&buf, &.{});
     try script.appendSlice(testing.allocator, buf[0..n]);
     try script.appendSlice(testing.allocator, tail);
-    const opts: Options = .{ .limits = .{ .max_header_bytes = 2048, .max_body_size = 1024 }, .out_limit = 4096, .max_concurrent_streams = 8 };
+    const opts: Options = .{ .limits = .{ .max_header_bytes = 2048, .max_body_size = 1024 }, .out_limit = 4096, .max_concurrent_streams = 8, .enable_connect_protocol = true, .websocket = .{ .max_message_size = 4096, .max_send_queue_bytes = 8192 } };
     const whole = try Harness.init(opts);
     defer whole.deinit();
     whole.handler.big = "big body for the fuzzer, not very big";

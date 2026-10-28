@@ -1295,6 +1295,8 @@ const H2Client = struct {
     /// Our receive windows, replenished in batches.
     conn_consumed: u32 = 0,
     max_frame_size: u32 = 16384,
+    /// The server sent SETTINGS_ENABLE_CONNECT_PROTOCOL=1.
+    connect_protocol: bool = false,
 
     const Reply = struct {
         status: u16 = 0,
@@ -1375,7 +1377,6 @@ const H2Client = struct {
     /// stream id) is done, or a GOAWAY arrives. Answers SETTINGS and PING,
     /// replenishes windows.
     fn collect(self: *H2Client, responses: *std.AutoHashMap(u31, *Reply)) !?h2frame.ErrorCode {
-        const a = testing.allocator;
         while (true) {
             var pending: usize = 0;
             var it = responses.valueIterator();
@@ -1383,6 +1384,21 @@ const H2Client = struct {
                 if (!r.*.done) pending += 1;
             }
             if (pending == 0) return null;
+            if (try self.readFrames(responses)) |code| return code;
+        }
+    }
+
+    /// Reads until `reply` has at least `len` body bytes (WebSockets).
+    fn collectBody(self: *H2Client, responses: *std.AutoHashMap(u31, *Reply), reply: *const Reply, len: usize) !void {
+        while (reply.body.items.len < len) {
+            if (try self.readFrames(responses)) |_| return error.GoAway;
+        }
+    }
+
+    /// One read, and the frames in it. Returns a GOAWAY's code.
+    fn readFrames(self: *H2Client, responses: *std.AutoHashMap(u31, *Reply)) !?h2frame.ErrorCode {
+        const a = testing.allocator;
+        {
             const space = try self.reader.readSpace(&self.pool, .{});
             const n = try sys.read(self.tcp.fd, space);
             if (n == 0) return error.EndOfStream;
@@ -1397,6 +1413,7 @@ const H2Client = struct {
                             var sit = st.iterator();
                             while (sit.next()) |setting| {
                                 if (setting.id == .max_frame_size) self.max_frame_size = setting.value;
+                                if (setting.id == .enable_connect_protocol) self.connect_protocol = setting.value == 1;
                             }
                             var buf: [h2frame.header_len]u8 = undefined;
                             _ = try h2frame.writeSettingsAck(&buf);
@@ -1452,6 +1469,35 @@ const H2Client = struct {
                 }
             }
             self.reader.releaseIfIdle(&self.pool);
+        }
+        return null;
+    }
+
+    /// An extended CONNECT for a WebSocket (RFC 8441).
+    fn connectWs(self: *H2Client, stream: u31, path: []const u8) !void {
+        var block: [1024]u8 = undefined;
+        var bn: usize = 0;
+        for ([_][2][]const u8{ .{ ":method", "CONNECT" }, .{ ":protocol", "websocket" }, .{ ":scheme", "http" }, .{ ":path", path }, .{ ":authority", "localhost" }, .{ "sec-websocket-version", "13" } }) |f|
+            bn += try self.enc.encode(block[bn..], f[0], f[1], .{});
+        var hdr: [1100]u8 = undefined;
+        const n = try h2frame.writeHeaders(&hdr, stream, h2frame.flag.end_headers, block[0..bn]);
+        try self.tcp.send(hdr[0..n]);
+    }
+
+    /// One masked WebSocket frame, in DATA frames.
+    fn wsSend(self: *H2Client, stream: u31, op: ws.Opcode, payload: []const u8, end: bool) !void {
+        const a = testing.allocator;
+        const wire = try a.alloc(u8, payload.len + ws.protocol.max_header_len);
+        defer a.free(wire);
+        var rest = ws.protocol.encodeFrame(wire, true, op, payload, .{ 0x11, 0x22, 0x33, 0x44 });
+        while (true) {
+            const k = @min(rest.len, self.max_frame_size);
+            const out = try a.alloc(u8, k + h2frame.header_len);
+            defer a.free(out);
+            const dn = try h2frame.writeData(out, stream, end and k == rest.len, rest[0..k]);
+            try self.tcp.send(out[0..dn]);
+            rest = rest[k..];
+            if (rest.len == 0) break;
         }
     }
 
@@ -1702,6 +1748,82 @@ fn testH2Uploads(backend: Backend) !void {
     try c.fetch(5, "POST", "/upload-reject", "abc", &rej);
     try testing.expectEqual(@as(u16, 413), rej.status);
     try testing.expectEqualStrings("too much", rej.body.items);
+}
+
+/// A server WebSocket frame (unmasked), for comparing bytes.
+fn wsServerFrame(out: []u8, op: ws.Opcode, payload: []const u8) []const u8 {
+    return ws.protocol.encodeFrame(out, true, op, payload, null);
+}
+
+test "h2c: WebSockets over HTTP/2 (RFC 8441) beside requests on one connection" {
+    try forEachBackend(testH2WebSocket);
+}
+
+fn testH2WebSocket(backend: Backend) !void {
+    const r = try Running.start(backend, h2Config());
+    defer r.stop();
+    const c = try H2Client.connect(r.port);
+    defer c.close();
+    const big = try testing.allocator.alloc(u8, 100 * 1024);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i *% 13);
+    var one: H2Client.Reply = .{};
+    defer one.deinit();
+    var two: H2Client.Reply = .{};
+    defer two.deinit();
+    var get: H2Client.Reply = .{};
+    defer get.deinit();
+    var map = std.AutoHashMap(u31, *H2Client.Reply).init(testing.allocator);
+    defer map.deinit();
+    try map.put(1, &one);
+    try map.put(3, &two);
+    try map.put(5, &get);
+    // Two WebSockets and a request, interleaved.
+    try c.connectWs(1, "/ws");
+    try c.connectWs(3, "/ws");
+    try c.wsSend(1, .text, "hello one", false);
+    try c.wsSend(3, .binary, big, false);
+    try c.request(5, "GET", "/plain", null);
+    try c.wsSend(1, .text, "async", false);
+    var expect1: std.ArrayList(u8) = .empty;
+    defer expect1.deinit(testing.allocator);
+    var fb: [64]u8 = undefined;
+    try expect1.appendSlice(testing.allocator, wsServerFrame(&fb, .text, "hello one"));
+    try expect1.appendSlice(testing.allocator, wsServerFrame(&fb, .text, "later"));
+    try c.collectBody(&map, &one, expect1.items.len);
+    try c.collectBody(&map, &two, big.len + 4);
+    try testing.expect(c.connect_protocol);
+    try testing.expectEqual(@as(u16, 200), one.status);
+    try testing.expectEqual(@as(u16, 200), two.status);
+    try testing.expectEqualSlices(u8, expect1.items, one.body.items);
+    try testing.expectEqualSlices(u8, &.{ 0x82, 0x7f }, two.body.items[0..2]);
+    try testing.expectEqualSlices(u8, big, two.body.items[10..]);
+    while (!get.done) _ = try c.readFrames(&map);
+    try testing.expectEqualStrings("ok", get.body.items);
+    try testing.expectEqual(@as(usize, 2), r.srv.handler.ws_conns.load(.monotonic));
+
+    // The client closes the first: echo, END_STREAM, RST_STREAM(NO_ERROR).
+    one.body.clearRetainingCapacity();
+    try c.wsSend(1, .close, "\x03\xe8", false);
+    while (!one.done or one.rst == null) _ = try c.readFrames(&map);
+    try testing.expectEqualSlices(u8, "\x88\x02\x03\xe8", one.body.items);
+    try testing.expectEqual(h2frame.ErrorCode.no_error, one.rst.?);
+    // The server closes the second; our close with END_STREAM ends it.
+    two.body.clearRetainingCapacity();
+    try c.wsSend(3, .text, "close-me", false);
+    try c.collectBody(&map, &two, 7);
+    try testing.expectEqualSlices(u8, "\x88\x05\x03\xe8bye", two.body.items);
+    try c.wsSend(3, .close, "\x03\xe8", true);
+    while (!two.done) _ = try c.readFrames(&map);
+    try testing.expectEqual(@as(?h2frame.ErrorCode, null), two.rst);
+    sleepMs(20);
+    try testing.expectEqual(@as(usize, 2), r.srv.handler.ws_disconns.load(.monotonic));
+    try testing.expectEqual(@as(u16, 1000), r.srv.handler.close_code.load(.monotonic));
+    // The connection goes on.
+    var after: H2Client.Reply = .{};
+    defer after.deinit();
+    try c.fetch(7, "GET", "/after", null, &after);
+    try testing.expectEqualStrings("ok", after.body.items);
 }
 
 test "h2c: GOAWAY on shutdown" {
@@ -2149,6 +2271,45 @@ const H3Client = struct {
         return id;
     }
 
+    /// An extended CONNECT for a WebSocket (RFC 9220).
+    fn connectWs(self: *H3Client, path: []const u8) !u64 {
+        const id = try self.c.openBidi();
+        var section: [512]u8 = undefined;
+        var n: usize = 2;
+        @memcpy(section[0..2], &qpack.section_prefix);
+        for ([_][2][]const u8{ .{ ":method", "CONNECT" }, .{ ":protocol", "websocket" }, .{ ":scheme", "https" }, .{ ":authority", "localhost" }, .{ ":path", path }, .{ "sec-websocket-version", "13" } }) |f|
+            n += try qpack.encodeField(section[n..], f[0], f[1]);
+        var hdr: [16]u8 = undefined;
+        var w: quic_packet.Writer = .{ .buf = &hdr };
+        h3frame.writeHeader(&w, .headers, n);
+        try self.c.write(id, w.written(), false);
+        try self.c.write(id, section[0..n], false);
+        return id;
+    }
+
+    /// One masked WebSocket frame in a DATA frame.
+    fn wsSend(self: *H3Client, id: u64, op: ws.Opcode, payload: []const u8, fin: bool) !void {
+        const wire = try testing.allocator.alloc(u8, payload.len + ws.protocol.max_header_len);
+        defer testing.allocator.free(wire);
+        const f = ws.protocol.encodeFrame(wire, true, op, payload, .{ 0x11, 0x22, 0x33, 0x44 });
+        var hdr: [16]u8 = undefined;
+        var w: quic_packet.Writer = .{ .buf = &hdr };
+        h3frame.writeHeader(&w, .data, f.len);
+        try self.c.write(id, w.written(), false);
+        try self.c.write(id, f, fin);
+    }
+
+    /// Drives the connection until stream `id` has `len` bytes of DATA.
+    fn waitBody(self: *H3Client, id: u64, len: usize) !void {
+        try self.runUntil(10_000, .{ id, len }, struct {
+            fn f(want: struct { u64, usize }, h: *H3Client) bool {
+                var r = h.response(want[0]) catch return false;
+                defer r.body.deinit(testing.allocator);
+                return r.body.items.len >= want[1];
+            }
+        }.f);
+    }
+
     fn waitFinished(self: *H3Client, ids: []const u64) !void {
         try self.runUntil(10_000, ids, struct {
             fn f(list: []const u64, h: *H3Client) bool {
@@ -2227,6 +2388,70 @@ fn testHttp3Uploads(backend: Backend) !void {
     defer b.body.deinit(testing.allocator);
     const body2 = big_body[0 .. 2 * 1024 * 1024];
     try testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "n={d} hash={x}", .{ body2.len, fnv(body2) }), b.body.items);
+}
+
+test "http3: WebSockets over HTTP/3 (RFC 9220) beside requests on one connection" {
+    try forEachBackend(testHttp3WebSocket);
+}
+
+fn testHttp3WebSocket(backend: Backend) !void {
+    var cfg = tlsConfig();
+    cfg.http3 = .{};
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    var cl = try H3Client.connect(r.srv.getQuicPort());
+    defer cl.close();
+    try cl.start();
+    const big = try testing.allocator.alloc(u8, 100 * 1024);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i *% 13);
+    const one = try cl.connectWs("/ws");
+    const two = try cl.connectWs("/ws");
+    try cl.wsSend(one, .text, "hello one", false);
+    try cl.wsSend(two, .binary, big, false);
+    const get = try cl.request("GET", "/plain", "");
+    try cl.wsSend(one, .text, "async", false);
+    var fb: [64]u8 = undefined;
+    var expect1: std.ArrayList(u8) = .empty;
+    defer expect1.deinit(testing.allocator);
+    try expect1.appendSlice(testing.allocator, wsServerFrame(&fb, .text, "hello one"));
+    try expect1.appendSlice(testing.allocator, wsServerFrame(&fb, .text, "later"));
+    try cl.waitBody(one, expect1.items.len);
+    try cl.waitBody(two, big.len + 10);
+    try cl.waitFinished(&.{get});
+    {
+        var a = try cl.response(one);
+        defer a.body.deinit(testing.allocator);
+        try testing.expectEqualStrings("200", &a.status);
+        try testing.expectEqualSlices(u8, expect1.items, a.body.items);
+        var b = try cl.response(two);
+        defer b.body.deinit(testing.allocator);
+        try testing.expectEqualSlices(u8, &.{ 0x82, 0x7f }, b.body.items[0..2]);
+        try testing.expectEqualSlices(u8, big, b.body.items[10..]);
+        var g = try cl.response(get);
+        defer g.body.deinit(testing.allocator);
+        try testing.expectEqualStrings("ok", g.body.items);
+    }
+    try testing.expectEqual(@as(usize, 2), r.srv.handler.ws_conns.load(.monotonic));
+    // The client closes the first (echo, FIN); the server closes the
+    // second, and our close with FIN ends it.
+    try cl.wsSend(one, .close, "\x03\xe8", false);
+    try cl.wsSend(two, .text, "close-me", false);
+    try cl.waitFinished(&.{one});
+    try cl.waitBody(two, big.len + 10 + 7);
+    try cl.wsSend(two, .close, "\x03\xe8", true);
+    try cl.waitFinished(&.{two});
+    {
+        var a = try cl.response(one);
+        defer a.body.deinit(testing.allocator);
+        try testing.expect(std.mem.endsWith(u8, a.body.items, "\x88\x02\x03\xe8"));
+        var b = try cl.response(two);
+        defer b.body.deinit(testing.allocator);
+        try testing.expect(std.mem.endsWith(u8, b.body.items, "\x88\x05\x03\xe8bye"));
+    }
+    sleepMs(20);
+    try testing.expectEqual(@as(usize, 2), r.srv.handler.ws_disconns.load(.monotonic));
+    try testing.expectEqual(@as(u16, 1000), r.srv.handler.close_code.load(.monotonic));
 }
 
 test "http3: requests over UDP, large bodies, exchanges from other threads" {

@@ -5,6 +5,9 @@
 const std = @import("std");
 const sys = @import("./sys.zig");
 
+/// `ws`: an HTTP/1.1 connection carrying a WebSocket. `exchange`: an
+/// exchange slot, which for a WebSocket over HTTP/2 or HTTP/3 is the
+/// tunnel slot routing to its stream.
 pub const Kind = enum(u1) { ws, exchange };
 
 pub const Entry = packed struct(u64) {

@@ -19,6 +19,7 @@ const Response = @import("../response.zig").Response;
 const Header = @import("../header.zig").Header;
 const Status = @import("../status.zig").Status;
 const Mailbox = @import("../mailbox.zig").Mailbox;
+const MailboxEntry = @import("../mailbox.zig").Entry;
 
 pub const Options = struct {
     /// Unsent bytes per exchange before `write` fails with WouldBlock.
@@ -140,6 +141,12 @@ pub const Entry = struct {
     head_pending: bool = false,
     /// Monotonic seconds; checked once a second by the worker.
     deadline: u32 = 0,
+    /// The slot carries a WebSocket over HTTP/2 or HTTP/3 rather than a
+    /// response: sends post it, and the transport finds its stream by it.
+    /// No handle is given to the handler. The deadline applies only while
+    /// `tunnel_timed`.
+    tunnel: bool = false,
+    tunnel_timed: bool = false,
 
     // -- Guarded by `mutex` --
     mutex: sys.Mutex = .{},
@@ -249,6 +256,8 @@ pub const Slab = struct {
         e.framing = .chunked;
         e.keep_alive = true;
         e.stream_id = 0;
+        e.tunnel = false;
+        e.tunnel_timed = false;
         // Deadlines are whole seconds: +1 so at least the timeout passes.
         e.deadline = now +% self.opts.response_timeout_s +% 1;
         e.mutex.unlock();
@@ -271,6 +280,36 @@ pub const Slab = struct {
 
     pub fn entry(self: *Self, slot: u32) *Entry {
         return &self.entries[slot];
+    }
+
+    /// Worker thread: a slot for a WebSocket over HTTP/2 or HTTP/3, bound
+    /// to its connection and stream at once, with no deadline until
+    /// `tunnelTimer` sets one.
+    pub fn createTunnel(self: *Self, conn_slot: u32, conn_gen: u32, stream_id: u32) error{TooManyExchanges}!Exchange {
+        const ex = try self.create(0);
+        const e = &self.entries[ex.slot];
+        e.mutex.lock();
+        e.conn_slot = conn_slot;
+        e.conn_gen = conn_gen;
+        e.stream_id = stream_id;
+        e.bound = true;
+        e.tunnel = true;
+        // Neither `later` nor `streaming`: no handleAbort when it ends.
+        e.state = .finished;
+        e.mutex.unlock();
+        return ex;
+    }
+
+    /// Worker thread: times a tunnel as the HTTP/1.1 worker times a
+    /// WebSocket's socket: `request_timeout_s` while output is stalled
+    /// (restarted by progress) or while our close frame waits for the
+    /// peer's; no deadline otherwise.
+    pub fn tunnelTimer(self: *Self, slot: u32, now: u32, stalled: bool, progressed: bool, closing: bool) void {
+        const e = &self.entries[slot];
+        if ((stalled and (progressed or !e.tunnel_timed)) or (!stalled and closing and !e.tunnel_timed)) {
+            e.deadline = now +% self.opts.request_timeout_s +% 1;
+        }
+        e.tunnel_timed = stalled or closing;
     }
 
     /// Worker thread, for `resp.stream()`: the head goes out with the
@@ -347,11 +386,16 @@ pub const Exchange = struct {
         return e;
     }
 
+    /// The mailbox entry that names this exchange.
+    pub fn mailboxEntry(self: Self) MailboxEntry {
+        return .{ .kind = .exchange, .slot = self.slot, .gen = @intCast(self.gen & 0x7fffffff) };
+    }
+
     fn post(self: Self, e: *Entry) void {
         const do_post = !e.posted;
         e.posted = true;
         e.mutex.unlock();
-        if (do_post) self.slab.mailbox.post(.{ .kind = .exchange, .slot = self.slot, .gen = @intCast(self.gen & 0x7fffffff) });
+        if (do_post) self.slab.mailbox.post(self.mailboxEntry());
     }
 
     /// Answers a `later()` exchange with a complete response. The body is

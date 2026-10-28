@@ -7,8 +7,13 @@
 //! buffer when handleRequest returns; `later()` and `stream()` exchanges
 //! are drained as the stream's unacknowledged data allows.
 //!
+//! WebSockets (RFC 9220): with `enable_connect_protocol`, an extended
+//! CONNECT whose handler accepts it (`ws.upgrader.handleUpgrade`) gets a
+//! 200, and the stream's DATA frames then carry the WebSocket both ways
+//! through a `ws.Conn`.
+//!
 //! QPACK uses the static table only (see qpack.zig). Server push is never
-//! used; extended CONNECT (RFC 9220) and DATAGRAM are not yet supported.
+//! used; DATAGRAM is not yet supported.
 const std = @import("std");
 const quic = @import("../quic/conn.zig");
 const packet = @import("../quic/packet.zig");
@@ -18,6 +23,9 @@ const fields_mod = @import("../http/fields.zig");
 const parser = @import("../http/parser.zig");
 const date = @import("../http/date.zig");
 const exchange = @import("../http/exchange.zig");
+const ws = @import("../ws/conn.zig");
+const sys = @import("../sys.zig");
+const BufferPool = @import("../http/session.zig").BufferPool;
 const Request = @import("../request.zig").Request;
 const Header = @import("../header.zig").Header;
 const Response = @import("../response.zig").Response;
@@ -51,6 +59,12 @@ pub const Options = struct {
     stream_buffer: usize = 1024 * 1024,
     /// Largest control stream frame accepted (SETTINGS and friends).
     max_control_frame: usize = 4096,
+    /// Advertise SETTINGS_ENABLE_CONNECT_PROTOCOL and accept extended
+    /// CONNECT (RFC 9220), for WebSockets. Set by the server when the
+    /// handler has WebSocket hooks.
+    enable_connect_protocol: bool = false,
+    /// Limits for WebSockets over this connection.
+    websocket: ws.Options = .{},
 };
 
 /// Everything `process` needs besides the connection.
@@ -69,6 +83,10 @@ pub fn Context(comptime Handler: type) type {
         /// exchanges to find their way back.
         conn_slot: u32,
         conn_gen: u32,
+        /// The worker's read buffers, for WebSocket decoders.
+        pool: *BufferPool,
+        /// The UDP socket, for `ws.Conn.fd` (identification only).
+        fd: sys.fd_t = -1,
     };
 }
 
@@ -106,6 +124,18 @@ const Stream = struct {
     /// stays unread in the QUIC stream, so no credit is given for it.
     body_stream: bool = false,
     body_paused: bool = false,
+    /// An extended CONNECT: DATA is never buffered as a body. It goes to
+    /// `ws` once the handler accepted a WebSocket, and is dropped
+    /// otherwise.
+    tunnel: bool = false,
+    ws: ?*ws.Conn = null,
+    /// The WebSocket has output the stream's buffer held back; while it
+    /// does, input is left unread (`ws_held`), so QUIC flow control holds
+    /// the client back.
+    ws_pending: bool = false,
+    ws_held: bool = false,
+    /// The client finished its side (FIN), all of it read.
+    ws_peer_done: bool = false,
 
     fn clear(s: *Stream) void {
         s.fields.clear();
@@ -184,6 +214,10 @@ pub const Conn = struct {
         var pw: packet.Writer = .{ .buf = &payload };
         pw.varint(@backingInt(frame.SettingId.max_field_section_size));
         pw.varint(self.opts.qpack.max_field_section_size);
+        if (self.opts.enable_connect_protocol) {
+            pw.varint(@backingInt(frame.SettingId.enable_connect_protocol));
+            pw.varint(1);
+        }
         pw.varint(0x1f * 7 + 0x21);
         pw.varint(0);
         frame.writeHeader(&w, .settings, pw.pos);
@@ -438,6 +472,33 @@ pub const Conn = struct {
             if (s.frame_left > 0) {
                 const n: usize = @intCast(@min(s.frame_left, data.len));
                 if (n == 0) break;
+                if (s.frame_type == .data and s.tunnel) {
+                    const w = s.ws orelse {
+                        // Not a WebSocket: dropped.
+                        q.streamConsume(slot, n);
+                        s.frame_left -= n;
+                        continue;
+                    };
+                    if (s.ws_pending) {
+                        s.ws_held = true;
+                        return;
+                    }
+                    var rest = data[0..n];
+                    while (rest.len > 0 and !w.wantsClose()) {
+                        const space = w.decoder.readSpace(ctx.pool) catch return self.streamError(ctx, slot, .internal_error);
+                        const k = @min(space.len, rest.len);
+                        @memcpy(space[0..k], rest[0..k]);
+                        w.decoder.commitRead(k);
+                        rest = rest[k..];
+                        _ = w.process(Handler, ctx.handler);
+                    }
+                    w.decoder.releaseIfIdle(ctx.pool);
+                    q.streamConsume(slot, n);
+                    s.frame_left -= n;
+                    self.pumpStream(Handler, ctx, slot);
+                    if (!s.active) return;
+                    continue;
+                }
                 if (s.frame_type == .data and s.body_stream) {
                     if (s.body_paused) return;
                     s.fields.body_received += n;
@@ -474,6 +535,7 @@ pub const Conn = struct {
                     const section = data[h.size..][0..@intCast(h.len)];
                     if (s.phase == .headers) {
                         var sink = s.fields.sink(self.allocator);
+                        sink.allow_protocol = self.opts.enable_connect_protocol;
                         self.decoder.decode(section, &sink) catch |err| switch (err) {
                             error.FieldSectionTooLarge => s.fields.fault = s.fields.fault orelse .headers_too_large,
                             error.OutOfMemory => return self.fail(.internal_error, "", ctx.now_us),
@@ -482,6 +544,15 @@ pub const Conn = struct {
                         s.fields.endHead(self.allocator) catch return self.fail(.internal_error, "", ctx.now_us);
                         q.streamConsume(slot, h.size + section.len);
                         s.phase = .body;
+                        if (s.fields.isExtendedConnect()) {
+                            // Answered now; DATA is the tunnel's.
+                            s.tunnel = true;
+                            if (@hasDecl(Handler, "handleHead") and self.checkHead(Handler, ctx, slot) == .reject)
+                                return self.respondSync(Handler, ctx, slot);
+                            self.dispatch(Handler, ctx, slot);
+                            if (!s.active) return;
+                            continue;
+                        }
                         if (@hasDecl(Handler, "handleHead") and s.fields.fault == null) {
                             switch (self.checkHead(Handler, ctx, slot)) {
                                 .buffer => {},
@@ -527,6 +598,14 @@ pub const Conn = struct {
                     s.frame_left = h.len;
                 },
             }
+        }
+        if (s.tunnel) {
+            // The client's FIN ends a WebSocket like a TCP FIN.
+            if (s.ws != null and q.streamFinished(slot)) {
+                s.ws_peer_done = true;
+                self.pumpStream(Handler, ctx, slot);
+            }
+            return;
         }
         if (!q.streamComplete(slot) or (s.dispatched and !s.body_stream) or s.body_paused) return;
         // The request is all here.
@@ -589,6 +668,7 @@ pub const Conn = struct {
     fn abandon(self: *Self, ctx: anytype, slot: u32, reset: ?ErrorCode) void {
         const s = &self.streams[slot];
         if (!s.active) return;
+        dropWebSocket(ctx, s);
         if (s.exchange != NIL) {
             abortExchange(ctx, s.exchange);
             ctx.exchanges.release(s.exchange);
@@ -609,6 +689,16 @@ pub const Conn = struct {
         s.active = false;
         self.quic.releaseStream(slot);
         self.maybeClose(now_us);
+    }
+
+    /// The stream is ending: handleWSDisconn, then the WebSocket is freed
+    /// (its tunnel slot goes with the stream's exchange).
+    fn dropWebSocket(ctx: anytype, s: *Stream) void {
+        const w = s.ws orelse return;
+        s.ws = null;
+        const Handler = @TypeOf(ctx.handler.*);
+        if (@hasDecl(Handler, "handleWSDisconn")) ctx.handler.handleWSDisconn(w);
+        w.destroy(ctx.pool);
     }
 
     fn abortExchange(ctx: anytype, slot: u32) void {
@@ -645,8 +735,36 @@ pub const Conn = struct {
         }
         s.is_head = req.method == .HEAD;
         ctx.handler.handleRequest(req, resp);
+        if (s.tunnel and resp.is_ws_upgrade) return self.startWebSocket(Handler, ctx, slot);
         if (resp.mode != .sync) return self.bindExchange(Handler, ctx, slot);
         self.respondSync(Handler, ctx, slot);
+    }
+
+    /// The handler accepted a WebSocket (RFC 9220 §3): a 2xx HEADERS, then
+    /// the stream's DATA frames are the WebSocket's. A tunnel slot in the
+    /// exchange slab routes sends from other threads back here.
+    fn startWebSocket(self: *Self, comptime Handler: type, ctx: *const Context(Handler), slot: u32) void {
+        const resp = ctx.resp;
+        const s = &self.streams[slot];
+        const code = @backingInt(resp.status);
+        if (!@hasDecl(Handler, "handleWSFrame") or code < 200 or code >= 300) {
+            resp.is_ws_upgrade = false;
+            return self.respondSync(Handler, ctx, slot);
+        }
+        const ex = ctx.exchanges.createTunnel(ctx.conn_slot, ctx.conn_gen, slot) catch {
+            resp.reset();
+            resp.status = .service_unavailable;
+            return self.respondSync(Handler, ctx, slot);
+        };
+        s.ws = ws.Conn.create(self.allocator, ctx.fd, self.opts.websocket, ctx.exchanges.mailbox, ex.mailboxEntry()) catch {
+            ctx.exchanges.release(ex.slot);
+            return self.streamError(ctx, slot, .internal_error);
+        };
+        s.exchange = ex.slot;
+        self.exchanges += 1;
+        self.writeHead(ctx, slot, resp.status, resp.headerBytes(), null) catch return self.fail(.internal_error, "", ctx.now_us);
+        if (@hasDecl(Handler, "handleWSConn")) ctx.handler.handleWSConn(s.ws.?);
+        self.pumpStream(Handler, ctx, slot);
     }
 
     fn respondSync(self: *Self, comptime Handler: type, ctx: *const Context(Handler), slot: u32) void {
@@ -741,6 +859,10 @@ pub const Conn = struct {
         if (stream_slot >= self.streams.len) return;
         const s = &self.streams[stream_slot];
         if (!s.active or s.exchange != ex_slot) return;
+        if (s.ws) |w| {
+            w.clearPosted();
+            return self.pumpStream(Handler, ctx, stream_slot);
+        }
         if (ctx.exchanges.handle(ex_slot).takeResume() and s.body_paused) {
             s.body_paused = false;
             self.readRequest(Handler, ctx, stream_slot);
@@ -754,13 +876,18 @@ pub const Conn = struct {
         const stream_slot = ctx.exchanges.entry(slot).stream_id;
         if (stream_slot >= self.streams.len) return;
         const s = &self.streams[stream_slot];
-        if (s.active and s.exchange == slot) self.abandon(ctx, stream_slot, .internal_error);
+        if (!s.active or s.exchange != slot) return;
+        // A WebSocket's output stalled, or the peer never answered our
+        // close frame.
+        if (s.ws != null) return self.streamError(ctx, stream_slot, .request_cancelled);
+        self.abandon(ctx, stream_slot, .internal_error);
     }
 
     /// The worker is closing the connection: tell handlers about live
     /// exchanges and release them.
     pub fn abortAll(self: *Self, ctx: anytype) void {
         for (self.streams) |*s| {
+            if (s.active) dropWebSocket(ctx, s);
             if (s.active and s.exchange != NIL) {
                 abortExchange(ctx, s.exchange);
                 ctx.exchanges.release(s.exchange);
@@ -776,6 +903,7 @@ pub const Conn = struct {
         const q = self.quic;
         const s = &self.streams[slot];
         if (s.exchange == NIL or self.failed) return;
+        if (s.ws != null) return self.pumpWebSocket(Handler, ctx, slot);
         const ex = ctx.exchanges.handle(s.exchange);
         const is_head = s.is_head;
         while (true) {
@@ -819,6 +947,41 @@ pub const Conn = struct {
             }
             if (!r.more) return;
         }
+    }
+
+    /// Moves what the WebSocket has queued into the stream, in DATA
+    /// frames, as far as the stream's buffer allows; reads on once it is
+    /// all in. Once the WebSocket is over (the close handshake, a failure,
+    /// or the client's FIN) and its output is in, FIN ends our side.
+    fn pumpWebSocket(self: *Self, comptime Handler: type, ctx: *const Context(Handler), slot: u32) void {
+        const q = self.quic;
+        const s = &self.streams[slot];
+        const w = s.ws.?;
+        var progressed = false;
+        while (true) {
+            const buffered = q.streamBuffered(slot);
+            if (buffered >= self.opts.stream_buffer) break;
+            const bytes = w.wireBytes();
+            if (bytes.len == 0) break;
+            const n = @min(bytes.len, self.opts.stream_buffer - buffered, 64 * 1024);
+            self.writeFrame(slot, .data, bytes[0..n]) catch return self.fail(.internal_error, "", ctx.now_us);
+            w.advance(n);
+            progressed = true;
+        }
+        s.ws_pending = w.hasOutput();
+        ctx.exchanges.tunnelTimer(s.exchange, ctx.now, s.ws_pending, progressed, w.closeSent());
+        if (s.ws_pending) return q.streamWantWritable(slot, self.opts.stream_buffer / 2);
+        if (s.ws_held) {
+            // Input left unread while output was stalled.
+            s.ws_held = false;
+            return self.readRequest(Handler, ctx, slot);
+        }
+        if (!w.wantsClose() and !s.ws_peer_done) return;
+        dropWebSocket(ctx, s);
+        ctx.exchanges.release(s.exchange);
+        s.exchange = NIL;
+        self.exchanges -= 1;
+        self.finishResponse(ctx, slot);
     }
 
     fn notifyWritable(comptime Handler: type, ctx: *const Context(Handler), ex: exchange.Exchange) void {
