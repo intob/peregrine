@@ -1,11 +1,13 @@
 //! Benchmark server. Every path answers "Hello, World!" (TechEmpower
 //! plaintext) except `/64k`, a 64 KiB body (four full TLS records); request
 //! bodies are read and discarded.
-//! Usage: bench-server [workers] [auto|epoll|io_uring] [port] [tls|h3]
+//! Usage: bench-server [workers] [auto|epoll|io_uring] [port] [tls|h3|plain] [stream]
 //! With `tls`, serves TLS 1.3 with the self-signed P-256 certificate in
 //! this directory, with ALPN "h2" and "http/1.1"; `h3` adds HTTP/3 on the
 //! same UDP port. Plaintext serves HTTP/1.1 and HTTP/2 with prior
-//! knowledge (h2c).
+//! knowledge (h2c). With `stream`, every request body is streamed to the
+//! handler (handleHead, handleBody) and the response follows its end, for
+//! conformance and interop runs of that path.
 const std = @import("std");
 const per = @import("peregrine");
 
@@ -28,14 +30,45 @@ const Handler = struct {
     }
 };
 
+/// Streams every body: counts it, then answers once it has ended.
+const StreamHandler = struct {
+    pub fn init(allocator: std.mem.Allocator) !*StreamHandler {
+        return try allocator.create(StreamHandler);
+    }
+
+    pub fn deinit(_: *StreamHandler) void {}
+
+    pub fn handleHead(_: *StreamHandler, _: *per.Request, _: *per.Response) per.BodyMode {
+        return .stream;
+    }
+
+    pub fn handleRequest(_: *StreamHandler, _: *per.Request, resp: *per.Response) void {
+        _ = resp.later() catch {
+            resp.status = .service_unavailable;
+        };
+    }
+
+    pub fn handleBody(_: *StreamHandler, ex: per.Exchange, _: []const u8, end: ?[]const per.Header) per.BodyAction {
+        if (end != null) {
+            ex.respond(.{ .headers = &.{.{ .key = "content-type", .value = "text/plain" }} }, "Hello, World!") catch {};
+        }
+        return .more;
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len > 5 and std.mem.eql(u8, args[5], "stream")) return serve(StreamHandler, args);
+    return serve(Handler, args);
+}
+
+fn serve(comptime H: type, args: []const [:0]const u8) !void {
     const workers = if (args.len > 1) try std.fmt.parseInt(usize, args[1], 10) else 0;
     const backend = if (args.len > 2) std.meta.stringToEnum(per.Backend, args[2]) orelse return error.BadBackend else .auto;
     const port = if (args.len > 3) try std.fmt.parseInt(u16, args[3], 10) else 8080;
     const use_h3 = args.len > 4 and std.mem.eql(u8, args[4], "h3");
     const use_tls = use_h3 or (args.len > 4 and std.mem.eql(u8, args[4], "tls"));
-    const srv = try per.Server(Handler).init(std.heap.smp_allocator, port, .{
+    const srv = try per.Server(H).init(std.heap.smp_allocator, port, .{
         .worker_thread_count = workers,
         .backend = backend,
         .h2c = true,
@@ -46,6 +79,6 @@ pub fn main(init: std.process.Init) !void {
         } else null,
         .http3 = if (use_h3) .{} else null,
     });
-    std.debug.print("listening on :{d} ({s}, {d} workers{s})\n", .{ srv.getPort(), @tagName(srv.getBackend()), srv.workers.len, if (use_h3) ", tls, h3" else if (use_tls) ", tls" else "" });
+    std.debug.print("listening on :{d} ({s}, {d} workers{s}{s})\n", .{ srv.getPort(), @tagName(srv.getBackend()), srv.workers.len, if (use_h3) ", tls, h3" else if (use_tls) ", tls" else "", if (H == StreamHandler) ", streamed bodies" else "" });
     try srv.start();
 }

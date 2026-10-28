@@ -1,8 +1,8 @@
 # Handler API redesign (M5): proposal
 
-Status: steps 1 and 2 of "Suggested order of work" are implemented on HTTP/1.1
-(`src/http/exchange.zig`, `src/mailbox.zig`); step 3 (request bodies) waits
-until after h2. Decisions taken on the **(decide)** items:
+Status: implemented on HTTP/1.1, HTTP/2 and HTTP/3 (`src/http/exchange.zig`,
+`src/mailbox.zig`, the session and the h2/h3 connections), steps 1 to 4.
+Decisions taken on the **(decide)** items:
 
 - The name is `Exchange` (h2/h3 use "stream" for something else).
 - `response_timeout_s` is a separate config value for `later()` exchanges;
@@ -18,6 +18,14 @@ Differences from the text below, as implemented: `ex.respond(head, body)` and
 `resp.setContentLength(n)` must be called before `resp.stream()`; `abort()` on
 a `later()` exchange that has not responded closes the connection without a
 response; a `finish` short of the declared Content-Length aborts the exchange.
+For request bodies (step 3): `handleBody(ex, chunk, end: ?[]const Header)`
+takes the trailers as a slice valid during the call; `.stream` only streams
+if handleRequest takes an exchange (one that answers at once leaves the body
+unread, like `.reject`); a response that ends before its body leaves the
+rest unread too; and an HTTP/1.1 `.reject` of a request that announced a body
+always closes the connection, with or without `Expect: 100-continue` (the
+client may send the body anyway, and it can't be told from the next
+request).
 
 ## What has to change, and what must not
 

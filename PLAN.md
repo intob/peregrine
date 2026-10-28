@@ -55,7 +55,7 @@ Design rules that apply to every layer:
 | M2. Throughput architecture | 🟡 io_uring works (opt-in, not yet faster than epoll); sendfile, NUMA open |
 | M3. WebSockets over HTTP/1.1 | ✅ reworked; permessage-deflate, Autobahn, benchmarks open |
 | M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; faster handshakes, resumption and kTLS are listed under "Later in M4" |
-| M5. HTTP/2 | ✅ h2 over TLS (ALPN) and h2c on every backend, h2spec 146/146 over TLS, fuzzed, benchmarked; WebSockets over h2 and request-body streaming open |
+| M5. HTTP/2 | ✅ h2 over TLS (ALPN) and h2c on every backend, h2spec 146/146 over TLS, fuzzed, benchmarked; streamed request bodies on every protocol; WebSockets over h2 open |
 | M6. HTTP/3 and QUIC | 🟡 HTTP/3 over QUIC v1 on every backend, interop-tested (aioquic, curl/ngtcp2, h2load), benchmarked against nginx and Caddy; migration, 0-RTT, pacing, ECN, PMTUD open |
 | M7. Verification and benchmarking | 🟡 ongoing for each milestone |
 
@@ -416,8 +416,31 @@ which RFC 9113 deprecated).
       writes). Pipelining rule: parsing pauses while an exchange is pending. The
       synchronous path is unchanged: one branch on `resp.mode`, measured within
       noise (`zig build bench`, keep-alive and pipelined wrk)
-- [ ] Handler API step 3 (`handleHead`, streamed request bodies, request trailers):
-      after h2
+- [x] **Handler API step 3** on HTTP/1.1, HTTP/2 and HTTP/3: an optional
+      `handleHead(req, resp) BodyMode` runs once the head is parsed.
+      `.buffer` is today's behaviour; `.reject` answers with `resp` without
+      reading the body (no 100 Continue; h1 closes with a lingering close if
+      a body was announced, h2 RST_STREAM(NO_ERROR), h3
+      STOP_SENDING(H3_NO_ERROR)); `.stream` calls handleRequest at once, and
+      once it takes an exchange the body goes to `handleBody(ex, chunk, end)`
+      as it arrives, with no size limit, the trailers on the last call.
+      `.pause` holds the client back through the transport until
+      `ex.resumeBody()` (any thread): h1 stops reading the socket, h2 returns
+      window only for delivered bytes (keeping at most a window of DATA),
+      h3 leaves DATA unread in the QUIC stream (no MAX_STREAM_DATA). A
+      response that ends before its body leaves the rest unread. Request
+      trailers are kept (`req.trailers` when buffered; validated like other
+      fields on h2/h3). The h1 chunked decoder gained a piece-by-piece mode
+      (`ChunkedScanner.next`), trailer sections bounded by max_header_bytes.
+      Proof: session tests under every split with and without pauses, a
+      fuzz target (`fuzz: streamed body split invariance`), in-memory h2/h3
+      tests (including that a paused body really holds the window), streamed
+      and rejected requests in the h2 split-invariance script, end-to-end
+      uploads beyond max_body_size on h1, TLS, h2c and HTTP/3, held and
+      resumed from another thread, on kqueue, epoll and io_uring; h2spec
+      146/146 over TLS and h3spec 77/77 also with `bench-server ... stream`
+      (every body streamed). The fast path is unchanged (`zig build bench`
+      and wrk keep-alive/pipelined within noise)
 - [x] Frame layer (RFC 9113), `src/h2/frame.zig`: I/O-free `Reader` with the
       `Session` buffer discipline (pooled, held only while bytes are unprocessed,
       grown for a frame larger than a pool buffer), a parser for every frame type

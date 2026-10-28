@@ -31,6 +31,7 @@ Note: This project has just started, and is not yet a complete HTTP server imple
     - `Alt-Svc` is added to every response so browsers find HTTP/3
     - Interop-tested with aioquic, curl (ngtcp2) and h2load
 - Streaming and deferred responses: `resp.stream()` writes a body over time (chunked on HTTP/1.1, DATA frames on HTTP/2 and HTTP/3), `resp.later()` answers from any thread
+- Streamed request bodies: `handleHead` accepts, rejects (before `100 Continue`) or streams a request on its headers; `handleBody` gets the body as it arrives, with no size limit and with trailers, and can pause it (flow control holds the client back)
 - Support for WebSockets
 - TLS 1.3, written from scratch on top of `std.crypto` (no OpenSSL)
     - X25519MLKEM768 (post-quantum hybrid), X25519 and P-256 key exchange, HelloRetryRequest
@@ -197,6 +198,38 @@ pub fn handleRequest(self: *Handler, req: *per.Request, resp: *per.Response) voi
 ```
 A full queue makes `ex.write` return `error.WouldBlock`; the optional `handleWritable(ex)` hook is called once it drains. `handleAbort(ex)` is called if the client leaves or the exchange times out (`response_timeout_s` for `later()`, `request_timeout_s` between writes).
 
+### Stream or reject a request body
+By default a body is received whole (up to `max_body_size`) before `handleRequest`. The optional `handleHead` hook decides on the headers alone: `.buffer` (the default), `.reject` (answer with `resp` and don't read the body; no `100 Continue` is sent), or `.stream`. A streamed request calls `handleRequest` at once with an empty body; once it takes an exchange, `handleBody` gets the body as it arrives, on the worker thread, with no size limit. The last call has `end` set, with the trailers.
+```zig
+pub fn handleHead(_: *Handler, req: *per.Request, resp: *per.Response) per.BodyMode {
+    if (req.findHeader("authorization") == null) {
+        resp.status = .unauthorized;
+        return .reject;
+    }
+    return if (std.mem.eql(u8, req.getPath(), "/upload")) .stream else .buffer;
+}
+
+pub fn handleRequest(self: *Handler, req: *per.Request, resp: *per.Response) void {
+    if (std.mem.eql(u8, req.getPath(), "/upload")) {
+        // The body follows through handleBody; answer with ex.respond.
+        _ = resp.later() catch { resp.status = .service_unavailable; };
+        return;
+    }
+    // ...
+}
+
+pub fn handleBody(self: *Handler, ex: per.Exchange, chunk: []const u8, end: ?[]const per.Header) per.BodyAction {
+    self.queue.push(chunk); // copied: `chunk` and `end` are valid during the call
+    if (end != null) {
+        ex.respond(.{ .status = .created }, "stored") catch {};
+        return .more;
+    }
+    // Pause while the queue is long; another thread calls ex.resumeBody().
+    return if (self.queue.len() > limit) .pause else .more;
+}
+```
+While a body is paused the client is held back by the transport: HTTP/1.1 stops reading the socket, HTTP/2 withholds `WINDOW_UPDATE`, HTTP/3 `MAX_STREAM_DATA`. If the response ends before the body does, the rest is not read (HTTP/1.1 closes the connection; HTTP/2 and HTTP/3 reset the request stream with `NO_ERROR`). Trailers of a buffered body are in `req.trailers`.
+
 ### Implement a server
 ```zig
 const std = @import("std");
@@ -240,7 +273,7 @@ The server will shutdown gracefully if an interrupt signal is received. Alternat
 ## Memory management model
 
 ### Request lifecycle
-The server manages request and response buffers internally, reusing them across requests to avoid allocations. `Request` fields (path, headers, body) are slices into the connection's read buffer and are only valid until `handleRequest` returns. When a handler processes a request, it must copy any data it needs to retain, as the underlying buffers will be reused for subsequent requests.
+The server manages request and response buffers internally, reusing them across requests to avoid allocations. `Request` fields (path, headers, body, trailers) are slices into the connection's read buffer and are only valid until `handleRequest` returns; a streamed body's chunks only during each `handleBody` call. When a handler processes a request, it must copy any data it needs to retain, as the underlying buffers will be reused for subsequent requests.
 
 Response headers are copied as they are added, so their values can be freed straight away. For the body:
 - `setBody(buf)` copies into the worker's response buffer (`response_body_buffer_size`).
@@ -342,7 +375,7 @@ Until these things are done, I don't think that this project can possibly be con
 See [PLAN.md](PLAN.md) for the full checklist. In order:
 
 1. TLS 1.3 follow-ups: io_uring support, fuzzing, faster handshakes, RSA certificates, resumption, kTLS on Linux
-2. HTTP/2: HPACK, flow control, RFC 9218 priorities, WebSockets over h2 (RFC 8441), with a handler API that supports streaming responses
+2. HTTP/2 follow-ups: RFC 9218 priorities, WebSockets over h2 (RFC 8441)
 3. HTTP/3 follow-ups: connection migration, 0-RTT, pacing, ECN, PMTU discovery, GRO, the QPACK dynamic table, WebSockets over h3 (RFC 9220)
 4. Throughout: `sendfile`, tuning io_uring until it beats epoll, WebSocket `permessage-deflate`, and verification with Autobahn, h2spec, quic-interop-runner, soak, adversarial and differential (HTTP Garden) testing
 5. API reference
