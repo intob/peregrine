@@ -19,6 +19,7 @@ const parser = @import("../http/parser.zig");
 const date = @import("../http/date.zig");
 const exchange = @import("../http/exchange.zig");
 const Request = @import("../request.zig").Request;
+const Header = @import("../header.zig").Header;
 const Response = @import("../response.zig").Response;
 const Status = @import("../status.zig").Status;
 const Fields = fields_mod.Fields;
@@ -100,6 +101,11 @@ const Stream = struct {
     is_head: bool = false,
     head_sent: bool = false,
     exchange: u32 = NIL,
+    /// The body goes to the exchange through handleBody as it arrives
+    /// (handleHead chose `.stream`). While the handler has paused it, DATA
+    /// stays unread in the QUIC stream, so no credit is given for it.
+    body_stream: bool = false,
+    body_paused: bool = false,
 
     fn clear(s: *Stream) void {
         s.fields.clear();
@@ -432,7 +438,16 @@ pub const Conn = struct {
             if (s.frame_left > 0) {
                 const n: usize = @intCast(@min(s.frame_left, data.len));
                 if (n == 0) break;
-                if (s.frame_type == .data) {
+                if (s.frame_type == .data and s.body_stream) {
+                    if (s.body_paused) return;
+                    s.fields.body_received += n;
+                    if (s.fields.content_length) |cl| {
+                        if (s.fields.body_received > cl) return self.streamError(ctx, slot, .message_error);
+                    }
+                    // Delivered from the stream's buffer, then consumed.
+                    self.deliver(Handler, ctx, slot, data[0..n], null);
+                    if (!s.active) return;
+                } else if (s.frame_type == .data) {
                     s.fields.appendBody(self.allocator, data[0..n], max_body) catch return self.fail(.internal_error, "", ctx.now_us);
                     if (s.fields.fault == .body_too_large and !s.dispatched) {
                         q.streamConsume(slot, n);
@@ -464,18 +479,33 @@ pub const Conn = struct {
                             error.OutOfMemory => return self.fail(.internal_error, "", ctx.now_us),
                             else => return self.fail(.qpack_decompression_failed, "", ctx.now_us),
                         };
-                        s.fields.endHead(self.allocator, max_body) catch return self.fail(.internal_error, "", ctx.now_us);
+                        s.fields.endHead(self.allocator) catch return self.fail(.internal_error, "", ctx.now_us);
                         q.streamConsume(slot, h.size + section.len);
                         s.phase = .body;
+                        if (@hasDecl(Handler, "handleHead") and s.fields.fault == null) {
+                            switch (self.checkHead(Handler, ctx, slot)) {
+                                .buffer => {},
+                                // The response, then STOP_SENDING if the
+                                // body is still to come (§4.1).
+                                .reject => return self.respondSync(Handler, ctx, slot),
+                                .stream => {
+                                    self.startBody(Handler, ctx, slot);
+                                    if (!s.active or !s.body_stream) return;
+                                    continue;
+                                },
+                            }
+                        }
+                        s.fields.limitBody(max_body);
                         if (s.fields.fault) |f| {
                             if (f == .protocol) return self.streamError(ctx, slot, .message_error);
                             // Answer now; the rest of the request is unread.
                             return self.dispatch(Handler, ctx, slot);
                         }
                     } else {
-                        var sink: fields_mod.TrailerSink = .{};
+                        var sink = s.fields.trailerSink(self.allocator);
                         self.decoder.decode(section, &sink) catch |err| switch (err) {
                             error.FieldSectionTooLarge => {},
+                            error.OutOfMemory => return self.fail(.internal_error, "", ctx.now_us),
                             else => return self.fail(.qpack_decompression_failed, "", ctx.now_us),
                         };
                         q.streamConsume(slot, h.size + section.len);
@@ -498,12 +528,49 @@ pub const Conn = struct {
                 },
             }
         }
-        if (!q.streamComplete(slot) or s.dispatched) return;
+        if (!q.streamComplete(slot) or (s.dispatched and !s.body_stream) or s.body_paused) return;
         // The request is all here.
         if (s.phase == .headers or s.frame_left > 0 or q.streamReadable(slot).len > 0)
             return self.streamError(ctx, slot, .request_incomplete);
         if (!s.fields.lengthMatches()) return self.streamError(ctx, slot, .message_error);
+        if (s.body_stream) return self.deliver(Handler, ctx, slot, "", s.fields.trailers(&ctx.req.headers));
         self.dispatch(Handler, ctx, slot);
+    }
+
+    /// handleHead on a complete field section. An unknown method is left
+    /// to dispatch (501).
+    fn checkHead(self: *Self, comptime Handler: type, ctx: *const Context(Handler), slot: u32) exchange.BodyMode {
+        const s = &self.streams[slot];
+        if (!s.fields.fill(ctx.req)) return .buffer;
+        s.is_head = ctx.req.method == .HEAD;
+        ctx.resp.reset();
+        const mode = ctx.handler.handleHead(ctx.req, ctx.resp);
+        if (mode == .stream and !@hasDecl(Handler, "handleBody")) return .buffer;
+        return mode;
+    }
+
+    /// handleHead chose `.stream`: handleRequest runs now with an empty
+    /// body. If it takes an exchange, DATA goes to handleBody from here
+    /// on; if it answers at once, the body is not read (STOP_SENDING with
+    /// H3_NO_ERROR after the response).
+    fn startBody(self: *Self, comptime Handler: type, ctx: *const Context(Handler), slot: u32) void {
+        const s = &self.streams[slot];
+        s.dispatched = true;
+        ctx.resp.reset();
+        _ = s.fields.fill(ctx.req);
+        ctx.handler.handleRequest(ctx.req, ctx.resp);
+        if (ctx.resp.mode == .sync) return self.respondSync(Handler, ctx, slot);
+        s.body_stream = true;
+        self.bindExchange(Handler, ctx, slot);
+    }
+
+    /// Calls handleBody; the end turns streaming off.
+    fn deliver(self: *Self, comptime Handler: type, ctx: *const Context(Handler), slot: u32, chunk: []const u8, end: ?[]const Header) void {
+        if (!@hasDecl(Handler, "handleBody")) unreachable;
+        const s = &self.streams[slot];
+        if (end != null) s.body_stream = false;
+        const action = ctx.exchanges.handle(s.exchange).deliverBody(ctx.handler, chunk, end, ctx.now);
+        if (end == null and action == .pause) s.body_paused = true;
     }
 
     /// A stream error: reset both directions with `code`.
@@ -670,7 +737,13 @@ pub const Conn = struct {
         const stream_slot = ctx.exchanges.entry(ex_slot).stream_id;
         if (stream_slot >= self.streams.len) return;
         const s = &self.streams[stream_slot];
-        if (s.active and s.exchange == ex_slot) self.pumpStream(Handler, ctx, stream_slot);
+        if (!s.active or s.exchange != ex_slot) return;
+        if (ctx.exchanges.handle(ex_slot).takeResume() and s.body_paused) {
+            s.body_paused = false;
+            self.readRequest(Handler, ctx, stream_slot);
+            if (!s.active or s.exchange != ex_slot) return;
+        }
+        self.pumpStream(Handler, ctx, stream_slot);
     }
 
     /// The worker's exchange deadline scan found this exchange expired.

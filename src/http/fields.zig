@@ -1,9 +1,10 @@
 //! Request fields decoded from HPACK or QPACK, validated as RFC 9113 §8.2
 //! and §8.3 (HTTP/2) and RFC 9114 §4.2 and §4.3 (HTTP/3) require, and
 //! stored for the handler: names and values back to back in one buffer,
-//! then the body.
+//! then the body, then any trailers.
 const std = @import("std");
 const Request = @import("../request.zig").Request;
+const Header = @import("../header.zig").Header;
 const Method = @import("../method.zig").Method;
 const MAX_HEADERS = @import("../request.zig").MAX_HEADERS;
 
@@ -37,6 +38,10 @@ pub const Fields = struct {
     content_length: ?u64 = null,
     body_received: u64 = 0,
     fault: ?Fault = null,
+    /// Trailers: names and values from `trl_off` in `buf`, references
+    /// after the headers' in `hdr`.
+    trl_off: usize = 0,
+    trl_count: u16 = 0,
 
     pub fn clear(self: *Self) void {
         self.buf.clearRetainingCapacity();
@@ -52,7 +57,19 @@ pub const Fields = struct {
     }
 
     pub fn body(self: *const Self) []const u8 {
-        return self.buf.items[self.body_start..];
+        return self.buf.items[self.body_start..if (self.trl_count > 0) self.trl_off else self.buf.items.len];
+    }
+
+    /// A sink for the trailer section, stored after the body.
+    pub fn trailerSink(self: *Self, a: std.mem.Allocator) TrailerStore {
+        self.trl_off = self.buf.items.len;
+        return .{ .buf = &self.buf, .allocator = a, .refs = self.hdr[self.hdr_count..], .count = &self.trl_count };
+    }
+
+    /// The trailers as headers, written into `out` (valid as long as
+    /// `buf` is unchanged).
+    pub fn trailers(self: *const Self, out: []Header) []const Header {
+        return resolve(self.buf.items, self.hdr[self.hdr_count..][0..self.trl_count], out);
     }
 
     pub fn sink(self: *Self, a: std.mem.Allocator) RequestSink {
@@ -60,9 +77,10 @@ pub const Fields = struct {
     }
 
     /// The field section is complete: synthesise `host` from :authority
-    /// for handlers written for HTTP/1.1, check the pseudo-header fields
-    /// and the declared body size.
-    pub fn endHead(self: *Self, a: std.mem.Allocator, max_body_size: usize) std.mem.Allocator.Error!void {
+    /// for handlers written for HTTP/1.1 and check the pseudo-header
+    /// fields. The declared body size is checked by `limitBody`, unless
+    /// the handler streams the body.
+    pub fn endHead(self: *Self, a: std.mem.Allocator) std.mem.Allocator.Error!void {
         if (self.fault == null and !self.has_host and self.authority != null and self.hdr_count < MAX_HEADERS) {
             const auth = self.value(self.authority.?);
             const off = self.buf.items.len;
@@ -74,10 +92,13 @@ pub const Fields = struct {
         }
         self.body_start = self.buf.items.len;
         if (self.fault == null) self.validate();
-        if (self.fault == null) {
-            if (self.content_length) |cl| {
-                if (cl > max_body_size) self.fault = .body_too_large;
-            }
+    }
+
+    /// A body to be buffered: a declared length over `max` is a fault.
+    pub fn limitBody(self: *Self, max: usize) void {
+        if (self.fault != null) return;
+        if (self.content_length) |cl| {
+            if (cl > max) self.fault = .body_too_large;
         }
     }
 
@@ -138,6 +159,7 @@ pub const Fields = struct {
         }
         req.headers_len = self.hdr_count;
         req.body = self.body();
+        req.trailers = self.trailers(req.headers[self.hdr_count..]);
         return true;
     }
 };
@@ -243,17 +265,43 @@ pub const RequestSink = struct {
     }
 };
 
-/// Trailers are validated and dropped (no API for them yet).
-pub const TrailerSink = struct {
+/// Validates trailer fields as RequestSink does regular ones (no
+/// pseudo-header fields) and stores them: names and values appended to
+/// `buf`, references in `refs`. Fields beyond `refs.len` are dropped.
+pub const TrailerStore = struct {
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    refs: []HeaderRef,
+    count: *u16,
     fault: bool = false,
 
-    pub fn header(self: *TrailerSink, name: []const u8, _: []const u8) !void {
+    pub fn header(self: *TrailerStore, name: []const u8, val: []const u8) !void {
         if (name.len == 0 or name[0] == ':') self.fault = true;
         for (name) |c| {
             if (c >= 'A' and c <= 'Z' or !isTokenChar(c)) self.fault = true;
         }
+        for (val) |c| {
+            if (c == 0 or c == '\r' or c == '\n') self.fault = true;
+        }
+        if (val.len > 0 and (val[0] == ' ' or val[0] == '\t' or val[val.len - 1] == ' ' or val[val.len - 1] == '\t')) self.fault = true;
+        if (self.fault or self.count.* >= self.refs.len) return;
+        const off = self.buf.items.len;
+        try self.buf.ensureUnusedCapacity(self.allocator, name.len + val.len);
+        self.buf.appendSliceAssumeCapacity(name);
+        self.buf.appendSliceAssumeCapacity(val);
+        self.refs[self.count.*] = .{ .name_off = @intCast(off), .name_len = @intCast(name.len), .value_len = @intCast(val.len) };
+        self.count.* += 1;
     }
 };
+
+/// Headers for stored references, written into `out`.
+pub fn resolve(buf: []const u8, refs: []const HeaderRef, out: []Header) []const Header {
+    const n = @min(refs.len, out.len);
+    for (refs[0..n], out[0..n]) |r, *h| {
+        h.* = .{ .key = buf[r.name_off..][0..r.name_len], .value = buf[r.name_off + r.name_len ..][0..r.value_len] };
+    }
+    return out[0..n];
+}
 
 pub const DiscardSink = struct {
     pub fn header(_: *DiscardSink, _: []const u8, _: []const u8) !void {}
@@ -294,7 +342,8 @@ test "request fields: valid, malformed, host synthesis" {
     try s.header(":authority", "example.com");
     try s.header(":path", "/x?y");
     try s.header("accept", "*/*");
-    try f.endHead(a, 1024);
+    try f.endHead(a);
+    f.limitBody(1024);
     try testing.expectEqual(@as(?Fault, null), f.fault);
     try testing.expectEqual(@as(u16, 2), f.hdr_count);
     var req = try Request.init(a);
@@ -320,7 +369,7 @@ test "request fields: valid, malformed, host synthesis" {
         f.clear();
         s = f.sink(a);
         for (c) |kv| try s.header(kv[0], kv[1]);
-        try f.endHead(a, 1024);
+        try f.endHead(a);
         try testing.expectEqual(@as(?Fault, .protocol), f.fault);
     }
     f.clear();
@@ -330,6 +379,37 @@ test "request fields: valid, malformed, host synthesis" {
     try s.header(":authority", "example.com");
     try s.header(":path", "/");
     try s.header("content-length", "5000");
-    try f.endHead(a, 1024);
+    try f.endHead(a);
+    try testing.expectEqual(@as(?Fault, null), f.fault);
+    f.limitBody(1024);
     try testing.expectEqual(@as(?Fault, .body_too_large), f.fault);
+}
+
+test "trailers: stored after the body, validated, extra ones dropped" {
+    const a = testing.allocator;
+    var f: Fields = .{};
+    defer f.deinit(a);
+    var s = f.sink(a);
+    try s.header(":method", "POST");
+    try s.header(":scheme", "https");
+    try s.header(":authority", "example.com");
+    try s.header(":path", "/");
+    try f.endHead(a);
+    try f.appendBody(a, "body", 1024);
+    var t = f.trailerSink(a);
+    try t.header("x-sum", "4");
+    try t.header("x-b", "two");
+    try testing.expect(!t.fault);
+    var req = try Request.init(a);
+    defer req.deinit();
+    try testing.expect(f.fill(req));
+    try testing.expectEqualStrings("body", req.body);
+    try testing.expectEqual(@as(usize, 2), req.trailers.len);
+    try testing.expectEqualStrings("x-sum", req.trailers[0].key);
+    try testing.expectEqualStrings("two", req.trailers[1].value);
+    for ([_][2][]const u8{ .{ ":path", "/" }, .{ "Upper", "x" }, .{ "x", " lead" }, .{ "x", "a\nb" } }) |kv| {
+        var bad = f.trailerSink(a);
+        try bad.header(kv[0], kv[1]);
+        try testing.expect(bad.fault);
+    }
 }

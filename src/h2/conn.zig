@@ -14,6 +14,7 @@ const hpack = @import("./hpack.zig");
 const parser = @import("../http/parser.zig");
 const date = @import("../http/date.zig");
 const exchange = @import("../http/exchange.zig");
+const fields_mod = @import("../http/fields.zig");
 const BufferPool = @import("../http/session.zig").BufferPool;
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
@@ -88,7 +89,7 @@ const StreamState = enum(u8) {
     half_closed_remote,
 };
 
-const HeaderRef = struct { name_off: u32, name_len: u32, value_len: u32 };
+const HeaderRef = fields_mod.HeaderRef;
 
 const Stream = struct {
     id: u31 = 0,
@@ -127,6 +128,19 @@ const Stream = struct {
     stalled: bool = false,
     /// Bytes consumed since the last stream WINDOW_UPDATE.
     consumed: u32 = 0,
+    /// Trailers: names and values from `trl_off` in `req`, references
+    /// after the headers' in `hdr`.
+    trl_off: usize = 0,
+    trl_count: u16 = 0,
+    /// The body goes to the exchange through handleBody as it arrives
+    /// (handleHead chose `.stream`). While the handler has paused it,
+    /// DATA is kept in `req` from `body_start`, the window held back:
+    /// `body_pos` bytes of that were delivered, `body_end` says the rest
+    /// of the request (END_STREAM, trailers) is in too.
+    body_stream: bool = false,
+    body_paused: bool = false,
+    body_end: bool = false,
+    body_pos: usize = 0,
 
     fn clear(s: *Stream) void {
         s.req.clearRetainingCapacity();
@@ -145,6 +159,15 @@ const Stream = struct {
 
     fn slice(s: *const Stream, ref: HeaderRef) []const u8 {
         return s.req.items[ref.name_off + ref.name_len ..][0..ref.value_len];
+    }
+
+    /// The end of the body bytes in `req` (trailers follow).
+    fn bodyEnd(s: *const Stream) usize {
+        return if (s.trl_count > 0) s.trl_off else s.req.items.len;
+    }
+
+    fn trailers(s: *const Stream, out: []Header) []const Header {
+        return fields_mod.resolve(s.req.items, s.hdr[s.hdr_count..][0..s.trl_count], out);
     }
 };
 
@@ -601,6 +624,7 @@ pub const Conn = struct {
         if (s.state != .open) return self.resetStream(ctx, s, .stream_closed);
         if (d.flow_len > s.recv_window) return self.resetStream(ctx, s, .flow_control_error);
         s.recv_window -= d.flow_len;
+        if (s.body_stream) return self.streamData(Handler, ctx, s, d);
         if (s.fault == null) {
             s.body_received += d.data.len;
             if (s.content_length) |cl| {
@@ -620,13 +644,64 @@ pub const Conn = struct {
             return self.dispatch(Handler, ctx, s);
         }
         // Replenish the stream window as the body is consumed, in batches.
-        s.consumed += d.flow_len;
-        if (s.consumed >= self.opts.initial_window_size / 2) {
-            var buf: [frame.header_len + 4]u8 = undefined;
-            const n = frame.writeWindowUpdate(&buf, s.id, @intCast(s.consumed)) catch unreachable;
-            self.out.appendSlice(self.allocator, buf[0..n]) catch {};
-            s.recv_window += s.consumed;
-            s.consumed = 0;
+        self.creditStream(s, d.flow_len);
+    }
+
+    /// Returns `n` bytes of the stream's window once half the window has
+    /// been consumed (only while the request is still arriving).
+    fn creditStream(self: *Self, s: *Stream, n: u32) void {
+        s.consumed += n;
+        if (s.state != .open or s.consumed < self.opts.initial_window_size / 2) return;
+        var buf: [frame.header_len + 4]u8 = undefined;
+        const len = frame.writeWindowUpdate(&buf, s.id, @intCast(s.consumed)) catch unreachable;
+        self.out.appendSlice(self.allocator, buf[0..len]) catch {};
+        s.recv_window += s.consumed;
+        s.consumed = 0;
+    }
+
+    /// DATA for a streamed body: handed to the handler at once, or kept
+    /// while it has paused (or earlier DATA is still kept). The window is
+    /// returned only for delivered bytes, so a paused stream holds at most
+    /// a window's worth.
+    fn streamData(self: *Self, comptime Handler: type, ctx: *const Context(Handler), s: *Stream, d: anytype) void {
+        s.body_received += d.data.len;
+        if (s.content_length) |cl| {
+            if (s.body_received > cl or (d.end_stream and s.body_received != cl)) return self.resetStream(ctx, s, .protocol_error);
+        }
+        // Padding is never delivered.
+        self.creditStream(s, d.flow_len - @as(u32, @intCast(d.data.len)));
+        if (d.end_stream) s.state = .half_closed_remote;
+        if (s.body_paused or s.req.items.len > s.body_start) {
+            s.req.appendSlice(self.allocator, d.data) catch return self.fail(.internal_error);
+            if (d.end_stream) s.body_end = true;
+            return;
+        }
+        if (d.data.len == 0 and !d.end_stream) return;
+        self.deliver(Handler, ctx, s, d.data, if (d.end_stream) &.{} else null);
+    }
+
+    /// Calls handleBody, and returns the window for the bytes.
+    fn deliver(self: *Self, comptime Handler: type, ctx: *const Context(Handler), s: *Stream, chunk: []const u8, end: ?[]const Header) void {
+        if (!@hasDecl(Handler, "handleBody")) unreachable;
+        if (end != null) s.body_stream = false;
+        const action = ctx.exchanges.handle(s.exchange).deliverBody(ctx.handler, chunk, end, ctx.now);
+        if (end == null and action == .pause) s.body_paused = true;
+        self.creditStream(s, @intCast(chunk.len));
+    }
+
+    /// Delivers what was kept while the body was paused, and the end once
+    /// it is in.
+    fn drainBody(self: *Self, comptime Handler: type, ctx: *const Context(Handler), s: *Stream) void {
+        while (s.active and s.body_stream and !s.body_paused) {
+            const rest = s.req.items[s.body_start + s.body_pos .. s.bodyEnd()];
+            if (rest.len == 0 and !s.body_end) {
+                // All delivered: later DATA goes straight through.
+                s.req.items.len = s.body_start;
+                s.body_pos = 0;
+                return;
+            }
+            s.body_pos += rest.len;
+            self.deliver(Handler, ctx, s, rest, if (s.body_end) s.trailers(&ctx.req.headers) else null);
         }
     }
 
@@ -720,9 +795,12 @@ pub const Conn = struct {
         }
         const s = &self.streams[slot];
         if (trailers) {
-            var sink: TrailerSink = .{};
+            // Kept after the body (and after a paused body's kept DATA).
+            s.trl_off = s.req.items.len;
+            var sink: fields_mod.TrailerStore = .{ .buf = &s.req, .allocator = self.allocator, .refs = s.hdr[s.hdr_count..], .count = &s.trl_count };
             self.decoder.decode(block, &sink) catch |err| switch (err) {
                 error.HeaderListTooLarge => {},
+                error.OutOfMemory => return self.fail(.internal_error),
                 else => return self.fail(.compression_error),
             };
             if (sink.fault) return self.resetStream(ctx, s, .protocol_error);
@@ -730,6 +808,10 @@ pub const Conn = struct {
                 if (s.body_received != cl and s.fault == null) return self.resetStream(ctx, s, .protocol_error);
             }
             s.state = .half_closed_remote;
+            if (s.body_stream) {
+                s.body_end = true;
+                return self.drainBody(Handler, ctx, s);
+            }
             return self.dispatch(Handler, ctx, s);
         }
         var sink: RequestSink = .{ .stream = s, .allocator = self.allocator };
@@ -750,18 +832,27 @@ pub const Conn = struct {
         }
         s.body_start = s.req.items.len;
         if (s.fault == null) self.validateRequest(s);
-        if (s.fault == null) {
-            if (s.content_length) |cl| {
-                if (cl > self.opts.limits.max_body_size) s.fault = .body_too_large;
-            }
-        }
         if (end_stream) {
             if (s.content_length) |cl| {
                 if (cl != 0 and s.fault == null) return self.resetStream(ctx, s, .protocol_error);
             }
             s.state = .half_closed_remote;
-            return self.dispatch(Handler, ctx, s);
         }
+        if (@hasDecl(Handler, "handleHead") and s.fault == null) {
+            switch (self.checkHead(Handler, ctx, s)) {
+                .buffer => {},
+                // The response, then RST_STREAM(NO_ERROR) if the body is
+                // still to come (§8.1).
+                .reject => return self.respondSync(Handler, ctx, s, ctx.req.method == .HEAD),
+                .stream => return self.startBody(Handler, ctx, s),
+            }
+        }
+        if (s.fault == null) {
+            if (s.content_length) |cl| {
+                if (cl > self.opts.limits.max_body_size) s.fault = .body_too_large;
+            }
+        }
+        if (end_stream) return self.dispatch(Handler, ctx, s);
         // A fault with a body still to come: answer now, reset the rest.
         if (s.fault) |f| {
             if (f == .protocol) return self.resetStream(ctx, s, .protocol_error);
@@ -809,26 +900,64 @@ pub const Conn = struct {
             };
             resp.body = "";
         } else {
-            req.reset();
-            req.version = .@"HTTP/1.1";
-            req.method = Method.parse(s.slice(s.method.?)) catch {
+            if (!fillRequest(ctx, s)) {
                 resp.status = .not_implemented;
                 return self.respondSync(Handler, ctx, s, false);
-            };
-            is_head = req.method == .HEAD;
-            req.path_and_query = s.slice(s.path.?);
-            for (s.hdr[0..s.hdr_count], 0..) |h, i| {
-                req.headers[i] = .{
-                    .key = s.req.items[h.name_off..][0..h.name_len],
-                    .value = s.req.items[h.name_off + h.name_len ..][0..h.value_len],
-                };
             }
-            req.headers_len = s.hdr_count;
-            req.body = s.req.items[s.body_start..];
+            is_head = req.method == .HEAD;
             ctx.handler.handleRequest(req, resp);
             if (resp.mode != .sync) return self.bindExchange(Handler, ctx, s, is_head);
         }
         self.respondSync(Handler, ctx, s, is_head);
+    }
+
+    /// Fills the worker's Request from the stream. False for an unknown
+    /// method.
+    fn fillRequest(ctx: anytype, s: *Stream) bool {
+        const req = ctx.req;
+        req.reset();
+        req.version = .@"HTTP/1.1";
+        req.method = Method.parse(s.slice(s.method.?)) catch return false;
+        req.path_and_query = s.slice(s.path.?);
+        for (s.hdr[0..s.hdr_count], 0..) |h, i| {
+            req.headers[i] = .{
+                .key = s.req.items[h.name_off..][0..h.name_len],
+                .value = s.req.items[h.name_off + h.name_len ..][0..h.value_len],
+            };
+        }
+        req.headers_len = s.hdr_count;
+        req.body = s.req.items[s.body_start..s.bodyEnd()];
+        req.trailers = s.trailers(req.headers[s.hdr_count..]);
+        return true;
+    }
+
+    /// handleHead on a complete field block. An unknown method is left
+    /// to dispatch (501).
+    fn checkHead(_: *Self, comptime Handler: type, ctx: *const Context(Handler), s: *Stream) exchange.BodyMode {
+        if (!fillRequest(ctx, s)) return .buffer;
+        ctx.resp.reset();
+        const mode = ctx.handler.handleHead(ctx.req, ctx.resp);
+        if (mode == .stream and !@hasDecl(Handler, "handleBody")) return .buffer;
+        return mode;
+    }
+
+    /// handleHead chose `.stream`: handleRequest runs now with an empty
+    /// body. If it takes an exchange, DATA goes to handleBody from here
+    /// on; if it answers at once, the body is not read (RST_STREAM with
+    /// NO_ERROR after the response).
+    fn startBody(self: *Self, comptime Handler: type, ctx: *const Context(Handler), s: *Stream) void {
+        const resp = ctx.resp;
+        resp.reset();
+        _ = fillRequest(ctx, s);
+        const is_head = ctx.req.method == .HEAD;
+        ctx.handler.handleRequest(ctx.req, resp);
+        if (resp.mode == .sync) return self.respondSync(Handler, ctx, s, is_head);
+        s.body_stream = true;
+        s.body_end = s.state == .half_closed_remote;
+        s.req.items.len = s.body_start;
+        self.bindExchange(Handler, ctx, s, is_head);
+        // The exchange may have finished (and the stream closed) already.
+        if (s.active and s.exchange != NIL) self.drainBody(Handler, ctx, s);
     }
 
     /// Serialises a complete response: HEADERS, then DATA as the windows
@@ -971,7 +1100,13 @@ pub const Conn = struct {
     /// Called by the worker for a mailbox post naming this exchange.
     pub fn onExchangePosted(self: *Self, comptime Handler: type, ctx: *const Context(Handler), slot: u32) void {
         for (self.streams) |*s| {
-            if (s.active and s.exchange == slot) return self.pumpStream(Handler, ctx, s);
+            if (!s.active or s.exchange != slot) continue;
+            if (ctx.exchanges.handle(slot).takeResume() and s.body_paused) {
+                s.body_paused = false;
+                self.drainBody(Handler, ctx, s);
+            }
+            if (s.active and s.exchange == slot) self.pumpStream(Handler, ctx, s);
+            return;
         }
     }
 
@@ -1255,18 +1390,6 @@ const RequestSink = struct {
     }
 };
 
-/// Trailers are validated and dropped (no API for them yet).
-const TrailerSink = struct {
-    fault: bool = false,
-
-    pub fn header(self: *TrailerSink, name: []const u8, _: []const u8) !void {
-        if (name.len == 0 or name[0] == ':') self.fault = true;
-        for (name) |c| {
-            if (c >= 'A' and c <= 'Z' or !isTokenChar(c)) self.fault = true;
-        }
-    }
-};
-
 const DiscardSink = struct {
     pub fn header(_: *DiscardSink, _: []const u8, _: []const u8) !void {}
 };
@@ -1293,6 +1416,37 @@ const TestHandler = struct {
     aborts: usize = 0,
     writable: usize = 0,
     big: []const u8 = "",
+    /// Streamed bodies (paths under /up): what handleBody saw.
+    bodies: std.ArrayList(u8) = .empty,
+    received: usize = 0,
+    /// handleBody pauses after each chunk.
+    pause: bool = false,
+
+    pub fn handleHead(_: *TestHandler, req: *Request, resp: *Response) exchange.BodyMode {
+        const path = req.getPath();
+        if (std.mem.eql(u8, path, "/reject")) {
+            resp.status = .forbidden;
+            resp.setBodyBorrowed("no");
+            return .reject;
+        }
+        return if (std.mem.startsWith(u8, path, "/up")) .stream else .buffer;
+    }
+
+    pub fn handleBody(self: *TestHandler, ex: exchange.Exchange, chunk: []const u8, end: ?[]const Header) exchange.BodyAction {
+        const a = testing.allocator;
+        self.received += chunk.len;
+        self.bodies.print(a, "{d}:{s};", .{ chunk.len, chunk[0..@min(chunk.len, 8)] }) catch unreachable;
+        if (end) |trailers| {
+            self.bodies.appendSlice(a, "END") catch unreachable;
+            for (trailers) |t| self.bodies.print(a, " [{s}={s}]", .{ t.key, t.value }) catch unreachable;
+            self.bodies.append(a, '\n') catch unreachable;
+            var buf: [32]u8 = undefined;
+            ex.respond(.{}, std.fmt.bufPrint(&buf, "got {d}", .{self.received}) catch unreachable) catch unreachable;
+            self.received = 0;
+            return .more;
+        }
+        return if (self.pause) .pause else .more;
+    }
 
     pub fn handleRequest(self: *TestHandler, req: *Request, resp: *Response) void {
         const a = testing.allocator;
@@ -1303,8 +1457,17 @@ const TestHandler = struct {
             }
         }
         if (req.body.len > 0) self.log.print(a, " body={d}:{s}", .{ req.body.len, req.body[0..@min(req.body.len, 12)] }) catch unreachable;
+        for (req.trailers) |t| self.log.print(a, " trailer[{s}={s}]", .{ t.key, t.value }) catch unreachable;
         self.log.append(a, '\n') catch unreachable;
         const path = req.getPath();
+        if (std.mem.eql(u8, path, "/up-sync")) {
+            resp.setBodyBorrowed("early");
+            return;
+        }
+        if (std.mem.startsWith(u8, path, "/up")) {
+            self.exchanges.append(a, resp.later() catch unreachable) catch unreachable;
+            return;
+        }
         resp.addNewHeader("Content-Type", "text/plain") catch {};
         if (std.mem.eql(u8, path, "/later") or std.mem.eql(u8, path, "/stream")) {
             const ex = if (path[1] == 'l') resp.later() catch unreachable else resp.stream() catch unreachable;
@@ -1396,6 +1559,7 @@ const Harness = struct {
         h.resp.deinit();
         h.pool.deinit();
         h.handler.log.deinit(a);
+        h.handler.bodies.deinit(a);
         h.handler.exchanges.deinit(a);
         h.out.deinit(a);
         h.enc.deinit();
@@ -1713,7 +1877,7 @@ test "requests: fast path, bodies, trailers, multiplexing, HEAD, 204" {
         \\headers 11 end=true [:status=204] [content-type=text/plain] [date]
         \\
     );
-    try h.expectLog("POST /echo [host=example.com] body=3:abc\nHEAD / [host=h]\nGET /empty [host=example.com]\n");
+    try h.expectLog("POST /echo [host=example.com] body=3:abc trailer[x-trailer=t]\nHEAD / [host=h]\nGET /empty [host=example.com]\n");
 }
 
 test "request validation (RFC 9113 §8): each rule, and the status codes" {
@@ -2117,6 +2281,123 @@ test "exchanges per stream: later(), stream() with trailers, abort, client reset
     try testing.expectEqual(@as(usize, 2), h.handler.aborts);
 }
 
+fn postTo(h: *Harness, stream: u31, path: []const u8, end_stream: bool) !void {
+    try h.headers(.{ .stream = stream, .end_stream = end_stream, .fields = &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = path },
+        .{ .name = ":authority", .value = "example.com" },
+    } });
+}
+
+test "streamed bodies: handleHead reject and stream, trailers, an early answer" {
+    const h = try Harness.init(.{ .limits = .{ .max_body_size = 10 } });
+    defer h.deinit();
+    try h.preface();
+    h.events.clearRetainingCapacity();
+    // Rejected: without a body the stream just ends; with one, the rest is
+    // refused with RST_STREAM(NO_ERROR) after the response.
+    try postTo(h, 1, "/reject", true);
+    try postTo(h, 3, "/reject", false);
+    try h.expectEvents(
+        \\headers 1 end=false [:status=403] [content-length=2] [date]
+        \\data 1 len=2 end=true
+        \\headers 3 end=false [:status=403] [content-length=2] [date]
+        \\data 3 len=2 end=true
+        \\rst 3 no_error
+        \\
+    );
+    try h.expectLog("");
+    // Streamed, beyond max_body_size, with trailers.
+    try postTo(h, 5, "/up", false);
+    try h.expectLog("POST /up [host=example.com]\n");
+    try h.data(5, "hello ", false);
+    try h.data(5, "streamed world", false);
+    try h.expectEvents("");
+    try h.headers(.{ .stream = 5, .fields = &.{.{ .name = "x-sum", .value = "20" }} });
+    try testing.expectEqualStrings("6:hello ;14:streamed;0:;END [x-sum=20]\n", h.handler.bodies.items);
+    try h.expectEvents(
+        \\headers 5 end=false [:status=200] [content-length=6] [date]
+        \\data 5 len=6 end=true
+        \\
+    );
+    // No body at all: the end is delivered at once.
+    h.handler.bodies.clearRetainingCapacity();
+    try postTo(h, 7, "/up", true);
+    try testing.expectEqualStrings("0:;END\n", h.handler.bodies.items);
+    try h.expectEvents("headers 7 end=false [:status=200] [content-length=5] [date]\ndata 7 len=5 end=true\n");
+    // Answered at once: the body is refused.
+    try postTo(h, 9, "/up-sync", false);
+    try h.expectEvents("headers 9 end=false [:status=200] [content-length=5] [date]\ndata 9 len=5 end=true\nrst 9 no_error\n");
+    try h.data(9, "ignored", true);
+    try h.expectEvents("");
+    // A body cut short of its content-length, or past it, is malformed.
+    try h.headers(.{ .stream = 11, .end_stream = false, .fields = &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/up" },
+        .{ .name = "content-length", .value = "3" },
+    } });
+    try h.data(11, "abcd", false);
+    try h.expectEvents("rst 11 protocol_error\n");
+    try testing.expectEqual(@as(usize, 1), h.handler.aborts);
+    h.events.clearRetainingCapacity();
+    try h.expectLog("POST /up [host=example.com]\nPOST /up-sync [host=example.com]\nPOST /up\n");
+    try testing.expectEqual(@as(u32, 0), h.conn.activeStreams());
+}
+
+test "streamed bodies: a pause holds the window back, resume delivers what was kept" {
+    const h = try Harness.init(.{ .initial_window_size = 65535 });
+    defer h.deinit();
+    try h.preface();
+    h.events.clearRetainingCapacity();
+    h.handler.pause = true;
+    try postTo(h, 1, "/up", false);
+    const chunk: [16384]u8 = @splat('u');
+    // The first DATA is delivered, then the handler pauses: the rest of
+    // the window's worth is kept, and no WINDOW_UPDATE goes out.
+    try h.data(1, &chunk, false);
+    try h.data(1, &chunk, false);
+    try h.data(1, &chunk, false);
+    try h.data(1, chunk[0..16383], false);
+    try testing.expectEqualStrings("16384:uuuuuuuu;", h.handler.bodies.items);
+    try h.expectEvents("");
+    // Past the window: a flow control error, so the hold is real.
+    const h2 = try Harness.init(.{ .initial_window_size = 65535 });
+    defer h2.deinit();
+    try h2.preface();
+    h2.events.clearRetainingCapacity();
+    h2.handler.pause = true;
+    try postTo(h2, 1, "/up", false);
+    for (0..4) |_| try h2.data(1, &chunk, false);
+    try h2.expectEvents("rst 1 flow_control_error\n");
+    try testing.expectEqual(@as(usize, 1), h2.handler.aborts);
+    // Resume: what was kept is delivered in one call, and the window
+    // comes back.
+    h.handler.pause = false;
+    try h.handler.exchanges.items[0].resumeBody();
+    try h.drainMailbox();
+    try h.collect();
+    try testing.expectEqualStrings("16384:uuuuuuuu;49151:uuuuuuuu;", h.handler.bodies.items);
+    try h.expectEvents("window 1 +65535\n");
+    // Paused again with END_STREAM kept: the end waits for the resume too.
+    h.handler.pause = true;
+    try h.data(1, &chunk, false);
+    try h.data(1, "tail", true);
+    try testing.expectEqualStrings("16384:uuuuuuuu;49151:uuuuuuuu;16384:uuuuuuuu;", h.handler.bodies.items);
+    try h.expectEvents("");
+    try h.handler.exchanges.items[0].resumeBody();
+    try h.drainMailbox();
+    try h.collect();
+    try testing.expectEqualStrings("16384:uuuuuuuu;49151:uuuuuuuu;16384:uuuuuuuu;4:tail;END\n", h.handler.bodies.items);
+    try h.expectEvents("headers 1 end=false [:status=200] [content-length=9] [date]\ndata 1 len=9 end=true\n");
+    // A client reset while paused aborts the exchange.
+    try postTo(h, 3, "/up", false);
+    try h.data(3, "x", false);
+    try h.rst(3, .cancel);
+    try testing.expectEqual(@as(usize, 1), h.handler.aborts);
+}
+
 test "defence: rapid reset" {
     const h = try Harness.init(.{ .max_resets_per_second = 5 });
     defer h.deinit();
@@ -2320,6 +2601,7 @@ test "split invariance" {
     defer ref.deinit();
     try ref.feed(script);
     try testing.expect(ref.per_stream.count() > 3);
+    try testing.expect(std.mem.indexOf(u8, ref.handler.bodies.items, "END") != null);
     var prng = std.Random.DefaultPrng.init(11);
     const random = prng.random();
     for (0..40) |iteration| {
@@ -2345,10 +2627,12 @@ fn expectSameStreams(a: *Harness, b: *Harness) !void {
         try testing.expectEqualStrings(entry.value_ptr.items, other.items);
     }
     try testing.expectEqualStrings(a.handler.log.items, b.handler.log.items);
+    try testing.expectEqualStrings(a.handler.bodies.items, b.handler.bodies.items);
 }
 
-/// A conversation with requests, bodies, trailers, window updates, pings,
-/// settings, a refused stream and finally a connection error.
+/// A conversation with requests, buffered and streamed bodies, trailers, a
+/// rejected request, window updates, pings, settings, a refused stream and
+/// finally a connection error.
 fn buildScript() ![]u8 {
     const a = testing.allocator;
     var enc = try hpack.Encoder.init(a, 4096);
@@ -2365,7 +2649,8 @@ fn buildScript() ![]u8 {
         var bn: usize = 0;
         bn += try enc.encode(block[bn..], ":method", if (i % 3 == 0) "POST" else "GET", .{});
         bn += try enc.encode(block[bn..], ":scheme", "https", .{});
-        bn += try enc.encode(block[bn..], ":path", if (i % 3 == 0) "/echo" else if (i % 3 == 1) "/" else "/big", .{});
+        const path = if (i % 6 == 0) "/up" else if (i % 3 == 0) "/echo" else if (i == 4) "/reject" else if (i % 3 == 1) "/" else "/big";
+        bn += try enc.encode(block[bn..], ":path", path, .{});
         bn += try enc.encode(block[bn..], "x-req", &(@as([3]u8, @splat('a' + @as(u8, @intCast(i))))), .{});
         if (i % 3 == 0) {
             n = try frame.writeHeaders(&buf, stream, frame.flag.end_headers, block[0..bn]);

@@ -14,6 +14,7 @@ const exchange = @import("../http/exchange.zig");
 const date = @import("../http/date.zig");
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
+const Header = @import("../header.zig").Header;
 const Mailbox = @import("../mailbox.zig").Mailbox;
 const sys = @import("../sys.zig");
 const Client = test_client.Client;
@@ -26,6 +27,38 @@ const TestHandler = struct {
     exchanges: std.ArrayList(exchange.Exchange) = .empty,
     aborts: usize = 0,
     big: []const u8 = "",
+    /// Streamed bodies (paths under /up): calls, bytes, and the ends.
+    bodies: std.ArrayList(u8) = .empty,
+    chunks: usize = 0,
+    received: usize = 0,
+    /// handleBody pauses after each chunk.
+    pause: bool = false,
+
+    pub fn handleHead(_: *TestHandler, req: *Request, resp: *Response) exchange.BodyMode {
+        const path = req.getPath();
+        if (std.mem.eql(u8, path, "/reject")) {
+            resp.status = .forbidden;
+            resp.setBodyBorrowed("no");
+            return .reject;
+        }
+        return if (std.mem.startsWith(u8, path, "/up")) .stream else .buffer;
+    }
+
+    pub fn handleBody(self: *TestHandler, ex: exchange.Exchange, chunk: []const u8, end: ?[]const Header) exchange.BodyAction {
+        const a = testing.allocator;
+        self.chunks += 1;
+        self.received += chunk.len;
+        if (end) |trailers| {
+            self.bodies.print(a, "END n={d}", .{self.received}) catch unreachable;
+            for (trailers) |t| self.bodies.print(a, " [{s}={s}]", .{ t.key, t.value }) catch unreachable;
+            self.bodies.append(a, '\n') catch unreachable;
+            var buf: [32]u8 = undefined;
+            ex.respond(.{}, std.fmt.bufPrint(&buf, "got {d}", .{self.received}) catch unreachable) catch unreachable;
+            self.received = 0;
+            return .more;
+        }
+        return if (self.pause) .pause else .more;
+    }
 
     pub fn handleRequest(self: *TestHandler, req: *Request, resp: *Response) void {
         const a = testing.allocator;
@@ -36,8 +69,17 @@ const TestHandler = struct {
             }
         }
         if (req.body.len > 0) self.log.print(a, " body={d}", .{req.body.len}) catch unreachable;
+        for (req.trailers) |t| self.log.print(a, " trailer[{s}={s}]", .{ t.key, t.value }) catch unreachable;
         self.log.append(a, '\n') catch unreachable;
         const path = req.getPath();
+        if (std.mem.eql(u8, path, "/up-sync")) {
+            resp.setBodyBorrowed("early");
+            return;
+        }
+        if (std.mem.startsWith(u8, path, "/up")) {
+            self.exchanges.append(a, resp.later() catch unreachable) catch unreachable;
+            return;
+        }
         resp.addNewHeader("Content-Type", "text/plain") catch {};
         if (std.mem.eql(u8, path, "/later") or std.mem.eql(u8, path, "/stream")) {
             const ex = if (path[1] == 'l') resp.later() catch unreachable else resp.stream() catch unreachable;
@@ -136,6 +178,7 @@ const Harness = struct {
         h.resp.deinit();
         h.qdec.deinit();
         h.handler.log.deinit(h.a);
+        h.handler.bodies.deinit(h.a);
         h.handler.exchanges.deinit(h.a);
         h.a.destroy(h);
     }
@@ -399,6 +442,91 @@ test "HTTP/3: a body over the limit gets 413 and STOP_SENDING" {
     var r2 = try h.response(ok);
     defer r2.deinit();
     try testing.expectEqualStrings("Hello, World!", r2.body.items);
+}
+
+/// A request with a body in one DATA frame, then trailers.
+fn requestWithTrailers(h: *Harness, path: []const u8, body: []const u8, trailers: []const qpack.Field) !u64 {
+    const id = try h.client.openBidi();
+    try h.writeHeaders(id, &([_]qpack.Field{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = path },
+    }), &.{}, false);
+    var hdr: [16]u8 = undefined;
+    var w: packet.Writer = .{ .buf = &hdr };
+    frame.writeHeader(&w, .data, body.len);
+    try h.client.write(id, w.written(), false);
+    try h.client.write(id, body, false);
+    try h.writeHeaders(id, &.{}, trailers, true);
+    return id;
+}
+
+test "HTTP/3: handleHead reject and stream, trailers, an early answer" {
+    const h = try Harness.init();
+    defer h.deinit();
+    h.h3_opts.limits.max_body_size = 1000;
+    try h.startClient();
+    const up: [3000]u8 = @splat('u');
+    // Rejected: without a body the request just ends; with one (more than
+    // a packet, so not all in yet), the rest is refused with
+    // STOP_SENDING(H3_NO_ERROR).
+    const rej = try h.request("GET", "/reject", &.{}, "");
+    const rej_body = try h.request("POST", "/reject", &.{}, &up);
+    // Streamed beyond max_body_size, with trailers; answered at once.
+    const streamed = try requestWithTrailers(h, "/up", &up, &.{.{ .name = "x-sum", .value = "3000" }});
+    const early = try h.request("POST", "/up-sync", &.{}, &up);
+    // Buffered trailers reach the request.
+    const buffered = try requestWithTrailers(h, "/echo", "abc", &.{.{ .name = "x-t", .value = "1" }});
+    try h.run(100);
+    inline for (.{ rej, rej_body }) |id| {
+        var r = try h.response(id);
+        defer r.deinit();
+        try testing.expectEqualStrings("403", r.status.?);
+        try testing.expectEqualStrings("no", r.body.items);
+    }
+    try testing.expectEqual(@as(?u64, null), (try h.client.getStream(rej)).stop_code);
+    try testing.expectEqual(@as(?u64, 0x100), (try h.client.getStream(rej_body)).stop_code);
+    var s = try h.response(streamed);
+    defer s.deinit();
+    try testing.expectEqualStrings("got 3000", s.body.items);
+    try testing.expectEqualStrings("END n=3000 [x-sum=3000]\n", h.handler.bodies.items);
+    var e = try h.response(early);
+    defer e.deinit();
+    try testing.expectEqualStrings("early", e.body.items);
+    try testing.expectEqual(@as(?u64, 0x100), (try h.client.getStream(early)).stop_code);
+    var b = try h.response(buffered);
+    defer b.deinit();
+    try testing.expectEqualStrings("abc", b.body.items);
+    try testing.expect(std.mem.indexOf(u8, h.handler.log.items, "POST /echo [host=example.com] body=3 trailer[x-t=1]\n") != null);
+    try testing.expectEqual(@as(u32, 0), h.h3c.?.activeRequests());
+}
+
+test "HTTP/3: a paused body holds MAX_STREAM_DATA back until resumed" {
+    const h = try Harness.init();
+    defer h.deinit();
+    try h.startClient();
+    h.handler.pause = true;
+    const up = try testing.allocator.alloc(u8, 3 * 1024 * 1024);
+    defer testing.allocator.free(up);
+    @memset(up, 'p');
+    const id = try h.request("POST", "/up", &.{}, up);
+    try h.run(400);
+    // One chunk was delivered; the rest waits in the stream, and the
+    // client is held at the first window (1 MiB).
+    try testing.expectEqual(@as(usize, 1), h.handler.chunks);
+    const st = try h.client.getStream(id);
+    try testing.expectEqual(@as(u64, 1 << 20), st.send.max_data);
+    try testing.expect(st.send.blocked());
+    try testing.expectEqualStrings("", h.handler.bodies.items);
+    // Resumed: everything else arrives.
+    h.handler.pause = false;
+    try h.handler.exchanges.items[0].resumeBody();
+    try h.run(5000);
+    var r = try h.response(id);
+    defer r.deinit();
+    try testing.expectEqualStrings("got 3145728", r.body.items);
+    try testing.expectEqualStrings("END n=3145728\n", h.handler.bodies.items);
 }
 
 test "HTTP/3: later() and stream() exchanges with trailers" {

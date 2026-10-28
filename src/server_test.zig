@@ -1649,6 +1649,61 @@ fn testH2Exchanges(backend: Backend) !void {
     try testing.expectEqualStrings("ok", after.body.items);
 }
 
+test "h2c: streamed uploads, a held body resumed from another thread, reject" {
+    try forEachBackend(testH2Uploads);
+}
+
+/// Resumes the upload the handler holds, once it holds one.
+fn resumeHeldSoon(h: *TestHandler) !void {
+    var tries: usize = 0;
+    while (true) : (tries += 1) {
+        h.resumeHeld() catch |err| switch (err) {
+            error.NothingHeld => {
+                if (tries > 500) return err;
+                sleepMs(5);
+                continue;
+            },
+            else => return err,
+        };
+        return;
+    }
+}
+
+fn testH2Uploads(backend: Backend) !void {
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    var cfg = h2Config();
+    cfg.limits.max_body_size = 64 * 1024;
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    const c = try H2Client.connect(r.port);
+    defer c.close();
+    var expected: [64]u8 = undefined;
+    // Beyond max_body_size (within the windows: the client doesn't wait).
+    var up: H2Client.Reply = .{};
+    defer up.deinit();
+    const body = big_body[0 .. 600 * 1024];
+    try c.fetch(1, "POST", "/upload", body, &up);
+    try testing.expectEqual(@as(u16, 200), up.status);
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "n={d} hash={x}", .{ body.len, fnv(body) }), up.body.items);
+    // Held after the first DATA, resumed from this thread.
+    var held: H2Client.Reply = .{};
+    defer held.deinit();
+    const body2 = big_body[0 .. 300 * 1024];
+    try c.request(3, "POST", "/upload-hold", body2);
+    try resumeHeldSoon(r.srv.handler);
+    var map = std.AutoHashMap(u31, *H2Client.Reply).init(testing.allocator);
+    defer map.deinit();
+    try map.put(3, &held);
+    try testing.expectEqual(@as(?h2frame.ErrorCode, null), try c.collect(&map));
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "n={d} hash={x}", .{ body2.len, fnv(body2) }), held.body.items);
+    // Rejected on its head.
+    var rej: H2Client.Reply = .{};
+    defer rej.deinit();
+    try c.fetch(5, "POST", "/upload-reject", "abc", &rej);
+    try testing.expectEqual(@as(u16, 413), rej.status);
+    try testing.expectEqualStrings("too much", rej.body.items);
+}
+
 test "h2c: GOAWAY on shutdown" {
     try forEachBackend(testH2Goaway);
 }
@@ -1911,6 +1966,31 @@ fn testTlsKeepAlive(backend: Backend) !void {
     try c.expectCleanClose();
 }
 
+test "tls: a streamed upload, then a request on the same connection" {
+    try forEachBackend(testTlsUpload);
+}
+
+fn testTlsUpload(backend: Backend) !void {
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    var cfg = tlsConfig();
+    cfg.limits.max_body_size = 64 * 1024;
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    const c = try TlsClient.connect(r.port);
+    defer c.close();
+    const body = big_body[0 .. 3 * 1024 * 1024];
+    try c.send("POST /upload-pause HTTP/1.1\r\nHost: x\r\nContent-Length: 3145728\r\n\r\n");
+    try c.send(body);
+    try c.send("GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+    var got: [128]u8 = undefined;
+    var expected: [64]u8 = undefined;
+    const a = try c.readResponse(&got);
+    try testing.expectEqual(@as(u16, 200), a.status);
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "n={d} hash={x}", .{ body.len, fnv(body) }), got[0..a.body_len]);
+    const b = try c.readResponse(&got);
+    try testing.expectEqualStrings("ok", got[0..b.body_len]);
+}
+
 test "tls: websocket echo and server-initiated sends" {
     try forEachBackend(testTlsWebSocket);
 }
@@ -2111,6 +2191,43 @@ const H3Client = struct {
         return r;
     }
 };
+
+test "http3: streamed uploads, a held body resumed from another thread" {
+    try forEachBackend(testHttp3Uploads);
+}
+
+fn testHttp3Uploads(backend: Backend) !void {
+    var cfg = tlsConfig();
+    cfg.http3 = .{};
+    cfg.limits.max_body_size = 64 * 1024;
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    var cl = try H3Client.connect(r.srv.getQuicPort());
+    defer cl.close();
+    try cl.start();
+    const body = big_body[0 .. 3 * 1024 * 1024];
+    const up = try cl.request("POST", "/upload", body);
+    const held = try cl.request("POST", "/upload-hold", big_body[0 .. 2 * 1024 * 1024]);
+    // Drive the client until the handler holds the second upload.
+    try cl.runUntil(10_000, r.srv.handler, struct {
+        fn f(h: *TestHandler, _: *H3Client) bool {
+            h.uploads_mutex.lock();
+            defer h.uploads_mutex.unlock();
+            return h.held != null;
+        }
+    }.f);
+    try r.srv.handler.resumeHeld();
+    try cl.waitFinished(&.{ up, held });
+    var expected: [64]u8 = undefined;
+    var a = try cl.response(up);
+    defer a.body.deinit(testing.allocator);
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "n={d} hash={x}", .{ body.len, fnv(body) }), a.body.items);
+    var b = try cl.response(held);
+    defer b.body.deinit(testing.allocator);
+    const body2 = big_body[0 .. 2 * 1024 * 1024];
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "n={d} hash={x}", .{ body2.len, fnv(body2) }), b.body.items);
+}
 
 test "http3: requests over UDP, large bodies, exchanges from other threads" {
     try forEachBackend(testHttp3);
