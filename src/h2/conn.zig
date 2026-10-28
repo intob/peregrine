@@ -26,6 +26,7 @@ const ws = @import("../ws/conn.zig");
 const sys = @import("../sys.zig");
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
+const File = @import("../response.zig").File;
 const Status = @import("../status.zig").Status;
 const Method = @import("../method.zig").Method;
 const Header = @import("../header.zig").Header;
@@ -141,6 +142,9 @@ const Stream = struct {
     pending: std.ArrayList(u8) = .empty,
     pending_pos: usize = 0,
     pending_end: bool = false,
+    /// A file body still to send (Response.sendFile), read as the windows
+    /// allow; closed by whoever clears it.
+    file: ?File = null,
     /// The exchange answering this stream, or NIL.
     exchange: u32 = NIL,
     /// Set while output waits for a window; cleared on progress.
@@ -186,10 +190,12 @@ const Stream = struct {
     fn free(s: *Stream, allocator: std.mem.Allocator) void {
         s.req.deinit(allocator);
         s.pending.deinit(allocator);
+        if (s.file) |f| f.release();
+        s.file = null;
     }
 
     inline fn hasOutput(s: *const Stream) bool {
-        return s.pending_pos < s.pending.items.len or s.pending_end or s.exchange != NIL;
+        return s.pending_pos < s.pending.items.len or s.pending_end or s.exchange != NIL or s.file != null;
     }
 
     /// The priority output is scheduled by. A tunnel never ends, so it
@@ -524,6 +530,8 @@ pub const Conn = struct {
         } else if (s.hasOutput()) {
             self.output_streams -= 1;
         }
+        if (s.file) |f| f.release();
+        s.file = null;
         if (self.hb_slot != NIL and &self.streams[self.hb_slot] == s) {
             self.hb_stream = 0;
             self.hb_slot = NIL;
@@ -1205,10 +1213,21 @@ pub const Conn = struct {
     fn respondSync(self: *Self, comptime Handler: type, ctx: *const Context(Handler), s: *Stream, is_head: bool) void {
         const resp = ctx.resp;
         const code = @backingInt(resp.status);
-        const has_body = !is_head and code >= 200 and code != 204 and code != 304 and resp.body.len > 0;
-        const content_length: ?usize = if (resp.status.allowsContentLength() and !resp.is_ws_upgrade) resp.body.len else null;
+        const body_len = resp.bodyLen();
+        const has_body = !is_head and code >= 200 and code != 204 and code != 304 and body_len > 0;
+        const content_length: ?usize = if (resp.status.allowsContentLength() and !resp.is_ws_upgrade) @intCast(body_len) else null;
         self.writeHead(ctx, s, resp.status, resp.headerBytes(), content_length, !has_body);
         s.head_sent = true;
+        if (resp.takeFile()) |f| {
+            if (!has_body) {
+                f.release();
+                return self.finishStream(ctx, s);
+            }
+            // Read into DATA frames as the windows allow.
+            s.file = f;
+            self.output_streams += 1;
+            return self.pumpStream(Handler, ctx, s);
+        }
         if (!has_body) return self.finishStream(ctx, s);
         const yield = self.blocked_count > 0 and self.mustYield(s);
         const sent = if (yield) 0 else self.writeData(s, resp.body, true);
@@ -1481,6 +1500,7 @@ pub const Conn = struct {
         if (self.failed) return;
         self.setBlocked(s, false);
         if (s.ws != null) return self.pumpWebSocket(Handler, ctx, s, budget);
+        if (s.file != null) return self.sendFile(ctx, s, budget);
         if (s.pending_end or s.pending_pos < s.pending.items.len) {
             const rest = s.pending.items[s.pending_pos..];
             const k = @min(rest.len, budget);
@@ -1566,6 +1586,44 @@ pub const Conn = struct {
             }
             if (!r.more) return;
         }
+    }
+
+    /// Reads the file body straight into DATA frames, as far as the
+    /// windows, `out_limit` and `budget` allow; END_STREAM on the last.
+    fn sendFile(self: *Self, ctx: anytype, s: *Stream, budget: usize) void {
+        const f = &s.file.?;
+        var sent: usize = 0;
+        while (f.len > 0) {
+            if (self.unsent() > self.opts.out_limit) return self.setBlocked(s, s.send_window > 0);
+            if (sent >= budget) return;
+            const window = @min(s.send_window, self.send_window);
+            const room = self.opts.out_limit + 2 * self.opts.max_frame_size -| self.unsent();
+            const max: usize = @intCast(@min(@as(u64, if (window > 0) @intCast(window) else 0), self.peer_max_frame_size, room -| frame.header_len, budget - sent, f.len));
+            if (max == 0) {
+                self.setBlocked(s, s.send_window > 0);
+                return self.noteStall(ctx, s, false);
+            }
+            const start = self.out.items.len;
+            self.out.ensureUnusedCapacity(self.allocator, frame.header_len + max) catch return self.fail(.internal_error);
+            self.out.items.len = start + frame.header_len + max;
+            const got = sys.pread(f.fd, self.out.items[start + frame.header_len ..][0..max], f.offset) catch 0;
+            if (got < max) {
+                // The file shrank: the response can't be completed.
+                self.out.items.len = start;
+                return self.resetStream(ctx, s, .internal_error);
+            }
+            f.offset += max;
+            f.len -= max;
+            sent += max;
+            frame.writeHeader(self.out.items[start..][0..frame.header_len], @intCast(max), .data, if (f.len == 0) frame.flag.end_stream else 0, s.id);
+            s.send_window -= @intCast(max);
+            self.send_window -= @intCast(max);
+            self.noteStall(ctx, s, true);
+        }
+        f.release();
+        s.file = null;
+        self.output_streams -= 1;
+        self.finishStream(ctx, s);
     }
 
     /// Sends what the WebSocket has queued as the windows allow. Once
@@ -1824,6 +1882,10 @@ const TestHandler = struct {
     /// WebSockets: the last one opened, and what the hooks saw.
     ws_conn: ?*ws.Conn = null,
     ws_log: std.ArrayList(u8) = .empty,
+    /// /file and /file-owned (a duplicate the connection closes).
+    file_fd: sys.fd_t = -1,
+    file_len: u64 = 0,
+    owned_fd: sys.fd_t = -1,
 
     pub fn handleWSConn(self: *TestHandler, conn: *ws.Conn) void {
         self.ws_conn = conn;
@@ -1903,6 +1965,15 @@ const TestHandler = struct {
             ws_upgrader.handleUpgrade(undefined, req, resp) catch {
                 resp.status = .bad_request;
             };
+            return;
+        }
+        if (std.mem.eql(u8, path, "/file")) {
+            resp.sendFile(.{ .fd = self.file_fd, .len = self.file_len });
+            return;
+        }
+        if (std.mem.eql(u8, path, "/file-owned")) {
+            self.owned_fd = @intCast(std.posix.system.dup(self.file_fd));
+            resp.sendFile(.{ .fd = self.owned_fd, .len = self.file_len, .close = true });
             return;
         }
         resp.addNewHeader("Content-Type", "text/plain") catch {};
@@ -3071,6 +3142,55 @@ test "output backpressure: process stops parsing above out_limit" {
     try testing.expectEqual(@as(usize, 5), std.mem.count(u8, h.events.items, "end=true"));
     try testing.expectEqual(@as(usize, 5 * 3000), 5 * 3000);
     try testing.expectEqual(@as(u32, 0), h.conn.activeStreams());
+}
+
+fn fdOpen(fd: sys.fd_t) bool {
+    return std.posix.errno(std.posix.system.fcntl(fd, std.posix.F.GETFD, @as(usize, 0))) != .BADF;
+}
+
+test "file bodies: DATA frames through the windows, HEAD, a reset closes the owned file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const file = try tmp.dir.createFile(io, "f", .{ .read = true });
+    defer file.close(io);
+    var content: [100_000]u8 = undefined;
+    for (&content, 0..) |*b, i| b.* = @truncate(i *% 7);
+    try file.writeStreamingAll(io, &content);
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    h.handler.file_fd = file.handle;
+    h.handler.file_len = content.len;
+    try h.preface();
+    h.events.clearRetainingCapacity();
+    // The client's windows (65535) hold the rest back.
+    try h.get(1, "/file");
+    try testing.expect(std.mem.startsWith(u8, h.events.items, "headers 1 end=false [:status=200] [content-length=100000] [date]\n"));
+    try expectData(h, "1:16384 1:16384 1:16384 1:16383");
+    try h.window(1, 100_000);
+    try h.window(0, 100_000);
+    try expectData(h, "1:16384 1:16384 1:1697!");
+    try testing.expectEqualSlices(u8, &content, h.data_out.items);
+    try testing.expectEqual(@as(u32, 0), h.conn.activeStreams());
+    // HEAD: the length only, and an owned file closed at once.
+    try h.headers(.{ .stream = 3, .fields = &.{
+        .{ .name = ":method", .value = "HEAD" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/file-owned" },
+    } });
+    try h.expectEvents("headers 3 end=true [:status=200] [content-length=100000] [date]\n");
+    try testing.expect(!fdOpen(h.handler.owned_fd));
+    // Reset by the client mid-file: closed too.
+    try h.get(5, "/file-owned");
+    try testing.expect(fdOpen(h.handler.owned_fd));
+    try h.rst(5, .cancel);
+    try testing.expect(!fdOpen(h.handler.owned_fd));
+    // Open at the end: closed with the connection.
+    try h.get(7, "/file-owned");
+    h.conn.abortAll(&h.ctx());
+    h.conn.deinit(&h.pool);
+    try testing.expect(!fdOpen(h.handler.owned_fd));
+    h.conn = try Conn.init(testing.allocator, .{});
 }
 
 /// A GET with an optional `priority` header, as frame bytes.

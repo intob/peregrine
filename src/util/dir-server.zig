@@ -2,24 +2,29 @@ const std = @import("std");
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
 const Mime = @import("./mime.zig").Mime;
+const Body = @import("./body.zig").Body;
 
 const Hit = struct {
-    contents: []u8,
+    body: Body,
     content_type: []const u8,
 };
 
 pub const DirServerConfig = struct {
     request_path: []const u8 = "/",
+    /// Files up to this size are held in memory; larger ones stay open
+    /// (one descriptor each) and are sent from the file.
+    memory_max: usize = 64 * 1024,
 };
 
-/// DirServer simply loads all files into memory on init. This
-/// prevents risk of OOM errors without unloading existing entries.
-/// Files are served without copying.
+/// DirServer opens every file under the directory on init: small ones are
+/// read into memory, large ones kept open. Nothing is reloaded, so memory
+/// use is fixed. Files are served without copying.
 pub const DirServer = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
     req_path: []const u8,
+    memory_max: usize,
     hits: std.ArrayList(*Hit),
     files: std.StringHashMap(*Hit),
 
@@ -28,6 +33,7 @@ pub const DirServer = struct {
         self.* = .{
             .allocator = allocator,
             .req_path = cfg.request_path,
+            .memory_max = cfg.memory_max,
             .hits = .empty,
             .files = std.StringHashMap(*Hit).init(allocator),
         };
@@ -52,7 +58,7 @@ pub const DirServer = struct {
         while (keys.next()) |k| self.allocator.free(k.*);
         self.files.deinit();
         for (self.hits.items) |hit| {
-            self.allocator.free(hit.contents);
+            hit.body.deinit(self.allocator);
             self.allocator.destroy(hit);
         }
         self.hits.deinit(self.allocator);
@@ -68,7 +74,7 @@ pub const DirServer = struct {
         const rel_path = path[self.req_path.len..];
         if (self.files.get(rel_path)) |hit| {
             try resp.addNewHeader("content-type", hit.content_type);
-            resp.setBodyBorrowed(hit.contents);
+            hit.body.serve(resp);
         } else {
             resp.status = .not_found;
         }
@@ -77,11 +83,12 @@ pub const DirServer = struct {
     fn loadEntry(self: *Self, io: std.Io, entry: std.Io.Dir.Walker.Entry) !void {
         const hit = try self.allocator.create(Hit);
         errdefer self.allocator.destroy(hit);
+        const file = try entry.dir.openFile(io, entry.basename, .{});
         hit.* = .{
-            .contents = try entry.dir.readFileAlloc(io, entry.basename, self.allocator, .unlimited),
+            .body = try Body.load(self.allocator, io, file, self.memory_max),
             .content_type = Mime.fromExtension(std.fs.path.extension(entry.basename)).toString(),
         };
-        errdefer self.allocator.free(hit.contents);
+        errdefer hit.body.deinit(self.allocator);
         try self.hits.append(self.allocator, hit);
         try self.putPath(entry.path, hit);
         if (std.mem.eql(u8, entry.basename, "index.html")) {

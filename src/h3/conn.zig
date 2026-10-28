@@ -30,6 +30,7 @@ const BufferPool = @import("../http/session.zig").BufferPool;
 const Request = @import("../request.zig").Request;
 const Header = @import("../header.zig").Header;
 const Response = @import("../response.zig").Response;
+const File = @import("../response.zig").File;
 const Status = @import("../status.zig").Status;
 const Fields = fields_mod.Fields;
 const ErrorCode = frame.ErrorCode;
@@ -143,8 +144,17 @@ const Stream = struct {
     prio: Priority = .{},
     /// A PRIORITY_UPDATE set `prio`: it overrides the header.
     prio_frame: bool = false,
+    /// A file body still to send (Response.sendFile), read into the
+    /// stream as its buffer drains.
+    file: ?File = null,
+
+    fn releaseFile(s: *Stream) void {
+        if (s.file) |f| f.release();
+        s.file = null;
+    }
 
     fn clear(s: *Stream) void {
+        s.releaseFile();
         s.fields.clear();
         s.* = .{ .fields = s.fields };
     }
@@ -194,7 +204,10 @@ pub const Conn = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        for (self.streams) |*s| s.fields.deinit(self.allocator);
+        for (self.streams) |*s| {
+            s.releaseFile();
+            s.fields.deinit(self.allocator);
+        }
         self.allocator.free(self.streams);
         self.allocator.free(self.idle_prio);
         self.decoder.deinit();
@@ -306,7 +319,9 @@ pub const Conn = struct {
                 },
                 .stream_writable => |slot| {
                     const s = &self.streams[slot];
-                    if (s.active and s.exchange != NIL) self.pumpStream(Handler, ctx, slot);
+                    if (s.active and s.file != null) {
+                        self.pumpFile(ctx, slot);
+                    } else if (s.active and s.exchange != NIL) self.pumpStream(Handler, ctx, slot);
                 },
             }
         }
@@ -775,6 +790,7 @@ pub const Conn = struct {
     fn endRequest(self: *Self, slot: u32, now_us: u64) void {
         const s = &self.streams[slot];
         if (!s.active) return;
+        s.releaseFile();
         s.responded = true;
         if (s.request) self.active_requests -= 1;
         s.active = false;
@@ -862,10 +878,50 @@ pub const Conn = struct {
         const resp = ctx.resp;
         const s = &self.streams[slot];
         const code = @backingInt(resp.status);
-        const has_body = !s.is_head and code >= 200 and code != 204 and code != 304 and resp.body.len > 0;
-        const content_length: ?usize = if (resp.status.allowsContentLength()) resp.body.len else null;
-        self.writeHead(ctx, slot, resp.status, resp.headerBytes(), content_length) catch return self.fail(.internal_error, "", ctx.now_us);
+        const body_len = resp.bodyLen();
+        const has_body = !s.is_head and code >= 200 and code != 204 and code != 304 and body_len > 0;
+        const content_length: ?usize = if (resp.status.allowsContentLength()) @intCast(body_len) else null;
+        const file = resp.takeFile();
+        self.writeHead(ctx, slot, resp.status, resp.headerBytes(), content_length) catch {
+            if (file) |f| f.release();
+            return self.fail(.internal_error, "", ctx.now_us);
+        };
+        if (file) |f| {
+            if (!has_body) {
+                f.release();
+                return self.finishResponse(ctx, slot);
+            }
+            s.file = f;
+            return self.pumpFile(ctx, slot);
+        }
         if (has_body) self.writeData(slot, resp.body) catch return self.fail(.internal_error, "", ctx.now_us);
+        self.finishResponse(ctx, slot);
+    }
+
+    /// Reads the file body into DATA frames in the stream, as far as its
+    /// buffer allows; FIN after the last.
+    fn pumpFile(self: *Self, ctx: anytype, slot: u32) void {
+        const q = self.quic;
+        const s = &self.streams[slot];
+        const f = &s.file.?;
+        while (f.len > 0) {
+            const buffered = q.streamBuffered(slot);
+            if (buffered >= self.opts.stream_buffer) return q.streamWantWritable(slot, self.opts.stream_buffer / 2);
+            const room: usize = @intCast(@min(self.opts.stream_buffer - buffered, 64 * 1024, f.len));
+            const buf = q.streamReserve(slot, 5 + room) catch return self.fail(.internal_error, "", ctx.now_us);
+            const got = sys.pread(f.fd, buf[5..][0..room], f.offset) catch 0;
+            if (got < room) {
+                // The file shrank: the response can't be completed.
+                q.resetSend(slot, @backingInt(ErrorCode.internal_error));
+                return self.endRequest(slot, ctx.now_us);
+            }
+            buf[0] = @backingInt(frame.FrameType.data);
+            _ = packet.writeVarintLen(buf[1..], room, 4);
+            q.streamCommit(slot, 5 + room);
+            f.offset += room;
+            f.len -= room;
+        }
+        s.releaseFile();
         self.finishResponse(ctx, slot);
     }
 
@@ -982,6 +1038,7 @@ pub const Conn = struct {
     pub fn abortAll(self: *Self, ctx: anytype) void {
         for (self.streams) |*s| {
             if (s.active) dropWebSocket(ctx, s);
+            s.releaseFile();
             if (s.active and s.exchange != NIL) {
                 abortExchange(ctx, s.exchange);
                 ctx.exchanges.release(s.exchange);

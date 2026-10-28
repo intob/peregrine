@@ -74,6 +74,90 @@ pub fn write(fd: fd_t, buf: []const u8) IoError!usize {
     }
 }
 
+pub const SendfileError = IoError || error{
+    /// This system or this file can't be sent with sendfile: read and
+    /// write it instead.
+    Unsupported,
+    /// The file ended before `count` bytes (it was truncated).
+    FileTruncated,
+};
+
+/// Tests set this to exercise the read-and-write fallback.
+pub var sendfile_disabled = false;
+
+/// Sends up to `count` bytes of `file` from `offset` to the socket `sock`
+/// without copying them through user space. Returns the bytes sent;
+/// error.WouldBlock only if none were.
+pub fn sendfile(sock: fd_t, file: fd_t, offset: u64, count: usize) SendfileError!usize {
+    if (count == 0) return 0;
+    if (sendfile_disabled) return error.Unsupported;
+    if (is_linux) {
+        while (true) {
+            var off: i64 = @intCast(offset);
+            const rc = linux.sendfile(sock, file, &off, count);
+            switch (posix.errno(rc)) {
+                .SUCCESS => return if (rc == 0) error.FileTruncated else rc,
+                .INTR => continue,
+                .AGAIN => return error.WouldBlock,
+                .CONNRESET, .PIPE, .TIMEDOUT, .NOTCONN => return error.ConnectionClosed,
+                .INVAL, .NOSYS, .OPNOTSUPP => return error.Unsupported,
+                else => |e| return unexpected(e),
+            }
+        }
+    }
+    switch (native_os) {
+        .macos => while (true) {
+            var len: std.c.off_t = @intCast(count);
+            const rc = std.c.sendfile(file, sock, @intCast(offset), &len, null, 0);
+            const sent: usize = @intCast(len);
+            switch (posix.errno(rc)) {
+                .SUCCESS => return if (sent == 0) error.FileTruncated else sent,
+                // Partial sends report what went out.
+                .INTR => if (sent > 0) return sent else continue,
+                .AGAIN => return if (sent > 0) sent else error.WouldBlock,
+                .CONNRESET, .PIPE, .TIMEDOUT, .NOTCONN => return error.ConnectionClosed,
+                .INVAL, .OPNOTSUPP, .NOTSOCK => return error.Unsupported,
+                else => |e| return unexpected(e),
+            }
+        },
+        .freebsd => while (true) {
+            var sbytes: std.c.off_t = 0;
+            const rc = std.c.sendfile(file, sock, @intCast(offset), count, null, &sbytes, 0);
+            const sent: usize = @intCast(sbytes);
+            switch (posix.errno(rc)) {
+                .SUCCESS => return if (sent == 0) error.FileTruncated else sent,
+                .INTR, .BUSY => if (sent > 0) return sent else continue,
+                .AGAIN => return if (sent > 0) sent else error.WouldBlock,
+                .CONNRESET, .PIPE, .TIMEDOUT, .NOTCONN => return error.ConnectionClosed,
+                .INVAL, .OPNOTSUPP, .NOTSOCK => return error.Unsupported,
+                else => |e| return unexpected(e),
+            }
+        },
+        else => return error.Unsupported,
+    }
+}
+
+pub const PreadError = error{ FileTruncated, Unexpected };
+
+/// Reads `buf.len` bytes of `file` at `offset` (fewer only at the end of
+/// the file, which is error.FileTruncated if nothing is left).
+pub fn pread(file: fd_t, buf: []u8, offset: u64) PreadError!usize {
+    if (buf.len == 0) return 0;
+    var done: usize = 0;
+    while (done < buf.len) {
+        const rc = system.pread(file, buf[done..].ptr, buf.len - done, @intCast(offset + done));
+        switch (posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return if (done == 0) error.FileTruncated else done;
+                done += @intCast(rc);
+            },
+            .INTR => continue,
+            else => |e| return unexpected(e),
+        }
+    }
+    return done;
+}
+
 pub fn close(fd: fd_t) void {
     _ = system.close(fd);
 }

@@ -41,6 +41,10 @@ const TestHandler = struct {
     /// WebSockets: the last one opened, and what the hooks saw.
     ws_conn: ?*ws.Conn = null,
     ws_log: std.ArrayList(u8) = .empty,
+    /// /file and /file-owned (a duplicate the connection closes).
+    file_fd: sys.fd_t = -1,
+    file_len: u64 = 0,
+    owned_fd: sys.fd_t = -1,
 
     pub fn handleWSConn(self: *TestHandler, conn: *ws.Conn) void {
         self.ws_conn = conn;
@@ -120,6 +124,15 @@ const TestHandler = struct {
             ws_upgrader.handleUpgrade(undefined, req, resp) catch {
                 resp.status = .bad_request;
             };
+            return;
+        }
+        if (std.mem.eql(u8, path, "/file")) {
+            resp.sendFile(.{ .fd = self.file_fd, .len = self.file_len });
+            return;
+        }
+        if (std.mem.eql(u8, path, "/file-owned")) {
+            self.owned_fd = @intCast(std.posix.system.dup(self.file_fd));
+            resp.sendFile(.{ .fd = self.owned_fd, .len = self.file_len, .close = true });
             return;
         }
         resp.addNewHeader("Content-Type", "text/plain") catch {};
@@ -936,6 +949,61 @@ test "HTTP/3: unknown stream types and frame types are ignored" {
     defer r.deinit();
     try testing.expectEqualStrings("Hello, World!", r.body.items);
     try testing.expect(h.client.closed == null);
+}
+
+fn fdOpen(fd: sys.fd_t) bool {
+    return std.posix.errno(std.posix.system.fcntl(fd, std.posix.F.GETFD, @as(usize, 0))) != .BADF;
+}
+
+test "HTTP/3: file bodies through a small stream buffer, HEAD, STOP_SENDING closes the owned file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const file = try tmp.dir.createFile(io, "f", .{ .read = true });
+    defer file.close(io);
+    const content = try testing.allocator.alloc(u8, 300_000);
+    defer testing.allocator.free(content);
+    for (content, 0..) |*b, i| b.* = @truncate(i *% 7);
+    try file.writeStreamingAll(io, content);
+    const h = try Harness.init();
+    defer h.deinit();
+    h.h3_opts.stream_buffer = 16 * 1024;
+    h.handler.file_fd = file.handle;
+    h.handler.file_len = content.len;
+    try h.startClient();
+    const id = try h.request("GET", "/file", &.{}, "");
+    const head = try h.request("HEAD", "/file-owned", &.{}, "");
+    try h.run(400);
+    {
+        var r = try h.response(id);
+        defer r.deinit();
+        try testing.expectEqualStrings("200", r.status.?);
+        try testing.expectEqualSlices(u8, content, r.body.items);
+        try testing.expect(h.client.finished(id));
+        var rh = try h.response(head);
+        defer rh.deinit();
+        try testing.expect(std.mem.indexOf(u8, rh.headers.items, "content-length=300000;") != null);
+        try testing.expectEqual(@as(usize, 0), rh.body.items.len);
+        try testing.expect(!fdOpen(h.handler.owned_fd));
+    }
+    // STOP_SENDING mid-file.
+    const stopped = try h.request("GET", "/file-owned", &.{}, "");
+    try h.run(3);
+    try testing.expect(fdOpen(h.handler.owned_fd));
+    var buf: [16]u8 = undefined;
+    var sw: packet.Writer = .{ .buf = &buf };
+    qframe.writeStopSending(&sw, stopped, 0x10c);
+    try h.client.injectFrames(sw.written());
+    try h.run(10);
+    try testing.expect(!fdOpen(h.handler.owned_fd));
+    // Open when the connection goes: closed with it.
+    _ = try h.request("GET", "/file-owned", &.{}, "");
+    try h.run(3);
+    try testing.expect(fdOpen(h.handler.owned_fd));
+    h.h3c.?.abortAll(&h.ctx());
+    h.h3c.?.deinit();
+    h.h3c = null;
+    try testing.expect(!fdOpen(h.handler.owned_fd));
 }
 
 /// A PRIORITY_UPDATE frame (RFC 9218 §7.2), for the control stream.

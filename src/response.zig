@@ -2,7 +2,22 @@ const std = @import("std");
 const Header = @import("./header.zig").Header;
 const Status = @import("./status.zig").Status;
 const exchange = @import("./http/exchange.zig");
+const sys = @import("./sys.zig");
 pub const Exchange = exchange.Exchange;
+
+/// A response body read from an open file (`Response.sendFile`).
+pub const File = struct {
+    fd: sys.fd_t,
+    offset: u64 = 0,
+    len: u64,
+    /// The server closes `fd` once the body is sent or abandoned.
+    close: bool = false,
+
+    /// Closes the file if the server owns it.
+    pub fn release(self: *const File) void {
+        if (self.close) sys.close(self.fd);
+    }
+};
 
 pub const Mode = enum(u8) {
     /// The response is complete when handleRequest returns.
@@ -33,6 +48,8 @@ pub const Response = struct {
     preset_len: usize = 0,
     /// The body to send. Set it with setBody (copies) or setBodyBorrowed.
     body: []const u8 = "",
+    /// A body from a file instead (sendFile).
+    file: ?File = null,
     body_buf: []u8,
     allocator: std.mem.Allocator,
     /// Set by later() and stream(); checked by the session once.
@@ -105,6 +122,20 @@ pub const Response = struct {
         self.body = buf;
     }
 
+    /// Sends `len` bytes of an open file, from `offset`, as the body. On
+    /// plaintext HTTP/1.1 (epoll, kqueue) the bytes go from the page cache
+    /// to the socket with sendfile(2); elsewhere they are read in chunks as
+    /// the connection takes them, so a large file is never held in memory.
+    /// The file must stay unchanged until it is sent. With `.close = true`
+    /// the server closes it then (or when the response is abandoned);
+    /// otherwise keep it open while any response may still be sending it,
+    /// for instance for the server's lifetime.
+    pub fn sendFile(self: *Self, file: File) void {
+        if (self.file) |f| f.release();
+        self.file = file;
+        self.body = "";
+    }
+
     /// Returns a slice of the response buffer to write a body into directly.
     /// Call commitBody with the number of bytes written.
     pub fn bodyWriteBuffer(self: *Self) []u8 {
@@ -170,8 +201,22 @@ pub const Response = struct {
         self.is_ws_upgrade = false;
         self.header_len = self.preset_len;
         self.body = "";
+        // A file nothing took (an exchange answered instead).
+        if (self.file) |f| f.release();
+        self.file = null;
         self.mode = .sync;
         self.content_length = null;
+    }
+
+    /// Takes the file body: the caller now closes it (`File.release`).
+    pub fn takeFile(self: *Self) ?File {
+        defer self.file = null;
+        return self.file;
+    }
+
+    /// The body's length, from a file or bytes.
+    pub fn bodyLen(self: *const Self) u64 {
+        return if (self.file) |f| f.len else self.body.len;
     }
 };
 

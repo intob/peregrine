@@ -22,6 +22,7 @@ const BufferPool = session.BufferPool;
 const Out = session.Out;
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
+const File = @import("../response.zig").File;
 const ws = @import("../ws/conn.zig");
 const WsConn = ws.Conn;
 const tls = @import("../tls/conn.zig");
@@ -51,6 +52,8 @@ const Op = enum(u8) {
     udp,
     /// The next QUIC timer.
     quic_timer,
+    /// The socket has room again, for a file body sent with sendfile.
+    write_ready,
 };
 
 inline fn userData(gen: u32, slot: u32, op: Op) u64 {
@@ -155,6 +158,8 @@ pub fn Worker(comptime Handler: type) type {
         pool: BufferPool,
         /// Per-connection output buffers.
         out_pool: BufferPool,
+        /// Where TLS reads file bodies to encrypt them.
+        file_buf: []u8,
         req: *Request,
         resp: *Response,
         date_line: [date.header_len]u8 = undefined,
@@ -204,6 +209,8 @@ pub fn Worker(comptime Handler: type) type {
             errdefer pool.deinit();
             var out_pool = try BufferPool.init(allocator, out_size, opts.buffer_pool_size);
             errdefer out_pool.deinit();
+            const file_buf = try allocator.alloc(u8, 16 * 1024);
+            errdefer allocator.free(file_buf);
             var tls_pools: ?tls.Pools = if (opts.tls != null) try tls.Pools.init(allocator, opts.tls_buffer_pool_size) else null;
             errdefer if (tls_pools) |*p| p.deinit();
             var seed: [std.Random.ChaCha.secret_seed_length]u8 = undefined;
@@ -225,6 +232,7 @@ pub fn Worker(comptime Handler: type) type {
                 .free_len = free_slots.len,
                 .pool = pool,
                 .out_pool = out_pool,
+                .file_buf = file_buf,
                 .req = req,
                 .resp = resp,
                 .now = sys.monotonicSeconds(),
@@ -295,6 +303,7 @@ pub fn Worker(comptime Handler: type) type {
             self.waker.deinit();
             self.pool.deinit();
             self.out_pool.deinit();
+            self.allocator.free(self.file_buf);
             self.req.deinit();
             self.resp.deinit();
             self.allocator.free(self.conns);
@@ -393,6 +402,12 @@ pub fn Worker(comptime Handler: type) type {
                 .recv => self.onRecv(c, cqe),
                 .recv_plain => self.onRecvPlain(c, cqe),
                 .write => if (c.ws != null) self.onWsWrite(c, cqe) else if (c.h2 != null) self.onH2Write(c, cqe) else self.onWrite(c, cqe),
+                .write_ready => {
+                    c.write_inflight = false;
+                    if (c.closing) return;
+                    if (cqe.res < 0) return self.closeConn(c);
+                    self.sendFile(c);
+                },
                 .cancel => {},
                 else => unreachable,
             }
@@ -735,6 +750,7 @@ pub fn Worker(comptime Handler: type) type {
                 c.borrowed = false;
             }
             c.session.deinit(&self.pool);
+            if (c.out.file) |f| f.release();
             if (c.out.buf.len > 0) self.out_pool.release(c.out.buf);
             c.out = .{ .buf = &.{} };
             if (c.out_body_owned.len > 0) self.allocator.free(c.out_body_owned);
@@ -924,7 +940,57 @@ pub fn Worker(comptime Handler: type) type {
             } else {
                 c.sent += @intCast(cqe.res);
                 if (c.sent < c.out.totalLen()) return self.submitWrite(c);
+                if (c.out.file != null) return self.sendFile(c);
             }
+            self.writeDone(c);
+        }
+
+        /// Sends the file body after the head with sendfile(2), straight
+        /// from this completion (the socket is non-blocking), waiting for
+        /// POLLOUT when the socket is full. Where sendfile doesn't work,
+        /// reads a buffer's worth into Out (written by now) and writes it.
+        fn sendFile(self: *Self, c: *Conn) void {
+            const f = &c.out.file.?;
+            var progressed = false;
+            while (f.len > 0) {
+                const count: usize = @intCast(@min(f.len, 1 << 30));
+                const n = sys.sendfile(c.fd, f.fd, f.offset, count) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        if (progressed) self.arm(c, .active);
+                        const sqe = self.getSqe();
+                        sqe.prep_poll_add(c.fd, linux.POLL.OUT);
+                        sqe.user_data = userData(c.gen, self.slotOf(c), .write_ready);
+                        c.write_inflight = true;
+                        c.inflight += 1;
+                        return;
+                    },
+                    error.Unsupported => {
+                        const chunk = c.out.buf[0..@intCast(@min(f.len, c.out.buf.len))];
+                        const got = sys.pread(f.fd, chunk, f.offset) catch 0;
+                        if (got < chunk.len) return self.closeConn(c);
+                        f.offset += got;
+                        f.len -= got;
+                        c.out.len = got;
+                        c.out.body = "";
+                        c.out.tail = "";
+                        c.sent = 0;
+                        return self.submitWrite(c);
+                    },
+                    // A connection error, or the file shrank.
+                    else => return self.closeConn(c),
+                };
+                f.offset += n;
+                f.len -= n;
+                progressed = true;
+            }
+            if (progressed) self.arm(c, .active);
+            f.release();
+            c.out.file = null;
+            self.writeDone(c);
+        }
+
+        /// The response in Out is all written: release it and carry on.
+        fn writeDone(self: *Self, c: *Conn) void {
             c.out.clear();
             c.sent = 0;
             if (c.out_body_owned.len > 0) {
@@ -1445,6 +1511,25 @@ pub fn Worker(comptime Handler: type) type {
                         self.closeConn(c);
                         return .closed;
                     };
+                } else if (c.out.file) |*f| {
+                    // A file body: a record's worth at a time.
+                    if (f.len == 0) {
+                        f.release();
+                        c.out.file = null;
+                    } else {
+                        const chunk = self.file_buf[0..@intCast(@min(f.len, self.file_buf.len))];
+                        const got = sys.pread(f.fd, chunk, f.offset) catch 0;
+                        if (got < chunk.len) {
+                            self.closeConn(c);
+                            return .closed;
+                        }
+                        const n = t.encrypt(&.{chunk}) catch {
+                            self.closeConn(c);
+                            return .closed;
+                        };
+                        f.offset += n;
+                        f.len -= n;
+                    }
                 }
             }
             if (!t.hasWire()) return .idle;

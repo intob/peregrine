@@ -11,6 +11,7 @@ const BufferPool = session.BufferPool;
 const Out = session.Out;
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
+const File = @import("../response.zig").File;
 const ws = @import("../ws/conn.zig");
 const WsConn = ws.Conn;
 const tls = @import("../tls/conn.zig");
@@ -29,6 +30,9 @@ const UDP_TOKEN: u64 = std.math.maxInt(u64) - 2;
 const NIL: u32 = std.math.maxInt(u32);
 /// Connections accepted per listener event, to stay fair to existing ones.
 const ACCEPT_BATCH = 64;
+/// File body bytes read at a time where sendfile isn't used (one TLS
+/// record).
+const file_chunk = 16 * 1024;
 
 pub const Options = struct {
     session: session.Options,
@@ -103,6 +107,9 @@ pub fn Worker(comptime Handler: type) type {
             pending_body: []const u8 = "",
             pending_body_owned: []u8 = &.{},
             pending_tail: []const u8 = "",
+            /// A file body still to send, after the plaintext above
+            /// (`offset` and `len` advance as it goes out).
+            pending_file: ?File = null,
             /// The exchange whose response this connection is waiting
             /// for or writing (a slot in the worker's slab), or NIL.
             exchange: u32 = NIL,
@@ -121,6 +128,10 @@ pub fn Worker(comptime Handler: type) type {
             }
 
             inline fn hasPendingPlain(c: *const Conn) bool {
+                return c.pendingBytes() or c.pending_file != null;
+            }
+
+            inline fn pendingBytes(c: *const Conn) bool {
                 return c.pending_head_pos < c.pending_head.len or c.pending_body.len > 0 or c.pending_tail.len > 0;
             }
         };
@@ -152,6 +163,9 @@ pub fn Worker(comptime Handler: type) type {
         resp: *Response,
         out: Out,
         out_buf: []u8,
+        /// Where file bodies are read when sendfile can't send them (TLS,
+        /// or a file it doesn't support).
+        file_buf: []u8,
         date_line: [date.header_len]u8 = undefined,
         now: u32,
         last_realtime: i64 = 0,
@@ -205,6 +219,8 @@ pub fn Worker(comptime Handler: type) type {
             if (opts.out_buffer_size < session.headRoom(resp)) return error.OutBufferTooSmall;
             const out_buf = try allocator.alloc(u8, opts.out_buffer_size);
             errdefer allocator.free(out_buf);
+            const file_buf = try allocator.alloc(u8, file_chunk);
+            errdefer allocator.free(file_buf);
             var tls_pools: ?tls.Pools = if (opts.tls != null) try tls.Pools.init(allocator, opts.tls_buffer_pool_size) else null;
             errdefer if (tls_pools) |*p| p.deinit();
             var seed: [std.Random.ChaCha.secret_seed_length]u8 = undefined;
@@ -229,6 +245,7 @@ pub fn Worker(comptime Handler: type) type {
                 .resp = resp,
                 .out_buf = out_buf,
                 .out = .{ .buf = out_buf },
+                .file_buf = file_buf,
                 .now = sys.monotonicSeconds(),
                 .idle = .{ .timeout = opts.keep_alive_timeout_s },
                 .active = .{ .timeout = opts.request_timeout_s },
@@ -283,6 +300,7 @@ pub fn Worker(comptime Handler: type) type {
             self.req.deinit();
             self.resp.deinit();
             self.allocator.free(self.out_buf);
+            self.allocator.free(self.file_buf);
             self.allocator.free(self.conns);
             self.allocator.free(self.free_slots);
             if (self.tls_pools) |*p| p.deinit();
@@ -611,6 +629,8 @@ pub fn Worker(comptime Handler: type) type {
             c.pending_body = "";
             c.pending_body_owned = &.{};
             c.pending_tail = "";
+            if (c.pending_file) |f| f.release();
+            c.pending_file = null;
             if (c.release) |r| {
                 r.call();
                 c.release = null;
@@ -1074,13 +1094,19 @@ pub fn Worker(comptime Handler: type) type {
             const n = sys.writev(c.fd, self.out.iovecs(&iov)) catch |err| switch (err) {
                 error.WouldBlock => 0,
                 else => {
+                    if (self.out.file) |f| f.release();
                     self.out.clear();
                     self.closeConn(c);
                     return false;
                 },
             };
             if (n == total) {
+                const file = self.out.file;
                 self.out.clear();
+                if (file) |f| {
+                    c.pending_file = f;
+                    return self.writeFile(c) != null;
+                }
                 return true;
             }
             self.savePending(c, n) catch {
@@ -1094,6 +1120,9 @@ pub fn Worker(comptime Handler: type) type {
 
         fn savePending(self: *Self, c: *Conn, written: usize) !void {
             const out = &self.out;
+            // Whatever happens next, the connection owns the file now.
+            c.pending_file = out.file;
+            out.file = null;
             if (written < out.len) {
                 c.pending_head = try self.allocator.dupe(u8, out.buf[written..out.len]);
                 c.pending_head_pos = 0;
@@ -1169,15 +1198,63 @@ pub fn Worker(comptime Handler: type) type {
                 iov[iov_len] = .{ .base = c.pending_tail.ptr, .len = c.pending_tail.len };
                 iov_len += 1;
             }
-            const n = sys.writev(c.fd, iov[0..iov_len]) catch |err| switch (err) {
-                error.WouldBlock => return false,
-                else => {
-                    self.closeConn(c);
-                    return null;
-                },
-            };
-            advancePending(c, n);
-            return n > 0;
+            var n: usize = 0;
+            if (iov_len > 0) {
+                n = sys.writev(c.fd, iov[0..iov_len]) catch |err| switch (err) {
+                    error.WouldBlock => return false,
+                    else => {
+                        self.closeConn(c);
+                        return null;
+                    },
+                };
+                advancePending(c, n);
+                if (c.pendingBytes()) return n > 0;
+            }
+            const file_progress = self.writeFile(c) orelse return null;
+            return n > 0 or file_progress;
+        }
+
+        /// Sends the pending file body until it is done or the socket is
+        /// full: sendfile(2), or read and write where it isn't supported.
+        /// Returns whether bytes were written, or null if the connection
+        /// was closed.
+        fn writeFile(self: *Self, c: *Conn) ?bool {
+            var progressed = false;
+            while (c.pending_file) |*f| {
+                if (f.len == 0) {
+                    f.release();
+                    c.pending_file = null;
+                    break;
+                }
+                const count: usize = @intCast(@min(f.len, 1 << 30));
+                const n = sys.sendfile(c.fd, f.fd, f.offset, count) catch |err| switch (err) {
+                    error.WouldBlock => return progressed,
+                    error.Unsupported => self.writeFileCopy(c, f) catch |e| switch (e) {
+                        error.WouldBlock => return progressed,
+                        else => {
+                            self.closeConn(c);
+                            return null;
+                        },
+                    },
+                    else => {
+                        // A connection error, or the file shrank: the
+                        // response can't be completed.
+                        self.closeConn(c);
+                        return null;
+                    },
+                };
+                f.offset += n;
+                f.len -= n;
+                progressed = true;
+            }
+            return progressed;
+        }
+
+        fn writeFileCopy(self: *Self, c: *Conn, f: *const File) !usize {
+            const chunk = self.file_buf[0..@intCast(@min(f.len, self.file_buf.len))];
+            const got = try sys.pread(f.fd, chunk, f.offset);
+            if (got < chunk.len) return error.FileTruncated;
+            return sys.write(c.fd, chunk);
         }
 
         fn advancePending(c: *Conn, n: usize) void {
@@ -1275,11 +1352,14 @@ pub fn Worker(comptime Handler: type) type {
                 if (self.tlsFlush(c, t) == null) return false;
                 if (consumed == total or t.hasWire()) break;
             }
-            if (consumed < total) {
+            if (consumed < total or out.file != null) {
                 self.savePending(c, consumed) catch {
                     self.closeConn(c);
                     return false;
                 };
+                // A file body follows the head: encrypt it as the socket
+                // takes it.
+                if (consumed == total and !t.hasWire()) return self.tlsWritePending(c, t) != null;
             }
             return true;
         }
@@ -1290,6 +1370,28 @@ pub fn Worker(comptime Handler: type) type {
             while (true) {
                 progressed = (self.tlsFlush(c, t) orelse return null) or progressed;
                 if (t.hasWire() or !c.hasPendingPlain()) return progressed;
+                if (!c.pendingBytes()) {
+                    // The file body: a record's worth at a time.
+                    const f = &c.pending_file.?;
+                    if (f.len == 0) {
+                        f.release();
+                        c.pending_file = null;
+                        continue;
+                    }
+                    const chunk = self.file_buf[0..@intCast(@min(f.len, self.file_buf.len))];
+                    const got = sys.pread(f.fd, chunk, f.offset) catch 0;
+                    if (got < chunk.len) {
+                        self.closeConn(c);
+                        return null;
+                    }
+                    const consumed = t.encrypt(&.{chunk}) catch {
+                        self.closeConn(c);
+                        return null;
+                    };
+                    f.offset += consumed;
+                    f.len -= consumed;
+                    continue;
+                }
                 const consumed = t.encrypt(&.{ c.pending_head[c.pending_head_pos..], c.pending_body, c.pending_tail }) catch {
                     self.closeConn(c);
                     return null;

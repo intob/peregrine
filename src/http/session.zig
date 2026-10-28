@@ -7,6 +7,7 @@ const parser = @import("./parser.zig");
 const date = @import("./date.zig");
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
+const File = @import("../response.zig").File;
 const Status = @import("../status.zig").Status;
 const Header = @import("../header.zig").Header;
 const exchange = @import("./exchange.zig");
@@ -70,15 +71,20 @@ pub const Out = struct {
     /// Sent after the body: the CRLF that ends a chunk of a streamed
     /// response whose bytes are borrowed.
     tail: []const u8 = "",
+    /// A file body, sent after the head (with nothing in `body`). Whoever
+    /// writes it closes it (`File.release`).
+    file: ?File = null,
 
     pub inline fn isEmpty(self: *const Out) bool {
-        return self.len == 0 and self.body.len == 0;
+        return self.len == 0 and self.body.len == 0 and self.file == null;
     }
 
+    /// The file, if any, has been taken by the writer.
     pub inline fn clear(self: *Out) void {
         self.len = 0;
         self.body = "";
         self.tail = "";
+        self.file = null;
     }
 
     pub inline fn totalLen(self: *const Out) usize {
@@ -298,7 +304,7 @@ pub fn process(comptime Handler: type, s: *Session, ctx: *const Context(Handler)
         // and Out must have room for the largest possible response head.
         // Checked before parsing: chunked bodies are decoded in place, so a
         // request must not be parsed twice.
-        if (out.body.len > 0) return .flush;
+        if (out.body.len > 0 or out.file != null) return .flush;
         if (out.len > 0 and out.free() < headRoom(ctx.resp)) return .flush;
         var data = s.buf[s.start..s.end];
         if (s.head_scan == 0) {
@@ -563,7 +569,7 @@ fn writeResponse(
     const send_body = req.method != .HEAD and code >= 200 and code != 204 and code != 304;
     if (resp.status.allowsContentLength() and !resp.is_ws_upgrade) {
         out.append("content-length: ");
-        out.len += std.fmt.printInt(out.buf[out.len..], resp.body.len, 10, .lower, .{});
+        out.len += std.fmt.printInt(out.buf[out.len..], resp.bodyLen(), 10, .lower, .{});
         out.append("\r\n");
     }
     out.append(date_line);
@@ -575,6 +581,10 @@ fn writeResponse(
         out.append("connection: keep-alive\r\n");
     }
     out.append("\r\n");
+    if (resp.takeFile()) |f| {
+        if (send_body and f.len > 0) out.file = f else f.release();
+        return;
+    }
     if (!send_body or resp.body.len == 0) return;
     if (more and resp.body.len <= out.free()) {
         // More pipelined requests follow and the response object will be
@@ -674,6 +684,11 @@ fn HarnessFor(comptime H: type) type {
             try h.written.appendSlice(testing.allocator, h.out.buf[0..h.out.len]);
             try h.written.appendSlice(testing.allocator, h.out.body);
             try h.written.appendSlice(testing.allocator, h.out.tail);
+            if (h.out.file) |f| {
+                defer f.release();
+                const dst = try h.written.addManyAsSlice(testing.allocator, @intCast(f.len));
+                try testing.expectEqual(dst.len, try sys.pread(f.fd, dst, f.offset));
+            }
             h.out.clear();
         }
 
@@ -744,6 +759,67 @@ fn HarnessFor(comptime H: type) type {
 }
 
 const DATE = "date: Sun, 06 Nov 1994 08:49:37 GMT\r\n";
+
+fn dupFd(fd: sys.fd_t) sys.fd_t {
+    return @intCast(std.posix.system.dup(fd));
+}
+
+fn isOpen(fd: sys.fd_t) bool {
+    return std.posix.errno(std.posix.system.fcntl(fd, std.posix.F.GETFD, @as(usize, 0))) != .BADF;
+}
+
+const FileHandler = struct {
+    fd: sys.fd_t = -1,
+    owned: [4]sys.fd_t = @splat(-1),
+    owned_len: usize = 0,
+
+    pub fn handleRequest(self: *FileHandler, req: *Request, resp: *Response) void {
+        const path = req.getPath();
+        // /file: bytes 2..12 of the file; /owned: a duplicate the server
+        // closes.
+        if (std.mem.eql(u8, path, "/file")) {
+            resp.sendFile(.{ .fd = self.fd, .offset = 2, .len = 10 });
+        } else if (std.mem.startsWith(u8, path, "/owned")) {
+            const dup = dupFd(self.fd);
+            self.owned[self.owned_len] = dup;
+            self.owned_len += 1;
+            resp.sendFile(.{ .fd = dup, .len = 4, .close = true });
+            // Replaced by bytes: the file is released at once.
+            if (std.mem.eql(u8, path, "/owned-replaced")) resp.sendFile(.{ .fd = dupFd(self.fd), .len = 1, .close = true });
+        } else {
+            resp.setBodyBorrowed("hi");
+        }
+    }
+};
+
+test "file bodies: a range, HEAD, pipelined, owned files closed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const file = try tmp.dir.createFile(io, "body", .{ .read = true });
+    defer file.close(io);
+    try file.writeStreamingAll(io, "0123456789abcdef");
+    const h = try HarnessFor(FileHandler).init(.{}, 4096, 4096);
+    defer h.deinit();
+    h.handler.fd = file.handle;
+    // Pipelined: the file body ends one write; the next response follows.
+    try h.feed("GET /file HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\nHEAD /file HTTP/1.1\r\nHost: x\r\n\r\n" ++
+        "GET /owned HTTP/1.1\r\nHost: x\r\n\r\nHEAD /owned HTTP/1.1\r\nHost: x\r\n\r\nGET /owned-replaced HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\ncontent-length: 10\r\n" ++ DATE ++ "\r\n23456789ab" ++
+            "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n" ++ DATE ++ "\r\nhi" ++
+            "HTTP/1.1 200 OK\r\ncontent-length: 10\r\n" ++ DATE ++ "\r\n" ++
+            "HTTP/1.1 200 OK\r\ncontent-length: 4\r\n" ++ DATE ++ "\r\n0123" ++
+            "HTTP/1.1 200 OK\r\ncontent-length: 4\r\n" ++ DATE ++ "\r\n" ++
+            "HTTP/1.1 200 OK\r\ncontent-length: 1\r\n" ++ DATE ++ "\r\n0",
+        h.written.items,
+    );
+    try testing.expect(h.resp.file == null);
+    // Owned files are closed once sent, not sent (HEAD) or replaced.
+    try testing.expectEqual(@as(usize, 3), h.handler.owned_len);
+    for (h.handler.owned[0..3]) |fd| try testing.expect(!isOpen(fd));
+    try testing.expect(isOpen(file.handle));
+}
 
 test "single request" {
     const h = try Harness.init(.{}, 4096, 4096);

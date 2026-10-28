@@ -52,7 +52,7 @@ Design rules that apply to every layer:
 | Milestone | State |
 |---|---|
 | M1. HTTP/1.1 core | ✅ done (streaming responses landed with the M5 handler API) |
-| M2. Throughput architecture | 🟡 io_uring works (opt-in, not yet faster than epoll); sendfile, NUMA open |
+| M2. Throughput architecture | 🟡 io_uring works (opt-in, not yet faster than epoll); sendfile done (plaintext; TLS needs kTLS); NUMA open |
 | M3. WebSockets over HTTP/1.1 | ✅ reworked; permessage-deflate, Autobahn, benchmarks open |
 | M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; faster handshakes, resumption and kTLS are listed under "Later in M4" |
 | M5. HTTP/2 | ✅ h2 over TLS (ALPN) and h2c on every backend, h2spec 146/146 over TLS, fuzzed, benchmarked; streamed request bodies on every protocol; WebSockets over h2 (RFC 8441); RFC 9218 priorities |
@@ -159,7 +159,34 @@ end-to-end test pipelines 8 MB + 1 MB responses to a slow reader.
 - [x] Workers pinned to cores (`pin_workers`, respects the allowed CPU set)
 - [x] Zero-copy bodies (`setBodyBorrowed`), format-in-place (`bodyWriteBuffer` /
       `commitBody`), status line + headers + body in at most two iovecs
-- [ ] `sendfile`/`splice` for file bodies (plaintext only; over TLS needs kTLS, M4)
+- [x] **File bodies and sendfile**: `resp.sendFile(.{ fd, offset, len, close })`
+      (`close`: the server closes the file once sent, or when the response is
+      abandoned: HEAD, a reset, the connection closing, an exchange taken
+      instead). Plaintext HTTP/1.1 sends the head, then sendfile(2) until done
+      or EAGAIN (epoll/kqueue: the rest on the next writability edge;
+      io_uring: straight from the write completion, the socket being
+      non-blocking, with a one-shot POLLOUT poll when it is full). Where
+      sendfile isn't supported (some BSDs, files it refuses) the file is
+      read and written a buffer at a time. Over TLS (until kTLS), HTTP/2
+      (DATA frames read straight into the output, within the windows and
+      the priority scheduler's budget) and HTTP/3 (into the QUIC stream up
+      to `stream_buffer`) the file is read with pread as the connection takes
+      it. A file that ends before its length closes the connection (h2/h3:
+      resets the stream). `util.FileServer` and `util.DirServer` keep files
+      up to `memory_max` (64 KiB) in memory and larger ones open. Proof:
+      session tests (a range, HEAD, pipelining, owned files closed in every
+      case), h2 tests (DATA through the windows, HEAD, a reset, teardown),
+      h3 tests (300 KB through a 16 KB stream buffer, HEAD, STOP_SENDING,
+      teardown), end-to-end on every backend over HTTP/1.1 with and without
+      sendfile, TLS, h2c and HTTP/3 (8 MB, pipelined, read slowly, a
+      truncated file); curl gets the identical 1 MiB over HTTP/1.1, TLS,
+      h2, h2c and HTTP/3 on epoll and io_uring. Benchmark (Docker on the M2
+      Pro, server on CPUs 0-3 with 4 workers, `wrk -t4 -c64` on 6-11, two
+      rounds, host load ~6): 1 MiB from memory 104-105 µs server CPU per
+      request (35K req/s), from the file 78-86 µs (36-39K req/s), on both
+      epoll and io_uring; 64 KiB 10-11 µs from memory, 13-14 µs from the
+      file (two syscalls instead of one writev), hence the 64 KiB threshold
+      in the file servers. Not done: over TLS this needs kTLS (M4)
 - [ ] NUMA-local allocation
 - [ ] UDP fast path for QUIC (M6): `recvmmsg`/`sendmmsg`, `UDP_SEGMENT` (GSO) and
       `UDP_GRO`, io_uring equivalents
@@ -466,8 +493,11 @@ Later in M4:
       HTTP/3 end-to-end tests receive one ticket. Interop on Linux: OpenSSL
       3.5 `s_client -sess_out/-sess_in` resumes ("Reused") with
       X25519MLKEM768, X25519 and P-256; aioquic 1.3 resumes over HTTP/3
-      (io_uring). Not fuzzed yet: the TLS fuzz target runs without tickets
-      (the ClientHello parsing is fuzzed, the PSK choice isn't)
+      (io_uring). The TLS fuzz target (25 min on Linux, ReleaseSafe, 6
+      instances: about 2.6M runs, 444 corpus inputs, no failures, after a
+      harness fix in 110b869) covers the new handshake code and the
+      pre_shared_key parsing, but runs without tickets, so the PSK choice
+      itself isn't fuzzed
 - [ ] 0-RTT (early data): needs replay protection (a single-use ticket
       store or strike register) and the 0-RTT keys in both transports
 - [ ] Several certificates selected by SNI; OCSP stapling

@@ -90,7 +90,7 @@ Note that these benchmarks simply measure serving static GET requests, and they 
 - Vectored IO: pipelined responses go out in a single `writev`
 - Zero heap allocations per-request
 - Read buffers are pooled and only held while a connection has unprocessed bytes, so idle keep-alive connections use no buffer memory
-- Zero-copy response bodies with `setBodyBorrowed`
+- Zero-copy response bodies with `setBodyBorrowed`, and from files with `sendFile` (sendfile(2) on plaintext HTTP/1.1; `util.FileServer` and `util.DirServer` keep large files open and use it)
 - `Date` header formatted once per second, not per request
 - Timeouts without a syscall per connection (deadline-ordered intrusive lists)
 - Linux: `TCP_DEFER_ACCEPT` plus reading straight after accept
@@ -287,6 +287,7 @@ Response headers are copied as they are added, so their values can be freed stra
 - `setBody(buf)` copies into the worker's response buffer (`response_body_buffer_size`).
 - `bodyWriteBuffer()` + `commitBody(len)` let you format straight into that buffer.
 - `setBodyBorrowed(buf)` sends `buf` without copying. It must stay valid and unchanged until the response is sent, so use it for static or cached content.
+- `sendFile(.{ .fd = fd, .offset = 0, .len = n })` sends part of an open file. On plaintext HTTP/1.1 (every backend) the kernel sends it with sendfile(2), so it never passes through user space: for a 1 MiB file that is about 20% less server CPU than the same body from memory; below about 64 KiB memory is cheaper. Over TLS, HTTP/2 and HTTP/3 it is read in chunks as the connection takes them, so a large file is never held in memory. With `.close = true` the server closes the file once it is sent (or the response is abandoned); otherwise keep it open for as long as responses may still be sending it.
 
 ### Handler responsibilities
 - Handlers own and manage their internal memory

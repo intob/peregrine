@@ -20,6 +20,18 @@ const testing = std.testing;
 
 const big_body_len = 8 * 1024 * 1024;
 var big_body: [big_body_len]u8 = undefined;
+/// A file holding big_body, for the /file paths (see testFiles).
+var test_file_fd: sys.fd_t = -1;
+/// The last owned duplicate of it handed to the server.
+var last_owned_fd = std.atomic.Value(sys.fd_t).init(-1);
+
+fn dupFd(fd: sys.fd_t) sys.fd_t {
+    return @intCast(std.posix.system.dup(fd));
+}
+
+fn isOpen(fd: sys.fd_t) bool {
+    return std.posix.errno(std.posix.system.fcntl(fd, std.posix.F.GETFD, @as(usize, 0))) != .BADF;
+}
 
 const TestHandler = struct {
     allocator: std.mem.Allocator,
@@ -261,6 +273,22 @@ const TestHandler = struct {
         if (std.mem.eql(u8, path, "/hang")) {
             // Never answered: the client leaves, or the timeout ends it.
             _ = resp.later() catch unreachable;
+            return;
+        }
+        if (std.mem.startsWith(u8, path, "/file")) {
+            // big_body from a file: whole, a range, an owned duplicate, or
+            // a length past the end (the file "shrank").
+            if (std.mem.eql(u8, path, "/file-range")) {
+                resp.sendFile(.{ .fd = test_file_fd, .offset = 1000, .len = 5000 });
+            } else if (std.mem.eql(u8, path, "/file-owned")) {
+                const fd = dupFd(test_file_fd);
+                last_owned_fd.store(fd, .release);
+                resp.sendFile(.{ .fd = fd, .len = big_body_len, .close = true });
+            } else if (std.mem.eql(u8, path, "/file-truncated")) {
+                resp.sendFile(.{ .fd = test_file_fd, .len = big_body_len + 10 });
+            } else {
+                resp.sendFile(.{ .fd = test_file_fd, .len = big_body_len });
+            }
             return;
         }
         if (std.mem.eql(u8, path, "/ws")) {
@@ -643,6 +671,97 @@ fn testLargeResponses(backend: Backend) !void {
     try c2.send("GET /other HTTP/1.1\r\nHost: x\r\n\r\n");
     res = try c2.readResponse(&head, null);
     try testing.expectEqual(@as(u16, 200), res.status);
+}
+
+test "file bodies: sendfile on HTTP/1.1, and over TLS, h2c and HTTP/3" {
+    try forEachBackend(testFiles);
+}
+
+fn testFiles(backend: Backend) !void {
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const file = try tmp.dir.createFile(io, "big", .{ .read = true });
+    defer file.close(io);
+    try file.writeStreamingAll(io, &big_body);
+    test_file_fd = file.handle;
+    defer test_file_fd = -1;
+    const got = try testing.allocator.alloc(u8, big_body_len);
+    defer testing.allocator.free(got);
+    var head: [4096]u8 = undefined;
+    // HTTP/1.1 with sendfile, then with its read-and-write fallback.
+    for ([_]bool{ false, true }) |no_sendfile| {
+        sys.sendfile_disabled = no_sendfile;
+        defer sys.sendfile_disabled = false;
+        // HTTP/1.1, pipelined and read slowly: the socket fills mid-file.
+        const r = try Running.start(backend, h2Config());
+        defer r.stop();
+        var c = try Client.connect(r.port);
+        defer c.close();
+        try c.send("GET /file HTTP/1.1\r\nHost: x\r\n\r\nGET /file-range HTTP/1.1\r\nHost: x\r\n\r\n" ++
+            "HEAD /file HTTP/1.1\r\nHost: x\r\n\r\nGET /file-owned HTTP/1.1\r\nHost: x\r\n\r\nGET /end HTTP/1.1\r\nHost: x\r\n\r\n");
+        sleepMs(50);
+        var res = try c.readResponse(&head, got);
+        try testing.expectEqual(@as(usize, big_body_len), res.body_len);
+        try testing.expect(std.mem.eql(u8, &big_body, got));
+        res = try c.readResponse(&head, got);
+        try testing.expectEqualSlices(u8, big_body[1000..6000], got[0..res.body_len]);
+        // HEAD: the length, no body.
+        const head_res = try c.readHead(&head);
+        try testing.expect(std.mem.indexOf(u8, head_res, "content-length: 8388608\r\n") != null);
+        res = try c.readResponse(&head, got);
+        try testing.expectEqual(@as(usize, big_body_len), res.body_len);
+        try testing.expect(std.mem.eql(u8, &big_body, got));
+        res = try c.readResponse(&head, null);
+        try testing.expect(std.mem.indexOf(u8, res.head, "x-path: /end\r\n") != null);
+        // The owned file was closed once sent.
+        var tries: usize = 0;
+        while (isOpen(last_owned_fd.load(.acquire)) and tries < 100) : (tries += 1) sleepMs(10);
+        try testing.expect(!isOpen(last_owned_fd.load(.acquire)));
+        // A file shorter than its length: the connection closes mid-body.
+        var c2 = try Client.connect(r.port);
+        defer c2.close();
+        try c2.send("GET /file-truncated HTTP/1.1\r\nHost: x\r\n\r\n");
+        if (c2.readResponse(&head, got)) |_| return error.TestUnexpectedResult else |_| {}
+
+        // h2c.
+        const h = try H2Client.connect(r.port);
+        defer h.close();
+        var reply: H2Client.Reply = .{};
+        defer reply.deinit();
+        try h.fetch(1, "GET", "/file", null, &reply);
+        try testing.expectEqual(@as(u16, 200), reply.status);
+        try testing.expect(std.mem.eql(u8, &big_body, reply.body.items));
+        var range: H2Client.Reply = .{};
+        defer range.deinit();
+        try h.fetch(3, "GET", "/file-range", null, &range);
+        try testing.expectEqualSlices(u8, big_body[1000..6000], range.body.items);
+    }
+    {
+        // TLS (read and encrypted) and HTTP/3.
+        var cfg = tlsConfig();
+        cfg.http3 = .{};
+        const r = try Running.start(backend, cfg);
+        defer r.stop();
+        const c = try TlsClient.connect(r.port);
+        defer c.close();
+        try c.send("GET /file HTTP/1.1\r\nHost: x\r\n\r\nGET /file-range HTTP/1.1\r\nHost: x\r\n\r\n");
+        var res = try c.readResponse(got);
+        try testing.expectEqual(@as(usize, big_body_len), res.body_len);
+        try testing.expect(std.mem.eql(u8, &big_body, got));
+        res = try c.readResponse(got);
+        try testing.expectEqualSlices(u8, big_body[1000..6000], got[0..res.body_len]);
+
+        var h3 = try H3Client.connect(r.srv.getQuicPort());
+        defer h3.close();
+        try h3.start();
+        const id = try h3.request("GET", "/file-range", "");
+        try h3.waitFinished(&.{id});
+        var a = try h3.response(id);
+        defer a.body.deinit(testing.allocator);
+        try testing.expectEqualSlices(u8, big_body[1000..6000], a.body.items);
+    }
 }
 
 test "malformed requests get an error and close" {

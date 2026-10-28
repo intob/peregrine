@@ -1,7 +1,9 @@
 //! Benchmark server. Every path answers "Hello, World!" (TechEmpower
-//! plaintext) except `/64k`, a 64 KiB body (four full TLS records), and
-//! `/ws`, a WebSocket echo (HTTP/1.1 Upgrade, or extended CONNECT on HTTP/2
-//! and HTTP/3); request bodies are read and discarded.
+//! plaintext) except `/64k`, a 64 KiB body (four full TLS records), `/1m`
+//! (1 MiB), the same two from a file (`/64k-file`, `/1m-file`: sendfile on
+//! plaintext HTTP/1.1), and `/ws`, a WebSocket echo (HTTP/1.1 Upgrade, or
+//! extended CONNECT on HTTP/2 and HTTP/3); request bodies are read and
+//! discarded.
 //! Usage: bench-server [workers] [auto|epoll|io_uring] [port] [tls|h3|plain] [stream] [rsa]
 //! With `tls`, serves TLS 1.3 with the self-signed P-256 certificate in
 //! this directory (`rsa`: the RSA-2048 one), with ALPN "h2" and
@@ -13,16 +15,30 @@
 const std = @import("std");
 const per = @import("peregrine");
 
-const big_body: [64 * 1024]u8 = @splat('x');
+const big_body: [1024 * 1024]u8 = @splat('x');
 
 const Handler = struct {
+    /// A file holding big_body (in the temporary directory).
+    file: std.Io.File,
+
     pub fn init(allocator: std.mem.Allocator) !*Handler {
-        return try allocator.create(Handler);
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        const dir = std.Io.Dir.cwd();
+        const path = "/tmp/peregrine-bench-body";
+        const file = try dir.createFile(io, path, .{ .read = true });
+        errdefer file.close(io);
+        try file.writeStreamingAll(io, &big_body);
+        dir.deleteFile(io, path) catch {};
+        const h = try allocator.create(Handler);
+        h.* = .{ .file = file };
+        return h;
     }
 
     pub fn deinit(_: *Handler) void {}
 
-    pub fn handleRequest(_: *Handler, req: *per.Request, resp: *per.Response) void {
+    pub fn handleRequest(self: *Handler, req: *per.Request, resp: *per.Response) void {
         if (std.mem.eql(u8, req.getPath(), "/ws")) {
             per.ws.upgrader.handleUpgrade(undefined, req, resp) catch {
                 resp.status = .bad_request;
@@ -30,8 +46,15 @@ const Handler = struct {
             return;
         }
         resp.addNewHeader("content-type", "text/plain") catch {};
-        if (std.mem.eql(u8, req.getPath(), "/64k")) {
+        const path = req.getPath();
+        if (std.mem.eql(u8, path, "/64k")) {
+            resp.setBodyBorrowed(big_body[0 .. 64 * 1024]);
+        } else if (std.mem.eql(u8, path, "/1m")) {
             resp.setBodyBorrowed(&big_body);
+        } else if (std.mem.eql(u8, path, "/64k-file")) {
+            resp.sendFile(.{ .fd = self.file.handle, .len = 64 * 1024 });
+        } else if (std.mem.eql(u8, path, "/1m-file")) {
+            resp.sendFile(.{ .fd = self.file.handle, .len = big_body.len });
         } else {
             resp.setBodyBorrowed("Hello, World!");
         }

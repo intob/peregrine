@@ -80,6 +80,7 @@ test {
     _ = @import("./h3/conn_test.zig");
     _ = @import("./http/fields.zig");
     _ = @import("./http/priority.zig");
+    _ = @import("./util/file-server.zig");
     _ = @import("./server_test.zig");
     @import("std").testing.refAllDecls(@This());
 }
