@@ -580,7 +580,9 @@ pub const Conn = struct {
     pub fn process(self: *Self, comptime Handler: type, ctx: *const Context(Handler)) Action {
         self.refreshBudgets(ctx.now);
         while (true) {
-            if (self.failed) return .close;
+            // After a GOAWAY with no streams left, the rest of the input is
+            // not read, however it was split.
+            if (self.wantsClose()) return .close;
             if (self.unsent() > self.opts.out_limit) return .flush;
             if (self.state == .preface) {
                 const data = self.reader.buf[self.reader.start..self.reader.end];
@@ -3642,5 +3644,7 @@ test "fuzz: h2 connection" {
         script[frame.preface.len + frame.header_len ..],
         &[_]u8{ 0, 0, 5, 1, 5, 0, 0, 0, 1, 0x82, 0x87, 0x84, 0x41, 0x00 },
         &[_]u8{ 0, 0, 8, 6, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8 },
+        // Found by the fuzzer.
+        @embedFile("testdata/fuzz/split-1.bin"),
     } });
 }
