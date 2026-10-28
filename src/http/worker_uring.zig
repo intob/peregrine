@@ -69,9 +69,69 @@ pub fn available() bool {
     var ring = IoUring.init(8, 0) catch return false;
     defer ring.deinit();
     const probe = ring.get_probe() catch return false;
-    return probe.is_supported(.ACCEPT) and probe.is_supported(.RECV) and
+    if (!(probe.is_supported(.ACCEPT) and probe.is_supported(.RECV) and
         probe.is_supported(.WRITEV) and probe.is_supported(.ASYNC_CANCEL) and
-        probe.is_supported(.TIMEOUT);
+        probe.is_supported(.TIMEOUT))) return false;
+    var buffers = bufferGroup(&ring, std.heap.page_allocator, BUFFER_GROUP_ID, 64, 1) catch return false;
+    freeBufferGroup(&buffers, std.heap.page_allocator);
+    return true;
+}
+
+/// Registers (or unregisters) a provided-buffer ring. Ubuntu 24.04's
+/// kernels from 6.8.0-136 refuse every registration whose reserved words
+/// are zero, as the kernel requires (a backport of "io_uring/kbuf: use
+/// mem_is_zero()" inverted the check), so after EINVAL this tries once
+/// more with a reserved word set, which a correct kernel refuses too.
+fn registerBufRing(fd: linux.fd_t, opcode: linux.IORING_REGISTER, addr: u64, entries: u16, group: u16) !void {
+    var reg = std.mem.zeroInit(linux.io_uring_buf_reg, .{
+        .ring_addr = addr,
+        .ring_entries = entries,
+        .bgid = group,
+        // Incremental consumption, since 6.12.
+        .flags = .{ .inc = opcode == .REGISTER_PBUF_RING },
+    });
+    var rc = linux.io_uring_register(fd, opcode, &reg, 1);
+    if (linux.errno(rc) == .INVAL and reg.flags.inc) {
+        reg.flags.inc = false;
+        rc = linux.io_uring_register(fd, opcode, &reg, 1);
+    }
+    if (linux.errno(rc) == .INVAL) {
+        reg.resv[0] = 1;
+        rc = linux.io_uring_register(fd, opcode, &reg, 1);
+    }
+    switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        .INVAL => return error.ArgumentsInvalid,
+        else => |e| return std.posix.unexpectedErrno(e),
+    }
+}
+
+/// `IoUring.BufferGroup.init`, registering with `registerBufRing`.
+fn bufferGroup(ring: *IoUring, allocator: std.mem.Allocator, group: u16, size: u32, count: u16) !IoUring.BufferGroup {
+    const buffers = try allocator.alloc(u8, size * count);
+    errdefer allocator.free(buffers);
+    const heads = try allocator.alloc(u32, count);
+    errdefer allocator.free(heads);
+    @memset(heads, 0);
+    const len = @as(usize, count) * @sizeOf(linux.io_uring_buf);
+    const map = try std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    errdefer std.posix.munmap(map);
+    const br: *align(std.heap.page_size_min) linux.io_uring_buf_ring = @ptrCast(map.ptr);
+    try registerBufRing(ring.fd, .REGISTER_PBUF_RING, @intFromPtr(br), count, group);
+    IoUring.buf_ring_init(br);
+    const mask = IoUring.buf_ring_mask(count);
+    for (0..count) |i| {
+        const id: u16 = @intCast(i);
+        IoUring.buf_ring_add(br, buffers[size * i ..][0..size], id, mask, id);
+    }
+    IoUring.buf_ring_advance(br, count);
+    return .{ .ring = ring, .group_id = group, .br = br, .buffers = buffers, .heads = heads, .buffer_size = size, .buffers_count = count };
+}
+
+fn freeBufferGroup(g: *IoUring.BufferGroup, allocator: std.mem.Allocator) void {
+    registerBufRing(g.ring.fd, .UNREGISTER_PBUF_RING, 0, 0, g.group_id) catch {};
+    // Unregisters again (ENOENT, ignored), then unmaps and frees.
+    g.deinit(allocator);
 }
 
 pub fn Worker(comptime Handler: type) type {
@@ -256,7 +316,7 @@ pub fn Worker(comptime Handler: type) type {
             errdefer self.ring.deinit();
             // Note: BufferGroup stores a pointer to the ring, so the ring must
             // not move after this (the worker lives in a stable slice).
-            self.buffers = try IoUring.BufferGroup.init(
+            self.buffers = try bufferGroup(
                 &self.ring,
                 allocator,
                 BUFFER_GROUP_ID,
@@ -319,7 +379,7 @@ pub fn Worker(comptime Handler: type) type {
 
         fn freeBuffers(self: *Self) void {
             if (!self.buffers_live) return;
-            self.buffers.deinit(self.allocator);
+            freeBufferGroup(&self.buffers, self.allocator);
             self.buffers_live = false;
         }
 

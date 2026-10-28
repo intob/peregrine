@@ -535,7 +535,15 @@ Later in M4:
       server CPU per request with kTLS against 477-521 µs read and encrypted
       in user space; in-memory bodies unchanged (64 KiB 33-35 µs, 1 MiB
       311-343 µs). With kTLS forced on every connection they cost 41-43 and
-      399-452 µs, hence on demand
+      399-452 µs, hence on demand. Also on real x86_64 hardware: a Hetzner
+      VM with Ubuntu 24.04 (6.8.0-138, AES-NI), whole suite passes (rekey
+      closes, as on 6.12). That box turned up an Ubuntu kernel bug: from
+      6.8.0-136 (still in -147) the backport of "io_uring/kbuf: use
+      mem_is_zero()" inverted the check on io_uring_buf_reg.resv, so every
+      correct buffer ring registration gets EINVAL and the io_uring worker
+      failed to start. The worker now registers the ring itself, retrying
+      with a reserved word set (which a correct kernel refuses), and
+      `available()` probes a buffer ring so anything else falls back to epoll
 - [ ] TLS 1.2 (ECDHE + AEAD only) if real clients need it
 - [ ] Differential testing with tlsfuzzer or BoringSSL's BoGo runner
 
