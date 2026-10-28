@@ -37,7 +37,7 @@ Note: This project has just started, and is not yet a complete HTTP server imple
 - TLS 1.3, written from scratch on top of `std.crypto` (no OpenSSL)
     - X25519MLKEM768 (post-quantum hybrid), X25519 and P-256 key exchange, HelloRetryRequest
     - AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305
-    - ECDSA P-256/P-384 and Ed25519 certificates, ALPN, KeyUpdate
+    - ECDSA P-256/P-384, Ed25519 and RSA (PSS) certificates, ALPN, KeyUpdate
     - The server's handshake work (key exchange, key schedule, signature) takes about 115 µs per core with a P-256 certificate and X25519MLKEM768, using precomputed tables for P-256 signing and X25519 key generation
     - HTTP/1.1, HTTP/2 and WebSockets over TLS, on every backend
 - Cross-platform IO Multiplexing
@@ -154,12 +154,12 @@ Pass the PEM certificate chain and private key in the config. They are parsed at
 const srv = try per.Server(Handler).init(gpa, 443, .{
     .tls = .{
         .cert_pem = cert_pem, // leaf first, then intermediates
-        .key_pem = key_pem, // PKCS#8 or SEC1; ECDSA P-256/P-384 or Ed25519
+        .key_pem = key_pem, // PKCS#8, SEC1 or PKCS#1; ECDSA P-256/P-384, Ed25519 or RSA (2048-4096 bits)
         .alpn = &.{"http/1.1"}, // the default
     },
 });
 ```
-RSA certificates aren't supported yet. Session resumption and 0-RTT aren't either: every connection does a full handshake.
+RSA keys sign with RSA-PSS (`rsa_pss_rsae_sha256`, which every TLS 1.3 client supports); a 2048-bit RSA signature costs the server about 1 ms, roughly 25 times an ECDSA P-256 one, so prefer ECDSA certificates where you can. Session resumption and 0-RTT aren't supported yet: every connection does a full handshake.
 
 ### Serve HTTP/2
 Over TLS, add `"h2"` to the ALPN list; on a plaintext port, set `h2c` to accept the HTTP/2 connection preface (clients with prior knowledge, such as `curl --http2-prior-knowledge`). Both ports keep serving HTTP/1.1.
@@ -381,7 +381,7 @@ Until these things are done, I don't think that this project can possibly be con
 
 See [PLAN.md](PLAN.md) for the full checklist. In order:
 
-1. TLS 1.3 follow-ups: faster handshakes, RSA certificates, resumption, kTLS on Linux
+1. TLS 1.3 follow-ups: resumption, kTLS on Linux, faster handshakes (the rest)
 2. HTTP/3 follow-ups: connection migration, 0-RTT, pacing, ECN, PMTU discovery, GRO, the QPACK dynamic table, DATAGRAM (RFC 9221)
 3. Throughout: `sendfile`, tuning io_uring until it beats epoll, WebSocket `permessage-deflate`, and verification with Autobahn, h2spec, quic-interop-runner, soak, adversarial and differential (HTTP Garden) testing
 4. API reference

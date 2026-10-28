@@ -6,21 +6,26 @@ const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const EcdsaP384Sha384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 const Ed25519 = std.crypto.sign.Ed25519;
 const p256 = @import("./p256.zig");
+const rsa = @import("./rsa.zig");
 
-pub const max_signature_len = EcdsaP384Sha384.Signature.der_encoded_length_max;
+pub const max_signature_len = @max(EcdsaP384Sha384.Signature.der_encoded_length_max, rsa.max_len);
 pub const noise_len = EcdsaP384Sha384.noise_length;
 
 pub const PrivateKey = union(enum) {
     ecdsa_p256: EcdsaP256Sha256.KeyPair,
     ecdsa_p384: EcdsaP384Sha384.KeyPair,
     ed25519: Ed25519.KeyPair,
+    /// 2048 to 4096 bits.
+    rsa: rsa.PrivateKey,
 
-    /// The only scheme each key type is used with in TLS 1.3.
+    /// The only scheme each key type is used with in TLS 1.3 (for RSA, the
+    /// one every client implements).
     pub fn scheme(self: *const PrivateKey) SignatureScheme {
         return switch (self.*) {
             .ecdsa_p256 => .ecdsa_secp256r1_sha256,
             .ecdsa_p384 => .ecdsa_secp384r1_sha384,
             .ed25519 => .ed25519,
+            .rsa => .rsa_pss_rsae_sha256,
         };
     }
 
@@ -43,6 +48,7 @@ pub const PrivateKey = union(enum) {
                 @memcpy(out[0..bytes.len], &bytes);
                 return out[0..bytes.len];
             },
+            .rsa => |*key| return key.sign(msg, noise[0..rsa.salt_len].*, out[0..rsa.max_len]),
         }
     }
 
@@ -57,6 +63,13 @@ pub const PrivateKey = union(enum) {
                 std.mem.eql(u8, pub_key, &kp.public_key.toUncompressedSec1()),
             .ed25519 => |kp| parsed.pub_key_algo == .curveEd25519 and
                 std.mem.eql(u8, pub_key, &kp.public_key.toBytes()),
+            .rsa => |*key| {
+                if (parsed.pub_key_algo != .rsaEncryption) return false;
+                const parts = Certificate.rsa.PublicKey.parseDer(pub_key) catch return false;
+                var e_buf: [4]u8 = undefined;
+                return std.mem.eql(u8, std.mem.trimStart(u8, parts.modulus, &.{0}), key.modulus()) and
+                    std.mem.eql(u8, std.mem.trimStart(u8, parts.exponent, &.{0}), key.exponent(&e_buf));
+            },
         };
     }
 };
@@ -90,10 +103,12 @@ pub const Credentials = struct {
         var key_it: PemIterator = .{ .data = key_pem };
         const key = while (try key_it.next()) |block| {
             const sec1 = std.mem.eql(u8, block.label, "EC PRIVATE KEY");
-            if (!sec1 and !std.mem.eql(u8, block.label, "PRIVATE KEY")) continue;
-            var buf: [512]u8 = undefined;
+            const pkcs1 = std.mem.eql(u8, block.label, "RSA PRIVATE KEY");
+            if (!sec1 and !pkcs1 and !std.mem.eql(u8, block.label, "PRIVATE KEY")) continue;
+            var buf: [4096]u8 = undefined;
             const der = try block.decodeInto(&buf);
             defer std.crypto.secureZero(u8, der);
+            if (pkcs1) break PrivateKey{ .rsa = try rsa.PrivateKey.fromPkcs1(der) };
             break if (sec1) try parseSec1(der, null) else try parsePkcs8(der);
         } else return error.NoPrivateKey;
 
@@ -160,6 +175,7 @@ const oid_ec_public_key = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 };
 const oid_prime256v1 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
 const oid_secp384r1 = [_]u8{ 0x2b, 0x81, 0x04, 0x00, 0x22 };
 const oid_ed25519 = [_]u8{ 0x2b, 0x65, 0x70 };
+const oid_rsa_encryption = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 };
 
 const Der = struct {
     bytes: []const u8,
@@ -217,6 +233,7 @@ fn parsePkcs8(der: []const u8) !PrivateKey {
         if (seed.len != Ed25519.KeyPair.seed_length) return error.InvalidKey;
         return .{ .ed25519 = try Ed25519.KeyPair.generateDeterministic(seed[0..32].*) };
     }
+    if (std.mem.eql(u8, oid, &oid_rsa_encryption)) return .{ .rsa = try rsa.PrivateKey.fromPkcs1(private) };
     return error.UnsupportedKey;
 }
 
@@ -261,6 +278,11 @@ pub const testdata = struct {
     pub const p384_key = @embedFile("testdata/p384.key");
     pub const ed25519_cert = @embedFile("testdata/ed25519.pem");
     pub const ed25519_key = @embedFile("testdata/ed25519.key");
+    pub const rsa2048_cert = @embedFile("testdata/rsa2048.pem");
+    pub const rsa2048_key = @embedFile("testdata/rsa2048.key");
+    pub const rsa4096_cert = @embedFile("testdata/rsa4096.pem");
+    /// PKCS#1 ("RSA PRIVATE KEY").
+    pub const rsa4096_key = @embedFile("testdata/rsa4096.rsa.key");
 };
 
 test "load every supported key type and sign" {
@@ -269,6 +291,8 @@ test "load every supported key type and sign" {
         .{ .cert = testdata.p256_cert, .key = testdata.p256_sec1_key, .scheme = .ecdsa_secp256r1_sha256 },
         .{ .cert = testdata.p384_cert, .key = testdata.p384_key, .scheme = .ecdsa_secp384r1_sha384 },
         .{ .cert = testdata.ed25519_cert, .key = testdata.ed25519_key, .scheme = .ed25519 },
+        .{ .cert = testdata.rsa2048_cert, .key = testdata.rsa2048_key, .scheme = .rsa_pss_rsae_sha256 },
+        .{ .cert = testdata.rsa4096_cert, .key = testdata.rsa4096_key, .scheme = .rsa_pss_rsae_sha256 },
     };
     for (cases) |case| {
         var creds = try Credentials.fromPem(std.testing.allocator, case.cert, case.key);
@@ -292,6 +316,14 @@ test "load every supported key type and sign" {
                 const pk = try Ed25519.PublicKey.fromBytes(parsed.pubKey()[0..32].*);
                 try Ed25519.Signature.fromBytes(sig[0..64].*).verify("message", pk);
             },
+            .rsa => {
+                const parts = try Certificate.rsa.PublicKey.parseDer(parsed.pubKey());
+                const pk = try Certificate.rsa.PublicKey.fromBytes(parts.exponent, parts.modulus);
+                switch (sig.len) {
+                    inline 256, 512 => |len| try Certificate.rsa.PSSSignature.verify(len, sig[0..len], "message", pk, std.crypto.hash.sha2.Sha256),
+                    else => return error.UnexpectedLength,
+                }
+            },
         }
     }
 }
@@ -299,6 +331,9 @@ test "load every supported key type and sign" {
 test "reject mismatched key, missing blocks and garbage" {
     const a = std.testing.allocator;
     try std.testing.expectError(error.KeyCertificateMismatch, Credentials.fromPem(a, testdata.p256_cert, testdata.p384_key));
+    try std.testing.expectError(error.KeyCertificateMismatch, Credentials.fromPem(a, testdata.rsa2048_cert, testdata.rsa4096_key));
+    try std.testing.expectError(error.KeyCertificateMismatch, Credentials.fromPem(a, testdata.p256_cert, testdata.rsa2048_key));
+    try std.testing.expectError(error.KeyCertificateMismatch, Credentials.fromPem(a, testdata.rsa2048_cert, testdata.p256_key));
     try std.testing.expectError(error.NoCertificate, Credentials.fromPem(a, testdata.p256_key, testdata.p256_key));
     try std.testing.expectError(error.NoPrivateKey, Credentials.fromPem(a, testdata.p256_cert, testdata.p256_cert));
     try std.testing.expectError(error.InvalidPem, Credentials.fromPem(a, "-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----", testdata.p256_key));

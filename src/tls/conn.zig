@@ -698,6 +698,8 @@ test "handshake and echo with std's TLS client, every suite, group and key type"
     const keys = [_][2][]const u8{
         .{ td.p256_cert, td.p256_key },
         .{ td.p384_cert, td.p384_key },
+        .{ td.rsa2048_cert, td.rsa2048_key },
+        .{ td.rsa4096_cert, td.rsa4096_key },
     };
     const suites = [_]Suite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 };
     const groups = [_]tls.NamedGroup{ .x25519_ml_kem768, .x25519, .secp256r1 };

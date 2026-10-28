@@ -226,7 +226,7 @@ Ed25519, `std.crypto.tls` enums and `hkdfExpandLabel`.
 - Key exchange: X25519, secp256r1, and the hybrid **X25519MLKEM768** (what current
   browsers send first). HelloRetryRequest when the client offered a group we support
   but no key share for it.
-- Certificates: ECDSA P-256/P-384 and Ed25519 keys (PKCS#8 or SEC1 PEM). The chain is
+- Certificates: ECDSA P-256/P-384, Ed25519 and RSA keys (PKCS#8, SEC1 or PKCS#1 PEM). The chain is
   sent as configured.
 - ALPN (`http/1.1` now, `h2` in M5); SNI is accepted (one certificate for now).
 - Middlebox compatibility: echo `legacy_session_id`, send one `change_cipher_spec`,
@@ -244,6 +244,7 @@ Ed25519, `std.crypto.tls` enums and `hkdfExpandLabel`.
 | `conn.zig` | `tls.Conn`: one TLS-over-TCP connection. Buffers ciphertext like `Session` does (pooled, held only while unprocessed), drives the handshake, decrypts application data for the HTTP/WebSocket layers and encrypts their output into a wire buffer |
 | `credentials.zig` | PEM/DER loading of the certificate chain and private key; signing CertificateVerify |
 | `p256.zig`, `x25519.zig` | Base-point tables: ECDSA P-256 signing, P-256 ECDHE key pairs, X25519 public keys |
+| `rsa.zig` | RSA private keys and RSASSA-PSS signing |
 | `fuzz.zig` | Fuzz target over `tls.Conn`: a scripted client (see the checklist) |
 
 The handshake keeps a running transcript hash, not the transcript, and its state is
@@ -415,7 +416,26 @@ Later in M4:
       non-handshake records between the fragments of a handshake message are not
       (§5.1 says they MUST NOT appear); change_cipher_spec before ClientHello is
       dropped rather than rejected
-- [ ] RSA certificates (RSA-PSS signing: std has only verification)
+- [x] **RSA certificates** (`src/tls/rsa.zig`): PKCS#1 and PKCS#8 keys of
+      2048-4096 bits (two primes), signing `rsa_pss_rsae_sha256` only (every
+      TLS 1.3 client must support it, RFC 8446 §9.1): EMSA-PSS with MGF1 and
+      a 32-byte random salt, the private operation by the CRT with std's
+      constant-time `std.crypto.ff` exponentiation, and every signature
+      checked with the public exponent before it is sent (a CRT fault would
+      otherwise reveal the factors). A key is checked at load by signing and
+      verifying, and must match the certificate's modulus and exponent. No
+      blinding (the exponentiation is constant time). Proof: signatures
+      verify with std's PSS verifier (2048 and 4096 bits, several messages
+      and salts), corrupted keys are rejected, std's TLS client completes
+      every suite × group with RSA-2048 and RSA-4096 certificates; OpenSSL
+      3.5 verifies the CertificateVerify with each group, curl over HTTP/2
+      and HTTP/3 (`bench-server ... tls|h3 rsa`). Cost (macOS, `bench-tls --
+      handshake`): about 1.2 ms per RSA-2048 handshake and 6.6 ms for
+      RSA-4096, against OpenSSL's 0.55 ms and 3.8 ms per signature; std's
+      generic big-number code is the limit. Not done: rsa_pss_rsae_sha384
+      and _sha512 (a client that doesn't offer _sha256 gets
+      handshake_failure, and none should), rsa_pss_pss_* keys, faster modular
+      exponentiation
 - [ ] Session tickets and resumption (PSK-DHE); 0-RTT only with replay protection
 - [ ] Several certificates selected by SNI; OCSP stapling
 - [ ] **kTLS on Linux**: handshake in userspace, record crypto in the kernel, so
@@ -553,7 +573,12 @@ which RFC 9113 deprecated).
       order across packets with an incremental pair interleaved, which fails
       with a FIFO send queue; updates before and after a request, each error,
       a waiting exchange kept); `priority` headers and PRIORITY_UPDATEs in the
-      h2 split-invariance script and both connection fuzz targets. Interop on
+      h2 split-invariance script and both connection fuzz targets (fuzzed
+      together on Linux, ReleaseSafe, 6 instances, 25 min: about 8.2M runs,
+      707 corpus inputs, 18.5% of instrumented PCs, no failures, after the
+      first run found an older split-invariance bug: frames after a client's
+      GOAWAY were read only when they arrived in the same read, fixed in
+      534d861). Interop on
       Linux: nghttp 1.69 `--extpri` over h2c (u=0 first, the `u=1,i` pair
       alternating frame by frame, then u=5, then the rest of a u=7 stream that
       had started first), aioquic 1.3 over HTTP/3 with `priority` headers and

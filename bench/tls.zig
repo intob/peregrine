@@ -154,9 +154,9 @@ fn clientHello(buf: []u8, group: tls.NamedGroup, share: []const u8) []const u8 {
     w.int(u16, 2);
     w.int(u16, @backingInt(group));
     w.int(u16, @backingInt(tls.ExtensionType.signature_algorithms));
+    w.int(u16, 10);
     w.int(u16, 8);
-    w.int(u16, 6);
-    for ([_]u16{ 0x0403, 0x0503, 0x0807 }) |sa| w.int(u16, sa);
+    for ([_]u16{ 0x0403, 0x0503, 0x0807, 0x0804 }) |sa| w.int(u16, sa);
     w.int(u16, @backingInt(tls.ExtensionType.key_share));
     w.int(u16, @intCast(share.len + 6));
     w.int(u16, @intCast(share.len + 4));
@@ -232,6 +232,8 @@ fn handshakes() !void {
         .{ "ECDSA P-256", td.p256_cert, td.p256_key },
         .{ "ECDSA P-384", td.p384_cert, td.p384_key },
         .{ "Ed25519", td.ed25519_cert, td.ed25519_key },
+        .{ "RSA-2048", td.rsa2048_cert, td.rsa2048_key },
+        .{ "RSA-4096", td.rsa4096_cert, td.rsa4096_key },
     };
     var entropy: [handshake.entropy_len]u8 = undefined;
     sys.randomBytes(&entropy);
@@ -242,7 +244,7 @@ fn handshakes() !void {
         for (groups) |g| {
             const config: handshake.Config = .{ .credentials = &creds, .alpn = &.{"h2"} };
             const hello = clientHello(&hello_buf, g[0], g[1]);
-            const iterations = 2000;
+            const iterations: usize = if (std.mem.startsWith(u8, c[0], "RSA")) 100 else 2000;
             const start = sys.nanoTimestamp();
             for (0..iterations) |_| {
                 var hs = handshake.Handshake.init(gpa, &config, &entropy);

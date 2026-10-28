@@ -2,9 +2,10 @@
 //! plaintext) except `/64k`, a 64 KiB body (four full TLS records), and
 //! `/ws`, a WebSocket echo (HTTP/1.1 Upgrade, or extended CONNECT on HTTP/2
 //! and HTTP/3); request bodies are read and discarded.
-//! Usage: bench-server [workers] [auto|epoll|io_uring] [port] [tls|h3|plain] [stream]
+//! Usage: bench-server [workers] [auto|epoll|io_uring] [port] [tls|h3|plain] [stream] [rsa]
 //! With `tls`, serves TLS 1.3 with the self-signed P-256 certificate in
-//! this directory, with ALPN "h2" and "http/1.1"; `h3` adds HTTP/3 on the
+//! this directory (`rsa`: the RSA-2048 one), with ALPN "h2" and
+//! "http/1.1"; `h3` adds HTTP/3 on the
 //! same UDP port. Plaintext serves HTTP/1.1 and HTTP/2 with prior
 //! knowledge (h2c). With `stream`, every request body is streamed to the
 //! handler (handleHead, handleBody) and the response follows its end, for
@@ -72,7 +73,9 @@ const StreamHandler = struct {
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len > 5 and std.mem.eql(u8, args[5], "stream")) return serve(StreamHandler, args);
+    for (args[@min(args.len, 5)..]) |arg| {
+        if (std.mem.eql(u8, arg, "stream")) return serve(StreamHandler, args);
+    }
     return serve(Handler, args);
 }
 
@@ -82,13 +85,15 @@ fn serve(comptime H: type, args: []const [:0]const u8) !void {
     const port = if (args.len > 3) try std.fmt.parseInt(u16, args[3], 10) else 8080;
     const use_h3 = args.len > 4 and std.mem.eql(u8, args[4], "h3");
     const use_tls = use_h3 or (args.len > 4 and std.mem.eql(u8, args[4], "tls"));
+    var use_rsa = false;
+    for (args[@min(args.len, 5)..]) |arg| use_rsa = use_rsa or std.mem.eql(u8, arg, "rsa");
     const srv = try per.Server(H).init(std.heap.smp_allocator, port, .{
         .worker_thread_count = workers,
         .backend = backend,
         .h2c = true,
         .tls = if (use_tls) .{
-            .cert_pem = @embedFile("cert.pem"),
-            .key_pem = @embedFile("key.pem"),
+            .cert_pem = if (use_rsa) @embedFile("rsa.pem") else @embedFile("cert.pem"),
+            .key_pem = if (use_rsa) @embedFile("rsa.key") else @embedFile("key.pem"),
             .alpn = &.{ "h2", "http/1.1" },
         } else null,
         .http3 = if (use_h3) .{} else null,
