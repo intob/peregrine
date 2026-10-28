@@ -73,6 +73,16 @@ pub const TlsOptions = struct {
     /// How long a ticket is valid (at most 7 days), and how often the key
     /// derived from `ticket_key` changes.
     ticket_lifetime_s: u32 = 24 * 3600,
+    /// Linux: before the first file body (`Response.sendFile`) on an
+    /// HTTP/1.1 connection, hand the connection's sending side to the
+    /// kernel (kTLS), so the file goes out with sendfile and the kernel
+    /// makes the records (for the rest of the connection). Otherwise our
+    /// own record encryption is used: for bytes already in memory it is
+    /// cheaper than the kernel's. Where the kernel has no TLS (no `tls`
+    /// module) everything stays in user space. Kernels without TLS 1.3
+    /// rekey support (before 6.14) can't switch keys, so a kTLS connection
+    /// whose client asks for a KeyUpdate is closed (clients rarely do).
+    ktls: bool = true,
     /// TLS record buffers preallocated per worker (input and output each).
     /// Like read buffers, only connections with unprocessed or unsent
     /// bytes hold one.
@@ -368,6 +378,7 @@ pub fn Server(comptime Handler: type) type {
                     .h2 = h2_opts,
                     .tls = if (srv.tls_credentials != null) &srv.tls_config else null,
                     .tls_buffer_pool_size = if (cfg.tls) |t| t.buffer_pool_size else 0,
+                    .ktls = if (cfg.tls) |t| t.ktls else false,
                     .quic = if (cfg.http3) |o| srv.quicOptions(o, i, worker_count) else null,
                 };
                 if (cfg.http3) |o| {

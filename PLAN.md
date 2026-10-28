@@ -52,9 +52,9 @@ Design rules that apply to every layer:
 | Milestone | State |
 |---|---|
 | M1. HTTP/1.1 core | ✅ done (streaming responses landed with the M5 handler API) |
-| M2. Throughput architecture | 🟡 io_uring works (opt-in, not yet faster than epoll); sendfile done (plaintext; TLS needs kTLS); NUMA open |
+| M2. Throughput architecture | 🟡 io_uring works (opt-in, not yet faster than epoll); sendfile done (plaintext, and TLS with kTLS); NUMA open |
 | M3. WebSockets over HTTP/1.1 | ✅ reworked; permessage-deflate, Autobahn, benchmarks open |
-| M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; faster handshakes, resumption and kTLS are listed under "Later in M4" |
+| M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; tables for P-256 and X25519, RSA-PSS, session tickets and kTLS done; the rest of "faster handshakes" and 0-RTT open |
 | M5. HTTP/2 | ✅ h2 over TLS (ALPN) and h2c on every backend, h2spec 146/146 over TLS, fuzzed, benchmarked; streamed request bodies on every protocol; WebSockets over h2 (RFC 8441); RFC 9218 priorities |
 | M6. HTTP/3 and QUIC | 🟡 HTTP/3 over QUIC v1 on every backend, interop-tested (aioquic, curl/ngtcp2, h2load), benchmarked against nginx and Caddy; WebSockets over h3 (RFC 9220); migration, 0-RTT, pacing, ECN, PMTUD open |
 | M7. Verification and benchmarking | 🟡 ongoing for each milestone |
@@ -167,7 +167,7 @@ end-to-end test pipelines 8 MB + 1 MB responses to a slow reader.
       io_uring: straight from the write completion, the socket being
       non-blocking, with a one-shot POLLOUT poll when it is full). Where
       sendfile isn't supported (some BSDs, files it refuses) the file is
-      read and written a buffer at a time. Over TLS (until kTLS), HTTP/2
+      read and written a buffer at a time. Over TLS (kTLS: see M4), HTTP/2
       (DATA frames read straight into the output, within the windows and
       the priority scheduler's budget) and HTTP/3 (into the QUIC stream up
       to `stream_buffer`) the file is read with pread as the connection takes
@@ -186,7 +186,7 @@ end-to-end test pipelines 8 MB + 1 MB responses to a slow reader.
       request (35K req/s), from the file 78-86 µs (36-39K req/s), on both
       epoll and io_uring; 64 KiB 10-11 µs from memory, 13-14 µs from the
       file (two syscalls instead of one writev), hence the 64 KiB threshold
-      in the file servers. Not done: over TLS this needs kTLS (M4)
+      in the file servers. Over TLS with kTLS (M4) files use sendfile too
 - [ ] NUMA-local allocation
 - [ ] UDP fast path for QUIC (M6): `recvmmsg`/`sendmmsg`, `UDP_SEGMENT` (GSO) and
       `UDP_GRO`, io_uring equivalents
@@ -501,8 +501,41 @@ Later in M4:
 - [ ] 0-RTT (early data): needs replay protection (a single-use ticket
       store or strike register) and the 0-RTT keys in both transports
 - [ ] Several certificates selected by SNI; OCSP stapling
-- [ ] **kTLS on Linux**: handshake in userspace, record crypto in the kernel, so
-      `sendfile` works over TLS
+- [x] **kTLS on Linux** (`TlsOptions.ktls`, on by default): the sending side of
+      an HTTP/1.1 connection goes to the kernel (TCP_ULP "tls", TLS_TX with the
+      current key, IV split into salt and the rest, and record sequence number)
+      just before its first file body, once our own records are written; from
+      then on the file goes out with sendfile and everything else as plaintext
+      writes, and the kernel makes the records. Receiving stays in user space.
+      On demand rather than for every connection because, measured, kTLS only
+      pays for files: our fused AES-GCM beats the kernel's GCM (AES and GHASH
+      passes, plus the copy in) for bytes already in memory. Our own records
+      then go out with sendmsg and a TLS_SET_RECORD_TYPE control message
+      (close_notify and other alerts). KeyUpdate: ours (at the record limit,
+      counted as an upper bound: one per write plus one per 16 KiB) or one the
+      client requests is sent before any more data (a gate on every write path:
+      a full socket waits like EAGAIN, POLLOUT on io_uring), then the kernel
+      gets the next key (TLS_TX again: TLS 1.3 rekey, Linux 6.14 on); a kernel
+      that refuses (6.12) means the connection is closed, with no alert since
+      its records no longer match the client's keys. A missing `tls` module
+      (ENOENT) turns kTLS off for the worker; an unsupported cipher just keeps
+      that connection in user space. Proof: a test hands one end of a loopback
+      pair to the kernel with a known key and nonzero sequence number and
+      opens what it sends (data, a KeyUpdate, data under the next key, an
+      alert) with our record layer, every suite; end-to-end on epoll and
+      io_uring (responses, then files through sendfile over kTLS, close_notify
+      through the kernel, and an 8 MB file with a KeyUpdate every 4 records:
+      about 128 rekeys on 6.18, a close on 6.12); curl over HTTP/1.1 and h2
+      (only HTTP/1.1 file connections switch: TlsTxSw); OpenSSL 3.3 KeyUpdate
+      both ways after a file (`K` answered on 6.18, closed on 6.12). Docker
+      Desktop's kernel has no kTLS, so this runs in a QEMU/HVF VM with Alpine's
+      linux-virt kernels 6.12 and 6.18 (tls and the arm64 crypto modules
+      loaded); the whole suite passes on both. Benchmark (6.18 VM, 4 workers,
+      wrk -t4 -c32 over TLS in the same VM, two rounds): 1 MiB file 349-366 µs
+      server CPU per request with kTLS against 477-521 µs read and encrypted
+      in user space; in-memory bodies unchanged (64 KiB 33-35 µs, 1 MiB
+      311-343 µs). With kTLS forced on every connection they cost 41-43 and
+      399-452 µs, hence on demand
 - [ ] TLS 1.2 (ECDHE + AEAD only) if real clients need it
 - [ ] Differential testing with tlsfuzzer or BoringSSL's BoGo runner
 
@@ -836,6 +869,12 @@ connection, for every server), so compare CPU/req there.
 - [ ] Protocol suites: Autobahn (WebSockets), tlsfuzzer/BoGo (TLS), h2spec (h2),
       quic-interop-runner (QUIC/h3)
 - [ ] Response correctness (REDbot)
+- [ ] **Unexplained leak report, not reproduced.** On 2026-10-28 two consecutive
+      Linux test runs in Docker (epoll, then io_uring; the binary of the kTLS
+      work, before the KeyUpdate gate) ended with "1 tests leaked memory"; the
+      output was cut to the summary line, so which test is unknown. The same
+      binary then passed 16 more runs (alone and under load) with no leak.
+      Look for a test whose cleanup races a server thread
 - [ ] Soak: hours at high concurrency, steady RSS and fd count
 - [ ] Adversarial load: slowloris (basic test exists), oversized headers, half-open
       connections, connection floods, TLS handshake floods

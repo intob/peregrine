@@ -16,6 +16,7 @@ const ws = @import("./ws/ws.zig");
 const h2frame = @import("./h2/frame.zig");
 const hpack = @import("./h2/hpack.zig");
 const BufferPool = @import("./http/session.zig").BufferPool;
+const tls_conn = @import("./tls/conn.zig");
 const testing = std.testing;
 
 const big_body_len = 8 * 1024 * 1024;
@@ -2270,6 +2271,99 @@ fn testTlsWebSocket(backend: Backend) !void {
     try testing.expectEqual(ws.Opcode.close, f.opcode);
     try c.send(Client.wsFrame(&frame, true, .close, &.{ 0x03, 0xe8 }));
     try c.expectCleanClose();
+}
+
+test "tls: kernel TLS (Linux): responses, a file with sendfile, close_notify" {
+    if (!sys.is_linux) return error.SkipZigTest;
+    try forEachBackend(testKernelTls);
+}
+
+fn testKernelTls(backend: Backend) !void {
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const file = try tmp.dir.createFile(io, "big", .{ .read = true });
+    defer file.close(io);
+    try file.writeStreamingAll(io, &big_body);
+    test_file_fd = file.handle;
+    defer test_file_fd = -1;
+    const r = try Running.start(backend, tlsConfig());
+    defer r.stop();
+    const before = tls_conn.kernel_tx_count.load(.monotonic);
+    const c = try TlsClient.connect(r.port);
+    defer c.close();
+    var small: [64]u8 = undefined;
+    try c.send("GET /a HTTP/1.1\r\nHost: x\r\n\r\n");
+    var res = try c.readResponse(&small);
+    try testing.expectEqualStrings("ok", small[0..res.body_len]);
+    const got = try testing.allocator.alloc(u8, big_body_len);
+    defer testing.allocator.free(got);
+    try c.send("GET /file HTTP/1.1\r\nHost: x\r\n\r\nGET /file-range HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    res = try c.readResponse(got);
+    try testing.expect(std.mem.eql(u8, &big_body, got[0..res.body_len]));
+    res = try c.readResponse(got);
+    try testing.expectEqualSlices(u8, big_body[1000..6000], got[0..res.body_len]);
+    // close_notify, sent through the kernel as an alert record.
+    try c.expectCleanClose();
+    // Without a tls module (Docker Desktop's kernel) the connection stays
+    // in user space, and the test above is all that runs.
+    if (!kernelTlsAvailable()) return;
+    try testing.expect(tls_conn.kernel_tx_count.load(.monotonic) > before);
+
+    // Our KeyUpdates every 4 records: the kernel switches keys about 128
+    // times in a file through sendfile (TLS 1.3 rekey, Linux 6.14 on), or
+    // the connection closes at the first.
+    tls_conn.test_key_update_limit = 4;
+    defer tls_conn.test_key_update_limit = null;
+    const c2 = try TlsClient.connect(r.port);
+    defer c2.close();
+    try c2.send("GET /file HTTP/1.1\r\nHost: x\r\n\r\n");
+    if (c2.readResponse(got)) |res2| {
+        try testing.expect(kernelRekeySupported());
+        try testing.expect(std.mem.eql(u8, &big_body, got[0..res2.body_len]));
+    } else |_| {
+        try testing.expect(!kernelRekeySupported());
+    }
+}
+
+/// Whether the kernel can switch TLS 1.3 sending keys (kTLS rekey).
+fn kernelRekeySupported() bool {
+    const linux = std.os.linux;
+    const l: sys.fd_t = @intCast(linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0));
+    defer sys.close(l);
+    var addr: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    if (linux.bind(l, @ptrCast(&addr), len) != 0) return false;
+    _ = linux.listen(l, 1);
+    _ = linux.getsockname(l, @ptrCast(&addr), &len);
+    const c: sys.fd_t = @intCast(linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0));
+    defer sys.close(c);
+    if (linux.connect(c, @ptrCast(&addr), len) != 0) return false;
+    // TLS 1.3, AES-128-GCM, any key: iv, key, salt, sequence number.
+    var info: [40]u8 = @splat(7);
+    info[0..4].* = .{ 0x04, 0x03, 51, 0 };
+    sys.ktls.enableTx(c, &info) catch return false;
+    sys.ktls.rekeyTx(c, &info) catch return false;
+    return true;
+}
+
+/// Whether this kernel has TLS (the tls module): attaching it to a
+/// connected loopback socket works.
+fn kernelTlsAvailable() bool {
+    const linux = std.os.linux;
+    const l: sys.fd_t = @intCast(linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0));
+    defer sys.close(l);
+    var addr: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    if (linux.bind(l, @ptrCast(&addr), len) != 0) return false;
+    _ = linux.listen(l, 1);
+    _ = linux.getsockname(l, @ptrCast(&addr), &len);
+    const c: sys.fd_t = @intCast(linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0));
+    defer sys.close(c);
+    if (linux.connect(c, @ptrCast(&addr), len) != 0) return false;
+    const rc = linux.setsockopt(c, linux.IPPROTO.TCP, linux.TCP.ULP, "tls", 3);
+    return std.posix.errno(rc) == .SUCCESS;
 }
 
 test "tls: plaintext HTTP to a TLS port gets an alert" {

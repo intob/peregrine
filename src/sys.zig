@@ -137,6 +137,87 @@ pub fn sendfile(sock: fd_t, file: fd_t, offset: u64, count: usize) SendfileError
     }
 }
 
+/// Kernel TLS (Linux): the kernel encrypts what is written to the socket
+/// into TLS records, so plain writes and sendfile work on a TLS connection.
+/// Only the sending side is used here.
+pub const ktls = struct {
+    pub const Error = error{
+        /// No kernel TLS here (no tls module): no use trying again.
+        NoModule,
+        /// Not for this cipher or this socket.
+        Unsupported,
+        Unexpected,
+    };
+
+    const tls_tx = 1;
+    const tls_set_record_type = 1;
+
+    pub const version_1_3: u16 = 0x0304;
+    pub const cipher_aes_gcm_128: u16 = 51;
+    pub const cipher_aes_gcm_256: u16 = 52;
+    pub const cipher_chacha20_poly1305: u16 = 54;
+
+    /// Hands the sending side of a connected TCP socket to the kernel.
+    /// `info` is a `tls12_crypto_info_*` structure (see linux/tls.h).
+    pub fn enableTx(fd: fd_t, info: []const u8) Error!void {
+        if (!is_linux) return error.NoModule;
+        const ulp = "tls";
+        switch (posix.errno(linux.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.ULP, ulp, ulp.len))) {
+            .SUCCESS, .EXIST => {},
+            .NOENT, .NOPROTOOPT, .PERM => return error.NoModule,
+            .OPNOTSUPP, .NOTCONN => return error.Unsupported,
+            else => |e| return unexpected(e),
+        }
+        return setTx(fd, info);
+    }
+
+    /// New keys for the sending side (TLS 1.3 KeyUpdate). Kernels before
+    /// TLS 1.3 rekey support refuse (error.Unsupported).
+    pub fn rekeyTx(fd: fd_t, info: []const u8) Error!void {
+        if (!is_linux) return error.Unsupported;
+        return setTx(fd, info);
+    }
+
+    fn setTx(fd: fd_t, info: []const u8) Error!void {
+        switch (posix.errno(linux.setsockopt(fd, linux.SOL.TLS, tls_tx, info.ptr, @intCast(info.len)))) {
+            .SUCCESS => {},
+            .INVAL, .BUSY, .OPNOTSUPP, .NOENT, .NOPROTOOPT, .NOMEM => return error.Unsupported,
+            else => |e| return unexpected(e),
+        }
+    }
+
+    /// Writes `data` as one record of `content_type` (an alert, or a
+    /// handshake message such as KeyUpdate); application data needs no
+    /// call, a plain write is one.
+    pub fn sendRecord(fd: fd_t, content_type: u8, data: []const u8) IoError!usize {
+        if (!is_linux) return error.Unexpected;
+        var control: [@sizeOf(linux.cmsghdr) + linux.cmsg_align]u8 align(@alignOf(linux.cmsghdr)) = @splat(0);
+        const hdr: *linux.cmsghdr = @ptrCast(&control);
+        hdr.* = .{ .len = @sizeOf(linux.cmsghdr) + 1, .level = linux.SOL.TLS, .type = tls_set_record_type };
+        control[@sizeOf(linux.cmsghdr)] = content_type;
+        const iov = [_]iovec_const{.{ .base = data.ptr, .len = data.len }};
+        const msg: linux.msghdr_const = .{
+            .name = null,
+            .namelen = 0,
+            .iov = &iov,
+            .iovlen = 1,
+            .control = &control,
+            .controllen = control.len,
+            .flags = 0,
+        };
+        while (true) {
+            const rc = linux.sendmsg(fd, &msg, linux.MSG.NOSIGNAL);
+            switch (posix.errno(rc)) {
+                .SUCCESS => return rc,
+                .INTR => continue,
+                .AGAIN => return error.WouldBlock,
+                .CONNRESET, .PIPE, .TIMEDOUT, .NOTCONN => return error.ConnectionClosed,
+                else => |e| return unexpected(e),
+            }
+        }
+    }
+};
+
 pub const PreadError = error{ FileTruncated, Unexpected };
 
 /// Reads `buf.len` bytes of `file` at `offset` (fewer only at the end of

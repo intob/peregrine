@@ -4,7 +4,7 @@
 //! plaintext HTTP/1.1), and `/ws`, a WebSocket echo (HTTP/1.1 Upgrade, or
 //! extended CONNECT on HTTP/2 and HTTP/3); request bodies are read and
 //! discarded.
-//! Usage: bench-server [workers] [auto|epoll|io_uring] [port] [tls|h3|plain] [stream] [rsa]
+//! Usage: bench-server [workers] [auto|epoll|io_uring] [port] [tls|h3|plain] [stream] [rsa] [noktls]
 //! With `tls`, serves TLS 1.3 with the self-signed P-256 certificate in
 //! this directory (`rsa`: the RSA-2048 one), with ALPN "h2" and
 //! "http/1.1"; `h3` adds HTTP/3 on the
@@ -109,7 +109,11 @@ fn serve(comptime H: type, args: []const [:0]const u8) !void {
     const use_h3 = args.len > 4 and std.mem.eql(u8, args[4], "h3");
     const use_tls = use_h3 or (args.len > 4 and std.mem.eql(u8, args[4], "tls"));
     var use_rsa = false;
-    for (args[@min(args.len, 5)..]) |arg| use_rsa = use_rsa or std.mem.eql(u8, arg, "rsa");
+    var ktls = true;
+    for (args[@min(args.len, 5)..]) |arg| {
+        use_rsa = use_rsa or std.mem.eql(u8, arg, "rsa");
+        if (std.mem.eql(u8, arg, "noktls")) ktls = false;
+    }
     const srv = try per.Server(H).init(std.heap.smp_allocator, port, .{
         .worker_thread_count = workers,
         .backend = backend,
@@ -118,6 +122,7 @@ fn serve(comptime H: type, args: []const [:0]const u8) !void {
             .cert_pem = if (use_rsa) @embedFile("rsa.pem") else @embedFile("cert.pem"),
             .key_pem = if (use_rsa) @embedFile("rsa.key") else @embedFile("key.pem"),
             .alpn = &.{ "h2", "http/1.1" },
+            .ktls = ktls,
         } else null,
         .http3 = if (use_h3) .{} else null,
     });

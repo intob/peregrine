@@ -287,7 +287,7 @@ Response headers are copied as they are added, so their values can be freed stra
 - `setBody(buf)` copies into the worker's response buffer (`response_body_buffer_size`).
 - `bodyWriteBuffer()` + `commitBody(len)` let you format straight into that buffer.
 - `setBodyBorrowed(buf)` sends `buf` without copying. It must stay valid and unchanged until the response is sent, so use it for static or cached content.
-- `sendFile(.{ .fd = fd, .offset = 0, .len = n })` sends part of an open file. On plaintext HTTP/1.1 (every backend) the kernel sends it with sendfile(2), so it never passes through user space: for a 1 MiB file that is about 20% less server CPU than the same body from memory; below about 64 KiB memory is cheaper. Over TLS, HTTP/2 and HTTP/3 it is read in chunks as the connection takes them, so a large file is never held in memory. With `.close = true` the server closes the file once it is sent (or the response is abandoned); otherwise keep it open for as long as responses may still be sending it.
+- `sendFile(.{ .fd = fd, .offset = 0, .len = n })` sends part of an open file. On plaintext HTTP/1.1 (every backend) the kernel sends it with sendfile(2), so it never passes through user space: for a 1 MiB file that is about 20% less server CPU than the same body from memory; below about 64 KiB memory is cheaper. Over TLS on Linux the connection's encryption moves to the kernel (kTLS) just before its first file body, so the file goes out with sendfile there too (about 25% less server CPU than reading and encrypting it); over HTTP/2 and HTTP/3 it is read in chunks as the connection takes them, so a large file is never held in memory. With `.close = true` the server closes the file once it is sent (or the response is abandoned); otherwise keep it open for as long as responses may still be sending it.
 
 ### Handler responsibilities
 - Handlers own and manage their internal memory
@@ -385,7 +385,7 @@ Until these things are done, I don't think that this project can possibly be con
 
 See [PLAN.md](PLAN.md) for the full checklist. In order:
 
-1. TLS 1.3 follow-ups: kTLS on Linux, faster handshakes (the rest)
+1. TLS 1.3 follow-ups: faster handshakes (the rest), 0-RTT
 2. HTTP/3 follow-ups: connection migration, 0-RTT, pacing, ECN, PMTU discovery, GRO, the QPACK dynamic table, DATAGRAM (RFC 9221)
 3. Throughout: `sendfile`, tuning io_uring until it beats epoll, WebSocket `permessage-deflate`, and verification with Autobahn, h2spec, quic-interop-runner, soak, adversarial and differential (HTTP Garden) testing
 4. API reference

@@ -30,6 +30,9 @@ const UDP_TOKEN: u64 = std.math.maxInt(u64) - 2;
 const NIL: u32 = std.math.maxInt(u32);
 /// Connections accepted per listener event, to stay fair to existing ones.
 const ACCEPT_BATCH = 64;
+/// TLS record content types (kTLS control records).
+const tls_alert: u8 = 21;
+const tls_handshake: u8 = 22;
 /// File body bytes read at a time where sendfile isn't used (one TLS
 /// record).
 const file_chunk = 16 * 1024;
@@ -60,6 +63,12 @@ pub const Options = struct {
     tls: ?*const tls.Config = null,
     /// TLS record buffers preallocated per worker (input and output each).
     tls_buffer_pool_size: usize = 0,
+    /// Linux: before the first file body on an HTTP/1.1 connection over
+    /// TLS, hand the sending side to the kernel (kTLS), so the file goes
+    /// out with sendfile (and everything after as plaintext writes). Not
+    /// otherwise: our own record encryption is cheaper than the kernel's
+    /// for bytes already in memory. Quietly off where the kernel can't.
+    ktls: bool = true,
     /// HTTP/3 on the worker's UDP socket, if it has one.
     quic: ?quic_endpoint.Options = null,
     /// Header lines added to every response, e.g. "alt-svc: ...\r\n".
@@ -166,6 +175,8 @@ pub fn Worker(comptime Handler: type) type {
         /// Where file bodies are read when sendfile can't send them (TLS,
         /// or a file it doesn't support).
         file_buf: []u8,
+        /// kTLS is wanted and, as far as this worker knows, available.
+        ktls_on: bool,
         date_line: [date.header_len]u8 = undefined,
         now: u32,
         last_realtime: i64 = 0,
@@ -246,6 +257,7 @@ pub fn Worker(comptime Handler: type) type {
                 .out_buf = out_buf,
                 .out = .{ .buf = out_buf },
                 .file_buf = file_buf,
+                .ktls_on = opts.ktls and sys.is_linux,
                 .now = sys.monotonicSeconds(),
                 .idle = .{ .timeout = opts.keep_alive_timeout_s },
                 .active = .{ .timeout = opts.request_timeout_s },
@@ -342,7 +354,7 @@ pub fn Worker(comptime Handler: type) type {
                 if (!c.open or c.h2 == null) continue;
                 const conn = c.h2.?;
                 conn.shutdown();
-                if (c.tls) |t| {
+                if (userTls(c)) |t| {
                     if (t.isEstablished() and !t.hasWire()) {
                         const n = t.encrypt(&.{conn.wireBytes()}) catch 0;
                         conn.advance(n);
@@ -879,7 +891,7 @@ pub fn Worker(comptime Handler: type) type {
         fn h2Flush(self: *Self, c: *Conn) bool {
             const conn = c.h2.?;
             while (true) {
-                if (c.tls) |t| {
+                if (userTls(c)) |t| {
                     const progressed = self.tlsFlush(c, t) orelse return false;
                     if (t.hasWire()) {
                         self.h2Timer(c);
@@ -897,6 +909,14 @@ pub fn Worker(comptime Handler: type) type {
                 }
                 const bytes = conn.wireBytes();
                 if (bytes.len == 0) break;
+                switch (self.kernelGate(c)) {
+                    .ready => {},
+                    .blocked => {
+                        self.h2Timer(c);
+                        return true;
+                    },
+                    .closed => return false,
+                }
                 const n = sys.write(c.fd, bytes) catch |err| switch (err) {
                     error.WouldBlock => {
                         self.h2Timer(c);
@@ -908,6 +928,7 @@ pub fn Worker(comptime Handler: type) type {
                     },
                 };
                 conn.advance(n);
+                if (!self.kernelWrote(c, n)) return false;
                 if (n < bytes.len) {
                     self.h2Timer(c);
                     return true;
@@ -1088,10 +1109,21 @@ pub fn Worker(comptime Handler: type) type {
         /// the connection (Out and the response are reused). Returns false
         /// if the connection was closed.
         fn writeOut(self: *Self, c: *Conn) bool {
-            if (c.tls) |t| return self.tlsWriteOut(c, t);
+            if (userTls(c)) |t| {
+                // A file body: the kernel sends it (kTLS and sendfile), from
+                // now on everything on this connection.
+                if (self.out.file != null) self.tryKernelTx(c, t);
+                if (!t.kernel_tx) return self.tlsWriteOut(c, t);
+            }
             var iov: [3]sys.iovec_const = undefined;
             const total = self.out.totalLen();
-            const n = sys.writev(c.fd, self.out.iovecs(&iov)) catch |err| switch (err) {
+            const gate = self.kernelGate(c);
+            if (gate == .closed) {
+                if (self.out.file) |f| f.release();
+                self.out.clear();
+                return false;
+            }
+            const n = if (gate == .blocked) 0 else sys.writev(c.fd, self.out.iovecs(&iov)) catch |err| switch (err) {
                 error.WouldBlock => 0,
                 else => {
                     if (self.out.file) |f| f.release();
@@ -1100,6 +1132,11 @@ pub fn Worker(comptime Handler: type) type {
                     return false;
                 },
             };
+            if (n > 0 and !self.kernelWrote(c, n)) {
+                if (self.out.file) |f| f.release();
+                self.out.clear();
+                return false;
+            }
             if (n == total) {
                 const file = self.out.file;
                 self.out.clear();
@@ -1146,7 +1183,7 @@ pub fn Worker(comptime Handler: type) type {
 
         /// Continues a partial write. Returns false if the connection is gone.
         fn writePending(self: *Self, c: *Conn) bool {
-            const progressed = (if (c.tls) |t| self.tlsWritePending(c, t) else self.writePendingPlain(c)) orelse
+            const progressed = (if (userTls(c)) |t| self.tlsWritePending(c, t) else self.writePendingPlain(c)) orelse
                 return false;
             if (c.hasPending()) {
                 // Progress extends the deadline; a stalled reader still times out.
@@ -1198,6 +1235,11 @@ pub fn Worker(comptime Handler: type) type {
                 iov[iov_len] = .{ .base = c.pending_tail.ptr, .len = c.pending_tail.len };
                 iov_len += 1;
             }
+            switch (self.kernelGate(c)) {
+                .ready => {},
+                .blocked => return false,
+                .closed => return null,
+            }
             var n: usize = 0;
             if (iov_len > 0) {
                 n = sys.writev(c.fd, iov[0..iov_len]) catch |err| switch (err) {
@@ -1208,6 +1250,7 @@ pub fn Worker(comptime Handler: type) type {
                     },
                 };
                 advancePending(c, n);
+                if (!self.kernelWrote(c, n)) return null;
                 if (c.pendingBytes()) return n > 0;
             }
             const file_progress = self.writeFile(c) orelse return null;
@@ -1225,6 +1268,11 @@ pub fn Worker(comptime Handler: type) type {
                     f.release();
                     c.pending_file = null;
                     break;
+                }
+                switch (self.kernelGate(c)) {
+                    .ready => {},
+                    .blocked => return progressed,
+                    .closed => return null,
                 }
                 const count: usize = @intCast(@min(f.len, 1 << 30));
                 const n = sys.sendfile(c.fd, f.fd, f.offset, count) catch |err| switch (err) {
@@ -1246,8 +1294,66 @@ pub fn Worker(comptime Handler: type) type {
                 f.offset += n;
                 f.len -= n;
                 progressed = true;
+                if (!self.kernelWrote(c, n)) return null;
             }
             return progressed;
+        }
+
+        /// The connection's TLS, if we still encrypt its output (not once
+        /// the kernel does: then writes are plaintext).
+        inline fn userTls(c: *const Conn) ?*TlsConn {
+            const t = c.tls orelse return null;
+            return if (t.kernel_tx) null else t;
+        }
+
+        /// Counts records the kernel made for `n` bytes written (kTLS).
+        fn kernelWrote(_: *Self, c: *Conn, n: usize) bool {
+            if (c.tls) |t| {
+                if (t.kernel_tx) t.kernelWrote(n);
+            }
+            return true;
+        }
+
+        const Gate = enum { ready, blocked, closed };
+
+        /// Before writing data through the kernel (kTLS): our KeyUpdate,
+        /// if due, goes first (RFC 8446 §4.6.3), then the kernel gets the
+        /// next key. `.blocked`: the socket is full, wait for room. Closes
+        /// the connection if the kernel can't switch keys (before TLS 1.3
+        /// rekey support).
+        fn kernelGate(self: *Self, c: *Conn) Gate {
+            const t = c.tls orelse return .ready;
+            if (!t.kernel_tx or !t.kernel_key_update) return .ready;
+            const msg = TlsConn.kernel_key_update_message;
+            const n = sys.ktls.sendRecord(c.fd, tls_handshake, msg) catch |err| switch (err) {
+                error.WouldBlock => return .blocked,
+                else => 0,
+            };
+            if (n == msg.len) {
+                t.kernelNextKey();
+                var info: [56]u8 = undefined;
+                defer std.crypto.secureZero(u8, &info);
+                if (sys.ktls.rekeyTx(c.fd, t.kernelTxInfo(&info))) |_| return .ready else |_| {}
+            }
+            // Our records no longer match the client's keys: no alert.
+            t.close_sent = true;
+            self.closeConn(c);
+            return .closed;
+        }
+
+        /// Hands the sending side to the kernel, before an HTTP/1.1 file
+        /// body (see Options.ktls), if our own records are all written.
+        fn tryKernelTx(self: *Self, c: *Conn, t: *TlsConn) void {
+            if (!self.ktls_on or !t.kernelTxReady()) return;
+            var info: [56]u8 = undefined;
+            sys.ktls.enableTx(c.fd, t.kernelTxInfo(&info)) catch |err| {
+                std.crypto.secureZero(u8, &info);
+                // No tls module: don't try again on this worker.
+                if (err == error.NoModule) self.ktls_on = false;
+                return;
+            };
+            std.crypto.secureZero(u8, &info);
+            t.startKernelTx();
         }
 
         fn writeFileCopy(self: *Self, c: *Conn, f: *const File) !usize {
@@ -1302,12 +1408,26 @@ pub fn Worker(comptime Handler: type) type {
                 return false;
             }
             if (t.peer_closed) c.peer_closed = true;
+            if (self.kernelGate(c) == .closed) return false;
             return self.tlsFlush(c, t) != null;
         }
 
         /// Writes TLS records until done or the socket is full. Returns
         /// whether bytes were written, or null if the connection was closed.
         fn tlsFlush(self: *Self, c: *Conn, t: *TlsConn) ?bool {
+            if (t.kernel_tx) {
+                // Only an alert of ours can be waiting.
+                const alert = t.kernel_alert orelse return false;
+                _ = sys.ktls.sendRecord(c.fd, tls_alert, &alert) catch |err| switch (err) {
+                    error.WouldBlock => return false,
+                    else => {
+                        self.closeConn(c);
+                        return null;
+                    },
+                };
+                t.kernel_alert = null;
+                return true;
+            }
             var progressed = false;
             while (t.hasWire()) {
                 const n = sys.write(c.fd, t.wireBytes()) catch |err| switch (err) {
@@ -1325,6 +1445,12 @@ pub fn Worker(comptime Handler: type) type {
 
         /// Best effort before closing (alerts, close_notify): one write.
         fn tlsWriteOnce(_: *Self, c: *Conn, t: *TlsConn) void {
+            if (t.kernel_tx) {
+                const alert = t.kernel_alert orelse return;
+                _ = sys.ktls.sendRecord(c.fd, tls_alert, &alert) catch {};
+                t.kernel_alert = null;
+                return;
+            }
             if (!t.hasWire()) return;
             const n = sys.write(c.fd, t.wireBytes()) catch return;
             t.advance(n);
@@ -1444,7 +1570,7 @@ pub fn Worker(comptime Handler: type) type {
         fn wsFlush(self: *Self, c: *Conn) bool {
             const w = c.ws.?;
             while (true) {
-                if (c.tls) |t| {
+                if (userTls(c)) |t| {
                     // TLS records first, then encrypt more WebSocket output.
                     const progressed = self.tlsFlush(c, t) orelse return false;
                     if (t.hasWire()) {
@@ -1462,6 +1588,14 @@ pub fn Worker(comptime Handler: type) type {
                 }
                 const bytes = w.wireBytes();
                 if (bytes.len == 0) break;
+                switch (self.kernelGate(c)) {
+                    .ready => {},
+                    .blocked => {
+                        self.wsTimer(c, false);
+                        return true;
+                    },
+                    .closed => return false,
+                }
                 const n = sys.write(c.fd, bytes) catch |err| switch (err) {
                     error.WouldBlock => {
                         self.wsTimer(c, false);
@@ -1473,6 +1607,7 @@ pub fn Worker(comptime Handler: type) type {
                     },
                 };
                 w.advance(n);
+                if (!self.kernelWrote(c, n)) return false;
                 if (n < bytes.len) {
                     // Socket buffer full: wait for writability.
                     self.wsTimer(c, true);

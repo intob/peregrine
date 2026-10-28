@@ -47,6 +47,11 @@ pub const Pools = struct {
     }
 };
 
+/// Connections whose sending side went to the kernel (kTLS), process-wide.
+pub var kernel_tx_count = std.atomic.Value(u64).init(0);
+/// Tests lower every new connection's `key_update_limit` with this.
+pub var test_key_update_limit: ?u64 = null;
+
 /// 0-RTT data the server rejects is skipped, up to this many bytes.
 const max_skipped_early_data = 64 * 1024;
 
@@ -90,11 +95,23 @@ pub const Conn = struct {
     close_sent: bool = false,
     /// See `key_update_after`; lowered by tests.
     key_update_limit: u64 = key_update_after,
+    /// The kernel encrypts our output (kTLS, `startKernelTx`): application
+    /// data is written to the socket as plaintext, `encrypt` is unused,
+    /// and an alert waits in `kernel_alert` for `sys.ktls.sendRecord`.
+    kernel_tx: bool = false,
+    kernel_alert: ?[2]u8 = null,
+    /// Records the kernel has made under the current key, an upper bound
+    /// (see `kernelWrote`).
+    kernel_records: u64 = 0,
+    /// Our KeyUpdate is due (the client asked, or the record limit was
+    /// reached): the event loop sends it before any more data, then
+    /// `kernelNextKey`.
+    kernel_key_update: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, pools: *Pools, config: *const Config, entropy: *const [entropy_len]u8) !Self {
         const hs = try allocator.create(handshake.Handshake);
         hs.* = .init(allocator, config, entropy);
-        return .{ .pools = pools, .hs = hs };
+        return .{ .pools = pools, .hs = hs, .key_update_limit = test_key_update_limit orelse key_update_after };
     }
 
     pub fn deinit(self: *Self) void {
@@ -386,6 +403,13 @@ pub const Conn = struct {
         switch (request) {
             .update_not_requested => {},
             .update_requested => {
+                // Our keys are in the kernel: the event loop answers
+                // (`kernelNextKey`) before writing anything else.
+                if (self.kernel_tx) {
+                    self.kernel_key_update = true;
+                    self.read.?.update();
+                    return;
+                }
                 // Answer under the current key, then switch (§4.6.3).
                 try self.sendRecords(.handshake, &key_update_not_requested);
                 self.write.?.update();
@@ -408,6 +432,10 @@ pub const Conn = struct {
     fn sendAlert(self: *Self, level: tls.Alert.Level, description: tls.Alert.Description) void {
         if (self.close_sent) return;
         self.close_sent = true;
+        if (self.kernel_tx) {
+            self.kernel_alert = .{ @backingInt(level), @backingInt(description) };
+            return;
+        }
         // Best effort: if there is no memory for the alert, just close.
         self.sendRecords(.alert, &.{ @backingInt(level), @backingInt(description) }) catch {};
     }
@@ -426,6 +454,82 @@ pub const Conn = struct {
 
     pub fn hasWire(self: *const Self) bool {
         return self.wire_end > self.wire_start;
+    }
+
+    // -- Kernel TLS -----------------------------------------------------------
+
+    /// The sending side can go to the kernel now: the handshake is done,
+    /// nothing we sealed is waiting to be written, no alert was sent.
+    pub fn kernelTxReady(self: *const Self) bool {
+        return self.isEstablished() and !self.kernel_tx and !self.hasWire() and !self.close_sent and self.write != null;
+    }
+
+    /// The kernel's `tls12_crypto_info_*` for our current sending key and
+    /// sequence number (linux/tls.h; TLS 1.3 splits the IV into a 4-byte
+    /// salt and the rest).
+    pub fn kernelTxInfo(self: *const Self, buf: *[56]u8) []const u8 {
+        const p = &self.write.?;
+        @memset(buf, 0);
+        std.mem.writeInt(u16, buf[0..2], 0x0304, .little);
+        var seq: [8]u8 = undefined;
+        std.mem.writeInt(u64, &seq, p.seq, .big);
+        switch (p.suite) {
+            inline else => |s| {
+                const ks = s.Schedule();
+                const key_len = s.Aead().key_length;
+                var key = ks.trafficKey(key_len, p.secret[0..ks.hash_len].*);
+                defer std.crypto.secureZero(u8, &key);
+                switch (s) {
+                    .aes_128_gcm_sha256, .aes_256_gcm_sha384 => {
+                        std.mem.writeInt(u16, buf[2..4], if (key_len == 16) 51 else 52, .little);
+                        buf[4..12].* = p.iv[4..12].*;
+                        @memcpy(buf[12..][0..key_len], &key);
+                        buf[12 + key_len ..][0..4].* = p.iv[0..4].*;
+                        buf[16 + key_len ..][0..8].* = seq;
+                        return buf[0 .. 24 + key_len];
+                    },
+                    .chacha20_poly1305_sha256 => {
+                        std.mem.writeInt(u16, buf[2..4], 54, .little);
+                        buf[4..16].* = p.iv;
+                        buf[16..48].* = key;
+                        buf[48..56].* = seq;
+                        return buf[0..56];
+                    },
+                }
+            },
+        }
+    }
+
+    /// The kernel took our sending side (`sys.ktls.enableTx` succeeded).
+    /// Our copy of the traffic secret stays, for the next key (KeyUpdate).
+    pub fn startKernelTx(self: *Self) void {
+        std.debug.assert(self.kernelTxReady());
+        self.kernel_tx = true;
+        _ = kernel_tx_count.fetchAdd(1, .monotonic);
+        if (self.wire_buf.len > 0) {
+            self.pools.out.release(self.wire_buf);
+            self.wire_buf = &.{};
+        }
+    }
+
+    /// Counts what one write to the socket made: at least one record, one
+    /// per full record's worth. At the key's record limit (see
+    /// `key_update_after`) our KeyUpdate becomes due.
+    pub fn kernelWrote(self: *Self, n: usize) void {
+        self.kernel_records += 1 + n / record.max_plaintext;
+        if (self.kernel_records >= self.key_update_limit) self.kernel_key_update = true;
+    }
+
+    /// Our KeyUpdate, for `sys.ktls.sendRecord` as a handshake record (22).
+    pub const kernel_key_update_message: []const u8 = &key_update_not_requested;
+
+    /// After our KeyUpdate went out through the kernel: the next sending
+    /// key, which the event loop hands over with `sys.ktls.rekeyTx` and
+    /// `kernelTxInfo` (kernels without TLS 1.3 rekey refuse: then close).
+    pub fn kernelNextKey(self: *Self) void {
+        self.write.?.update();
+        self.kernel_records = 0;
+        self.kernel_key_update = false;
     }
 
     pub fn advance(self: *Self, n: usize) void {
@@ -484,7 +588,7 @@ pub const Conn = struct {
     /// Encrypts as much of `parts` (taken in order, as one stream) as fits
     /// in the wire buffer. Returns the number of plaintext bytes consumed.
     pub fn encrypt(self: *Self, parts: []const []const u8) !usize {
-        std.debug.assert(self.isEstablished());
+        std.debug.assert(self.isEstablished() and !self.kernel_tx);
         var total: usize = 0;
         for (parts) |p| total += p.len;
         var consumed: usize = 0;
@@ -689,6 +793,89 @@ pub fn runAgainstStdClient(server: *TestServer, msg: []const u8, transcript: ?*s
     try result;
     try testing.expectEqualStrings("http/1.1", conn.alpn orelse "http/1.1");
     server.last_write_seq = if (conn.write) |w| w.seq else 0;
+}
+
+/// A connected loopback TCP pair (Linux), for the kernel TLS test.
+fn tcpPair() ![2]sys.fd_t {
+    const linux = std.os.linux;
+    const l: sys.fd_t = @intCast(linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0));
+    defer sys.close(l);
+    var addr: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    if (linux.bind(l, @ptrCast(&addr), len) != 0) return error.Bind;
+    _ = linux.listen(l, 1);
+    _ = linux.getsockname(l, @ptrCast(&addr), &len);
+    const c: sys.fd_t = @intCast(linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0));
+    if (linux.connect(c, @ptrCast(&addr), len) != 0) return error.Connect;
+    const a: sys.fd_t = @intCast(linux.accept(l, null, null));
+    return .{ a, c };
+}
+
+test "kernel TLS: records the kernel seals open with our keys, every suite" {
+    if (!sys.is_linux) return error.SkipZigTest;
+    var pools = try Pools.init(testing.allocator, 1);
+    defer pools.deinit();
+    var used = false;
+    for ([_]Suite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 }) |suite| {
+        const fds = try tcpPair();
+        defer sys.close(fds[0]);
+        defer sys.close(fds[1]);
+        const secret: [48]u8 = @splat(0x5a);
+        var conn: Conn = .{ .pools = &pools, .hs = null };
+        conn.write = .init(suite, secret[0..suite.hashLen()]);
+        conn.write.?.seq = 7; // after a few records of our own
+        var info_buf: [56]u8 = undefined;
+        sys.ktls.enableTx(fds[0], conn.kernelTxInfo(&info_buf)) catch |err| switch (err) {
+            // No tls module (Docker Desktop's kernel), or not this cipher.
+            error.NoModule => return error.SkipZigTest,
+            error.Unsupported => continue,
+            else => return err,
+        };
+        used = true;
+        conn.startKernelTx();
+        _ = try sys.write(fds[0], "hello, kernel");
+        // KeyUpdate, where the kernel can switch keys (TLS 1.3 rekey).
+        _ = try sys.ktls.sendRecord(fds[0], @backingInt(ContentType.handshake), &key_update_not_requested);
+        conn.write.?.update();
+        const rekeyed = if (sys.ktls.rekeyTx(fds[0], conn.kernelTxInfo(&info_buf))) true else |err| switch (err) {
+            error.Unsupported => false,
+            else => return err,
+        };
+        std.debug.print("{s}: rekey {s}\n", .{ @tagName(suite), if (rekeyed) "supported" else "unsupported" });
+        if (rekeyed) _ = try sys.write(fds[0], "after rekey");
+        _ = try sys.ktls.sendRecord(fds[0], @backingInt(ContentType.alert), &.{ 1, 0 });
+        var rx: Protection = .init(suite, secret[0..suite.hashLen()]);
+        rx.seq = 7;
+        var buf: [256]u8 = undefined;
+        var have: usize = 0;
+        var got: [4]ContentType = undefined;
+        var n: usize = 0;
+        const want: usize = if (rekeyed) 4 else 3;
+        while (n < want) {
+            have += try sys.read(fds[1], buf[have..]);
+            while (have >= record.header_len) {
+                const rec_len = record.header_len + std.mem.readInt(u16, buf[3..5], .big);
+                if (have < rec_len) break;
+                const opened = try rx.open(buf[0..rec_len]);
+                got[n] = opened.content_type;
+                if (n == 0) try testing.expectEqualStrings("hello, kernel", opened.data);
+                if (n == 1) {
+                    try testing.expectEqualSlices(u8, &key_update_not_requested, opened.data);
+                    if (rekeyed) rx.update();
+                }
+                if (n == 2 and rekeyed) try testing.expectEqualStrings("after rekey", opened.data);
+                if (n == want - 1) try testing.expectEqualSlices(u8, &.{ 1, 0 }, opened.data);
+                n += 1;
+                std.mem.copyForwards(u8, buf[0 .. have - rec_len], buf[rec_len..have]);
+                have -= rec_len;
+            }
+        }
+        try testing.expectEqual(ContentType.application_data, got[0]);
+        try testing.expectEqual(ContentType.handshake, got[1]);
+        try testing.expectEqual(ContentType.alert, got[want - 1]);
+        conn.deinit();
+    }
+    if (!used) return error.SkipZigTest;
 }
 
 test "handshake and echo with std's TLS client, every suite, group and key type" {
