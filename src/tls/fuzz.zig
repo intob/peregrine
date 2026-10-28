@@ -1379,8 +1379,13 @@ fn runScript(
             mres.benign = false;
             // With bytes left over after ClientHello1, ClientHello2 parses
             // as garbage first: some other alert, or none while the server
-            // waits for the rest of a message. Not modelled.
-            if (mres.framed) exp.fail(@src().line, d);
+            // waits for the rest of a message. An extension length that
+            // lies (carried over from ClientHello1, which parsed anyway)
+            // may fail ClientHello2's parsing first (decode_error). Not
+            // modelled.
+            var lying = false;
+            for (h2.exts.items) |e| lying = lying or e.len_delta != 0;
+            if (mres.framed and !lying) exp.fail(@src().line, d);
         }
         const ch2 = try h2.encode(a);
         try view.sentHello(ch2);
@@ -1656,6 +1661,9 @@ const corpus = [_][]const u8{
     // Harness: without Finished, application records split into more
     // records used up the server's budget for skipping 0-RTT data.
     @embedFile("testdata/fuzz/split-7.bin"),
+    // Harness: an extension length that lies, carried into ClientHello2,
+    // failed its parsing before the expected illegal_parameter.
+    @embedFile("testdata/fuzz/retry-8.bin"),
 };
 
 test "fuzz: tls.Conn handshake and record mutations" {
