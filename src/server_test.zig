@@ -9,6 +9,9 @@ const Backend = @import("./server.zig").Backend;
 const Request = @import("./request.zig").Request;
 const Response = @import("./response.zig").Response;
 const Exchange = @import("./http/exchange.zig").Exchange;
+const BodyMode = @import("./http/exchange.zig").BodyMode;
+const BodyAction = @import("./http/exchange.zig").BodyAction;
+const Header = @import("./header.zig").Header;
 const ws = @import("./ws/ws.zig");
 const h2frame = @import("./h2/frame.zig");
 const hpack = @import("./h2/hpack.zig");
@@ -33,6 +36,17 @@ const TestHandler = struct {
     /// A streamed flood: bytes still to send on the exchange in `flood`.
     flood_left: usize = 0,
     flood: ?Exchange = null,
+    /// Streamed request bodies in progress (any worker), and one held
+    /// paused until a test resumes it.
+    uploads_mutex: sys.Mutex = .{},
+    uploads: std.AutoHashMapUnmanaged(Exchange, Upload) = .empty,
+    held: ?Exchange = null,
+
+    const Upload = struct {
+        len: u64 = 0,
+        hash: std.hash.Fnv1a_32 = .init(),
+        pause: enum { none, each, hold } = .none,
+    };
 
     pub fn init(allocator: std.mem.Allocator) !*TestHandler {
         const h = try allocator.create(TestHandler);
@@ -41,7 +55,63 @@ const TestHandler = struct {
     }
 
     pub fn deinit(self: *TestHandler) void {
+        self.uploads.deinit(self.allocator);
         self.allocator.destroy(self);
+    }
+
+    pub fn handleHead(_: *TestHandler, req: *Request, resp: *Response) BodyMode {
+        const path = req.getPath();
+        if (!std.mem.startsWith(u8, path, "/upload")) return .buffer;
+        if (std.mem.eql(u8, path, "/upload-reject")) {
+            resp.status = .payload_too_large;
+            resp.setBodyBorrowed("too much");
+            return .reject;
+        }
+        return .stream;
+    }
+
+    /// Streamed uploads: the length, an FNV-1a hash of the bytes and the
+    /// trailers come back in the response.
+    pub fn handleBody(self: *TestHandler, ex: Exchange, chunk: []const u8, end: ?[]const Header) BodyAction {
+        self.uploads_mutex.lock();
+        defer self.uploads_mutex.unlock();
+        const up = self.uploads.getPtr(ex) orelse return .more;
+        up.len += chunk.len;
+        up.hash.update(chunk);
+        if (end) |trailers| {
+            var buf: [512]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            w.print("n={d} hash={x}", .{ up.len, up.hash.final() }) catch unreachable;
+            for (trailers) |t| w.print(" {s}={s}", .{ t.key, t.value }) catch unreachable;
+            _ = self.uploads.remove(ex);
+            ex.respond(.{}, w.buffered()) catch unreachable;
+            return .more;
+        }
+        switch (up.pause) {
+            .none => return .more,
+            .each => {
+                // Resumed through the mailbox, from the worker's own thread.
+                ex.resumeBody() catch unreachable;
+                return .pause;
+            },
+            .hold => {
+                up.pause = .none;
+                self.held = ex;
+                return .pause;
+            },
+        }
+    }
+
+    /// Test thread: resumes the held upload.
+    fn resumeHeld(self: *TestHandler) !void {
+        self.uploads_mutex.lock();
+        const ex = self.held orelse {
+            self.uploads_mutex.unlock();
+            return error.NothingHeld;
+        };
+        self.held = null;
+        self.uploads_mutex.unlock();
+        try ex.resumeBody();
     }
 
     pub fn handleWSConn(self: *TestHandler, _: *ws.Conn) void {
@@ -98,9 +168,12 @@ const TestHandler = struct {
         self.pumpFlood(ex);
     }
 
-    pub fn handleAbort(self: *TestHandler, _: Exchange) void {
+    pub fn handleAbort(self: *TestHandler, ex: Exchange) void {
         _ = self.aborts.fetchAdd(1, .monotonic);
         self.flood = null;
+        self.uploads_mutex.lock();
+        defer self.uploads_mutex.unlock();
+        _ = self.uploads.remove(ex);
     }
 
     fn release(ctx: ?*anyopaque) void {
@@ -139,6 +212,20 @@ const TestHandler = struct {
 
     pub fn handleRequest(self: *TestHandler, req: *Request, resp: *Response) void {
         const path = req.getPath();
+        if (std.mem.startsWith(u8, path, "/upload")) {
+            if (std.mem.eql(u8, path, "/upload-sync")) {
+                // Answered at once: the body is not read.
+                resp.setBodyBorrowed("early");
+                return;
+            }
+            const ex = resp.later() catch unreachable;
+            self.uploads_mutex.lock();
+            defer self.uploads_mutex.unlock();
+            self.uploads.put(self.allocator, ex, .{
+                .pause = if (std.mem.eql(u8, path, "/upload-pause")) .each else if (std.mem.eql(u8, path, "/upload-hold")) .hold else .none,
+            }) catch unreachable;
+            return;
+        }
         if (std.mem.eql(u8, path, "/later") or std.mem.eql(u8, path, "/later-stream")) {
             // Answered from another thread, after the handler returns.
             const ex = resp.later() catch unreachable;
@@ -1054,6 +1141,151 @@ fn testStreamBackpressure(backend: Backend) !void {
 
 /// An HTTP/2 client over TCP: HPACK, frames, and flow control enough to
 /// drive the server.
+fn setBlocking(fd: sys.fd_t, blocking: bool) void {
+    const nonblock: u32 = @bitCast(posix.O{ .NONBLOCK = true });
+    if (sys.is_linux) {
+        const flags: u32 = @truncate(std.os.linux.fcntl(fd, posix.F.GETFL, 0));
+        _ = std.os.linux.fcntl(fd, posix.F.SETFL, if (blocking) flags & ~nonblock else flags | nonblock);
+    } else {
+        const flags: u32 = @bitCast(system.fcntl(fd, posix.F.GETFL, @as(c_int, 0)));
+        _ = system.fcntl(fd, posix.F.SETFL, @as(c_int, @bitCast(if (blocking) flags & ~nonblock else flags | nonblock)));
+    }
+}
+
+fn fnv(bytes: []const u8) u32 {
+    var h: std.hash.Fnv1a_32 = .init();
+    h.update(bytes);
+    return h.final();
+}
+
+/// Reads one response and checks its status and body.
+fn expectResponse(c: *Client, status: u16, body: []const u8) !void {
+    var head: [1024]u8 = undefined;
+    var got: [512]u8 = undefined;
+    const r = try c.readResponse(&head, &got);
+    try testing.expectEqual(status, r.status);
+    try testing.expectEqualStrings(body, got[0..r.body_len]);
+}
+
+test "streamed request bodies: beyond max_body_size, chunked trailers, 100-continue, reject, early answer" {
+    try forEachBackend(testUploads);
+}
+
+fn testUploads(backend: Backend) !void {
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    // Buffered bodies stay limited to 64 KiB; streamed ones are not.
+    const r = try Running.start(backend, .{ .limits = .{ .max_body_size = 64 * 1024 } });
+    defer r.stop();
+    var c = try Client.connect(r.port);
+    defer c.close();
+    var expected: [128]u8 = undefined;
+
+    // 6 MB with Content-Length, sent in pieces, then a request after it.
+    const body = big_body[0 .. 6 * 1024 * 1024];
+    try c.send("POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 6291456\r\n\r\n");
+    var rest: []const u8 = body;
+    while (rest.len > 0) {
+        const n = @min(rest.len, 100_000);
+        try c.send(rest[0..n]);
+        rest = rest[n..];
+    }
+    try c.send("GET /after HTTP/1.1\r\nHost: x\r\n\r\n");
+    try expectResponse(&c, 200, try std.fmt.bufPrint(&expected, "n={d} hash={x}", .{ body.len, fnv(body) }));
+    try expectResponse(&c, 200, "ok");
+
+    // Chunked, with trailers.
+    try c.send("POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\nX-Sum: 11\r\nX-Other: b\r\n\r\n");
+    try expectResponse(&c, 200, try std.fmt.bufPrint(&expected, "n=11 hash={x} X-Sum=11 X-Other=b", .{fnv("hello world")}));
+
+    // 100-continue: the interim response first, then the body is wanted.
+    try c.send("PUT /upload-pause HTTP/1.1\r\nHost: x\r\nContent-Length: 1000000\r\nExpect: 100-continue\r\n\r\n");
+    try testing.expectEqualStrings("HTTP/1.1 100 Continue", try c.readLine());
+    c.consume("HTTP/1.1 100 Continue\r\n\r\n".len);
+    try c.send(big_body[0..1000000]);
+    try expectResponse(&c, 200, try std.fmt.bufPrint(&expected, "n=1000000 hash={x}", .{fnv(big_body[0..1000000])}));
+
+    // Rejected on its head: no 100 Continue, and the connection closes.
+    try c.send("PUT /upload-reject HTTP/1.1\r\nHost: x\r\nContent-Length: 1000000\r\nExpect: 100-continue\r\n\r\n");
+    var head: [1024]u8 = undefined;
+    var got: [64]u8 = undefined;
+    const rej = try c.readResponse(&head, &got);
+    try testing.expectEqual(@as(u16, 413), rej.status);
+    try testing.expect(std.mem.indexOf(u8, rej.head, "connection: close\r\n") != null);
+    try c.expectClosed();
+
+    // Answered before the body: the rest is drained, the connection closes.
+    var c2 = try Client.connect(r.port);
+    defer c2.close();
+    try c2.send("POST /upload-sync HTTP/1.1\r\nHost: x\r\nContent-Length: 300000\r\n\r\n");
+    try c2.send(big_body[0..100000]);
+    try expectResponse(&c2, 200, "early");
+    c2.send(big_body[0..200000]) catch {};
+    try c2.expectClosed();
+
+    // A client that leaves mid-body: the handler hears of it.
+    const aborts = r.srv.handler.aborts.load(.monotonic);
+    var c3 = try Client.connect(r.port);
+    try c3.send("POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 300000\r\n\r\n");
+    try c3.send(big_body[0..1000]);
+    sleepMs(50);
+    c3.close();
+    var waited: usize = 0;
+    while (r.srv.handler.aborts.load(.monotonic) == aborts and waited < 200) : (waited += 1) sleepMs(10);
+    try testing.expect(r.srv.handler.aborts.load(.monotonic) > aborts);
+}
+
+test "streamed request bodies: a paused body holds the client back" {
+    try forEachBackend(testUploadHold);
+}
+
+fn testUploadHold(backend: Backend) !void {
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    const r = try Running.start(backend, .{ .worker_thread_count = 1 });
+    defer r.stop();
+    var c = try Client.connect(r.port);
+    defer c.close();
+    const total = 64 * 1024 * 1024;
+    try c.send("POST /upload-hold HTTP/1.1\r\nHost: x\r\nContent-Length: 67108864\r\n\r\n");
+    // Non-blocking: send until the server stops taking bytes.
+    setBlocking(c.fd, false);
+    var sent: usize = 0;
+    var stalls: usize = 0;
+    while (stalls < 20) {
+        const piece = big_body[sent % big_body.len ..][0..@min(64 * 1024, big_body.len - sent % big_body.len)];
+        const n = sys.write(c.fd, piece) catch |err| switch (err) {
+            error.WouldBlock => {
+                stalls += 1;
+                sleepMs(10);
+                continue;
+            },
+            else => return err,
+        };
+        sent += n;
+        stalls = 0;
+    }
+    // Socket buffers and one read buffer hold the difference.
+    try testing.expect(sent < 16 * 1024 * 1024);
+    setBlocking(c.fd, true);
+    try r.srv.handler.resumeHeld();
+    var hash: std.hash.Fnv1a_32 = .init();
+    var i: usize = 0;
+    while (i < sent) {
+        const n = @min(sent - i, big_body.len - i % big_body.len);
+        hash.update(big_body[i % big_body.len ..][0..n]);
+        i += n;
+    }
+    while (sent < total) {
+        const off = sent % big_body.len;
+        const n = @min(total - sent, big_body.len - off);
+        try c.send(big_body[off..][0..n]);
+        hash.update(big_body[off..][0..n]);
+        sent += n;
+    }
+    var expected: [64]u8 = undefined;
+    try expectResponse(&c, 200, try std.fmt.bufPrint(&expected, "n={d} hash={x}", .{ total, hash.final() }));
+}
+
 const H2Client = struct {
     tcp: Client,
     enc: hpack.Encoder,

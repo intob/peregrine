@@ -8,6 +8,8 @@ const date = @import("./date.zig");
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
 const Status = @import("../status.zig").Status;
+const Header = @import("../header.zig").Header;
+const exchange = @import("./exchange.zig");
 const iovec_const = std.posix.iovec_const;
 
 /// Fixed-size read buffers shared by a worker's connections. A connection
@@ -122,7 +124,8 @@ pub const Action = enum {
     upgrade,
     /// Flush Out; the response (or the rest of it) comes through the
     /// exchange the handler took (`resp.exchange`). Don't call process
-    /// again until it ends: responses go out in request order.
+    /// again until it ends (responses go out in request order), except
+    /// to deliver a streamed request body while `wantsBody()`.
     wait,
 };
 
@@ -156,6 +159,39 @@ pub const Session = struct {
     wait_keep_alive: bool = true,
     wait_is_head: bool = false,
     wait_http10: bool = false,
+    /// handleHead chose `.buffer` for the request being received (it is
+    /// parsed again as more of its body arrives).
+    head_checked: bool = false,
+    /// A request body streamed to the handler (`handleHead` returned
+    /// `.stream`): what is left of it, and the exchange it goes to.
+    body: Body = .none,
+    body_left: u64 = 0,
+    body_paused: bool = false,
+    body_ex: exchange.Exchange = undefined,
+
+    pub const Body = enum(u8) {
+        none,
+        /// No body: only the end is still to be delivered.
+        end,
+        length,
+        chunked,
+    };
+
+    /// Whether the event loop should read: a streamed body is arriving
+    /// and the handler has not paused it.
+    pub inline fn wantsBody(self: *const Self) bool {
+        return self.body != .none and !self.body_paused;
+    }
+
+    /// The exchange ended: any body still arriving is not for anyone, and
+    /// the connection can't be reused.
+    pub fn endWait(self: *Self) bool {
+        const unread = self.body != .none;
+        self.waiting = false;
+        self.body = .none;
+        self.body_paused = false;
+        return unread;
+    }
 
     pub inline fn buffered(self: *const Self) usize {
         return self.end - self.start;
@@ -224,6 +260,7 @@ pub const Session = struct {
         self.chunked = .{};
         self.need = 0;
         self.sent_continue = false;
+        self.head_checked = false;
     }
 };
 
@@ -239,8 +276,10 @@ pub fn Context(comptime Handler: type) type {
     };
 }
 
-/// Longest status line + server-managed headers.
-const fixed_head_overhead = "HTTP/1.1 ".len + 48 + "content-length: ".len + 20 + 2 +
+const continue_line = "HTTP/1.1 100 Continue\r\n\r\n";
+
+/// Longest status line + server-managed headers (after a 100 Continue).
+const fixed_head_overhead = continue_line.len + "HTTP/1.1 ".len + 48 + "content-length: ".len + 20 + 2 +
     date.header_len + "connection: keep-alive\r\n".len + 2;
 
 /// Out must be at least this large.
@@ -250,7 +289,10 @@ pub fn headRoom(resp: *const Response) usize {
 
 pub fn process(comptime Handler: type, s: *Session, ctx: *const Context(Handler), out: *Out) Action {
     const opts = ctx.opts;
-    if (s.waiting) return .wait;
+    if (s.waiting) {
+        if (s.body != .none) return streamBody(Handler, s, ctx);
+        return .wait;
+    }
     while (true) {
         // A borrowed body must be written before the response is reused,
         // and Out must have room for the largest possible response head.
@@ -276,10 +318,27 @@ pub fn process(comptime Handler: type, s: *Session, ctx: *const Context(Handler)
         const head = parser.parseHead(data[0..head_len], ctx.req, opts.limits) catch |err| {
             return errorResponse(s, ctx, out, err);
         };
+        if (@hasDecl(Handler, "handleHead") and !s.head_checked) {
+            ctx.resp.reset();
+            var mode = ctx.handler.handleHead(ctx.req, ctx.resp);
+            if (mode == .stream and !@hasDecl(Handler, "handleBody")) mode = .buffer;
+            switch (mode) {
+                .buffer => s.head_checked = true,
+                .reject => {
+                    if (finishRequest(Handler, s, ctx, out, head_len, head.framing != .none)) |action| return action;
+                    continue;
+                },
+                .stream => {
+                    if (startBody(Handler, s, ctx, out, head)) |action| return action;
+                    continue;
+                },
+            }
+        }
         var total: usize = head_len;
         switch (head.framing) {
             .none => {},
             .length => |n| {
+                if (n > opts.limits.max_body_size) return errorResponse(s, ctx, out, error.PayloadTooLarge);
                 total += n;
                 if (data.len < total) {
                     s.need = total;
@@ -293,6 +352,12 @@ pub fn process(comptime Handler: type, s: *Session, ctx: *const Context(Handler)
                 };
                 if (!complete) return awaitBody(s, ctx, out, head);
                 const raw = s.buf[s.start + head_len ..][0..s.chunked.pos];
+                const section = s.chunked.trailers(raw);
+                if (section.len > 0) {
+                    const room = ctx.req.headers[ctx.req.headers_len..];
+                    const n = parser.parseTrailers(section, room) catch |err| return errorResponse(s, ctx, out, err);
+                    ctx.req.trailers = room[0..n];
+                }
                 ctx.req.body = raw[0..parser.decodeChunked(raw)];
                 total += s.chunked.pos;
             },
@@ -300,44 +365,131 @@ pub fn process(comptime Handler: type, s: *Session, ctx: *const Context(Handler)
 
         ctx.resp.reset();
         ctx.handler.handleRequest(ctx.req, ctx.resp);
-
-        s.requests +|= 1;
-        var keep_alive = ctx.req.keep_alive and !ctx.resp.close and
-            (opts.max_requests_per_connection == 0 or s.requests < opts.max_requests_per_connection);
-        s.start += total;
-        s.resetRequestState();
-        if (ctx.resp.mode != .sync) {
-            // The response comes through the exchange. A streamed body
-            // without a length to an HTTP/1.0 client is close-delimited.
-            const http10 = ctx.req.version == .@"HTTP/1.0";
-            if (ctx.resp.mode == .stream and http10 and ctx.resp.content_length == null) keep_alive = false;
-            s.waiting = true;
-            s.wait_keep_alive = keep_alive;
-            s.wait_is_head = ctx.req.method == .HEAD;
-            s.wait_http10 = http10;
-            if (ctx.resp.mode == .stream) writeStreamHead(ctx.req, ctx.resp, ctx.date, out, keep_alive);
-            return .wait;
-        }
-        const more = s.start < s.end;
-        writeResponse(ctx.req, ctx.resp, ctx.date, out, keep_alive, more);
-        if (ctx.resp.is_ws_upgrade) {
-            // Anything after the request is the first WebSocket frames; the
-            // event loop hands the buffer to the WebSocket side.
-            return .upgrade;
-        }
-        if (!keep_alive) {
-            s.start = s.end;
-            return .close;
-        }
+        if (finishRequest(Handler, s, ctx, out, total, false)) |action| return action;
     }
+}
+
+/// After the handler: accounts for the request's `consumed` bytes and
+/// serialises the response, or hands over to the exchange the handler
+/// took. With `unread_body` the request's body was not read (rejected, or
+/// answered without streaming it): the connection closes after the
+/// response, draining what the client still sends. Returns null to go on
+/// with the next request.
+fn finishRequest(comptime Handler: type, s: *Session, ctx: *const Context(Handler), out: *Out, consumed: usize, unread_body: bool) ?Action {
+    const opts = ctx.opts;
+    s.requests +|= 1;
+    var keep_alive = !unread_body and ctx.req.keep_alive and !ctx.resp.close and
+        (opts.max_requests_per_connection == 0 or s.requests < opts.max_requests_per_connection);
+    s.start += consumed;
+    s.resetRequestState();
+    if (ctx.resp.mode != .sync) {
+        // The response comes through the exchange. A streamed body
+        // without a length to an HTTP/1.0 client is close-delimited.
+        const http10 = ctx.req.version == .@"HTTP/1.0";
+        if (ctx.resp.mode == .stream and http10 and ctx.resp.content_length == null) keep_alive = false;
+        s.waiting = true;
+        s.wait_keep_alive = keep_alive;
+        s.wait_is_head = ctx.req.method == .HEAD;
+        s.wait_http10 = http10;
+        if (ctx.resp.mode == .stream) writeStreamHead(ctx.req, ctx.resp, ctx.date, out, keep_alive);
+        return .wait;
+    }
+    const more = s.start < s.end;
+    writeResponse(ctx.req, ctx.resp, ctx.date, out, keep_alive, more);
+    if (ctx.resp.is_ws_upgrade) {
+        // Anything after the request is the first WebSocket frames; the
+        // event loop hands the buffer to the WebSocket side.
+        return .upgrade;
+    }
+    if (!keep_alive) {
+        s.start = s.end;
+        if (unread_body) s.linger = true;
+        return .close;
+    }
+    return null;
+}
+
+/// handleHead chose `.stream`: handleRequest runs now with an empty body.
+/// If it takes an exchange, the body follows through handleBody once the
+/// worker has bound the exchange (process is called again while
+/// `wantsBody()`); otherwise the body is not read.
+fn startBody(comptime Handler: type, s: *Session, ctx: *const Context(Handler), out: *Out, head: parser.Head) ?Action {
+    ctx.resp.reset();
+    ctx.handler.handleRequest(ctx.req, ctx.resp);
+    if (ctx.resp.mode == .sync) return finishRequest(Handler, s, ctx, out, head.len, head.framing != .none);
+    // RFC 9110 §10.1.1: now the client may send the body.
+    if (head.expect_continue) out.append(continue_line);
+    s.body_ex = ctx.resp.exchange;
+    s.body_paused = false;
+    switch (head.framing) {
+        .none => s.body = .end,
+        .length => |n| {
+            s.body = .length;
+            s.body_left = n;
+        },
+        .chunked => s.body = .chunked,
+    }
+    return finishRequest(Handler, s, ctx, out, head.len, false);
+}
+
+/// Hands the buffered part of a streamed body to handleBody, until the
+/// buffer is empty (`.need_more`), the handler pauses, or the body ends
+/// (`.wait`: the exchange is still answering). A malformed chunked body
+/// can no longer be answered with a 400: the connection closes, and the
+/// handler hears of it through handleAbort.
+fn streamBody(comptime Handler: type, s: *Session, ctx: *const Context(Handler)) Action {
+    if (!@hasDecl(Handler, "handleBody")) unreachable;
+    while (!s.body_paused) {
+        const data = s.buf[s.start..s.end];
+        var chunk: []const u8 = "";
+        var end: ?[]const Header = null;
+        switch (s.body) {
+            .none => unreachable,
+            .end => end = &.{},
+            .length => {
+                const n: usize = @intCast(@min(s.body_left, data.len));
+                if (n == 0) return .need_more;
+                chunk = data[0..n];
+                s.start += n;
+                s.body_left -= n;
+                if (s.body_left == 0) end = &.{};
+            },
+            .chunked => {
+                const piece = s.chunked.next(data, ctx.opts.limits.max_header_bytes) catch {
+                    s.start = s.end;
+                    return .close;
+                };
+                s.start += piece.consumed;
+                if (piece.done) {
+                    // The worker's Request is free while the body streams:
+                    // its header slots hold the trailers for the call.
+                    const n = parser.parseTrailers(piece.trailers, &ctx.req.headers) catch {
+                        s.start = s.end;
+                        return .close;
+                    };
+                    end = ctx.req.headers[0..n];
+                } else if (piece.data.len == 0) {
+                    return .need_more;
+                }
+                chunk = piece.data;
+            },
+        }
+        if (end != null) {
+            s.body = .none;
+            s.chunked = .{};
+        }
+        const action = s.body_ex.deliverBody(ctx.handler, chunk, end, ctx.resp.now.*);
+        if (end != null) return .wait;
+        if (action == .pause) s.body_paused = true;
+    }
+    return .wait;
 }
 
 fn awaitBody(s: *Session, ctx: anytype, out: *Out, head: parser.Head) Action {
     if (head.expect_continue and !s.sent_continue) {
         // RFC 9110 §10.1.1: tell the client to send the body.
-        const line = "HTTP/1.1 100 Continue\r\n\r\n";
-        if (out.free() < line.len) return .flush;
-        out.append(line);
+        if (out.free() < continue_line.len) return .flush;
+        out.append(continue_line);
         s.sent_continue = true;
     }
     _ = ctx;
@@ -437,6 +589,8 @@ fn writeResponse(
 // Tests: drive the state machine without sockets.
 
 const testing = std.testing;
+const sys = @import("../sys.zig");
+const Mailbox = @import("../mailbox.zig").Mailbox;
 
 const EchoHandler = struct {
     calls: usize = 0,
@@ -455,89 +609,139 @@ const EchoHandler = struct {
     }
 };
 
-const Harness = struct {
-    pool: BufferPool,
-    session: Session = .{},
-    handler: EchoHandler = .{},
-    req: *Request,
-    resp: *Response,
-    out_buf: []u8,
-    out: Out,
-    written: std.ArrayList(u8) = .empty,
-    date_line: [date.header_len]u8 = undefined,
-    opts: Options,
-    closed: bool = false,
+const Harness = HarnessFor(EchoHandler);
 
-    fn init(opts: Options, pool_buf: usize, out_size: usize) !*Harness {
-        const h = try testing.allocator.create(Harness);
-        const out_buf = try testing.allocator.alloc(u8, out_size);
-        h.* = .{
-            .pool = try BufferPool.init(testing.allocator, pool_buf, 2),
-            .req = try Request.init(testing.allocator),
-            .resp = try Response.init(testing.allocator, 8192, 1024),
-            .out_buf = out_buf,
-            .out = .{ .buf = out_buf },
-            .opts = opts,
-        };
-        date.formatHeader(&h.date_line, 784111777);
-        return h;
-    }
+/// Drives a session the way the workers do, with an exchange slab: an
+/// exchange is bound when the session waits, drained into the output, and
+/// ended when done.
+fn HarnessFor(comptime H: type) type {
+    return struct {
+        const Self = @This();
 
-    fn deinit(h: *Harness) void {
-        h.session.deinit(&h.pool);
-        h.pool.deinit();
-        h.req.deinit();
-        h.resp.deinit();
-        h.written.deinit(testing.allocator);
-        testing.allocator.free(h.out_buf);
-        testing.allocator.destroy(h);
-    }
+        pool: BufferPool,
+        session: Session = .{},
+        handler: H = .{},
+        req: *Request,
+        resp: *Response,
+        mailbox: Mailbox,
+        slab: exchange.Slab,
+        now: u32 = 100,
+        bound: bool = false,
+        out_buf: []u8,
+        out: Out,
+        written: std.ArrayList(u8) = .empty,
+        date_line: [date.header_len]u8 = undefined,
+        opts: Options,
+        closed: bool = false,
 
-    fn flush(h: *Harness) !void {
-        try h.written.appendSlice(testing.allocator, h.out.buf[0..h.out.len]);
-        try h.written.appendSlice(testing.allocator, h.out.body);
-        h.out.clear();
-    }
-
-    /// Feed bytes as if they arrived in one read, then run the loop the way
-    /// the worker does.
-    fn feed(h: *Harness, bytes: []const u8) !void {
-        var rest = bytes;
-        while (rest.len > 0) {
-            const space = try h.session.readSpace(&h.pool, h.opts);
-            const n = @min(space.len, rest.len);
-            @memcpy(space[0..n], rest[0..n]);
-            h.session.commitRead(n);
-            rest = rest[n..];
-            try h.run();
-            if (h.closed) return;
+        fn init(opts: Options, pool_buf: usize, out_size: usize) !*Self {
+            const h = try testing.allocator.create(Self);
+            const out_buf = try testing.allocator.alloc(u8, out_size);
+            h.* = .{
+                .pool = try BufferPool.init(testing.allocator, pool_buf, 2),
+                .req = try Request.init(testing.allocator),
+                .resp = try Response.init(testing.allocator, 8192, 1024),
+                .mailbox = try Mailbox.init(testing.allocator, 16, try sys.Waker.init()),
+                .slab = undefined,
+                .out_buf = out_buf,
+                .out = .{ .buf = out_buf },
+                .opts = opts,
+            };
+            h.mailbox.bind();
+            h.slab = try exchange.Slab.init(testing.allocator, 4, &h.mailbox, .{});
+            h.resp.exchanges = &h.slab;
+            h.resp.now = &h.now;
+            date.formatHeader(&h.date_line, 784111777);
+            return h;
         }
-    }
 
-    fn run(h: *Harness) !void {
-        const ctx: Context(EchoHandler) = .{
-            .handler = &h.handler,
-            .req = h.req,
-            .resp = h.resp,
-            .date = &h.date_line,
-            .opts = h.opts,
-        };
-        while (true) {
-            const action = process(EchoHandler, &h.session, &ctx, &h.out);
-            try h.flush();
-            switch (action) {
-                .flush => continue,
-                .need_more => break,
-                .close, .upgrade => {
-                    h.closed = true;
-                    break;
-                },
-                .wait => break,
+        fn deinit(h: *Self) void {
+            if (h.bound) h.slab.release(h.resp.exchange.slot);
+            if (@hasDecl(H, "deinit")) h.handler.deinit();
+            h.session.deinit(&h.pool);
+            h.pool.deinit();
+            h.req.deinit();
+            h.resp.deinit();
+            h.slab.deinit();
+            h.mailbox.waker.deinit();
+            h.mailbox.deinit();
+            h.written.deinit(testing.allocator);
+            testing.allocator.free(h.out_buf);
+            testing.allocator.destroy(h);
+        }
+
+        fn flush(h: *Self) !void {
+            try h.written.appendSlice(testing.allocator, h.out.buf[0..h.out.len]);
+            try h.written.appendSlice(testing.allocator, h.out.body);
+            try h.written.appendSlice(testing.allocator, h.out.tail);
+            h.out.clear();
+        }
+
+        /// Feed bytes as if they arrived in one read, then run the loop the way
+        /// the worker does.
+        fn feed(h: *Self, bytes: []const u8) !void {
+            var rest = bytes;
+            while (rest.len > 0) {
+                const space = try h.session.readSpace(&h.pool, h.opts);
+                const n = @min(space.len, rest.len);
+                @memcpy(space[0..n], rest[0..n]);
+                h.session.commitRead(n);
+                rest = rest[n..];
+                try h.run();
+                if (h.closed) return;
             }
         }
-        h.session.releaseIfIdle(&h.pool);
-    }
-};
+
+        fn run(h: *Self) !void {
+            const ctx: Context(H) = .{
+                .handler = &h.handler,
+                .req = h.req,
+                .resp = h.resp,
+                .date = &h.date_line,
+                .opts = h.opts,
+            };
+            while (!h.closed) {
+                const action = process(H, &h.session, &ctx, &h.out);
+                try h.flush();
+                switch (action) {
+                    .flush => continue,
+                    .need_more => break,
+                    .close, .upgrade => h.closed = true,
+                    .wait => {
+                        const ex = h.resp.exchange;
+                        if (!h.bound) {
+                            h.slab.bindHttp1(ex, 0, 1, &h.session, h.resp, h.now);
+                            h.bound = true;
+                        }
+                        // A resume asked for since the last look.
+                        if (ex.takeResume()) h.session.body_paused = false;
+                        while (true) {
+                            const r = ex.fill(&h.out, &h.date_line, h.now);
+                            try h.flush();
+                            if (r.release) |rel| rel.call();
+                            if (r.aborted) {
+                                h.closed = true;
+                                break;
+                            }
+                            if (r.done) {
+                                const keep_alive = h.slab.entry(ex.slot).keep_alive;
+                                h.bound = false;
+                                h.slab.release(ex.slot);
+                                if (h.session.endWait() or !keep_alive) h.closed = true;
+                                break;
+                            }
+                            if (!r.progressed) break;
+                        }
+                        if (h.closed or !h.bound) continue;
+                        if (h.session.wantsBody()) continue;
+                        break;
+                    },
+                }
+            }
+            h.session.releaseIfIdle(&h.pool);
+        }
+    };
+}
 
 const DATE = "date: Sun, 06 Nov 1994 08:49:37 GMT\r\n";
 
@@ -672,5 +876,194 @@ test "fuzz: split invariance" {
         "POST /p HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\nabc",
         "\r\n\r\nGET /close HTTP/1.0\r\nConnection: keep-alive\r\n\r\n",
         "HEAD /big HTTP/1.1\r\nHost: x\r\n\r\n",
+    } });
+}
+
+/// Streams bodies under /stream, rejects /reject, buffers the rest; logs
+/// what it sees so runs can be compared.
+const BodyHandler = struct {
+    log: std.ArrayList(u8) = .empty,
+    /// Pause after every chunk (the harness then resumes).
+    pause: bool = false,
+    received: usize = 0,
+
+    pub fn deinit(self: *BodyHandler) void {
+        self.log.deinit(testing.allocator);
+    }
+
+    pub fn handleHead(self: *BodyHandler, req: *Request, resp: *Response) exchange.BodyMode {
+        _ = self;
+        const path = req.getPath();
+        if (std.mem.startsWith(u8, path, "/reject")) {
+            resp.status = .unauthorized;
+            resp.setBodyBorrowed("no");
+            return .reject;
+        }
+        if (std.mem.startsWith(u8, path, "/stream")) return .stream;
+        return .buffer;
+    }
+
+    pub fn handleRequest(self: *BodyHandler, req: *Request, resp: *Response) void {
+        const a = testing.allocator;
+        self.log.print(a, "{s} {s} body={d}", .{ @tagName(req.method), req.path_and_query, req.body.len }) catch unreachable;
+        for (req.trailers) |t| self.log.print(a, " [{s}={s}]", .{ t.key, t.value }) catch unreachable;
+        self.log.append(a, '\n') catch unreachable;
+        if (std.mem.eql(u8, req.getPath(), "/stream-sync")) {
+            resp.setBodyBorrowed("sync");
+            return;
+        }
+        if (std.mem.startsWith(u8, req.getPath(), "/stream")) {
+            self.received = 0;
+            _ = resp.later() catch unreachable;
+            return;
+        }
+        resp.setBodyBorrowed("buffered");
+    }
+
+    pub fn handleBody(self: *BodyHandler, ex: exchange.Exchange, chunk: []const u8, end: ?[]const Header) exchange.BodyAction {
+        const a = testing.allocator;
+        self.received += chunk.len;
+        self.log.appendSlice(a, chunk) catch unreachable;
+        if (end) |trailers| {
+            self.log.appendSlice(a, "|END") catch unreachable;
+            for (trailers) |t| self.log.print(a, " [{s}={s}]", .{ t.key, t.value }) catch unreachable;
+            self.log.append(a, '\n') catch unreachable;
+            var buf: [32]u8 = undefined;
+            ex.respond(.{}, std.fmt.bufPrint(&buf, "got {d}", .{self.received}) catch unreachable) catch unreachable;
+            return .more;
+        }
+        if (self.pause and chunk.len > 0) {
+            ex.resumeBody() catch unreachable;
+            return .pause;
+        }
+        return .more;
+    }
+};
+
+const BodyHarness = HarnessFor(BodyHandler);
+
+test "handleHead: reject answers without reading the body" {
+    // No body: the connection stays open.
+    var h = try BodyHarness.init(.{}, 4096, 4096);
+    try h.feed("GET /reject HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expect(!h.closed);
+    try testing.expectEqualStrings("HTTP/1.1 401 Unauthorized\r\ncontent-length: 2\r\n" ++ DATE ++ "\r\nno" ++
+        "HTTP/1.1 200 OK\r\ncontent-length: 8\r\n" ++ DATE ++ "\r\nbuffered", h.written.items);
+    h.deinit();
+    // A body: closed after the response, lingering; no 100 Continue.
+    h = try BodyHarness.init(.{}, 4096, 4096);
+    defer h.deinit();
+    try h.feed("PUT /reject HTTP/1.1\r\nHost: x\r\nContent-Length: 5000000\r\nExpect: 100-continue\r\n\r\nabc");
+    try testing.expect(h.closed and h.session.linger);
+    try testing.expectEqualStrings("HTTP/1.1 401 Unauthorized\r\ncontent-length: 2\r\n" ++ DATE ++ "connection: close\r\n\r\nno", h.written.items);
+    try testing.expectEqual(@as(usize, 0), h.handler.log.items.len);
+}
+
+test "streamed bodies: any split delivers the same body, trailers and responses" {
+    const big = parser.repeat("0123456789", 300);
+    const input = "PUT /stream-a HTTP/1.1\r\nHost: x\r\nContent-Length: 3000\r\nExpect: 100-continue\r\n\r\n" ++ big ++
+        "POST /stream-b HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "5\r\nhello\r\n1;e=1\r\n \r\n5\r\nworld\r\n0\r\nX-Sum: 11\r\nY: z\r\n\r\n" ++
+        "POST /c HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nT: 1\r\n\r\n" ++
+        "GET /stream-empty HTTP/1.1\r\nHost: x\r\n\r\n" ++
+        "GET /reject HTTP/1.1\r\nHost: x\r\n\r\n" ++
+        "POST /stream-sync HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\nabcd";
+    // Bodies above max_body_size stream; buffered ones are still limited.
+    const opts: Options = .{ .limits = .{ .max_body_size = 1000 } };
+
+    const ref = try BodyHarness.init(opts, 512, 2048);
+    defer ref.deinit();
+    try ref.feed(input);
+    try testing.expect(ref.closed and ref.session.linger);
+    try testing.expectEqualStrings(
+        "PUT /stream-a body=0\n" ++ big ++ "|END\n" ++
+            "POST /stream-b body=0\nhello world|END [X-Sum=11] [Y=z]\n" ++
+            "POST /c body=3 [T=1]\n" ++
+            "GET /stream-empty body=0\n|END\n" ++
+            "POST /stream-sync body=0\n",
+        ref.handler.log.items,
+    );
+    try testing.expectEqualStrings(
+        "HTTP/1.1 100 Continue\r\n\r\n" ++
+            "HTTP/1.1 200 OK\r\ncontent-length: 8\r\n" ++ DATE ++ "\r\ngot 3000" ++
+            "HTTP/1.1 200 OK\r\ncontent-length: 6\r\n" ++ DATE ++ "\r\ngot 11" ++
+            "HTTP/1.1 200 OK\r\ncontent-length: 8\r\n" ++ DATE ++ "\r\nbuffered" ++
+            "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n" ++ DATE ++ "\r\ngot 0" ++
+            "HTTP/1.1 401 Unauthorized\r\ncontent-length: 2\r\n" ++ DATE ++ "\r\nno" ++
+            "HTTP/1.1 200 OK\r\ncontent-length: 4\r\n" ++ DATE ++ "connection: close\r\n\r\nsync",
+        ref.written.items,
+    );
+
+    var prng = std.Random.DefaultPrng.init(0xb0d1);
+    const random = prng.random();
+    for (0..200) |iteration| {
+        const h = try BodyHarness.init(opts, 512, 2048);
+        defer h.deinit();
+        h.handler.pause = iteration % 2 == 1;
+        var rest: []const u8 = input;
+        while (rest.len > 0 and !h.closed) {
+            const max_chunk: usize = if (iteration == 0) 1 else 1 + random.uintLessThan(usize, 700);
+            const n = @min(rest.len, max_chunk);
+            try h.feed(rest[0..n]);
+            rest = rest[n..];
+        }
+        try testing.expect(h.closed);
+        try testing.expectEqualStrings(ref.written.items, h.written.items);
+        // Chunk boundaries differ; the bytes and events don't.
+        try testing.expectEqualStrings(ref.handler.log.items, h.handler.log.items);
+    }
+}
+
+test "streamed bodies: a malformed chunk closes the connection" {
+    const h = try BodyHarness.init(.{}, 4096, 4096);
+    defer h.deinit();
+    try h.feed("POST /stream HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcX\r\n");
+    try testing.expect(h.closed);
+    try testing.expect(!h.session.linger);
+    try testing.expectEqualStrings("POST /stream body=0\nabc", h.handler.log.items);
+}
+
+test "buffered bodies: Content-Length over max_body_size is 413 after handleHead" {
+    const h = try BodyHarness.init(.{ .limits = .{ .max_body_size = 10 } }, 4096, 4096);
+    defer h.deinit();
+    try h.feed("POST /b HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\n\r\n");
+    try testing.expect(h.closed);
+    try testing.expect(std.mem.startsWith(u8, h.written.items, "HTTP/1.1 413 "));
+}
+
+// Fuzz target: like "fuzz: split invariance", with a handler that streams,
+// rejects and buffers bodies, pausing on alternate runs.
+fn fuzzBodySplitInvariance(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buf: [2048]u8 = undefined;
+    const input = input_buf[0..smith.slice(&input_buf)];
+    const opts: Options = .{ .limits = .{ .max_header_bytes = 1024, .max_body_size = 512 } };
+
+    const whole = try BodyHarness.init(opts, 128, 2048);
+    defer whole.deinit();
+    try whole.feed(input);
+
+    const split = try BodyHarness.init(opts, 128, 2048);
+    defer split.deinit();
+    split.handler.pause = smith.value(bool);
+    var rest: []const u8 = input;
+    while (rest.len > 0 and !split.closed) {
+        const n = @min(rest.len, @as(usize, smith.value(u8)) + 1);
+        try split.feed(rest[0..n]);
+        rest = rest[n..];
+    }
+    try testing.expectEqual(whole.closed, split.closed);
+    try testing.expectEqualStrings(whole.written.items, split.written.items);
+    try testing.expectEqualStrings(whole.handler.log.items, split.handler.log.items);
+}
+
+test "fuzz: streamed body split invariance" {
+    try std.testing.fuzz({}, fuzzBodySplitInvariance, .{ .corpus = &.{
+        "PUT /stream HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhelloGET / HTTP/1.1\r\nHost: x\r\n\r\n",
+        "POST /stream HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3;e\r\nabc\r\n0\r\nT: v\r\n\r\n",
+        "POST /stream HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\nabc",
+        "POST /reject HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc",
+        "GET /reject HTTP/1.1\r\nHost: x\r\n\r\nGET /stream HTTP/1.1\r\nHost: x\r\n\r\n",
+        "POST /stream-sync HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc",
+        "POST /b HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\nA: 1\r\nB: 2\r\n\r\n",
     } });
 }

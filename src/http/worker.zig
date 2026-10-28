@@ -560,7 +560,7 @@ pub fn Worker(comptime Handler: type) type {
             self.unlink(c);
             c.session.deinit(&self.pool);
             self.freePending(c);
-            if (c.exchange != NIL) self.dropExchange(c, true);
+            if (c.exchange != NIL) _ = self.dropExchange(c, true);
             if (c.ws) |w| {
                 if (@hasDecl(Handler, "handleWSDisconn")) self.handler.handleWSDisconn(w);
                 w.destroy(&self.pool);
@@ -623,27 +623,8 @@ pub fn Worker(comptime Handler: type) type {
         /// this request. Bind it to the connection.
         fn bindExchange(self: *Self, c: *Conn) void {
             const ex = self.resp.exchange;
-            const e = self.exchanges.entry(ex.slot);
-            const s = &c.session;
             c.exchange = ex.slot;
-            e.mutex.lock();
-            e.conn_slot = self.slotOf(c);
-            e.conn_gen = c.gen;
-            e.bound = true;
-            e.keep_alive = s.wait_keep_alive;
-            e.is_head = s.wait_is_head;
-            e.http10 = s.wait_http10;
-            if (self.resp.mode == .stream) {
-                // The session wrote the head; fix the body framing now.
-                // beginStream set the state when stream() was called;
-                // the handler may have written or finished since.
-                e.head_pending = false;
-                e.framing = exchange.streamFraming(self.resp.status, s.wait_is_head, s.wait_http10, self.resp.content_length);
-                e.deadline = self.now +% self.opts.exchange.request_timeout_s +% 1;
-            } else {
-                e.head_pending = true;
-            }
-            e.mutex.unlock();
+            self.exchanges.bindHttp1(ex, self.slotOf(c), c.gen, &c.session, self.resp, self.now);
         }
 
         /// Writes queued exchange output until the socket is full or the
@@ -684,18 +665,24 @@ pub fn Worker(comptime Handler: type) type {
         /// request asked for it, otherwise the next pipelined request.
         fn exchangeDone(self: *Self, c: *Conn) void {
             const keep_alive = self.exchanges.entry(c.exchange).keep_alive;
-            self.dropExchange(c, false);
+            if (self.dropExchange(c, false)) {
+                // Answered before its body was all in: the rest can't be
+                // told from the next request.
+                c.session.linger = true;
+                return self.finish(c);
+            }
             if (!keep_alive) return self.finish(c);
             self.onReadable(c);
         }
 
         /// Frees the connection's exchange. `gone` means it did not end
         /// through the handle: the handler is told through handleAbort if
-        /// it may still be using it.
-        fn dropExchange(self: *Self, c: *Conn, gone: bool) void {
+        /// it may still be using it. Returns whether a streamed request
+        /// body was still arriving.
+        fn dropExchange(self: *Self, c: *Conn, gone: bool) bool {
             const slot = c.exchange;
             c.exchange = NIL;
-            c.session.waiting = false;
+            const unread = c.session.endWait();
             if (c.release) |r| {
                 r.call();
                 c.release = null;
@@ -708,6 +695,7 @@ pub fn Worker(comptime Handler: type) type {
                 if (in_use) self.handler.handleAbort(self.exchanges.handle(slot));
             }
             self.exchanges.release(slot);
+            return unread;
         }
 
         /// A post from the mailbox for an exchange.
@@ -728,7 +716,15 @@ pub fn Worker(comptime Handler: type) type {
                 return;
             }
             if (c.exchange != slot or c.ws != null or c.lingering) return;
-            _ = self.exchangeFlush(c);
+            if (self.exchanges.handle(slot).takeResume()) c.session.body_paused = false;
+            if (!self.exchangeFlush(c)) return;
+            self.resumeBody(c);
+        }
+
+        /// Reads on while a streamed request body is wanted and no output
+        /// is stalled (the body's bytes may already be buffered).
+        fn resumeBody(self: *Self, c: *Conn) void {
+            if (c.session.wantsBody() and !c.hasPending()) self.onReadable(c);
         }
 
         // -- HTTP/2 ---------------------------------------------------------
@@ -941,8 +937,9 @@ pub fn Worker(comptime Handler: type) type {
             }
             // Reading pauses while output is stalled, and while an
             // exchange is pending (its response goes out before any
-            // further pipelined request is parsed).
-            if (c.read_ready and !c.hasPending() and c.exchange == NIL) self.onReadable(c);
+            // further pipelined request is parsed), unless its request
+            // body is streaming in.
+            if (c.read_ready and !c.hasPending() and (c.exchange == NIL or c.session.wantsBody())) self.onReadable(c);
         }
 
         fn onReadable(self: *Self, c: *Conn) void {
@@ -1057,6 +1054,8 @@ pub fn Worker(comptime Handler: type) type {
                     .wait => {
                         if (c.exchange == NIL) self.bindExchange(c);
                         if (!self.exchangeFlush(c)) return .gone;
+                        // A streamed body: deliver what is buffered.
+                        if (c.session.wantsBody() and !c.hasPending()) continue;
                         return .blocked;
                     },
                 }
@@ -1141,7 +1140,7 @@ pub fn Worker(comptime Handler: type) type {
                 .none => {},
             }
             if (c.exchange != NIL) {
-                _ = self.exchangeFlush(c);
+                if (self.exchangeFlush(c)) self.resumeBody(c);
                 return false;
             }
             // Resume: buffered requests may be waiting even if no new data
@@ -1426,7 +1425,7 @@ pub fn Worker(comptime Handler: type) type {
                             }
                         }
                     } else if (c.exchange != NIL) {
-                        _ = self.exchangeFlush(c);
+                        self.exchangePosted(c.exchange, @intCast(self.exchanges.entry(c.exchange).gen & 0x7fffffff));
                     }
                 }
             }

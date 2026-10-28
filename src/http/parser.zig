@@ -8,6 +8,7 @@ const request_max_headers = @import("../request.zig").MAX_HEADERS;
 const Method = @import("../method.zig").Method;
 const Version = @import("../version.zig").Version;
 const Status = @import("../status.zig").Status;
+const Header = @import("../header.zig").Header;
 
 pub const Limits = struct {
     /// Maximum size of the request line plus headers.
@@ -51,6 +52,8 @@ pub const Framing = union(enum) {
 pub const Head = struct {
     /// Length of the request line and headers, including the final CRLFCRLF.
     len: usize,
+    /// A Content-Length body is not checked against `max_body_size` here:
+    /// a handler may stream it (see the session).
     framing: Framing,
     expect_continue: bool,
 };
@@ -154,7 +157,7 @@ pub fn parseHead(head: []const u8, req: *Request, limits: Limits) ParseError!Hea
             },
             14 => if (std.ascii.eqlIgnoreCase(h.key, "content-length")) {
                 if (content_length != null) return error.BadRequest;
-                content_length = try parseContentLength(h.value, limits.max_body_size);
+                content_length = try parseContentLength(h.value);
             },
             17 => if (std.ascii.eqlIgnoreCase(h.key, "transfer-encoding")) {
                 if (has_transfer_encoding) return error.BadRequest;
@@ -192,7 +195,7 @@ pub fn parseHead(head: []const u8, req: *Request, limits: Limits) ParseError!Hea
     };
 }
 
-fn parseField(field: []const u8) ParseError!@import("../header.zig").Header {
+fn parseField(field: []const u8) ParseError!Header {
     const colon = std.mem.indexOfScalar(u8, field, ':') orelse return error.BadRequest;
     const name = field[0..colon];
     // Rejects empty names, obs-fold (leading SP/HT) and whitespace before ':'.
@@ -206,7 +209,7 @@ fn parseField(field: []const u8) ParseError!@import("../header.zig").Header {
     return .{ .key = name, .value = value };
 }
 
-fn parseContentLength(value: []const u8, max: usize) ParseError!usize {
+fn parseContentLength(value: []const u8) ParseError!usize {
     if (value.len == 0) return error.BadRequest;
     var n: usize = 0;
     for (value) |c| {
@@ -214,7 +217,6 @@ fn parseContentLength(value: []const u8, max: usize) ParseError!usize {
         n = std.math.mul(usize, n, 10) catch return error.PayloadTooLarge;
         n = std.math.add(usize, n, c - '0') catch return error.PayloadTooLarge;
     }
-    if (n > max) return error.PayloadTooLarge;
     return n;
 }
 
@@ -266,7 +268,8 @@ inline fn isFieldValue(s: []const u8) bool {
 
 /// Incremental validator for a chunked body (RFC 9112 §7.1). It doesn't
 /// modify the input, so it can resume as more data arrives. Once complete,
-/// decodeChunked removes the framing in place.
+/// decodeChunked removes the framing in place. For a body handed to the
+/// handler as it arrives, `next` decodes it piece by piece instead.
 pub const ChunkedScanner = struct {
     const State = enum {
         size_first,
@@ -284,13 +287,20 @@ pub const ChunkedScanner = struct {
         done,
     };
 
+    /// Longest chunk-size line (size and extensions).
+    const max_line = 4096;
+
     state: State = .size_first,
     /// Bytes of raw (encoded) body consumed so far.
     pos: usize = 0,
     /// Chunk size being parsed, or chunk data remaining.
     n: u64 = 0,
     decoded: u64 = 0,
-    last_chunk: bool = false,
+    /// Bytes of the current chunk-size line.
+    line: u32 = 0,
+    /// Where the trailer section starts in the raw body, once the last
+    /// chunk has been seen.
+    trailer_at: usize = 0,
 
     /// Returns true once the whole chunked body (including trailers) has been
     /// seen; `pos` is then its encoded length.
@@ -299,82 +309,156 @@ pub const ChunkedScanner = struct {
         const max_raw = max_body * 2 + 4096;
         while (self.pos < raw.len) {
             if (self.pos >= max_raw) return error.PayloadTooLarge;
-            const c = raw[self.pos];
-            switch (self.state) {
-                .size_first, .size => {
-                    if (hexValue(c)) |d| {
-                        if (self.n > (max_body >> 4)) return error.PayloadTooLarge;
-                        self.n = (self.n << 4) | d;
-                        self.state = .size;
-                    } else if (self.state == .size_first) {
-                        return error.BadRequest;
-                    } else switch (c) {
-                        '\r' => self.state = .size_lf,
-                        ';' => self.state = .ext,
-                        ' ', '\t' => self.state = .ext_ws,
-                        else => return error.BadRequest,
-                    }
-                },
-                .ext_ws => switch (c) {
-                    ' ', '\t' => {},
-                    ';' => self.state = .ext,
-                    else => return error.BadRequest,
-                },
-                .ext => switch (c) {
-                    '\r' => self.state = .size_lf,
-                    '\n' => return error.BadRequest,
-                    else => if (c < ' ' and c != '\t' or c == 0x7f) return error.BadRequest,
-                },
-                .size_lf => {
-                    if (c != '\n') return error.BadRequest;
-                    if (self.n == 0) {
-                        self.state = .trailer_start;
-                    } else {
-                        self.decoded += self.n;
-                        if (self.decoded > max_body) return error.PayloadTooLarge;
-                        self.state = .data;
-                    }
-                },
-                .data => {
-                    const take = @min(self.n, raw.len - self.pos);
-                    self.pos += @intCast(take);
-                    self.n -= take;
-                    if (self.n == 0) self.state = .data_cr;
-                    continue;
-                },
-                .data_cr => {
-                    if (c != '\r') return error.BadRequest;
-                    self.state = .data_lf;
-                },
-                .data_lf => {
-                    if (c != '\n') return error.BadRequest;
-                    self.state = .size_first;
-                },
-                .trailer_start => switch (c) {
-                    '\r' => self.state = .final_lf,
-                    '\n' => return error.BadRequest,
-                    else => self.state = .trailer,
-                },
-                .trailer => switch (c) {
-                    '\r' => self.state = .trailer_lf,
-                    '\n' => return error.BadRequest,
-                    else => if (c < ' ' and c != '\t' or c == 0x7f) return error.BadRequest,
-                },
-                .trailer_lf => {
-                    if (c != '\n') return error.BadRequest;
-                    self.state = .trailer_start;
-                },
-                .final_lf => {
-                    if (c != '\n') return error.BadRequest;
-                    self.pos += 1;
-                    self.state = .done;
-                    return true;
-                },
-                .done => return true,
+            if (self.state == .data) {
+                const take = @min(self.n, raw.len - self.pos);
+                self.pos += @intCast(take);
+                self.n -= take;
+                if (self.n == 0) self.state = .data_cr;
+                continue;
             }
+            if (self.state == .done) return true;
+            try self.step(raw[self.pos], max_body);
             self.pos += 1;
         }
         return self.state == .done;
+    }
+
+    /// What `next` found.
+    pub const Piece = struct {
+        /// Bytes at the start of `raw` the caller is done with (framing,
+        /// and `data`): drop them before the next call.
+        consumed: usize = 0,
+        /// Body bytes, within raw[0..consumed].
+        data: []const u8 = "",
+        /// The body ended; `trailers` is its trailer section (field lines,
+        /// each ending in CRLF), within raw[0..consumed].
+        done: bool = false,
+        trailers: []const u8 = "",
+    };
+
+    /// Decodes a body as it arrives: `raw` holds the bytes after those
+    /// already consumed. Returns at the end of each run of data so the
+    /// caller can hand it on. The body has no size limit; the trailer
+    /// section is kept in `raw` until it is complete, up to `max_trailer`
+    /// bytes.
+    pub fn next(self: *ChunkedScanner, raw: []const u8, max_trailer: usize) ParseError!Piece {
+        while (self.pos < raw.len) {
+            switch (self.state) {
+                .data => {
+                    const take: usize = @intCast(@min(self.n, raw.len - self.pos));
+                    const data = raw[self.pos..][0..take];
+                    self.n -= take;
+                    if (self.n == 0) self.state = .data_cr;
+                    const consumed = self.pos + take;
+                    self.pos = 0;
+                    return .{ .consumed = consumed, .data = data };
+                },
+                .trailer_start, .trailer, .trailer_lf, .final_lf => {
+                    if (self.pos - self.trailer_at >= max_trailer) return error.HeadersTooLarge;
+                },
+                .done => break,
+                else => {},
+            }
+            try self.step(raw[self.pos], std.math.maxInt(u64));
+            self.pos += 1;
+            if (self.state == .done) {
+                const consumed = self.pos;
+                const section = raw[self.trailer_at .. consumed - 2];
+                self.pos = 0;
+                self.trailer_at = 0;
+                return .{ .consumed = consumed, .done = true, .trailers = section };
+            }
+        }
+        // Framing seen so far can go, except a trailer section in progress.
+        const keep = switch (self.state) {
+            .trailer_start, .trailer, .trailer_lf, .final_lf => self.trailer_at,
+            else => self.pos,
+        };
+        self.pos -= keep;
+        self.trailer_at = 0;
+        return .{ .consumed = keep };
+    }
+
+    /// One byte of framing (any state but `data` and `done`).
+    fn step(self: *ChunkedScanner, c: u8, max_body: u64) ParseError!void {
+        switch (self.state) {
+            .size_first, .size, .ext_ws, .ext => {
+                self.line += 1;
+                if (self.line > max_line) return error.BadRequest;
+            },
+            else => {},
+        }
+        switch (self.state) {
+            .size_first, .size => {
+                if (hexValue(c)) |d| {
+                    if (self.n > (max_body >> 4)) return error.PayloadTooLarge;
+                    self.n = (self.n << 4) | d;
+                    self.state = .size;
+                } else if (self.state == .size_first) {
+                    return error.BadRequest;
+                } else switch (c) {
+                    '\r' => self.state = .size_lf,
+                    ';' => self.state = .ext,
+                    ' ', '\t' => self.state = .ext_ws,
+                    else => return error.BadRequest,
+                }
+            },
+            .ext_ws => switch (c) {
+                ' ', '\t' => {},
+                ';' => self.state = .ext,
+                else => return error.BadRequest,
+            },
+            .ext => switch (c) {
+                '\r' => self.state = .size_lf,
+                '\n' => return error.BadRequest,
+                else => if (c < ' ' and c != '\t' or c == 0x7f) return error.BadRequest,
+            },
+            .size_lf => {
+                if (c != '\n') return error.BadRequest;
+                self.line = 0;
+                if (self.n == 0) {
+                    self.state = .trailer_start;
+                    self.trailer_at = self.pos + 1;
+                } else {
+                    self.decoded +|= self.n;
+                    if (self.decoded > max_body) return error.PayloadTooLarge;
+                    self.state = .data;
+                }
+            },
+            .data_cr => {
+                if (c != '\r') return error.BadRequest;
+                self.state = .data_lf;
+            },
+            .data_lf => {
+                if (c != '\n') return error.BadRequest;
+                self.state = .size_first;
+            },
+            .trailer_start => switch (c) {
+                '\r' => self.state = .final_lf,
+                '\n' => return error.BadRequest,
+                else => self.state = .trailer,
+            },
+            .trailer => switch (c) {
+                '\r' => self.state = .trailer_lf,
+                '\n' => return error.BadRequest,
+                else => if (c < ' ' and c != '\t' or c == 0x7f) return error.BadRequest,
+            },
+            .trailer_lf => {
+                if (c != '\n') return error.BadRequest;
+                self.state = .trailer_start;
+            },
+            .final_lf => {
+                if (c != '\n') return error.BadRequest;
+                self.state = .done;
+            },
+            .data, .done => unreachable,
+        }
+    }
+
+    /// The trailer section of a body `scan` found complete (field lines,
+    /// each ending in CRLF).
+    pub fn trailers(self: *const ChunkedScanner, raw: []const u8) []const u8 {
+        return raw[self.trailer_at .. self.pos - 2];
     }
 
     inline fn hexValue(c: u8) ?u4 {
@@ -386,6 +470,24 @@ pub const ChunkedScanner = struct {
         };
     }
 };
+
+/// Parses a trailer section (field lines, each ending in CRLF, as the
+/// chunked scanner delimits it) into `out`. Fields beyond `out.len` are
+/// dropped. Returns how many were stored.
+pub fn parseTrailers(section: []const u8, out: []Header) ParseError!usize {
+    var n: usize = 0;
+    var rest = section;
+    while (rest.len > 0) {
+        const cr = std.mem.indexOfScalar(u8, rest, '\r') orelse return error.BadRequest;
+        const h = try parseField(rest[0..cr]);
+        rest = rest[cr + 2 ..];
+        if (n < out.len) {
+            out[n] = h;
+            n += 1;
+        }
+    }
+    return n;
+}
 
 /// Removes chunked framing in place. `raw` must be a complete chunked body
 /// already validated by ChunkedScanner. Returns the decoded length.
@@ -601,4 +703,82 @@ test "malformed chunked bodies are rejected" {
     try testing.expectError(error.PayloadTooLarge, s.scan("FFFFFFFFFFFFFFFFFFFF\r\n", 1024));
     s = .{};
     try testing.expectError(error.PayloadTooLarge, s.scan("401\r\n", 1024));
+}
+
+test "chunked trailers" {
+    const raw = "3\r\nabc\r\n0\r\nX-Sum: 1\r\nOther:\tv \r\n\r\n";
+    var s: ChunkedScanner = .{};
+    try testing.expect(try s.scan(raw, 1024));
+    var out: [4]Header = undefined;
+    const n = try parseTrailers(s.trailers(raw), &out);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualStrings("X-Sum", out[0].key);
+    try testing.expectEqualStrings("1", out[0].value);
+    try testing.expectEqualStrings("v", out[1].value);
+    // Fields beyond the room given are dropped; malformed ones rejected.
+    try testing.expectEqual(@as(usize, 1), try parseTrailers("A: 1\r\nB: 2\r\n", out[0..1]));
+    try testing.expectError(error.BadRequest, parseTrailers("no colon\r\n", &out));
+    try testing.expectError(error.BadRequest, parseTrailers("A : 1\r\n", &out));
+    // No trailers.
+    s = .{};
+    try testing.expect(try s.scan("0\r\n\r\n", 1024));
+    try testing.expectEqual(@as(usize, 0), s.trailers("0\r\n\r\n").len);
+}
+
+/// Decodes `raw` with `next`, fed in pieces of at most `max_piece` bytes
+/// the way a session would (dropping consumed bytes, keeping the rest).
+fn decodeStreaming(raw: []const u8, max_piece: usize, body: *std.ArrayList(u8), trailers: *std.ArrayList(u8)) !usize {
+    var s: ChunkedScanner = .{};
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var fed: usize = 0;
+    while (true) {
+        const piece = try s.next(buf.items, 1024);
+        try body.appendSlice(testing.allocator, piece.data);
+        if (piece.done) {
+            try trailers.appendSlice(testing.allocator, piece.trailers);
+            return fed - (buf.items.len - piece.consumed);
+        }
+        std.mem.copyForwards(u8, buf.items[0 .. buf.items.len - piece.consumed], buf.items[piece.consumed..]);
+        buf.items.len -= piece.consumed;
+        if (piece.data.len > 0) continue;
+        if (fed == raw.len) return error.EndOfStream;
+        const n = @min(max_piece, raw.len - fed);
+        try buf.appendSlice(testing.allocator, raw[fed..][0..n]);
+        fed += n;
+    }
+}
+
+test "streaming chunked decode: any split gives the same body and trailers" {
+    const raw = "4\r\nWiki\r\n5;ext=1\r\npedia\r\nE\r\n in\r\n\r\nchunks.\r\n0\r\nT: x\r\nU: y\r\n\r\nNEXT";
+    for ([_]usize{ 1, 2, 3, 7, 64, 1000 }) |max_piece| {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(testing.allocator);
+        var trailers: std.ArrayList(u8) = .empty;
+        defer trailers.deinit(testing.allocator);
+        const used = try decodeStreaming(raw, max_piece, &body, &trailers);
+        try testing.expectEqualStrings("Wikipedia in\r\n\r\nchunks.", body.items);
+        try testing.expectEqualStrings("T: x\r\nU: y\r\n", trailers.items);
+        try testing.expectEqual(raw.len - "NEXT".len, used);
+    }
+}
+
+test "streaming chunked decode: errors and limits" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    var trailers: std.ArrayList(u8) = .empty;
+    defer trailers.deinit(testing.allocator);
+    try testing.expectError(error.BadRequest, decodeStreaming("4\r\nWikiX\r\n0\r\n\r\n", 3, &body, &trailers));
+    // No body limit, but chunk-size lines and trailers are bounded.
+    const big = "FFFFFFFFFFFF\r\n";
+    var s: ChunkedScanner = .{};
+    const p = try s.next(big, 1024);
+    try testing.expectEqual(big.len, p.consumed);
+    try testing.expectEqual(@as(u64, 0xFFFFFFFFFFFF), s.n);
+    s = .{};
+    const ext = "1;" ++ repeat("e", 5000);
+    try testing.expectError(error.BadRequest, s.next(ext, 1024));
+    s = .{};
+    const long_trailer = "0\r\nX: " ++ repeat("t", 2000) ++ "\r\n\r\n";
+    try testing.expectError(error.HeadersTooLarge, s.next(long_trailer, 1024));
 }

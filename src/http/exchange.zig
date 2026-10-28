@@ -14,6 +14,8 @@ const std = @import("std");
 const sys = @import("../sys.zig");
 const date = @import("./date.zig");
 const Out = @import("./session.zig").Out;
+const Session = @import("./session.zig").Session;
+const Response = @import("../response.zig").Response;
 const Header = @import("../header.zig").Header;
 const Status = @import("../status.zig").Status;
 const Mailbox = @import("../mailbox.zig").Mailbox;
@@ -43,6 +45,31 @@ pub const Error = error{
     InvalidHeader,
     TrailersTooLarge,
     OutOfMemory,
+};
+
+/// What a handler's `handleHead` decides about the request body.
+pub const BodyMode = enum(u8) {
+    /// Receive the whole body, then call handleRequest (the default).
+    buffer,
+    /// Answer with the response filled in `resp` and don't read the body:
+    /// HTTP/1.1 closes the connection after the response (draining what
+    /// arrives), HTTP/2 and HTTP/3 stop the request stream with NO_ERROR.
+    /// `100 Continue` is never sent.
+    reject,
+    /// Call handleRequest now with an empty body. If it takes an exchange
+    /// (`resp.later()` or `resp.stream()`), the body arrives through
+    /// `handleBody` on the worker thread; if it answers at once, the body
+    /// is not read, as with `.reject`.
+    stream,
+};
+
+/// What `handleBody` asks for next.
+pub const BodyAction = enum(u8) {
+    more,
+    /// Deliver nothing more until `ex.resumeBody()`. The client is held
+    /// back by the transport: HTTP/1.1 stops reading the socket, HTTP/2
+    /// withholds WINDOW_UPDATE, HTTP/3 MAX_STREAM_DATA.
+    pause,
 };
 
 /// Called on the worker thread once borrowed bytes have been written (or
@@ -137,6 +164,8 @@ pub const Entry = struct {
     written: usize = 0,
     /// The deadline the handler asked for, taken by the worker.
     new_deadline: ?u32 = null,
+    /// `resumeBody` was called; taken by the worker.
+    resume_body: bool = false,
 
     fn clear(self: *Self, allocator: std.mem.Allocator) void {
         for (self.segments.items) |seg| {
@@ -155,6 +184,7 @@ pub const Entry = struct {
         self.written = 0;
         self.head_length = null;
         self.new_deadline = null;
+        self.resume_body = false;
         _ = allocator;
     }
 
@@ -251,6 +281,31 @@ pub const Slab = struct {
         e.state = .streaming;
         e.head_length = content_length;
         e.mutex.unlock();
+    }
+
+    /// Worker thread: binds an HTTP/1.1 exchange to its connection once
+    /// the session returned `.wait` (posts before this are ignored; the
+    /// worker drains the exchange next). For `resp.stream()` the session
+    /// wrote the head, so the body framing is fixed now.
+    pub fn bindHttp1(self: *Self, ex: Exchange, conn_slot: u32, conn_gen: u32, s: *const Session, resp: *const Response, now: u32) void {
+        const e = &self.entries[ex.slot];
+        e.mutex.lock();
+        defer e.mutex.unlock();
+        e.conn_slot = conn_slot;
+        e.conn_gen = conn_gen;
+        e.bound = true;
+        e.keep_alive = s.wait_keep_alive;
+        e.is_head = s.wait_is_head;
+        e.http10 = s.wait_http10;
+        if (resp.mode == .stream) {
+            // beginStream set the state when stream() was called; the
+            // handler may have written or finished since.
+            e.head_pending = false;
+            e.framing = streamFraming(resp.status, s.wait_is_head, s.wait_http10, resp.content_length);
+            e.deadline = now +% self.opts.request_timeout_s +% 1;
+        } else {
+            e.head_pending = true;
+        }
     }
 
     /// Worker thread: the handle for an active slot.
@@ -420,6 +475,13 @@ pub const Exchange = struct {
         self.post(e);
     }
 
+    /// Delivers a request body again after `handleBody` returned `.pause`.
+    pub fn resumeBody(self: Self) Error!void {
+        const e = try self.lock();
+        e.resume_body = true;
+        self.post(e);
+    }
+
     /// Whether the handle still refers to a live exchange.
     pub fn isOpen(self: Self) bool {
         const e = self.lock() catch return false;
@@ -428,6 +490,30 @@ pub const Exchange = struct {
     }
 
     // -- Worker side -------------------------------------------------------
+
+    /// Worker thread: whether `resumeBody` was called since the last look.
+    pub fn takeResume(self: Self) bool {
+        const e = &self.slab.entries[self.slot];
+        e.mutex.lock();
+        defer e.mutex.unlock();
+        const r = e.resume_body;
+        e.resume_body = false;
+        return r;
+    }
+
+    /// Worker thread: hands request body bytes (valid during the call) to
+    /// the handler. `end` is set on the last call, with the request's
+    /// trailers. Progress keeps the exchange alive: its deadline moves to
+    /// the request timeout from now, and once the body has ended, to the
+    /// response timeout, never earlier than it was.
+    pub fn deliverBody(self: Self, handler: anytype, chunk: []const u8, end: ?[]const Header, now: u32) BodyAction {
+        const e = &self.slab.entries[self.slot];
+        const opts = self.slab.opts;
+        const t = if (end != null) @max(opts.response_timeout_s, opts.request_timeout_s) else opts.request_timeout_s;
+        const d = now +% t +% 1;
+        if (@as(i32, @bitCast(d -% e.deadline)) > 0) e.deadline = d;
+        return handler.handleBody(self, chunk, end);
+    }
 
     /// Worker thread: moves queued output into `out` with the exchange's
     /// framing. `out` must be empty. Returns what happened; after writing

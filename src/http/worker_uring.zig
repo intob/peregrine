@@ -743,7 +743,7 @@ pub fn Worker(comptime Handler: type) type {
                 r.call();
                 c.release = null;
             }
-            if (c.exchange != NIL) self.dropExchange(c, true);
+            if (c.exchange != NIL) _ = self.dropExchange(c, true);
             if (c.h2) |conn| {
                 const ctx = self.h2Context(c);
                 conn.abortAll(&ctx);
@@ -949,33 +949,16 @@ pub fn Worker(comptime Handler: type) type {
         // -- Exchanges ----------------------------------------------------
 
         /// The session returned `.wait`: bind the handler's exchange to
-        /// this connection (see worker.zig).
+        /// this connection.
         fn bindExchange(self: *Self, c: *Conn) void {
             const ex = self.resp.exchange;
-            const e = self.exchanges.entry(ex.slot);
-            const s = &c.session;
             c.exchange = ex.slot;
-            e.mutex.lock();
-            e.conn_slot = self.slotOf(c);
-            e.conn_gen = c.gen;
-            e.bound = true;
-            e.keep_alive = s.wait_keep_alive;
-            e.is_head = s.wait_is_head;
-            e.http10 = s.wait_http10;
-            if (self.resp.mode == .stream) {
-                // beginStream set the state when stream() was called;
-                // the handler may have written or finished since.
-                e.head_pending = false;
-                e.framing = exchange.streamFraming(self.resp.status, s.wait_is_head, s.wait_http10, self.resp.content_length);
-                e.deadline = self.now +% self.opts.exchange.request_timeout_s +% 1;
-            } else {
-                e.head_pending = true;
-            }
-            e.mutex.unlock();
+            self.exchanges.bindHttp1(ex, self.slotOf(c), c.gen, &c.session, self.resp, self.now);
         }
 
         /// Queues a write of the exchange's output, if any. Nothing is
-        /// read while an exchange is pending.
+        /// read while an exchange is pending, unless its request body is
+        /// streaming in (and no write is in flight).
         fn exchangeDrive(self: *Self, c: *Conn) void {
             if (c.write_inflight or c.closing) return;
             if (c.out.buf.len == 0) {
@@ -998,19 +981,26 @@ pub fn Worker(comptime Handler: type) type {
             self.out_pool.release(c.out.buf);
             c.out = .{ .buf = &.{} };
             self.unlink(c);
+            if (c.session.wantsBody()) self.drive(c);
         }
 
         fn exchangeDone(self: *Self, c: *Conn) void {
             const keep_alive = self.exchanges.entry(c.exchange).keep_alive;
-            self.dropExchange(c, false);
+            if (self.dropExchange(c, false)) {
+                // Answered before its body was all in: the rest can't be
+                // told from the next request.
+                c.session.linger = true;
+                return self.finish(c);
+            }
             if (!keep_alive) return self.finish(c);
             self.drive(c);
         }
 
-        fn dropExchange(self: *Self, c: *Conn, gone: bool) void {
+        /// Returns whether a streamed request body was still arriving.
+        fn dropExchange(self: *Self, c: *Conn, gone: bool) bool {
             const slot = c.exchange;
             c.exchange = NIL;
-            c.session.waiting = false;
+            const unread = c.session.endWait();
             if (gone and @hasDecl(Handler, "handleAbort")) {
                 const e = self.exchanges.entry(slot);
                 e.mutex.lock();
@@ -1019,6 +1009,7 @@ pub fn Worker(comptime Handler: type) type {
                 if (in_use) self.handler.handleAbort(self.exchanges.handle(slot));
             }
             self.exchanges.release(slot);
+            return unread;
         }
 
         fn exchangePosted(self: *Self, slot: u32, gen: u31) void {
@@ -1036,6 +1027,7 @@ pub fn Worker(comptime Handler: type) type {
                 return self.h2Drive(c);
             }
             if (c.exchange != slot or c.ws != null or c.lingering) return;
+            if (self.exchanges.handle(slot).takeResume()) c.session.body_paused = false;
             self.exchangeDrive(c);
         }
 
@@ -1569,7 +1561,7 @@ pub fn Worker(comptime Handler: type) type {
                             }
                         }
                     } else if (c.exchange != NIL and !c.lingering) {
-                        self.exchangeDrive(c);
+                        self.exchangePosted(c.exchange, @intCast(self.exchanges.entry(c.exchange).gen & 0x7fffffff));
                     }
                 }
             }

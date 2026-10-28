@@ -17,8 +17,13 @@ pub const Request = struct {
     version: Version = .@"HTTP/1.1",
     headers: [MAX_HEADERS]Header = undefined,
     headers_len: usize = 0,
-    /// Fully received (and de-chunked) request body.
+    /// Fully received (and de-chunked) request body. Empty when the
+    /// handler streams the body (`handleHead` returned `.stream`).
     body: []const u8 = "",
+    /// Trailer fields that followed a buffered body (HTTP/1.1 chunked
+    /// encoding, or trailing HEADERS on HTTP/2 and HTTP/3). Kept apart
+    /// from `headers`.
+    trailers: []const Header = &.{},
     /// Whether the connection stays open after this request, from the
     /// version and Connection header.
     keep_alive: bool = true,
@@ -97,6 +102,7 @@ pub const Request = struct {
     pub inline fn reset(self: *Self) void {
         self.headers_len = 0;
         self.body = "";
+        self.trailers = &.{};
         self.keep_alive = true;
     }
 };

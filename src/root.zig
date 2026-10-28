@@ -8,6 +8,10 @@ pub const Exchange = @import("./http/exchange.zig").Exchange;
 pub const ExchangeHead = @import("./http/exchange.zig").Head;
 pub const ExchangeError = @import("./http/exchange.zig").Error;
 pub const Release = @import("./http/exchange.zig").Release;
+/// What `handleHead` decides about a request body, and what
+/// `handleBody` asks for next. See src/http/exchange.zig.
+pub const BodyMode = @import("./http/exchange.zig").BodyMode;
+pub const BodyAction = @import("./http/exchange.zig").BodyAction;
 pub const Server = @import("./server.zig").Server;
 pub const Config = @import("./server.zig").Config;
 pub const ServerConfig = Config;
