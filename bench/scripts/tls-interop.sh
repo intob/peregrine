@@ -3,8 +3,9 @@
 # port) against OpenSSL's s_client (HTTP/1.1) and curl (HTTP/1.1, h2, h3),
 # for each group, then 480 new h2 connections per group, 160 at a time:
 # more than the 2 workers keep free states for (64 each by default), so
-# both reuse and the overflow paths run. Prints PASS/FAIL per check, and
-# the server's log if anything failed; exits 1 on any failure.
+# both reuse and the overflow paths run; and a HelloRetryRequest with
+# each client. Prints PASS/FAIL per check, and the server's log if
+# anything failed; exits 1 on any failure.
 # Usage: tls-interop.sh [epoll|io_uring] (default: both)
 # IMAGE: any image with OpenSSL 3.5+ (X25519MLKEM768) and curl with
 # HTTP/3 (default peregrine-h3load: OpenSSL 3.5, curl 8.23 with ngtcp2).
@@ -52,6 +53,17 @@ for g in $2; do
     check "curl $g --http2, 480 new connections, 160 at a time: $n ok" $r "$n of 480"
     rm -f /tmp/loop.*
 done
+# A HelloRetryRequest: the first share the clients send is for X448,
+# which the server does not support, so it asks for X25519 and checks
+# that ClientHello2 repeats ClientHello1.
+out=$(printf "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n" |
+    openssl s_client -connect 127.0.0.1:9443 -servername localhost -groups X448:X25519 -alpn http/1.1 -brief -ign_eof 2>&1)
+grp=$(echo "$out" | grep -iE "Negotiated TLS1.3 group|Peer Temp Key" | head -1)
+echo "$out" | grep -q "^HTTP/1.1 200" && echo "$grp" | grep -qi X25519 && r=ok || r=bad
+check "openssl s_client after a HelloRetryRequest (X448 share first): $grp" $r "$(echo "$out" | tail -2 | tr "\n" " ")"
+res=$(curl -sk --curves X448:X25519 --http2 https://localhost:9443/ --resolve localhost:9443:127.0.0.1 -o /dev/null -w "%{http_code}" 2>&1)
+[ "$res" = 200 ] && r=ok || r=bad
+check "curl --http2 after a HelloRetryRequest (X448 share first): $res" $r "$res"
 kill -0 $srv 2>/dev/null && r=ok || r=bad
 check "bench-server still running" $r "it exited"
 [ $fail = 0 ] || { echo "-- server log:"; tail -50 /tmp/srv.log; }

@@ -14,11 +14,15 @@
 //! code. `mulN` and `sqN` interleave independent products stage by stage,
 //! which helps the CPU overlap them.
 //!
-//! Runtime safety is off in every function: its overflow checks would be
-//! branches on carries of secret values (never taken, since the bounds
-//! hold, but branches all the same); the tests check the bounds against
-//! std's field and a u512 reference.
+//! Runtime safety is on only in Debug builds (where the tests trap any
+//! bound that doesn't hold): elsewhere its overflow checks would be
+//! branches on carries of secret values (never taken, but branches all
+//! the same). The functions without checked arithmetic don't set it.
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// Runtime safety for code on secret values: see the top.
+pub const safe = builtin.mode == .debug;
 
 pub const Fe = struct {
     /// Little-endian: the value is l[0] + l[1]·2^64 + l[2]·2^128 + l[3]·2^192.
@@ -30,7 +34,6 @@ pub const Fe = struct {
     /// RFC 7748 §5: the top bit is ignored; values from p to 2^255 − 1
     /// (non-canonical) are accepted as they are.
     pub fn fromBytes(s: [32]u8) Fe {
-        @setRuntimeSafety(false);
         var l: [4]u64 = undefined;
         inline for (0..4) |i| l[i] = std.mem.readInt(u64, s[i * 8 ..][0..8], .little);
         l[3] &= 0x7fff_ffff_ffff_ffff;
@@ -39,7 +42,7 @@ pub const Fe = struct {
 
     /// The canonical encoding (fully reduced mod p).
     pub fn toBytes(a: Fe) [32]u8 {
-        @setRuntimeSafety(false);
+        @setRuntimeSafety(safe);
         var l = a.l;
         // Fold bit 255 (2^255 ≡ 19): v < 2^255 + 19.
         const top = l[3] >> 63;
@@ -56,7 +59,7 @@ pub const Fe = struct {
     }
 
     pub inline fn add(a: Fe, b: Fe) Fe {
-        @setRuntimeSafety(false);
+        @setRuntimeSafety(safe);
         const s = @addWithOverflow(@as(u256, @bitCast(a.l)), @as(u256, @bitCast(b.l)));
         // 2^256 ≡ 38. If this carries too, the low limb is below 38.
         const t = @addWithOverflow(s[0], @as(u256, s[1]) * 38);
@@ -66,7 +69,7 @@ pub const Fe = struct {
     }
 
     pub inline fn sub(a: Fe, b: Fe) Fe {
-        @setRuntimeSafety(false);
+        @setRuntimeSafety(safe);
         const s = @subWithOverflow(@as(u256, @bitCast(a.l)), @as(u256, @bitCast(b.l)));
         // A borrow added 2^256; take 38 back. If this borrows too, the low
         // limb is at least 2^64 − 38.
@@ -78,7 +81,7 @@ pub const Fe = struct {
 
     /// b + 121666·a (the ladder's a24 term, as in std's ladder).
     pub inline fn mulAdd121666(a: Fe, b: Fe) Fe {
-        @setRuntimeSafety(false);
+        @setRuntimeSafety(safe);
         var lo: [5]u64 = undefined;
         var hi: [5]u64 = undefined;
         hi[0] = 0;
@@ -94,7 +97,7 @@ pub const Fe = struct {
 
     /// r mod 2^256 + 38·(r >> 256), for r < 2^320 with a small top limb.
     inline fn fold(r: u320) Fe {
-        @setRuntimeSafety(false);
+        @setRuntimeSafety(safe);
         const c: u64 = @truncate(r >> 256);
         const s = @addWithOverflow(@as(u256, @truncate(r)), @as(u256, c * 38));
         var o: [4]u64 = @bitCast(s[0]);
@@ -105,7 +108,7 @@ pub const Fe = struct {
     /// t_lo + 38·t_hi for n 512-bit products: the multiplications by 38
     /// first, then the carry chains.
     inline fn reduceN(comptime n: usize, t: [n][8]u64) [n]Fe {
-        @setRuntimeSafety(false);
+        @setRuntimeSafety(safe);
         var lo: [n][5]u64 = undefined;
         var hi: [n][5]u64 = undefined;
         inline for (0..4) |i| {
@@ -128,7 +131,7 @@ pub const Fe = struct {
 
     /// a[k]·b[k] for each k, interleaved.
     pub inline fn mulN(comptime n: usize, a: [n]Fe, b: [n]Fe) [n]Fe {
-        @setRuntimeSafety(false);
+        @setRuntimeSafety(safe);
         // Row i of each product is a_i·b: its low and high words.
         var lo: [n][4][5]u64 = undefined;
         var hi: [n][4][5]u64 = undefined;
@@ -161,7 +164,7 @@ pub const Fe = struct {
 
     /// a[k]² for each k, interleaved.
     pub inline fn sqN(comptime n: usize, a: [n]Fe) [n]Fe {
-        @setRuntimeSafety(false);
+        @setRuntimeSafety(safe);
         // The cross products a_i·a_j (i < j) in two groups of rows, then
         // doubled; then the squares a_i².
         var lo: [n][7]u64 = undefined;
@@ -213,17 +216,14 @@ pub const Fe = struct {
     }
 
     pub inline fn mul(a: Fe, b: Fe) Fe {
-        @setRuntimeSafety(false);
         return mulN(1, .{a}, .{b})[0];
     }
 
     pub inline fn sq(a: Fe) Fe {
-        @setRuntimeSafety(false);
         return sqN(1, .{a})[0];
     }
 
     fn sqn(a: Fe, n: usize) Fe {
-        @setRuntimeSafety(false);
         var r = a;
         for (0..n) |_| r = r.sq();
         return r;
@@ -231,7 +231,6 @@ pub const Fe = struct {
 
     /// a^(p − 2): 1/a, or 0 for 0 (std's addition chain).
     pub fn invert(a: Fe) Fe {
-        @setRuntimeSafety(false);
         var t0 = a.sq();
         var t1 = t0.sqn(2).mul(a);
         t0 = t0.mul(t1);
@@ -246,14 +245,12 @@ pub const Fe = struct {
 
     /// a = b if c is 1 (c is 0 or 1), in constant time.
     pub inline fn cMov(a: *Fe, b: Fe, c: u64) void {
-        @setRuntimeSafety(false);
         const mask = 0 -% c;
         inline for (0..4) |i| a.l[i] ^= (a.l[i] ^ b.l[i]) & mask;
     }
 
     /// Swaps a and b if c is 1 (c is 0 or 1), in constant time.
     pub inline fn cSwap(a: *Fe, b: *Fe, c: u64) void {
-        @setRuntimeSafety(false);
         const mask = 0 -% c;
         inline for (0..4) |i| {
             const x = (a.l[i] ^ b.l[i]) & mask;

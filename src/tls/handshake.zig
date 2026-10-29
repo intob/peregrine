@@ -439,20 +439,22 @@ pub const Handshake = struct {
     }
 
     /// RFC 8446 §4.1.2: ClientHello2 is ClientHello1 but for key_share,
-    /// early_data, cookie, pre_shared_key and padding. Of the rest, these
-    /// are what the handshake uses: server_name chose the certificate
-    /// (from ClientHello1), ALPN, groups and signature algorithms are
-    /// read from ClientHello2. The suites and session ID are compared
-    /// directly.
+    /// early_data, cookie, pre_shared_key and padding. A digest of every
+    /// other extension, in order (types, lengths and bodies); the suites
+    /// and session ID are compared directly. server_name matters most:
+    /// ClientHello1's chose the certificate.
     fn repeatedDigest(hello: ClientHello) [32]u8 {
         var h = std.crypto.hash.sha2.Sha256.init(.{});
-        for ([_]?[]const u8{ hello.server_name, hello.alpn, hello.supported_groups, hello.signature_algorithms }) |field| {
-            const bytes: []const u8 = field orelse "";
-            var len: [5]u8 = undefined;
-            len[0] = @intFromBool(field != null);
-            std.mem.writeInt(u32, len[1..5], @intCast(bytes.len), .big);
-            h.update(&len);
-            h.update(bytes);
+        // Framing was checked by `ClientHello.parse`.
+        var exts: Reader = .{ .data = hello.extensions };
+        while (exts.pos < hello.extensions.len) {
+            const at = exts.pos;
+            const ext_type: ExtensionType = @fromBackingInt(exts.int(u16) catch unreachable);
+            _ = exts.vector(u16) catch unreachable;
+            switch (ext_type) {
+                .key_share, .early_data, .cookie, .pre_shared_key, .padding => {},
+                else => h.update(hello.extensions[at..exts.pos]),
+            }
         }
         return h.finalResult();
     }
@@ -1005,6 +1007,8 @@ const ClientHello = struct {
     server_name: ?[]const u8 = null,
     /// The quic_transport_parameters extension's contents.
     quic_transport_params: ?[]const u8 = null,
+    /// The whole extensions block.
+    extensions: []const u8 = "",
     tls13: bool = false,
     early_data: bool = false,
     psk: bool = false,
@@ -1032,6 +1036,7 @@ const ClientHello = struct {
         if (r.pos == body.len) return error.ProtocolVersion;
         const exts_data = try r.vector(u16);
         if (r.pos != body.len) return error.DecodeError;
+        hello.extensions = exts_data;
 
         var exts: Reader = .{ .data = exts_data };
         var seen: [64]u16 = undefined;
@@ -1597,6 +1602,11 @@ test "HelloRetryRequest when no usable key share was sent" {
     try std.testing.expect(sink.events.items[3] == .write_secret);
 }
 
+/// A padding extension of `n` zero bytes.
+fn paddingExt(comptime n: u16) []const u8 {
+    return &[_]u8{ 0, 21, n >> 8, n & 0xff } ++ @as([n]u8, @splat(0));
+}
+
 test "HelloRetryRequest: ClientHello2 may change only what RFC 8446 §4.1.2 lets it" {
     const td = credentials.testdata;
     var default = try testCredentials();
@@ -1608,9 +1618,20 @@ test "HelloRetryRequest: ClientHello2 may change only what RFC 8446 §4.1.2 lets
     const x = X25519.recoverPublicKey(@splat(5));
     const share: []const KeyShare = &.{.{ .group = .x25519, .key_exchange = &x }};
     const sni = comptime sniExt("a.example");
-    const Hello = struct { extra: []const u8 = sni, groups: []const NamedGroup = &.{ .secp256r1, .x25519 }, alpn: ?[]const u8 = "\x02h2", sig_algs: []const u16 = &.{0x0403} };
-    const cases = [_]struct { ch2: Hello, ok: bool }{
+    const modes = comptime pskModes(&.{1});
+    const Hello = struct {
+        extra: []const u8 = sni,
+        groups: []const NamedGroup = &.{ .secp256r1, .x25519 },
+        alpn: ?[]const u8 = "\x02h2",
+        sig_algs: []const u16 = &.{0x0403},
+        versions: []const u16 = &.{0x0304},
+    };
+    const cases = [_]struct { ch1: Hello = .{}, ch2: Hello, ok: bool }{
         .{ .ch2 = .{}, .ok = true },
+        // Allowed: padding added, resized or removed; early_data removed.
+        .{ .ch2 = .{ .extra = sni ++ comptime paddingExt(40) }, .ok = true },
+        .{ .ch1 = .{ .extra = sni ++ comptime paddingExt(10) ++ &early_data_ext }, .ch2 = .{ .extra = sni ++ comptime paddingExt(300) }, .ok = true },
+        .{ .ch1 = .{ .extra = sni ++ comptime paddingExt(10) }, .ch2 = .{}, .ok = true },
         // server_name dropped or changed: the certificate was chosen by
         // ClientHello1's.
         .{ .ch2 = .{ .extra = "" }, .ok = false },
@@ -1619,6 +1640,10 @@ test "HelloRetryRequest: ClientHello2 may change only what RFC 8446 §4.1.2 lets
         .{ .ch2 = .{ .alpn = null }, .ok = false },
         .{ .ch2 = .{ .groups = &.{.x25519} }, .ok = false },
         .{ .ch2 = .{ .sig_algs = &.{ 0x0403, 0x0804 } }, .ok = false },
+        .{ .ch2 = .{ .versions = &.{ 0x0304, 0x0303 } }, .ok = false },
+        // Any other extension: added, or in another order.
+        .{ .ch2 = .{ .extra = sni ++ modes }, .ok = false },
+        .{ .ch1 = .{ .extra = sni ++ modes }, .ch2 = .{ .extra = modes ++ sni }, .ok = false },
     };
     var buf: [2048]u8 = undefined;
     for (cases) |case| {
@@ -1627,11 +1652,11 @@ test "HelloRetryRequest: ClientHello2 may change only what RFC 8446 §4.1.2 lets
         var sink: TestSink = .{ .allocator = std.testing.allocator };
         defer sink.deinit();
         // No key share: a HelloRetryRequest.
-        const d: Hello = .{};
-        try hs.feed(.initial, buildClientHello(&buf, .{ .groups = d.groups, .alpn = d.alpn, .sig_algs = d.sig_algs, .extra = d.extra }), &sink);
+        const a = case.ch1;
+        try hs.feed(.initial, buildClientHello(&buf, .{ .groups = a.groups, .alpn = a.alpn, .sig_algs = a.sig_algs, .versions = a.versions, .extra = a.extra }), &sink);
         try std.testing.expect(hs.isRetrying());
         const c = case.ch2;
-        const ch2 = buildClientHello(&buf, .{ .groups = c.groups, .shares = share, .alpn = c.alpn, .sig_algs = c.sig_algs, .extra = c.extra });
+        const ch2 = buildClientHello(&buf, .{ .groups = c.groups, .shares = share, .alpn = c.alpn, .sig_algs = c.sig_algs, .versions = c.versions, .extra = c.extra });
         if (case.ok) {
             try hs.feed(.initial, ch2, &sink);
             const facts = try flightFacts(&sink);
@@ -1640,6 +1665,26 @@ test "HelloRetryRequest: ClientHello2 may change only what RFC 8446 §4.1.2 lets
             try std.testing.expectError(error.IllegalParameter, hs.feed(.initial, ch2, &sink));
         }
     }
+    // A ticket's binders and age are recomputed in ClientHello2: see the
+    // resumption tests with a HelloRetryRequest.
+}
+
+test "HelloRetryRequest over QUIC: a ClientHello2 without ClientHello1's ALPN is refused" {
+    var creds = try testCredentials();
+    defer creds.deinit();
+    const config: Config = .{ .credentials = &creds, .groups = &.{.x25519}, .alpn = &.{"h3"}, .quic = true };
+    const entropy: [entropy_len]u8 = @splat(9);
+    var hs = Handshake.init(std.testing.allocator, &config, &entropy);
+    defer hs.deinit();
+    var sink: TestSink = .{ .allocator = std.testing.allocator };
+    defer sink.deinit();
+    const tp = [_]u8{ 0, 57, 0, 3, 0x01, 0x01, 0x10 };
+    var buf: [2048]u8 = undefined;
+    try hs.feed(.initial, buildClientHello(&buf, .{ .alpn = "\x02h3", .extra = &tp }), &sink);
+    try std.testing.expect(hs.isRetrying());
+    const x = X25519.recoverPublicKey(@splat(5));
+    const ch2 = buildClientHello(&buf, .{ .shares = &.{.{ .group = .x25519, .key_exchange = &x }}, .extra = &tp });
+    try std.testing.expectError(error.IllegalParameter, hs.feed(.initial, ch2, &sink));
 }
 
 test "every group and suite completes against a reference client computation" {

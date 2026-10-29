@@ -62,6 +62,7 @@ const ext_alpn: u16 = 16;
 const ext_padding: u16 = 21;
 const ext_pre_shared_key: u16 = 41;
 const ext_early_data: u16 = 42;
+const ext_cookie: u16 = 44;
 const ext_supported_versions: u16 = 43;
 const ext_psk_modes: u16 = 45;
 const ext_key_share: u16 = 51;
@@ -233,6 +234,35 @@ const HelloExt = struct {
 };
 
 const KeyShare = struct { group: u16, kx: []const u8 };
+
+/// Whether two ClientHellos have the same extensions, in the same order,
+/// apart from those ClientHello2 may change (RFC 8446 §4.1.2): what the
+/// server compares after a HelloRetryRequest.
+fn sameRepeated(h1: *const Hello, h2: *const Hello) bool {
+    const Filter = struct {
+        exts: []const HelloExt,
+        i: usize = 0,
+        fn next(f: *@This()) ?HelloExt {
+            while (f.i < f.exts.len) {
+                const e = f.exts[f.i];
+                f.i += 1;
+                switch (e.type) {
+                    ext_key_share, ext_early_data, ext_cookie, ext_pre_shared_key, ext_padding => {},
+                    else => return e,
+                }
+            }
+            return null;
+        }
+    };
+    var a: Filter = .{ .exts = h1.exts.items };
+    var b: Filter = .{ .exts = h2.exts.items };
+    while (true) {
+        const x = a.next();
+        const y = b.next();
+        if (x == null or y == null) return x == null and y == null;
+        if (x.?.type != y.?.type or !std.mem.eql(u8, x.?.body, y.?.body)) return false;
+    }
+}
 
 const Hello = struct {
     legacy_version: u16,
@@ -1777,15 +1807,8 @@ fn runScript(
                 if (!r2.benign or !r2.padding_only or !requested) mres.benign = false;
                 if (!r2.framed) mres.framed = false;
                 // §4.1.2: a valid ClientHello2 that changed what it must
-                // repeat (server_name, ALPN, groups, signature algorithms)
-                // is refused.
-                var changed = false;
-                for ([_]u16{ ext_server_name, ext_alpn, ext_supported_groups, ext_signature_algorithms }) |t| {
-                    const before = hello.ext(t);
-                    const after = h2.ext(t);
-                    if ((before == null) != (after == null) or (before != null and !std.mem.eql(u8, before.?, after.?))) changed = true;
-                }
-                if (changed and r2.benign and requested) retry_fault = .illegal_parameter;
+                // repeat (every extension but those, in order) is refused.
+                if (!sameRepeated(hello, &h2) and r2.benign and requested) retry_fault = .illegal_parameter;
             },
         }
         if (retry_fault) |d| {
