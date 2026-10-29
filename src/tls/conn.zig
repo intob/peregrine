@@ -42,26 +42,30 @@ pub const Pools = struct {
     conns: FreeList(*Conn),
     handshakes: FreeList(*handshake.Handshake),
 
-    /// Free handshake states kept. A handshake lasts about a round trip,
-    /// so even at thousands of handshakes a second per worker only a few
-    /// are under way at once; these cover a burst without pinning memory
-    /// after it (832 bytes each on aarch64, plus flight and reassembly
-    /// buffers of up to `Handshake.max_kept_buffer`).
-    pub const max_free_handshakes = 16;
-    /// Free connection states kept (1440 bytes each, no buffers: those
-    /// are the buffer pools'). They follow the difference between
-    /// connections closing and opening, not the number open, so a few
-    /// dozen absorb the churn of new connections.
-    pub const max_free_conns = 64;
+    // Up to `count` free states of each kind are kept (the buffer count:
+    // handshakes in flight are rate × round trip, 100 at 2000/s and 50
+    // ms, and a reconnect storm closes and opens many at once). The
+    // structs are small (1440 and 832 bytes on aarch64); what a handshake
+    // state can hold is its flight and reassembly buffers, bounded here:
+    // the first `large_buffer_states` free states keep buffers up to
+    // `large_buffer_kept`, the rest up to `small_buffer_kept` (a flight
+    // with one or two certificates). Worst case per worker for the
+    // default count of 64: 64 × (1440 + 832 + 2 × 4 KiB) + 16 × 2 × 12
+    // KiB, about 1 MiB; for 256, about 2.9 MiB. The reassembly buffer is
+    // only used by a message split across records, so it is usually
+    // empty.
+    pub const large_buffer_states = 16;
+    pub const large_buffer_kept = 16 * 1024;
+    pub const small_buffer_kept = 4 * 1024;
 
     pub fn init(allocator: std.mem.Allocator, count: usize) !Pools {
         var in = try BufferPool.init(allocator, in_buffer_size, count);
         errdefer in.deinit();
         var out = try BufferPool.init(allocator, out_buffer_size, count);
         errdefer out.deinit();
-        const conns = try allocator.alloc(*Conn, max_free_conns);
+        const conns = try allocator.alloc(*Conn, count);
         errdefer allocator.free(conns);
-        const handshakes = try allocator.alloc(*handshake.Handshake, max_free_handshakes);
+        const handshakes = try allocator.alloc(*handshake.Handshake, count);
         return .{ .allocator = allocator, .in = in, .out = out, .conns = .{ .items = conns }, .handshakes = .{ .items = handshakes } };
     }
 
@@ -105,12 +109,16 @@ pub const Pools = struct {
     }
 
     /// After the handshake finished or failed: wiped (secrets, transcript,
-    /// buffered messages) whether it is kept or freed.
+    /// buffered messages), then kept or freed.
     fn releaseHandshake(self: *Pools, hs: *handshake.Handshake) void {
-        hs.release();
-        if (self.handshakes.push(hs)) return;
-        hs.deinit();
-        self.allocator.destroy(hs);
+        const free = &self.handshakes;
+        if (free.len == free.items.len) {
+            hs.deinit();
+            self.allocator.destroy(hs);
+            return;
+        }
+        hs.release(if (free.len < large_buffer_states) large_buffer_kept else small_buffer_kept);
+        _ = free.push(hs);
     }
 };
 
@@ -1258,7 +1266,7 @@ test "a failed handshake leaves its pooled state as good as new" {
         };
         pools.destroyConn(conn);
         try testing.expectEqual(1, pools.handshakes.len);
-        try handshake.expectReleased(pools.handshakes.items[0]);
+        try handshake.expectReleased(pools.handshakes.items[0], Pools.large_buffer_kept);
     }
     // Then the good session, on the state those failures used.
     server.config.groups = (Config{ .credentials = &server.creds }).groups;
@@ -1268,6 +1276,62 @@ test "a failed handshake leaves its pooled state as good as new" {
     try handshake.expectFresh(conn.hs.?, &server.config, &testEntropy(5));
     try testing.expectEqual(msg.len, try replay(conn, good));
     try testing.expect(conn.isEstablished() and conn.peer_closed and !conn.failed);
+}
+
+test "a burst of concurrent handshakes allocates nothing the second time" {
+    const td = credentials.testdata;
+    var server: TestServer = undefined;
+    try server.init(td.p256_cert, td.p256_key);
+    defer server.deinit();
+    var transcript: std.ArrayList(u8) = .empty;
+    defer transcript.deinit(testing.allocator);
+    const msg = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    try runAgainstStdClient(&server, msg, &transcript);
+    const good = transcript.items;
+    const hello_end = record.header_len + std.mem.readInt(u16, good[3..5], .big);
+
+    // More than `large_buffer_states` at once.
+    const n = 40;
+    var counting: std.testing.FailingAllocator = .init(testing.allocator, .{});
+    var pools = try Pools.init(counting.allocator(), n);
+    defer pools.deinit();
+    var conns: [n]*Conn = undefined;
+    for (0..2) |round| {
+        const before = counting.allocations;
+        // Every handshake under way at once, then each finished.
+        for (&conns) |*c| {
+            c.* = try pools.createConn(&server.config, &testEntropy(5));
+            _ = try replay(c.*, good[0..hello_end]);
+            try testing.expect(!c.*.failed);
+        }
+        for (conns) |c| {
+            try testing.expectEqual(msg.len, try replay(c, good[hello_end..]));
+            try testing.expect(c.isEstablished());
+        }
+        for (conns) |c| pools.destroyConn(c);
+        if (round > 0) try testing.expectEqual(before, counting.allocations);
+        try testing.expectEqual(n, pools.conns.len);
+        try testing.expectEqual(n, pools.handshakes.len);
+        // Kept buffers are bounded, the flight (one certificate) kept.
+        for (pools.handshakes.slice(), 0..) |hs, i| {
+            try handshake.expectReleased(hs, if (i < Pools.large_buffer_states) Pools.large_buffer_kept else Pools.small_buffer_kept);
+            try testing.expect(hs.flight.len > 0);
+        }
+    }
+}
+
+test "states beyond what the pools keep are freed" {
+    const td = credentials.testdata;
+    var server: TestServer = undefined;
+    try server.init(td.p256_cert, td.p256_key);
+    defer server.deinit();
+    var pools = try Pools.init(testing.allocator, 2);
+    defer pools.deinit();
+    var conns: [3]*Conn = undefined;
+    for (&conns) |*c| c.* = try pools.createConn(&server.config, &testEntropy(5));
+    for (conns) |c| pools.destroyConn(c);
+    try testing.expectEqual(2, pools.conns.len);
+    try testing.expectEqual(2, pools.handshakes.len);
 }
 
 test "a reused connection state goes back to the pool when its handshake state can't be made" {

@@ -134,6 +134,15 @@ const Transcript = union(enum) {
     }
 };
 
+/// Zeroes a buffer, then frees it. `rawFree`, because `free` overwrites
+/// the memory first in safe builds, which would hide the zeroing from
+/// tests (in fast builds nothing does).
+fn freeZeroed(allocator: std.mem.Allocator, buf: []u8) void {
+    if (buf.len == 0) return;
+    std.crypto.secureZero(u8, buf);
+    allocator.rawFree(buf, .of(u8), @returnAddress());
+}
+
 pub const Handshake = struct {
     const Self = @This();
 
@@ -187,32 +196,32 @@ pub const Handshake = struct {
         return .{ .allocator = allocator, .config = config, .entropy = entropy.* };
     }
 
-    /// `release` keeps buffers up to this size.
-    pub const max_kept_buffer = 16 * 1024;
-
     pub fn deinit(self: *Self) void {
-        self.release();
-        self.partial.deinit(self.allocator);
-        self.allocator.free(self.flight);
+        self.release(0);
     }
 
     /// Ends a handshake (finished or failed) whose state will be reused
     /// (conn.zig's `Pools`): zeroes all of it, secrets, transcript and the
     /// buffers' whole capacity (they held the ClientHello, with any
     /// ticket and binders, and the flight), and frees buffers larger than
-    /// `max_kept_buffer`. `reinit` makes it usable again.
-    pub fn release(self: *Self) void {
+    /// `keep` bytes. `reinit` makes it usable again.
+    pub fn release(self: *Self, keep: usize) void {
         const allocator = self.allocator;
         var partial = self.partial;
         // Cleared first: in safe builds clearing marks the items undefined.
         partial.clearRetainingCapacity();
-        if (partial.capacity > max_kept_buffer) partial.clearAndFree(allocator);
-        std.crypto.secureZero(u8, partial.allocatedSlice());
+        if (partial.capacity > keep) {
+            freeZeroed(allocator, partial.allocatedSlice());
+            partial = .empty;
+        } else {
+            std.crypto.secureZero(u8, partial.allocatedSlice());
+        }
         var flight = self.flight;
-        std.crypto.secureZero(u8, flight);
-        if (flight.len > max_kept_buffer) {
-            allocator.free(flight);
+        if (flight.len > keep) {
+            freeZeroed(allocator, flight);
             flight = &.{};
+        } else {
+            std.crypto.secureZero(u8, flight);
         }
         std.crypto.secureZero(u8, std.mem.asBytes(self));
         self.allocator = allocator;
@@ -254,7 +263,7 @@ pub const Handshake = struct {
                 }
             }
             if (self.partial.items.len + rest.len > max_message_len + 4) return error.DecodeError;
-            self.partial.appendSlice(self.allocator, rest) catch return error.InternalError;
+            self.appendPartial(rest) catch return error.InternalError;
             rest = &.{};
             while (try messageLen(self.partial.items)) |n| {
                 const key_change = try self.handleMessage(level, self.partial.items[0..n], self.partial.items.len > n, sink);
@@ -265,6 +274,21 @@ pub const Handshake = struct {
             }
         }
         if (self.state == .done) self.partial.clearRetainingCapacity();
+    }
+
+    /// Appends to `partial`, growing it by hand so that the old buffer is
+    /// zeroed before it is freed (it can hold a ticket and binders).
+    fn appendPartial(self: *Self, bytes: []const u8) !void {
+        const p = &self.partial;
+        if (p.capacity - p.items.len < bytes.len) {
+            const new = try self.allocator.alloc(u8, @max(p.items.len + bytes.len, 2 * p.capacity));
+            const len = p.items.len;
+            @memcpy(new[0..len], p.items);
+            freeZeroed(self.allocator, p.allocatedSlice());
+            p.items = new[0..len];
+            p.capacity = new.len;
+        }
+        p.appendSliceAssumeCapacity(bytes);
     }
 
     fn messageLen(data: []const u8) Error!?usize {
@@ -648,9 +672,9 @@ pub const Handshake = struct {
         for (creds.chain) |c| chain_len += 3 + c.len + 2;
         const flight_len = 64 + 300 + self.transport_params.len + chain_len + credentials.max_signature_len + record.max_hash_len;
         if (self.flight.len < flight_len) {
-            self.allocator.free(self.flight);
-            self.flight = &.{};
-            self.flight = self.allocator.alloc(u8, flight_len) catch return error.InternalError;
+            const new = self.allocator.alloc(u8, flight_len) catch return error.InternalError;
+            freeZeroed(self.allocator, self.flight);
+            self.flight = new;
         }
         var w: Writer = .{ .buf = self.flight[0..flight_len] };
 
@@ -1251,8 +1275,8 @@ test "ServerHello and handshake secrets match RFC 8448" {
 
 /// Expects a released state to hold nothing of its last handshake: every
 /// byte zero but the allocator and the buffers' bookkeeping, the buffers'
-/// whole capacity zero, and none larger than `max_kept_buffer`.
-pub fn expectReleased(hs: *const Handshake) !void {
+/// whole capacity zero, and none larger than `keep`.
+pub fn expectReleased(hs: *const Handshake, keep: usize) !void {
     const bytes = std.mem.asBytes(hs);
     for (bytes, 0..) |b, i| {
         const kept = inline for (.{ "allocator", "partial", "flight" }) |name| {
@@ -1267,8 +1291,73 @@ pub fn expectReleased(hs: *const Handshake) !void {
     try std.testing.expectEqual(0, hs.partial.items.len);
     try std.testing.expect(std.mem.allEqual(u8, hs.partial.allocatedSlice(), 0));
     try std.testing.expect(std.mem.allEqual(u8, hs.flight, 0));
-    try std.testing.expect(hs.partial.capacity <= Handshake.max_kept_buffer);
-    try std.testing.expect(hs.flight.len <= Handshake.max_kept_buffer);
+    try std.testing.expect(hs.partial.capacity <= keep);
+    try std.testing.expect(hs.flight.len <= keep);
+}
+
+/// Counts frees of memory that wasn't zeroed first (std.testing.allocator
+/// overwrites memory as it frees it, so it can't tell). Refuses to remap,
+/// so a growing buffer is copied and its old memory freed here, seen.
+const ZeroCheckingAllocator = struct {
+    child: std.mem.Allocator,
+    unzeroed_frees: usize = 0,
+
+    fn allocator(self: *ZeroCheckingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *ZeroCheckingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, alignment, ra);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *ZeroCheckingAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len < memory.len and !std.mem.allEqual(u8, memory[new_len..], 0)) self.unzeroed_frees += 1;
+        return self.child.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *ZeroCheckingAllocator = @ptrCast(@alignCast(ctx));
+        if (!std.mem.allEqual(u8, memory, 0)) self.unzeroed_frees += 1;
+        self.child.rawFree(memory, alignment, ra);
+    }
+};
+
+test "buffers are zeroed before they are freed: growing, replaced, released" {
+    const td = credentials.testdata;
+    var p256 = try testCredentials();
+    defer p256.deinit();
+    var rsa = try Credentials.fromPem(std.testing.allocator, td.rsa2048_cert, td.rsa2048_key);
+    defer rsa.deinit();
+    const small: Config = .{ .credentials = &p256, .groups = &.{.x25519} };
+    // A longer chain and signature: a larger flight than the first one.
+    const large: Config = .{ .credentials = &rsa, .groups = &.{.x25519} };
+    const entropy: [entropy_len]u8 = @splat(7);
+    const x = X25519.recoverPublicKey(@splat(5));
+    var buf: [24 * 1024]u8 = undefined;
+    var extra_buf: [4 + 20000]u8 = @splat(0);
+    std.mem.writeInt(u16, extra_buf[0..2], 21, .big);
+    std.mem.writeInt(u16, extra_buf[2..4], 20000, .big);
+    // Larger than the kept size, and fed in pieces so its buffer grows.
+    const hello = buildClientHello(&buf, .{ .shares = &.{.{ .group = .x25519, .key_exchange = &x }}, .sig_algs = &.{ 0x0403, 0x0804 }, .extra = &extra_buf });
+    var zc: ZeroCheckingAllocator = .{ .child = std.testing.allocator };
+    var hs = Handshake.init(zc.allocator(), &small, &entropy);
+    for ([_]*const Config{ &small, &large }) |config| {
+        hs.reinit(config, &entropy);
+        var sink: TestSink = .{ .allocator = std.testing.allocator };
+        defer sink.deinit();
+        var pos: usize = 0;
+        while (pos < hello.len) : (pos += 700) try hs.feed(.initial, hello[pos..@min(pos + 700, hello.len)], &sink);
+        try std.testing.expect(hs.flight.len > 0);
+        if (config == &small) hs.release(16 * 1024);
+    }
+    hs.deinit();
+    try std.testing.expectEqual(0, zc.unzeroed_frees);
 }
 
 /// Expects a reused state to start like a new one.
@@ -1320,8 +1409,8 @@ test "release: nothing of the last handshake survives; big buffers are freed" {
             try hs.feed(.initial, hello[hello.len / 2 ..], &sink);
             try std.testing.expect(hs.partial.capacity >= hello.len);
             try std.testing.expect(hs.flight.len > 0);
-            hs.release();
-            try expectReleased(&hs);
+            hs.release(16 * 1024);
+            try expectReleased(&hs, 16 * 1024);
             hs.reinit(&config, &entropy);
             try expectFresh(&hs, &config, &entropy);
         }

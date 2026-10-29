@@ -15,15 +15,6 @@ const ws_deflate = @import("../ws/deflate.zig");
 const ws_inflate = @import("../ws/inflate.zig");
 const iovec_const = std.posix.iovec_const;
 
-/// Fixed-size read buffers shared by a worker's connections. A connection
-/// only holds one while it has unprocessed bytes, so idle keep-alive
-/// connections cost no buffer memory.
-///
-/// It also keeps a few larger buffers (WebSocket messages being
-/// reassembled) for the next message instead of freeing them: allocations
-/// that size are mapped from the kernel, and mapping, faulting in and
-/// unmapping a fresh buffer per message cost more than the message's own
-/// copies.
 /// A bounded stack of things waiting for reuse: BufferPool's buffers, and
 /// tls/conn.zig's connection and handshake states.
 pub fn FreeList(comptime T: type) type {
@@ -51,6 +42,15 @@ pub fn FreeList(comptime T: type) type {
     };
 }
 
+/// Fixed-size read buffers shared by a worker's connections. A connection
+/// only holds one while it has unprocessed bytes, so idle keep-alive
+/// connections cost no buffer memory.
+///
+/// It also keeps a few larger buffers (WebSocket messages being
+/// reassembled) for the next message instead of freeing them: allocations
+/// that size are mapped from the kernel, and mapping, faulting in and
+/// unmapping a fresh buffer per message cost more than the message's own
+/// copies.
 pub const BufferPool = struct {
     const Self = @This();
 

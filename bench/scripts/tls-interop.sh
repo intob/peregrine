@@ -1,9 +1,10 @@
 #!/bin/bash
 # TLS key-exchange interop in Docker: bench-server (TLS and HTTP/3 on one
 # port) against OpenSSL's s_client (HTTP/1.1) and curl (HTTP/1.1, h2, h3),
-# for each group, then 8 × 40 new h2 connections per group so reused
-# connection and handshake states get exercised. Prints PASS/FAIL per
-# check; exits 1 on any failure.
+# for each group, then 480 new h2 connections per group, 160 at a time:
+# more than the 2 workers keep free states for (64 each by default), so
+# both reuse and the overflow paths run. Prints PASS/FAIL per check, and
+# the server's log if anything failed; exits 1 on any failure.
 # Usage: tls-interop.sh [epoll|io_uring] (default: both)
 # IMAGE: any image with OpenSSL 3.5+ (X25519MLKEM768) and curl with
 # HTTP/3 (default peregrine-h3load: OpenSSL 3.5, curl 8.23 with ngtcp2).
@@ -21,7 +22,10 @@ BIN=$OUT/linux/bin
 client='
 /b/bench-server 2 "$1" 9443 h3 > /tmp/srv.log 2>&1 &
 srv=$!
-sleep 1
+for i in $(seq 100); do
+    curl -sk -o /dev/null https://127.0.0.1:9443/ && break
+    sleep 0.1
+done
 fail=0
 check() { if [ "$2" = ok ]; then echo "PASS $1"; else echo "FAIL $1 ($3)"; fail=1; fi; }
 for g in $2; do
@@ -38,18 +42,20 @@ for g in $2; do
         check "curl $g $v: $res, $used" $r "$(tail -1 /tmp/curl.err | tr -d "\r")"
     done
     pids=""
-    for j in 1 2 3 4 5 6 7 8; do
-        (for i in $(seq 40); do curl -sk --curves $g --http2 https://127.0.0.1:9443/ -o /dev/null -w "%{http_code}\n"; done > /tmp/loop.$j) &
+    for j in $(seq 160); do
+        (for i in 1 2 3; do curl -sk --curves $g --http2 https://127.0.0.1:9443/ -o /dev/null -w "%{http_code}\n"; done > /tmp/loop.$j) &
         pids="$pids $!"
     done
     wait $pids
     n=$(cat /tmp/loop.* | grep -c 200)
-    [ "$n" = 320 ] && r=ok || r=bad
-    check "curl $g --http2, 320 new connections: $n ok" $r "$n of 320"
+    [ "$n" = 480 ] && r=ok || r=bad
+    check "curl $g --http2, 480 new connections, 160 at a time: $n ok" $r "$n of 480"
     rm -f /tmp/loop.*
 done
+kill -0 $srv 2>/dev/null && r=ok || r=bad
+check "bench-server still running" $r "it exited"
+[ $fail = 0 ] || { echo "-- server log:"; tail -50 /tmp/srv.log; }
 kill $srv 2>/dev/null
-kill -0 $srv 2>/dev/null && wait $srv
 exit $fail
 '
 

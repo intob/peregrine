@@ -270,7 +270,7 @@ fn handshakes() !void {
             const iterations = 2000;
             const start = sys.nanoTimestamp();
             for (0..iterations) |_| {
-                hs.release();
+                hs.release(16 * 1024);
                 hs.reinit(&config, &entropy);
                 var sink: NullSink = .{};
                 try hs.feed(.initial, hello, &sink);
