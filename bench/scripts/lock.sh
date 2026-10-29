@@ -30,15 +30,32 @@ prune() {
     done
 }
 
-# Waits for this caller's turn. A ticket (pid, mode, what) is named by arrival
-# time, so the directory listing is the queue. Exclusive (x) goes once nothing
+# The next ticket number for NAME: a counter under a mkdir mutex, so tickets
+# sort by arrival whatever the clock or the tools in a sandbox say (a ticket
+# named by a timestamp that came out empty once sorted first and jumped the
+# queue). Numbers start at 2000000001 so they sort after the timestamp tickets
+# of older copies of this script that may still be waiting.
+next_ticket() {
+    local c=$LOCKS/$1.seq n i=0
+    until mkdir "$c.lk" 2>/dev/null; do
+        i=$((i + 1)); [ $i -gt 50 ] && rmdir "$c.lk" 2>/dev/null # a holder killed mid-update
+        sleep 0.1
+    done
+    n=$(cat "$c" 2>/dev/null); case $n in '' | *[!0-9]*) n=2000000000 ;; esac
+    n=$((n + 1)); echo $n > "$c"
+    rmdir "$c.lk"
+    echo $n
+}
+
+# Waits for this caller's turn. A ticket (pid, mode, what) is named by its
+# number, so the directory listing is the queue. Exclusive (x) goes once nothing
 # is held and no ticket is older; shared (s) once no exclusive lock is held
 # and no exclusive ticket is older. The lock or the share is taken before the
 # ticket goes, so a later caller never slips in between.
 queue() {
     local name=$1 mode=$2 q=$LOCKS/$1.q t older
     mkdir -p "$q" "$LOCKS/$name.s"
-    me=$q/$(perl -MTime::HiRes=time -e 'printf "%.6f", time' 2>/dev/null || date +%s)-$$
+    me=$q/$(next_ticket "$name")-$$
     printf '%s\n%s\n%s\n' $$ "$mode" "$3" > "$me"
     trap 'rm -f "$me"' EXIT
     trap 'exit 1' INT TERM HUP
@@ -64,7 +81,7 @@ queue() {
 case $1 in
 acquire)
     queue "$2" x "${3:-$PWD}"
-    echo "${3:-$PWD} since $(date '+%F %T')" > "$LOCKS/$2/owner" ;;
+    echo "${3:-$PWD} since $(date '+%F %T') (ticket $(basename "$me"))" > "$LOCKS/$2/owner" ;;
 release) rm -rf "${LOCKS:?}/$2" ;;
 share)
     queue "$2" s "${3:-$PWD}"
