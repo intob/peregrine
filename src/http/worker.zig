@@ -400,6 +400,7 @@ pub fn Worker(comptime Handler: type) type {
             self.expire(&self.idle);
             self.expire(&self.active);
             self.expireExchanges();
+            self.pool.trim();
             self.tickH2();
         }
 
@@ -958,6 +959,9 @@ pub fn Worker(comptime Handler: type) type {
             const ctx = self.h2Context(c);
             conn.pump(Handler, &ctx);
             if (conn.hasWire()) return self.h2Flush(c);
+            // Written: buffers go back (exchange posts and deadlines end
+            // here, not in h2Process).
+            conn.releaseIfIdle(&self.pool);
             self.h2Timer(c);
             return true;
         }

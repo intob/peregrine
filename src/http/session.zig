@@ -42,6 +42,61 @@ pub fn FreeList(comptime T: type) type {
     };
 }
 
+/// Buffers of one size kept for reuse, as many as were in use at once
+/// recently: `trim` (the worker's tick, once a second) frees the ones
+/// beyond the most in use since the trim before, so steady traffic, bursts
+/// included, allocates nothing, and an idle worker gives them all back
+/// within two ticks. Releasing never frees (a send in flight may still be
+/// reading a buffer until the worker has drained its ring) and never
+/// allocates (acquiring made room for it).
+pub const Recycler = struct {
+    /// Bytes per buffer; 0 until the first user sets it.
+    size: usize = 0,
+    free: FreeList([]u8) = .{ .items = &.{} },
+    in_use: usize = 0,
+    /// The most in use at once since the last trim.
+    peak: usize = 0,
+
+    pub fn acquire(self: *Recycler, allocator: std.mem.Allocator) ![]u8 {
+        if (self.free.pop()) |b| {
+            self.take();
+            return b;
+        }
+        // Room for every buffer to come back.
+        if (self.free.items.len < self.in_use + 1) {
+            const items = try allocator.alloc([]u8, @max(8, 2 * (self.in_use + 1)));
+            @memcpy(items[0..self.free.len], self.free.slice());
+            allocator.free(self.free.items);
+            self.free.items = items;
+        }
+        const b = try allocator.alloc(u8, self.size);
+        self.take();
+        return b;
+    }
+
+    fn take(self: *Recycler) void {
+        self.in_use += 1;
+        self.peak = @max(self.peak, self.in_use);
+    }
+
+    pub fn release(self: *Recycler, buf: []u8) void {
+        self.in_use -= 1;
+        const kept = self.free.push(buf);
+        std.debug.assert(kept);
+    }
+
+    pub fn trim(self: *Recycler, allocator: std.mem.Allocator) void {
+        while (self.free.len > self.peak -| self.in_use) allocator.free(self.free.pop().?);
+        self.peak = self.in_use;
+    }
+
+    pub fn deinit(self: *Recycler, allocator: std.mem.Allocator) void {
+        for (self.free.slice()) |b| allocator.free(b);
+        allocator.free(self.free.items);
+        self.* = .{};
+    }
+};
+
 /// Fixed-size read buffers shared by a worker's connections. A connection
 /// only holds one while it has unprocessed bytes, so idle keep-alive
 /// connections cost no buffer memory.
@@ -64,6 +119,11 @@ pub const BufferPool = struct {
     large: [large_cache_count][]u8 = undefined,
     large_len: usize = 0,
     large_bytes: usize = 0,
+    /// HTTP/2 output (h2/conn.zig): buffers for one frame and some
+    /// control frames, and for everything `out_limit` lets a connection
+    /// queue. Sizes are set by the first connection.
+    out_small: Recycler = .{},
+    out_large: Recycler = .{},
     /// The worker's WebSocket compressor and inflate tables, made on
     /// first use.
     ws_deflater: ?*ws_deflate.Deflater = null,
@@ -85,6 +145,8 @@ pub const BufferPool = struct {
         for (self.free.slice()) |b| self.allocator.free(b);
         self.allocator.free(self.free.items);
         for (self.large[0..self.large_len]) |b| self.allocator.free(b);
+        self.out_small.deinit(self.allocator);
+        self.out_large.deinit(self.allocator);
         if (self.ws_deflater) |d| self.allocator.destroy(d);
         if (self.ws_inflate_tables) |t| self.allocator.destroy(t);
     }
@@ -117,12 +179,20 @@ pub const BufferPool = struct {
         if (buf.len != self.buffer_size or !self.free.push(buf)) self.allocator.free(buf);
     }
 
+    /// Once a second, from the worker's tick: output buffers beyond what
+    /// was in use recently are freed.
+    pub fn trim(self: *Self) void {
+        self.out_small.trim(self.allocator);
+        self.out_large.trim(self.allocator);
+    }
+
     /// A buffer of at least `min` bytes: the smallest cached one that
-    /// fits, or a new one (whole pages).
+    /// fits (the one released last, of equals: it is the warmest), or a
+    /// new one (whole pages).
     pub fn acquireLarge(self: *Self, min: usize) ![]u8 {
         var best: ?usize = null;
         for (self.large[0..self.large_len], 0..) |b, i| {
-            if (b.len >= min and (best == null or b.len < self.large[best.?].len)) best = i;
+            if (b.len >= min and (best == null or b.len <= self.large[best.?].len)) best = i;
         }
         if (best) |i| {
             const b = self.large[i];
@@ -1018,6 +1088,53 @@ test "large buffers are cached for reuse, best fit first, within limits" {
     many.releaseLarge(try testing.allocator.alloc(u8, 8192));
     try testing.expectEqual(@as(usize, BufferPool.large_cache_count), many.large_len);
     try testing.expectEqual(@as(usize, (BufferPool.large_cache_count - 1) * 4096 + 8192), many.large_bytes);
+}
+
+test "large buffers of equal size: the one released last comes back first" {
+    var pool = try BufferPool.init(testing.allocator, 1024, 1);
+    defer pool.deinit();
+    const a = try pool.acquireLarge(8192);
+    const b = try pool.acquireLarge(8192);
+    const c = try pool.acquireLarge(8192);
+    pool.releaseLarge(a);
+    pool.releaseLarge(b);
+    pool.releaseLarge(c);
+    try testing.expect((try pool.acquireLarge(8192)).ptr == c.ptr);
+    try testing.expect((try pool.acquireLarge(8192)).ptr == b.ptr);
+    try testing.expect((try pool.acquireLarge(8192)).ptr == a.ptr);
+    pool.releaseLarge(a);
+    pool.releaseLarge(b);
+    pool.releaseLarge(c);
+}
+
+test "recycler: keeps as many as were in use at once recently, frees the rest on trim" {
+    var counting = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const a = counting.allocator();
+    var r: Recycler = .{ .size = 4096 };
+    defer r.deinit(a);
+    var held: [40][]u8 = undefined;
+    // Bursts of 40, again and again, between trims: allocated once.
+    var warm: usize = 0;
+    for (0..5) |round| {
+        for (&held) |*b| b.* = try r.acquire(a);
+        try testing.expectEqual(@as(usize, 40), r.peak);
+        if (round == 0) warm = counting.allocations;
+        for (held) |b| r.release(b);
+        try testing.expectEqual(warm, counting.allocations);
+        r.trim(a);
+        try testing.expectEqual(@as(usize, 40), r.free.len);
+    }
+    // The newest is the warmest.
+    const x = try r.acquire(a);
+    try testing.expect(x.ptr == held[held.len - 1].ptr);
+    r.release(x);
+    // Idle: the trim after a quiet second frees everything.
+    r.trim(a);
+    try testing.expectEqual(@as(usize, 1), r.free.len);
+    r.trim(a);
+    try testing.expectEqual(@as(usize, 0), r.free.len);
+    // Only the list itself is left.
+    try testing.expectEqual(counting.allocations - 1, counting.deallocations);
 }
 
 test "body larger than the pool buffer grows the buffer" {

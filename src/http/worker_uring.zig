@@ -600,6 +600,34 @@ pub fn Worker(comptime Handler: type) type {
                     conn.advance(n);
                 }
             }
+            self.drainConns(&cqes);
+        }
+
+        /// Closes every connection and waits for the operations still in
+        /// flight (shutting the sockets down fails writes at once), so no
+        /// send is left reading a buffer after it went back or was freed.
+        /// Connections accepted meanwhile are closed. Gives up after two
+        /// seconds; deinit frees what is left.
+        fn drainConns(self: *Self, cqes: []linux.io_uring_cqe) void {
+            for (self.conns) |*c| {
+                if (c.open) self.closeConn(c);
+            }
+            const deadline = sys.monotonicSeconds() + 2;
+            while (self.open_count > 0 and sys.monotonicSeconds() < deadline) {
+                _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
+                    error.SignalInterrupt => continue,
+                    else => return,
+                };
+                const n = self.ring.copy_cqes(cqes, 0) catch 0;
+                for (cqes[0..n]) |cqe| {
+                    const op: Op = @fromBackingInt(@intCast(@as(u8, @truncate(cqe.user_data))));
+                    if (op == .accept) {
+                        if (cqe.res >= 0) sys.close(cqe.res);
+                        continue;
+                    }
+                    self.dispatch(cqe);
+                }
+            }
         }
 
         fn dispatch(self: *Self, cqe: linux.io_uring_cqe) void {
@@ -842,6 +870,7 @@ pub fn Worker(comptime Handler: type) type {
             self.expire(&self.idle);
             self.expire(&self.active);
             self.expireExchanges();
+            self.pool.trim();
             self.tickH2();
         }
 

@@ -291,20 +291,23 @@ pub const Conn = struct {
     /// once the wire is drained, so frames can be queued while a write of
     /// the wire is in flight (as ws.Conn does).
     ///
-    /// Both live in the worker's buffers (`pool`), held only while they
-    /// have unsent bytes, so an idle connection holds none. Output starts
-    /// in a read buffer and moves to a large one (`large_size`, kept for
-    /// reuse in the pool's cache) when it outgrows that: allocations that
-    /// size are mapped from the kernel, and mapping, faulting in and
-    /// unmapping fresh ones for each burst of large responses cost about a
-    /// quarter of the server's CPU.
+    /// Both live in the worker's output buffers (`pool.out_small`,
+    /// `pool.out_large`), held only while they have unsent bytes, so an
+    /// idle connection, or one waiting for a window, holds none. Output
+    /// starts in a small buffer (one full frame and some control frames)
+    /// and moves to a large one (everything `out_limit` allows) when it
+    /// outgrows that. The worker keeps as many of each as were in use
+    /// recently: allocations the large size are mapped from the kernel,
+    /// and mapping, faulting in and unmapping fresh ones for each burst of
+    /// large responses cost about a quarter of the server's CPU.
     out: std.ArrayList(u8) = .empty,
     wire: std.ArrayList(u8) = .empty,
     wire_pos: usize = 0,
     pool: *BufferPool,
-    /// Room for everything `out_limit` lets `out` hold.
+    /// `pool.out_large.size`: room for everything `out_limit` lets `out`
+    /// hold.
     large_size: usize,
-    /// The last batch written outgrew a read buffer: start the next in a
+    /// The last batch written outgrew a small buffer: start the next in a
     /// large one rather than copying over.
     out_large: bool = false,
     state: State = .preface,
@@ -381,8 +384,16 @@ pub const Conn = struct {
             .order = order,
             .idle_prio = idle_prio,
             .pool = pool,
-            .large_size = std.mem.alignForward(usize, opts.out_limit + 2 * opts.max_frame_size + out_slack, 4096),
+            .large_size = 0,
         };
+        // Every connection of a worker has the same options; the first
+        // sizes the worker's buffers. A connection with a larger out_limit
+        // would grow past them (correct, but allocating).
+        if (pool.out_small.size == 0) {
+            pool.out_small.size = std.mem.alignForward(usize, frame.header_len + opts.max_frame_size + out_slack, 4096);
+            pool.out_large.size = std.mem.alignForward(usize, opts.out_limit + 2 * opts.max_frame_size + out_slack, 4096);
+        }
+        self.large_size = pool.out_large.size;
         errdefer self.giveBack(&self.out);
         // Our preface: SETTINGS, then a larger connection window.
         var buf: [64]u8 = undefined;
@@ -455,7 +466,7 @@ pub const Conn = struct {
     pub fn wireBytes(self: *Self) []const u8 {
         if (self.wire_pos == self.wire.items.len) {
             // Written: the buffer goes back.
-            if (self.wire.items.len > 0) self.out_large = self.wire.items.len > self.pool.buffer_size;
+            if (self.wire.items.len > 0) self.out_large = self.wire.items.len > self.pool.out_small.size;
             self.giveBack(&self.wire);
             self.wire_pos = 0;
             std.mem.swap(std.ArrayList(u8), &self.out, &self.wire);
@@ -476,26 +487,46 @@ pub const Conn = struct {
         return self.out.items.len + (self.wire.items.len - self.wire_pos);
     }
 
-    /// Room for `n` more bytes in `out`: a read buffer while that is
-    /// enough, then a large one (larger still, for header blocks beyond
-    /// `out_slack`), the bytes so far copied over.
+    /// Room for `n` more bytes in `out`: a small buffer while that is
+    /// enough, then a large one, the bytes so far copied over. Header
+    /// blocks beyond `out_slack` can need more than that: such a buffer
+    /// is allocated, and freed once written.
     fn reserve(self: *Self, n: usize) !void {
         const out = &self.out;
         if (out.capacity - out.items.len >= n) return;
         const need = out.items.len + n;
-        const buf = if (need <= self.pool.buffer_size and !self.out_large)
-            try self.pool.acquire()
+        const small = &self.pool.out_small;
+        const large = &self.pool.out_large;
+        const buf = if (need <= small.size and !self.out_large)
+            try small.acquire(self.pool.allocator)
+        else if (need <= large.size)
+            try large.acquire(self.pool.allocator)
         else
-            try self.pool.acquireLarge(@max(need, self.large_size, 2 * out.capacity));
+            try self.pool.allocator.alloc(u8, std.mem.alignForward(usize, @max(need, 2 * out.capacity), 4096));
         var grown: std.ArrayList(u8) = .initBuffer(buf);
         grown.appendSliceAssumeCapacity(out.items);
         self.giveBack(out);
         out.* = grown;
     }
 
+    /// Takes back a reservation in `out`: back to `len` bytes, and the
+    /// buffer goes back if that leaves it empty (an exchange or file with
+    /// nothing to send yet must not keep one).
+    fn unreserve(self: *Self, len: usize) void {
+        self.out.items.len = len;
+        if (len == 0) self.giveBack(&self.out);
+    }
+
     fn append(self: *Self, bytes: []const u8) !void {
         try self.reserve(bytes.len);
         self.out.appendSliceAssumeCapacity(bytes);
+    }
+
+    /// Room for a header block of `len` bytes in as many frames as the
+    /// peer's frame size takes.
+    fn reserveBlock(self: *Self, len: usize) !void {
+        const frames = @max(1, std.math.divCeil(usize, len, self.peer_max_frame_size) catch unreachable);
+        try self.reserve(len + frames * frame.header_len);
     }
 
     /// A frame whole, or nothing.
@@ -505,12 +536,18 @@ pub const Conn = struct {
         self.out.appendSliceAssumeCapacity(payload);
     }
 
-    /// Returns `out`'s or `wire`'s buffer to the pool, whose read buffers
-    /// are told from large ones by their size.
+    /// Returns `out`'s or `wire`'s buffer to where it came from, told by
+    /// its size.
     fn giveBack(self: *Self, list: *std.ArrayList(u8)) void {
         if (list.capacity == 0) return;
         const buf = list.allocatedSlice();
-        if (buf.len == self.pool.buffer_size) self.pool.release(buf) else self.pool.releaseLarge(buf);
+        if (buf.len == self.pool.out_small.size) {
+            self.pool.out_small.release(buf);
+        } else if (buf.len == self.pool.out_large.size) {
+            self.pool.out_large.release(buf);
+        } else {
+            self.pool.allocator.free(buf);
+        }
         list.* = .empty;
     }
 
@@ -1346,6 +1383,9 @@ pub const Conn = struct {
         self.encodeField("date", date_line[6 .. date_line.len - 2]) catch return self.fail(.internal_error);
         // Frame it.
         var block: []const u8 = self.enc_buf.items;
+        // All of it or nothing: a HEADERS without its CONTINUATIONs, then
+        // anything else, is a connection error for the client (§6.10).
+        self.reserveBlock(block.len) catch return self.fail(.internal_error);
         var first = true;
         while (true) {
             const n = @min(block.len, self.peer_max_frame_size);
@@ -1623,14 +1663,14 @@ pub const Conn = struct {
             self.out.items.len = start + frame.header_len + max;
             r = exchange.h2Poll(ex, self.out.items[start + frame.header_len ..][0..max], ctx.now);
             if (r.aborted) {
-                self.out.items.len = start;
+                self.unreserve(start);
                 return self.resetStream(ctx, s, .internal_error);
             }
             if (is_head) {
                 // No body for HEAD: the data is dropped.
-                self.out.items.len = start;
+                self.unreserve(start);
             } else if (r.n == 0) {
-                self.out.items.len = start;
+                self.unreserve(start);
             } else {
                 const end_on_data = r.end and r.trailers.len == 0;
                 frame.writeHeader(self.out.items[start..][0..frame.header_len], @intCast(r.n), .data, if (end_on_data) frame.flag.end_stream else 0, s.id);
@@ -1680,7 +1720,7 @@ pub const Conn = struct {
             const got = sys.pread(f.fd, self.out.items[start + frame.header_len ..][0..max], f.offset) catch 0;
             if (got < max) {
                 // The file shrank: the response can't be completed.
-                self.out.items.len = start;
+                self.unreserve(start);
                 return self.resetStream(ctx, s, .internal_error);
             }
             f.offset += max;
@@ -1749,6 +1789,9 @@ pub const Conn = struct {
             self.encodeField(name, value) catch return self.fail(.internal_error);
         }
         var block: []const u8 = self.enc_buf.items;
+        // All of it or nothing: a HEADERS without its CONTINUATIONs, then
+        // anything else, is a connection error for the client (§6.10).
+        self.reserveBlock(block.len) catch return self.fail(.internal_error);
         var first = true;
         while (true) {
             const n = @min(block.len, self.peer_max_frame_size);
@@ -3308,11 +3351,17 @@ test "output buffers: bursts of large responses allocate nothing once warm, an i
         h.events.clearRetainingCapacity();
         // Idle: no output buffer held; the large ones wait in the pool.
         try testing.expectEqual(@as(usize, 0), h.conn.out.capacity + h.conn.wire.capacity);
-        try testing.expect(h.pool.large_len >= 1 and h.pool.large_len <= 2);
+        try testing.expect(h.pool.out_large.free.len >= 1 and h.pool.out_large.free.len <= 2);
     }
-    // Small responses go out of read buffers.
+    try testing.expectEqual(warm, counting.allocations + counting.resize_index);
+    // The worker's tick keeps what was in use.
+    h.pool.trim();
+    try testing.expect(h.pool.out_large.free.len >= 1);
+    // Small responses go out of small buffers (the ticks above freed the
+    // ones not used meanwhile: the first round takes one again).
     h.check_body = null;
     for (0..3) |round| {
+        if (round == 1) warm = counting.allocations + counting.resize_index;
         try getBurst(h, @intCast(241 + 200 * round), 100, "/");
         try h.flushAll();
         try testing.expectEqual(@as(usize, 100 * "Hello, World!".len), h.data_out.items.len);
@@ -3320,6 +3369,76 @@ test "output buffers: bursts of large responses allocate nothing once warm, an i
         try testing.expectEqual(@as(usize, 0), h.conn.out.capacity + h.conn.wire.capacity);
     }
     try testing.expectEqual(warm, counting.allocations + counting.resize_index);
+    // Two quiet ticks: the worker frees them.
+    h.pool.trim();
+    h.pool.trim();
+    try testing.expectEqual(@as(usize, 0), h.pool.out_large.free.len + h.pool.out_small.free.len);
+}
+
+test "output buffers: an exchange or HEAD with nothing to send holds none; small DATA stays in a small buffer" {
+    const h = try Harness.initWith(.{}, testing.allocator, 16 * 1024);
+    defer h.deinit();
+    try h.preface();
+    try h.get(1, "/stream");
+    try h.headers(.{ .stream = 3, .fields = &.{
+        .{ .name = ":method", .value = "HEAD" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/stream" },
+    } });
+    try testing.expectEqual(@as(u32, 2), h.conn.activeStreams());
+    // What the epoll worker does once output drains, without
+    // releaseIfIdle: the polls reserve a frame and get nothing.
+    for (0..3) |_| {
+        const c = h.ctx();
+        h.conn.pump(TestHandler, &c);
+        try testing.expectEqual(@as(usize, 0), h.conn.out.capacity + h.conn.wire.capacity);
+    }
+    // A few bytes at a time (server-sent events): full-size frames are
+    // reserved, in small buffers.
+    const ex = h.handler.exchanges.items[0];
+    for (0..20) |_| {
+        try ex.write("event: tick\n\n");
+        try h.drainMailbox();
+        try h.collect();
+        const c = h.ctx();
+        h.conn.pump(TestHandler, &c);
+        try h.collect();
+        h.conn.releaseIfIdle(&h.pool);
+    }
+    try testing.expectEqual(@as(usize, 20 * "event: tick\n\n".len), h.data_out.items.len);
+    try testing.expectEqual(@as(usize, 0), h.pool.out_large.peak);
+    try testing.expectEqual(@as(usize, 0), h.conn.out.capacity + h.conn.wire.capacity);
+}
+
+test "output buffers: a header block goes in whole or not at all" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const h = try Harness.initWith(.{}, failing.allocator(), 16 * 1024);
+    defer h.deinit();
+    try h.preface();
+    // Longer than the peer's frame size: HEADERS and a CONTINUATION.
+    var lines: std.ArrayList(u8) = .empty;
+    defer lines.deinit(testing.allocator);
+    try lines.appendSlice(testing.allocator, "x-big: ");
+    try lines.appendNTimes(testing.allocator, '~', 20000);
+    try lines.appendSlice(testing.allocator, "\r\n");
+    try h.conn.enc_buf.ensureTotalCapacity(failing.allocator(), 64 * 1024);
+    // `out` has a large buffer with room for the HEADERS frame only, and
+    // growing past it fails.
+    try h.conn.reserve(h.conn.large_size);
+    const before = h.conn.large_size - 17000;
+    @memset(h.conn.out.allocatedSlice()[0..before], 0);
+    h.conn.out.items.len = before;
+    const s = &h.conn.streams[0];
+    s.id = 1;
+    failing.fail_index = failing.alloc_index;
+    const c = h.ctx();
+    h.conn.writeHead(&c, s, .ok, lines.items, null, true);
+    failing.fail_index = std.math.maxInt(usize);
+    // Nothing of the block, then the GOAWAY.
+    try testing.expect(h.conn.failed);
+    try testing.expectEqual(before + frame.header_len + 8, h.conn.out.items.len);
+    try testing.expectEqual(@as(u8, 7), h.conn.out.items[before + 3]);
+    h.conn.out.items.len = 0;
 }
 
 test "output buffers: a slow reader, many streams, a reset mid-response, windows, closing with output queued" {
