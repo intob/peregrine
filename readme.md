@@ -52,12 +52,20 @@ Note: This project has just started, and is not yet a complete HTTP server imple
     - Thread-safe request handling
 
 ## Benchmarks
-Plaintext "Hello, World!" on Linux (Docker on an M2 Pro: kernel 6.12, aarch64). Server on 6 cores (6 workers), `wrk -t6 -c256 -d10s` on the other 6, over loopback. Two runs each; numbers vary by about 10% between runs, so treat epoll and io_uring as equal here. Same machine for client and server, so these are relative, not absolute.
+Plaintext "Hello, World!" on Linux (Docker on an M2 Pro: kernel 6.12, aarch64), HTTP/1.1. Every server on 6 cores with 6 workers (threads or processes), `wrk -t6 -d8s` on the other 6, over loopback. Two interleaved runs each (October 2026); runs differ by a few percent. CPU/req is the server's CPU time per request (from its cgroup), which matters more than req/s here: every server keeps its 6 cores busy, and client and server share the machine, so these are relative, not absolute.
 
-| Requests/sec | NGINX | Peregrine (epoll) | Peregrine (io_uring) |
-|--------|-------|-----|-----|
-| Keep-alive | 767k–944k | 956k–1.09M | 995k–1.07M |
-| Pipelined ×16 | 1.24M–1.47M | 8.2M–9.4M | 8.5M–8.8M |
+| | keep-alive, 256 conns | | pipelined ×16, 256 conns | | keep-alive, 1024 conns | |
+|---|---|---|---|---|---|---|
+| | req/s | CPU/req | req/s | CPU/req | req/s | CPU/req |
+| **Peregrine (io_uring)** | 1.15M | 4.85 µs | 8.81M–8.88M | 0.58 µs | 1.22M | 4.68 µs |
+| **Peregrine (epoll)** | 1.14M–1.17M | 4.90–5.00 µs | 8.98M–9.00M | 0.55 µs | 1.19M–1.21M | 4.78–4.84 µs |
+| uWebSockets 20.74 | 1.11M | 5.06 µs | 8.29M–8.30M | 0.64–0.65 µs | 1.16M | 4.91–4.93 µs |
+| may-minihttp (Rust) | 1.02M | 5.56 µs | 8.33M–8.34M | 0.58 µs | 1.10M | 5.21–5.23 µs |
+| facil.io 0.7.6 | 0.98M–0.99M | 5.75–5.81 µs | 2.09M–2.15M | 2.79–2.87 µs | 1.00M | 5.72–5.74 µs |
+| NGINX 1.26 | 1.00M–1.01M | 5.69–5.72 µs | 1.26M–1.28M | 4.69–4.77 µs | 1.02M | 5.65 µs |
+| h2o 2.2.6 | 0.88M–0.90M | 6.51–6.63 µs | 1.49M–1.52M | 3.96–4.03 µs | 0.92M | 6.29 µs |
+
+Response heads differ a little (Peregrine 102 bytes, uWebSockets 119, may-minihttp 113, facil.io 167, h2o 233); h2o serves the body as a static file, the others from a handler. C and C++ servers built with `-O3 -march=native`, may-minihttp with `-C target-cpu=native`.
 
 HTTP/3 against nginx 1.29 and Caddy 2.11, same setup, `h2load --alpn-list=h3 -t6` on the other 6 cores. CPU/req is the server's CPU time per request; at "-c10 -m100" h2load is the limit for peregrine.
 
@@ -66,7 +74,7 @@ HTTP/3 against nginx 1.29 and Caddy 2.11, same setup, `h2load --alpn-list=h3 -t6
 | "Hello", 10 connections × 100 streams | 316k–321k req/s, 1.9–2.1 µs/req | 221k–227k, 4.8–4.9 µs/req | 160k–179k, 31–33 µs/req |
 | 64 KiB, 10 × 10 | 77k–78k req/s (4.7 GB/s), 40 µs/req | 11k–12k, 149–155 µs/req | 6.5k–6.7k, 387–403 µs/req |
 
-Reproduce: `zig build bench-server -Dtarget=aarch64-linux` (the server takes `[workers] [auto|epoll|io_uring] [port]`), and `zig build bench` for parser micro-benchmarks (about 190 ns to parse a 437-byte browser request with 8 headers).
+Reproduce: `zig build bench-server -Dtarget=aarch64-linux-musl -Dcpu=native` (the server takes `[workers] [auto|epoll|io_uring] [port]`), and `zig build bench` for parser micro-benchmarks (about 190 ns to parse a 437-byte browser request with 8 headers).
 
 The previous version, run using wrk on an M2 Pro (macOS) with 1000 connections:
 
@@ -387,7 +395,7 @@ See [PLAN.md](PLAN.md) for the full checklist. In order:
 
 1. TLS 1.3 follow-ups: faster handshakes (the rest), 0-RTT
 2. HTTP/3 follow-ups: connection migration, 0-RTT, pacing, ECN, PMTU discovery, GRO, the QPACK dynamic table, DATAGRAM (RFC 9221)
-3. Throughout: `sendfile`, tuning io_uring until it beats epoll, WebSocket `permessage-deflate`, and verification with Autobahn, h2spec, quic-interop-runner, soak, adversarial and differential (HTTP Garden) testing
+3. Throughout: io_uring for pipelined requests and uploads (a few percent behind epoll; ahead on keep-alive), WebSocket `permessage-deflate`, and verification with Autobahn, h2spec, quic-interop-runner, soak, adversarial and differential (HTTP Garden) testing
 4. API reference
 
 ## Nice to have

@@ -52,7 +52,7 @@ Design rules that apply to every layer:
 | Milestone | State |
 |---|---|
 | M1. HTTP/1.1 core | ✅ done (streaming responses landed with the M5 handler API) |
-| M2. Throughput architecture | 🟡 io_uring works (opt-in, not yet faster than epoll); sendfile done (plaintext, and TLS with kTLS); NUMA open |
+| M2. Throughput architecture | 🟡 io_uring works (opt-in; faster than epoll for keep-alive requests, 4-5% behind for pipelined requests and uploads); sendfile done (plaintext, and TLS with kTLS); NUMA open |
 | M3. WebSockets over HTTP/1.1 | ✅ reworked; permessage-deflate, Autobahn, benchmarks open |
 | M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; tables for P-256 and X25519, RSA-PSS, session tickets, kTLS, 0-RTT and SNI certificates done; the rest of "faster handshakes" open |
 | M5. HTTP/2 | ✅ h2 over TLS (ALPN) and h2c on every backend, h2spec 146/146 over TLS, fuzzed, benchmarked; streamed request bodies on every protocol; WebSockets over h2 (RFC 8441); RFC 9218 priorities |
@@ -134,25 +134,64 @@ end-to-end test pipelines 8 MB + 1 MB responses to a slow reader.
       recv armed at a time (backpressure); writes queued as SQEs so one
       `io_uring_enter` covers a batch; `SINGLE_ISSUER | DEFER_TASKRUN`;
       cancel-before-close with in-flight op counting
-- [ ] **Make io_uring faster than epoll.** Equal within noise for small requests,
-      so `.auto` picks epoll. To try: multishot recv, registered (direct) fds, `send`
-      instead of `writev` for one buffer, `send_zc` for large bodies, bigger
-      completion batches, back off re-arming accept on `EMFILE`.
-      Uploads are slower: a 12 KiB POST (plaintext, c=64) cost 12.4 µs of server
-      CPU on io_uring against 6.7-7.1 on epoll. Found with perf and counters (Docker
-      on the M2 Pro, host under load, interleaved runs):
+- [ ] **Make io_uring faster than epoll.** Faster for keep-alive requests now,
+      still behind for pipelined requests and uploads, so `.auto` picks epoll.
+      Server CPU per request (Docker on the M2 Pro, 6 workers, `wrk -t6` on the
+      other cores, two interleaved rounds, both fully optimised):
+
+      | | io_uring before | io_uring after | epoll |
+      |---|---|---|---|
+      | "Hello", c=256 | 5.08-5.10 µs | 4.82-4.84 µs | 4.91-4.97 µs |
+      | pipelined ×16, c=256 | 0.625 µs | 0.576-0.578 µs | 0.552-0.556 µs |
+      | POST 12 KiB, c=64 | 9.45 µs | 8.54-8.65 µs | 7.99-8.20 µs |
+
+  - [x] Plaintext HTTP/1.1 keeps one multishot receive armed across requests
+        instead of a receive (and a poll the kernel arms) per request: -4% on
+        "Hello". Input it brings while a response is being written, or that
+        the session has no room for (a paused body, a pipelined burst: the
+        kernel retries a multishot receive up to 32 times per pass, buffer
+        after buffer), stays in its kernel buffers (`Conn.parked`) and goes
+        in before anything more is received; holding partial input, being
+        busy or upgraded cancels the multishot receive. Single-shot with
+        `IORING_RECVSEND_POLL_FIRST` instead was no better than before
+  - [x] The receive for the next request goes in the same submission as the
+        response, not after its completion
+  - [x] Receive buffers are posted from a LIFO stack, only as many as recent
+        batches used (twice the most per batch, adapted each second, doubled
+        on ENOBUFS), not all 256 cycling through the ring; and without
+        incremental consumption, which packed requests into buffers back to
+        back so that 12 KiB uploads were often split across two receives:
+        uploads 9.3-9.5 → 8.5-8.8 µs
+  - [x] `send`/`sendmsg` instead of `writev` (no VFS layer), and bodies up to
+        1 KiB copied after the head so most responses are one buffer: within
+        noise
+  - [x] Tried and dropped: writing responses with a direct `writev` and only
+        falling back to the ring (worse: an SQE and its completion cost less
+        than the syscall); a smaller receive target (no change)
+  - [ ] What is left is the kernel's receive copy: `__arch_copy_to_user` takes
+        1.6-2x the time it does on epoll for the same bytes, even with one
+        connection per worker, where both copy into a single hot buffer, so
+        it isn't the buffers' cache footprint (epoll copies later, after its
+        own wakeup and syscall). Fixed files would save `fget`/`fput` on each
+        send (about 0.6%)
+  - Fixed while doing this: closing a connection that held part of a request
+    cancelled `.recv` when `.recv_plain` was armed, so a client that sent part
+    of a request and went quiet kept its slot and fd past the timeout (test
+    added)
+  - Earlier, before the work above (12 KiB POST, plaintext, c=64: 12.4 µs of
+    server CPU on io_uring against 6.7-7.1 on epoll; found with perf and
+    counters, host under load, interleaved runs):
   - [x] About two thirds of these requests arrive in two receives. The rest went
         through a second kernel buffer and was copied after the first part;
         a connection holding partial input now receives straight into that
         buffer, as on epoll: 11.0-12.1 → 10.0-10.3 µs
-  - [ ] The kernel copies into the coldest buffer: the ring is FIFO over 256 ×
-        16 KiB per worker, where epoll reuses hot pooled buffers. 16 buffers gave
-        8.8-8.9 µs in one set of runs and were within noise of 256 in the next, so
-        the default stays until it's measured on a quiet machine (a small ring
-        trades this for ENOBUFS round trips under bursts)
+  - [x] The kernel copies into the coldest buffer: the ring is FIFO over 256 ×
+        16 KiB per worker, where epoll reuses hot pooled buffers (now the LIFO
+        stack above)
   - [ ] The first part of a split request (4.3 KB on average) is still copied out
         of the kernel buffer. Holding the kernel buffer and receiving the rest into
-        its tail would avoid that when the request fits
+        its tail would avoid that when the request fits. With the multishot
+        receive, `perf stat` counts one receive per 12 KiB upload at c=64
 - [x] Listener per worker with `SO_REUSEPORT` (`SO_REUSEPORT_LB` where available);
       macOS workers share one listener in their own kqueues
 - [x] `TCP_DEFER_ACCEPT` plus reading straight after accept
@@ -976,7 +1015,36 @@ connection, for every server), so compare CPU/req there.
   - [ ] Latency percentiles at a fixed rate (`wrk2`)
   - [ ] TLS: handshakes/s per core. Throughput over TLS: first numbers in M4
   - [ ] h2/h3: h2load
-  - [x] Baseline nginx. Still to do: h2o, a minimal raw-epoll C server, Zap
+  - [x] Baseline nginx; h2o, facil.io (what Zap wraps), uWebSockets and
+        may-minihttp (HTTP/1.1, below). Still to do: a minimal raw-epoll C
+        server, h2o 2.3 (2.2.6 was measured), h2/h3 against h2o
+  - [x] `zig build bench`, `bench-tls` and `bench-server` build the library
+        with `.fast` too. They imported the `peregrine` module, which keeps
+        its own optimize mode (Debug by default), so without `-Doptimize` the
+        library ran with runtime safety checks: about 5% more server CPU per
+        pipelined request on epoll
+
+HTTP/1.1 against other fast servers (2026-10-29; Docker on the M2 Pro, Linux 6.12
+aarch64, plaintext "Hello, World!"; every server on CPUs 0-5 with 6 workers, `wrk -t6
+-d8s` on 6-11; two interleaved rounds; CPU per request from the server's cgroup):
+
+| | keep-alive c=256 | | pipelined ×16 c=256 | | keep-alive c=1024 | |
+|---|---|---|---|---|---|---|
+| | req/s | CPU/req | req/s | CPU/req | req/s | CPU/req |
+| peregrine io_uring | 1.15M | 4.85 µs | 8.81M-8.88M | 0.58 µs | 1.22M | 4.68 µs |
+| peregrine epoll | 1.14M-1.17M | 4.90-5.00 µs | 8.98M-9.00M | 0.55 µs | 1.19M-1.21M | 4.78-4.84 µs |
+| uWebSockets 20.74 | 1.11M | 5.06 µs | 8.29M-8.30M | 0.64-0.65 µs | 1.16M | 4.91-4.93 µs |
+| may-minihttp | 1.02M | 5.56 µs | 8.33M-8.34M | 0.58 µs | 1.10M | 5.21-5.23 µs |
+| facil.io 0.7.6 | 0.98M-0.99M | 5.75-5.81 µs | 2.09M-2.15M | 2.79-2.87 µs | 1.00M | 5.72-5.74 µs |
+| nginx 1.26 | 1.00M-1.01M | 5.69-5.72 µs | 1.26M-1.28M | 4.69-4.77 µs | 1.02M | 5.65 µs |
+| h2o 2.2.6 | 0.88M-0.90M | 6.51-6.63 µs | 1.49M-1.52M | 3.96-4.03 µs | 0.92M | 6.29 µs |
+
+Built from source in Alpine 3.21 (C/C++ with `-O3 -march=native`, Rust with
+`target-cpu=native`): facil.io's `http_listen` with `fio_start(.threads = 1,
+.workers = 6)`; uWebSockets' `App` on 6 threads (SO_REUSEPORT); may-minihttp's
+hello example with 6 workers; h2o with `num-threads: 6` serving a static file; nginx
+`return 200`. Response heads differ: peregrine 102 bytes, uWebSockets 119,
+may-minihttp 113, facil.io 167, h2o 233.
 
 First results (Docker on M2 Pro, Linux 6.12 aarch64, plaintext "Hello, World!", c=256,
 two runs each; ±10% run to run):

@@ -40,6 +40,7 @@ const H2Conn = h2.Conn;
 const h2_preface = @import("../h2/frame.zig").preface;
 
 const NIL: u32 = std.math.maxInt(u32);
+const NIL16: u16 = std.math.maxInt(u16);
 
 /// The ALPN protocol is HTTP/2.
 fn isH2(alpn: ?[]const u8) bool {
@@ -75,10 +76,10 @@ pub fn available() bool {
     defer ring.deinit();
     const probe = ring.get_probe() catch return false;
     if (!(probe.is_supported(.ACCEPT) and probe.is_supported(.RECV) and
-        probe.is_supported(.WRITEV) and probe.is_supported(.ASYNC_CANCEL) and
+        probe.is_supported(.SEND) and probe.is_supported(.SENDMSG) and probe.is_supported(.ASYNC_CANCEL) and
         probe.is_supported(.TIMEOUT))) return false;
-    var buffers = bufferGroup(&ring, std.heap.page_allocator, BUFFER_GROUP_ID, 64, 1) catch return false;
-    freeBufferGroup(&buffers, std.heap.page_allocator);
+    var buffers = RecvBuffers.init(ring.fd, std.heap.page_allocator, 64, 1) catch return false;
+    buffers.deinit(ring.fd, std.heap.page_allocator);
     return true;
 }
 
@@ -88,18 +89,16 @@ pub fn available() bool {
 /// mem_is_zero()" inverted the check), so after EINVAL this tries once
 /// more with a reserved word set, which a correct kernel refuses too.
 fn registerBufRing(fd: linux.fd_t, opcode: linux.IORING_REGISTER, addr: u64, entries: u16, group: u16) !void {
+    // Not incremental consumption (6.12): it packs receives into buffers
+    // back to back, so a request often starts near the end of one and is
+    // split across two receives (and copied); 12 KiB uploads cost about 5%
+    // more server CPU with it.
     var reg = std.mem.zeroInit(linux.io_uring_buf_reg, .{
         .ring_addr = addr,
         .ring_entries = entries,
         .bgid = group,
-        // Incremental consumption, since 6.12.
-        .flags = .{ .inc = opcode == .REGISTER_PBUF_RING },
     });
     var rc = linux.io_uring_register(fd, opcode, &reg, 1);
-    if (linux.errno(rc) == .INVAL and reg.flags.inc) {
-        reg.flags.inc = false;
-        rc = linux.io_uring_register(fd, opcode, &reg, 1);
-    }
     if (linux.errno(rc) == .INVAL) {
         reg.resv[0] = 1;
         rc = linux.io_uring_register(fd, opcode, &reg, 1);
@@ -111,37 +110,184 @@ fn registerBufRing(fd: linux.fd_t, opcode: linux.IORING_REGISTER, addr: u64, ent
     }
 }
 
-/// `IoUring.BufferGroup.init`, registering with `registerBufRing`.
-fn bufferGroup(ring: *IoUring, allocator: std.mem.Allocator, group: u16, size: u32, count: u16) !IoUring.BufferGroup {
-    const buffers = try allocator.alloc(u8, size * count);
-    errdefer allocator.free(buffers);
-    const heads = try allocator.alloc(u32, count);
-    errdefer allocator.free(heads);
-    @memset(heads, 0);
-    const len = @as(usize, count) * @sizeOf(linux.io_uring_buf);
-    const map = try std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
-    errdefer std.posix.munmap(map);
-    const br: *align(std.heap.page_size_min) linux.io_uring_buf_ring = @ptrCast(map.ptr);
-    try registerBufRing(ring.fd, .REGISTER_PBUF_RING, @intFromPtr(br), count, group);
-    IoUring.buf_ring_init(br);
-    const mask = IoUring.buf_ring_mask(count);
-    for (0..count) |i| {
-        const id: u16 = @intCast(i);
-        IoUring.buf_ring_add(br, buffers[size * i ..][0..size], id, mask, id);
-    }
-    IoUring.buf_ring_advance(br, count);
-    return .{ .ring = ring, .group_id = group, .br = br, .buffers = buffers, .heads = heads, .buffer_size = size, .buffers_count = count };
-}
+/// A connection's parked receive buffers, oldest first.
+const Parked = struct {
+    head: u16 = NIL16,
+    tail: u16 = NIL16,
+};
 
-/// `IoUring.BufferGroup.deinit` without its second unregistration, whose
-/// ENOENT std reports with a stack trace in debug builds.
-fn freeBufferGroup(g: *IoUring.BufferGroup, allocator: std.mem.Allocator) void {
-    registerBufRing(g.ring.fd, .UNREGISTER_PBUF_RING, 0, 0, g.group_id) catch {};
-    const map: [*]align(std.heap.page_size_min) u8 = @ptrCast(g.br);
-    std.posix.munmap(map[0 .. @as(usize, g.buffers_count) * @sizeOf(linux.io_uring_buf)]);
-    allocator.free(g.buffers);
-    allocator.free(g.heads);
-}
+/// Kernel-provided receive buffers (a registered buffer ring), posted to
+/// the kernel from a LIFO stack of free buffers. The kernel takes buffers
+/// from the ring in order, so a ring holding every buffer cycles through
+/// all of them, each receive landing in cold memory. Only as many as
+/// recent batches used (`target`) are posted; the rest wait on the stack,
+/// most recently used on top. A receive that finds the ring empty gets
+/// ENOBUFS (and a pooled buffer instead), and doubles the target.
+const RecvBuffers = struct {
+    br: *align(std.heap.page_size_min) linux.io_uring_buf_ring,
+    memory: []u8,
+    size: u32,
+    count: u16,
+    /// Free buffer ids, not posted; the most recently used last.
+    free: []u16,
+    free_len: u16,
+    /// Buffers held by a connection whose session couldn't take their
+    /// bytes yet (`Conn.parked`): the next one in its list, and the bytes
+    /// not yet taken.
+    next: []u16,
+    lo: []u32,
+    hi: []u32,
+    /// Buffers in the ring.
+    posted: u16 = 0,
+    /// Buffers to keep in the ring.
+    target: u16,
+    /// Buffers taken out of the ring since the last `topUp`, and the most
+    /// in one batch since the last `adapt`.
+    taken: u16 = 0,
+    taken_max: u16 = 0,
+    starved: bool = false,
+
+    const min_target = 8;
+
+    fn init(ring_fd: linux.fd_t, allocator: std.mem.Allocator, size: u32, count: u16) !RecvBuffers {
+        const memory = try allocator.alloc(u8, @as(usize, size) * count);
+        errdefer allocator.free(memory);
+        const free = try allocator.alloc(u16, count);
+        errdefer allocator.free(free);
+        const next = try allocator.alloc(u16, count);
+        errdefer allocator.free(next);
+        const lo = try allocator.alloc(u32, count);
+        errdefer allocator.free(lo);
+        const hi = try allocator.alloc(u32, count);
+        errdefer allocator.free(hi);
+        // Buffer 0 on top.
+        for (free, 0..) |*id, i| id.* = @intCast(count - 1 - i);
+        const len = @as(usize, count) * @sizeOf(linux.io_uring_buf);
+        const map = try std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+        errdefer std.posix.munmap(map);
+        const br: *align(std.heap.page_size_min) linux.io_uring_buf_ring = @ptrCast(map.ptr);
+        try registerBufRing(ring_fd, .REGISTER_PBUF_RING, @intFromPtr(br), count, BUFFER_GROUP_ID);
+        IoUring.buf_ring_init(br);
+        var self: RecvBuffers = .{
+            .br = br,
+            .memory = memory,
+            .size = size,
+            .count = count,
+            .free = free,
+            .free_len = count,
+            .next = next,
+            .lo = lo,
+            .hi = hi,
+            .target = @min(count, 2 * min_target),
+        };
+        self.topUp();
+        return self;
+    }
+
+    fn deinit(self: *RecvBuffers, ring_fd: linux.fd_t, allocator: std.mem.Allocator) void {
+        // Unregistering before the ring goes avoids std's second
+        // unregistration, whose ENOENT it reports with a stack trace.
+        registerBufRing(ring_fd, .UNREGISTER_PBUF_RING, 0, 0, BUFFER_GROUP_ID) catch {};
+        const map: [*]align(std.heap.page_size_min) u8 = @ptrCast(self.br);
+        std.posix.munmap(map[0 .. @as(usize, self.count) * @sizeOf(linux.io_uring_buf)]);
+        allocator.free(self.memory);
+        allocator.free(self.free);
+        allocator.free(self.next);
+        allocator.free(self.lo);
+        allocator.free(self.hi);
+    }
+
+    /// The received bytes of a completion that carries a buffer.
+    fn get(self: *RecvBuffers, cqe: linux.io_uring_cqe) ![]u8 {
+        const id = try cqe.buffer_id();
+        return self.memory[@as(usize, self.size) * id ..][0..@intCast(cqe.res)];
+    }
+
+    /// Done with a completion's buffer. Called once for every completion
+    /// that carries one, unless its buffer is parked.
+    fn put(self: *RecvBuffers, cqe: linux.io_uring_cqe) void {
+        const id = cqe.buffer_id() catch return;
+        self.leftRing();
+        self.release(id);
+    }
+
+    /// Keeps a completion's buffer, from `taken` bytes in, at the end of
+    /// a connection's list.
+    fn park(self: *RecvBuffers, cqe: linux.io_uring_cqe, taken: usize, list: *Parked) void {
+        const id = cqe.buffer_id() catch unreachable;
+        self.leftRing();
+        self.lo[id] = @intCast(taken);
+        self.hi[id] = @intCast(cqe.res);
+        self.next[id] = NIL16;
+        if (list.tail == NIL16) list.head = id else self.next[list.tail] = id;
+        list.tail = id;
+    }
+
+    /// The bytes of a list's first buffer not yet taken.
+    fn parkedBytes(self: *RecvBuffers, list: *const Parked) []u8 {
+        const id = list.head;
+        return self.memory[@as(usize, self.size) * id ..][self.lo[id]..self.hi[id]];
+    }
+
+    /// Takes `n` bytes of a list's first buffer, releasing it once empty.
+    fn unpark(self: *RecvBuffers, list: *Parked, n: usize) void {
+        const id = list.head;
+        self.lo[id] += @intCast(n);
+        if (self.lo[id] < self.hi[id]) return;
+        list.head = self.next[id];
+        if (list.head == NIL16) list.tail = NIL16;
+        self.release(id);
+    }
+
+    fn unparkAll(self: *RecvBuffers, list: *Parked) void {
+        while (list.head != NIL16) self.unpark(list, self.hi[list.head] - self.lo[list.head]);
+    }
+
+    /// A buffer has left the ring.
+    fn leftRing(self: *RecvBuffers) void {
+        self.posted -= 1;
+        self.taken += 1;
+    }
+
+    fn release(self: *RecvBuffers, id: u16) void {
+        self.free[self.free_len] = id;
+        self.free_len += 1;
+    }
+
+    /// A receive found no buffer: post more from now on.
+    fn starve(self: *RecvBuffers) void {
+        self.starved = true;
+        self.target = @intCast(@min(self.count, @as(u32, self.target) * 2));
+    }
+
+    /// Refills the ring up to `target`, hottest buffers first. Called once
+    /// per batch, before submitting.
+    fn topUp(self: *RecvBuffers) void {
+        self.taken_max = @max(self.taken_max, self.taken);
+        self.taken = 0;
+        const mask = IoUring.buf_ring_mask(self.count);
+        var added: u16 = 0;
+        while (self.posted + added < self.target and self.free_len > 0) : (added += 1) {
+            self.free_len -= 1;
+            const id = self.free[self.free_len];
+            IoUring.buf_ring_add(self.br, self.memory[@as(usize, self.size) * id ..][0..self.size], id, mask, added);
+        }
+        if (added == 0) return;
+        IoUring.buf_ring_advance(self.br, added);
+        self.posted += added;
+    }
+
+    /// Periodically: aim for twice the most taken in one batch lately,
+    /// unless a receive went without.
+    fn adapt(self: *RecvBuffers) void {
+        if (!self.starved) {
+            const want = @max(min_target, 2 * @as(u32, self.taken_max));
+            self.target = @intCast(@min(self.count, @max(want, self.target / 2)));
+        }
+        self.starved = false;
+        self.taken_max = 0;
+    }
+};
 
 pub fn Worker(comptime Handler: type) type {
     return struct {
@@ -158,6 +304,18 @@ pub fn Worker(comptime Handler: type) type {
             /// slot is only reused once this is zero.
             inflight: u8 = 0,
             recv_armed: bool = false,
+            /// The armed receive is multishot: it stays armed across
+            /// completions until cancelled or ended by the kernel.
+            recv_multi: bool = false,
+            /// A cancel for the armed receive is in flight.
+            recv_cancelling: bool = false,
+            /// The armed receive's operation (`.recv` or `.recv_plain`).
+            recv_op: Op = .recv,
+            /// Received bytes the session had no room for yet, still in the
+            /// kernel's buffers (plaintext HTTP/1.1, whose multishot receive
+            /// can bring several buffers' worth at once). They go in before
+            /// anything more is received.
+            parked: Parked = .{},
             write_inflight: bool = false,
             peer_closed: bool = false,
             /// Draining input after an error response (see Session.linger).
@@ -185,6 +343,8 @@ pub fn Worker(comptime Handler: type) type {
             /// Bytes of `out` written, or with TLS, encrypted.
             sent: usize = 0,
             iov: [3]sys.iovec_const = undefined,
+            /// sendmsg's header, for `iov`.
+            msg: linux.msghdr_const = undefined,
             /// The exchange whose response this connection is waiting
             /// for or writing (a slot in the worker's slab), or NIL.
             exchange: u32 = NIL,
@@ -204,7 +364,7 @@ pub fn Worker(comptime Handler: type) type {
         shutdown: *const std.atomic.Value(bool),
         opts: Options,
         ring: IoUring,
-        buffers: IoUring.BufferGroup,
+        buffers: RecvBuffers,
         /// SINGLE_ISSUER: once the worker thread has enabled the ring, only it
         /// may unregister the buffer ring, so it does so as it exits.
         buffers_live: bool = false,
@@ -323,12 +483,9 @@ pub fn Worker(comptime Handler: type) type {
             self.ring = try IoUring.init(cfg.ring_entries, linux.IORING_SETUP_SINGLE_ISSUER |
                 linux.IORING_SETUP_DEFER_TASKRUN | linux.IORING_SETUP_R_DISABLED);
             errdefer self.ring.deinit();
-            // Note: BufferGroup stores a pointer to the ring, so the ring must
-            // not move after this (the worker lives in a stable slice).
-            self.buffers = try bufferGroup(
-                &self.ring,
+            self.buffers = try .init(
+                self.ring.fd,
                 allocator,
-                BUFFER_GROUP_ID,
                 @intCast(opts.read_buffer_size),
                 cfg.recv_buffer_count,
             );
@@ -388,7 +545,7 @@ pub fn Worker(comptime Handler: type) type {
 
         fn freeBuffers(self: *Self) void {
             if (!self.buffers_live) return;
-            freeBufferGroup(&self.buffers, self.allocator);
+            self.buffers.deinit(self.ring.fd, self.allocator);
             self.buffers_live = false;
         }
 
@@ -406,6 +563,7 @@ pub fn Worker(comptime Handler: type) type {
             if (self.quic != null) self.armUdp();
             var cqes: [512]linux.io_uring_cqe = undefined;
             while (!self.shutdown.load(.acquire)) {
+                self.buffers.topUp();
                 _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
                     error.SignalInterrupt => continue,
                     else => {
@@ -472,7 +630,8 @@ pub fn Worker(comptime Handler: type) type {
             }
             const c = &self.conns[slot];
             if (c.gen != gen) return; // completions of a reused slot never happen (inflight gating)
-            c.inflight -= 1;
+            // A multishot receive stays in flight until its last completion.
+            if (op != .recv or cqe.flags & linux.IORING_CQE_F_MORE == 0) c.inflight -= 1;
             switch (op) {
                 .recv => self.onRecv(c, cqe),
                 .recv_plain => self.onRecvPlain(c, cqe),
@@ -561,14 +720,39 @@ pub fn Worker(comptime Handler: type) type {
         }
 
         fn armRecv(self: *Self, c: *Conn) void {
-            if (c.recv_armed or c.closing or c.peer_closed) return;
+            if (c.recv_armed or c.closing or c.peer_closed or c.parked.head != NIL16) return;
             if (!c.lingering and holdsPartialInput(c)) return self.armRecvPlain(c);
+            self.armRecvBuffered(c);
+        }
+
+        /// A receive into a kernel-provided buffer.
+        fn armRecvBuffered(self: *Self, c: *Conn) void {
+            if (c.recv_armed or c.closing or c.peer_closed) return;
             const sqe = self.getSqe();
             sqe.prep_rw(.RECV, c.fd, 0, 0, 0);
             sqe.flags |= linux.IOSQE_BUFFER_SELECT;
             sqe.buf_index = BUFFER_GROUP_ID;
             sqe.user_data = userData(c.gen, self.slotOf(c), .recv);
+            // Plaintext HTTP/1.1 keeps one receive armed across requests,
+            // instead of a receive (and a poll armed by the kernel) per
+            // request. Input that can't all be taken at once parks and
+            // cancels it (onRecv), which keeps backpressure.
+            if (c.tls == null and c.ws == null and c.h2 == null and c.proto_decided and !c.lingering) {
+                sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
+                c.recv_multi = true;
+            }
+            c.recv_op = .recv;
             c.recv_armed = true;
+            c.inflight += 1;
+        }
+
+        /// Cancels the armed receive; its last completion follows.
+        fn cancelRecv(self: *Self, c: *Conn) void {
+            if (!c.recv_armed or c.recv_cancelling) return;
+            const sqe = self.getSqe();
+            sqe.prep_cancel(userData(c.gen, self.slotOf(c), c.recv_op), 0);
+            sqe.user_data = userData(c.gen, self.slotOf(c), .cancel);
+            c.recv_cancelling = true;
             c.inflight += 1;
         }
 
@@ -579,6 +763,7 @@ pub fn Worker(comptime Handler: type) type {
         /// (most 12 KiB uploads under load).
         fn holdsPartialInput(c: *const Conn) bool {
             std.debug.assert(!c.borrowed);
+            if (c.parked.head != NIL16) return true;
             if (c.tls) |t| return t.partialRecordNeed() > 0;
             if (c.ws) |w| return w.decoder.buf.len > 0;
             if (c.h2) |conn| return conn.reader.buf.len > 0;
@@ -599,6 +784,7 @@ pub fn Worker(comptime Handler: type) type {
             const sqe = self.getSqe();
             sqe.prep_recv(c.fd, space, 0);
             sqe.user_data = userData(c.gen, self.slotOf(c), .recv_plain);
+            c.recv_op = .recv_plain;
             c.recv_armed = true;
             c.inflight += 1;
         }
@@ -624,7 +810,13 @@ pub fn Worker(comptime Handler: type) type {
                 n += 1;
             }
             const sqe = self.getSqe();
-            sqe.prep_writev(c.fd, c.iov[0..n], 0);
+            // send(msg) rather than writev: sockets only, so skip the VFS.
+            if (n == 1) {
+                sqe.prep_send(c.fd, c.iov[0].base[0..c.iov[0].len], linux.MSG.NOSIGNAL);
+            } else {
+                c.msg = .{ .name = null, .namelen = 0, .iov = &c.iov, .iovlen = n, .control = null, .controllen = 0, .flags = 0 };
+                sqe.prep_sendmsg(c.fd, &c.msg, linux.MSG.NOSIGNAL);
+            }
             sqe.user_data = userData(c.gen, self.slotOf(c), .write);
             c.write_inflight = true;
             c.inflight += 1;
@@ -645,6 +837,7 @@ pub fn Worker(comptime Handler: type) type {
             if (now == self.now) return;
             self.now = now;
             self.refreshDate();
+            self.buffers.adapt();
             self.expire(&self.idle);
             self.expire(&self.active);
             self.expireExchanges();
@@ -794,6 +987,8 @@ pub fn Worker(comptime Handler: type) type {
                 c.borrowed = false;
             }
             c.session.deinit(&self.pool);
+            // Parked input is discarded like the rest.
+            self.buffers.unparkAll(&c.parked);
             c.lingering = true;
             self.arm(c, .active);
             self.armRecv(c);
@@ -812,12 +1007,7 @@ pub fn Worker(comptime Handler: type) type {
                 }
             }
             self.unlink(c);
-            if (c.recv_armed) {
-                const sqe = self.getSqe();
-                sqe.prep_cancel(userData(c.gen, self.slotOf(c), .recv), 0);
-                sqe.user_data = userData(c.gen, self.slotOf(c), .cancel);
-                c.inflight += 1;
-            }
+            self.cancelRecv(c);
             // Shutting down the socket fails any in-flight write promptly.
             if (c.write_inflight) _ = linux.shutdown(c.fd, linux.SHUT.RDWR);
             if (c.inflight == 0) self.finishClose(c);
@@ -830,6 +1020,7 @@ pub fn Worker(comptime Handler: type) type {
         }
 
         fn freeConnResources(self: *Self, c: *Conn) void {
+            self.buffers.unparkAll(&c.parked);
             if (c.borrowed) {
                 c.session.buf = &.{};
                 c.borrowed = false;
@@ -915,31 +1106,54 @@ pub fn Worker(comptime Handler: type) type {
         // -- Completions -----------------------------------------------------
 
         fn onRecv(self: *Self, c: *Conn, cqe: linux.io_uring_cqe) void {
-            c.recv_armed = false;
+            if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
+                c.recv_armed = false;
+                c.recv_multi = false;
+                c.recv_cancelling = false;
+            }
+            // Stop receiving into kernel buffers when the input can't all
+            // be taken: it arrived while a response was being written (and
+            // is held until that's done), or part of a request or body is
+            // left over (the rest goes straight into the buffer holding it,
+            // as much as fits). Upgraded connections receive one at a time.
+            const busy = c.write_inflight;
+            defer if (c.recv_multi and !c.closing and (busy or c.ws != null or c.h2 != null or
+                (!c.borrowed and holdsPartialInput(c)))) self.cancelRecv(c);
             if (cqe.res < 0) {
                 if (c.closing) return;
-                if (cqe.err() == .NOBUFS and !c.lingering) return self.armRecvPlain(c);
+                if (cqe.err() == .NOBUFS) {
+                    self.buffers.starve();
+                    if (!c.lingering) return self.armRecvPlain(c);
+                }
+                // Cancelled for backpressure: receive again once ready.
+                if (cqe.err() == .CANCELED) return self.carryOn(c);
                 return self.closeConn(c);
             }
             if (c.lingering) {
-                if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) self.buffers.put(cqe) catch {};
+                if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) self.buffers.put(cqe);
                 c.lingered +|= @intCast(cqe.res);
                 if (cqe.res == 0 or c.lingered > sys.max_linger_bytes) return self.closeConn(c);
                 return self.armRecv(c);
             }
             if (cqe.res == 0) {
-                if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) self.buffers.put(cqe) catch {};
+                if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) self.buffers.put(cqe);
                 c.peer_closed = true;
                 if (c.closing) return;
-                if (c.ws != null) return self.wsDrive(c);
-                return self.drive(c);
+                return self.carryOn(c);
             }
             const data = self.buffers.get(cqe) catch return self.closeConn(c);
-            defer self.buffers.put(cqe) catch {};
+            var parked = false;
+            defer if (!parked) self.buffers.put(cqe);
             if (c.closing) return;
             if (c.tls) |t| return self.tlsFeed(c, t, data);
             if (c.ws != null) return self.wsFeed(c, data);
             if (c.h2 != null) return self.h2Feed(c, data);
+            if (c.parked.head != NIL16) {
+                // Behind input already waiting for room.
+                self.buffers.park(cqe, 0, &c.parked);
+                parked = true;
+                return;
+            }
             if (c.session.buf.len == 0) {
                 // Zero-copy: parse straight out of the kernel's buffer.
                 c.session.buf = data;
@@ -947,7 +1161,13 @@ pub fn Worker(comptime Handler: type) type {
                 c.session.end = data.len;
                 c.borrowed = true;
             } else {
-                self.appendInput(c, data) catch return self.closeConn(c);
+                const n = self.appendInput(c, data) catch return self.closeConn(c);
+                if (n < data.len) {
+                    // No room yet (more arrived while a response was being
+                    // written or a body is paused): drive takes it later.
+                    self.buffers.park(cqe, n, &c.parked);
+                    parked = true;
+                }
             }
             self.drive(c);
             // The kernel buffer goes back when this returns; keep leftovers.
@@ -956,6 +1176,7 @@ pub fn Worker(comptime Handler: type) type {
 
         fn onRecvPlain(self: *Self, c: *Conn, cqe: linux.io_uring_cqe) void {
             c.recv_armed = false;
+            c.recv_cancelling = false;
             if (c.closing) return;
             if (cqe.res < 0) return self.closeConn(c);
             if (c.tls) |t| {
@@ -993,15 +1214,42 @@ pub fn Worker(comptime Handler: type) type {
             self.drive(c);
         }
 
-        fn appendInput(self: *Self, c: *Conn, data: []const u8) !void {
-            var rest = data;
-            while (rest.len > 0) {
-                const space = try c.session.readSpace(&self.pool, self.opts.session);
-                const n = @min(space.len, rest.len);
-                @memcpy(space[0..n], rest[0..n]);
+        /// Copies as much of `data` into the session as it has room for
+        /// (it grows up to the request size limits).
+        fn appendInput(self: *Self, c: *Conn, data: []const u8) !usize {
+            var done: usize = 0;
+            while (done < data.len) {
+                const space = c.session.readSpace(&self.pool, self.opts.session) catch |err| switch (err) {
+                    error.BufferFull => return done,
+                    else => |e| return e,
+                };
+                const n = @min(space.len, data.len - done);
+                @memcpy(space[0..n], data[done..][0..n]);
                 c.session.commitRead(n);
-                rest = rest[n..];
+                done += n;
             }
+            return done;
+        }
+
+        /// Moves parked input into the session as far as it has room.
+        /// Whether any moved.
+        fn feedParked(self: *Self, c: *Conn) !bool {
+            var moved = false;
+            while (c.parked.head != NIL16) {
+                const bytes = self.buffers.parkedBytes(&c.parked);
+                const n = try self.appendInput(c, bytes);
+                if (n == 0) break;
+                moved = true;
+                self.buffers.unpark(&c.parked, n);
+                if (n < bytes.len) break;
+            }
+            return moved;
+        }
+
+        /// Carries on with whatever the connection was doing.
+        fn carryOn(self: *Self, c: *Conn) void {
+            if (c.ws != null) return self.wsDrive(c);
+            return self.drive(c);
         }
 
         fn unborrow(self: *Self, c: *Conn) !void {
@@ -1011,7 +1259,7 @@ pub fn Worker(comptime Handler: type) type {
             s.buf = &.{};
             s.start = 0;
             s.end = 0;
-            if (leftover.len > 0) try self.appendInput(c, leftover);
+            if (leftover.len > 0 and try self.appendInput(c, leftover) < leftover.len) return error.BufferFull;
         }
 
         fn onWrite(self: *Self, c: *Conn, cqe: linux.io_uring_cqe) void {
@@ -1415,9 +1663,8 @@ pub fn Worker(comptime Handler: type) type {
             const bytes = if (userTls(c) != null) "" else conn.wireBytes();
             if (bytes.len > 0) {
                 if (!self.kernelGate(c)) return;
-                c.iov[0] = .{ .base = bytes.ptr, .len = bytes.len };
                 const sqe = self.getSqe();
-                sqe.prep_writev(c.fd, c.iov[0..1], 0);
+                sqe.prep_send(c.fd, bytes, linux.MSG.NOSIGNAL);
                 sqe.user_data = userData(c.gen, self.slotOf(c), .write);
                 c.write_inflight = true;
                 c.inflight += 1;
@@ -1482,7 +1729,7 @@ pub fn Worker(comptime Handler: type) type {
                 .opts = self.opts.session,
                 .early_data = earlyData(c),
             };
-            while (true) {
+            input: while (true) {
                 if (c.out.buf.len == 0) {
                     c.out.buf = self.out_pool.acquire() catch return self.closeConn(c);
                 }
@@ -1502,13 +1749,36 @@ pub fn Worker(comptime Handler: type) type {
                     };
                     if (userTls(c)) |t| {
                         if (self.tlsSubmit(c, t) == .closed) return;
-                    } else self.submitWrite(c);
+                    } else {
+                        self.submitWrite(c);
+                        // Everything received is answered: receive the
+                        // next request in the same submission as this
+                        // response instead of after its completion. A
+                        // request arriving during the write is held until
+                        // it ends (one receive's worth at most).
+                        if (action == .need_more and c.after_write == .none and
+                            c.session.start == c.session.end and c.out.file == null and
+                            c.parked.head == NIL16)
+                        {
+                            if (!c.borrowed) c.session.releaseIfIdle(&self.pool);
+                            self.armRecvBuffered(c);
+                        }
+                    }
                     self.updateTimer(c);
                     return;
                 }
                 switch (action) {
                     .flush => continue,
-                    .need_more => break,
+                    .need_more => {
+                        if (c.parked.head == NIL16) break;
+                        // Parked input first. None fitting means a request
+                        // beyond the size limits, as when receiving into a
+                        // full buffer.
+                        if (c.borrowed) self.unborrow(c) catch return self.closeConn(c);
+                        const moved = self.feedParked(c) catch return self.closeConn(c);
+                        if (!moved) return self.closeConn(c);
+                        continue :input;
+                    },
                     .close => return self.finish(c),
                     .upgrade => return self.upgradeConn(c),
                     .wait => return self.exchangeDrive(c),
@@ -1707,9 +1977,8 @@ pub fn Worker(comptime Handler: type) type {
             }
             if (!t.hasWire()) return .idle;
             const bytes = t.wireBytes();
-            c.iov[0] = .{ .base = bytes.ptr, .len = bytes.len };
             const sqe = self.getSqe();
-            sqe.prep_writev(c.fd, c.iov[0..1], 0);
+            sqe.prep_send(c.fd, bytes, linux.MSG.NOSIGNAL);
             sqe.user_data = userData(c.gen, self.slotOf(c), .write);
             c.write_inflight = true;
             c.inflight += 1;
@@ -1767,9 +2036,8 @@ pub fn Worker(comptime Handler: type) type {
             const bytes = if (userTls(c) != null) "" else w.wireBytes();
             if (bytes.len > 0) {
                 if (!self.kernelGate(c)) return;
-                c.iov[0] = .{ .base = bytes.ptr, .len = bytes.len };
                 const sqe = self.getSqe();
-                sqe.prep_writev(c.fd, c.iov[0..1], 0);
+                sqe.prep_send(c.fd, bytes, linux.MSG.NOSIGNAL);
                 sqe.user_data = userData(c.gen, self.slotOf(c), .write);
                 c.write_inflight = true;
                 c.inflight += 1;

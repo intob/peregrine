@@ -63,6 +63,10 @@ pub const BufferPool = struct {
 
 /// Serialised output waiting to be written: `buf[0..len]`, then `body`,
 /// then `tail`.
+/// Bodies up to this size are copied after the head instead of written
+/// from where they are.
+const copy_body_max = 1024;
+
 pub const Out = struct {
     buf: []u8,
     len: usize = 0,
@@ -596,9 +600,10 @@ fn writeResponse(
         return;
     }
     if (!send_body or resp.body.len == 0) return;
-    if (more and resp.body.len <= out.free()) {
+    if ((more or resp.body.len <= copy_body_max) and resp.body.len <= out.free()) {
         // More pipelined requests follow and the response object will be
-        // reused, so copy small bodies to batch them into one write.
+        // reused, so copy small bodies to batch them into one write. A
+        // small body is copied anyway: one buffer is cheaper to send.
         out.append(resp.body);
     } else {
         out.body = resp.body;

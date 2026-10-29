@@ -47,13 +47,21 @@ pub fn build(b: *std.Build) !void {
         run_step.dependOn(&run_cmd.step);
     }
 
+    // The benchmarks import the library built for speed too: a module
+    // keeps its own optimize mode, so `lib` would be a Debug build (with
+    // runtime safety) unless -Doptimize is given.
+    const lib_fast = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .fast,
+    });
     const bench = b.addExecutable(.{
         .name = "bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("bench/parser.zig"),
             .target = target,
             .optimize = .fast,
-            .imports = &.{.{ .name = "peregrine", .module = lib }},
+            .imports = &.{.{ .name = "peregrine", .module = lib_fast }},
         }),
     });
     const bench_step = b.step("bench", "Run parser micro-benchmarks");
@@ -65,7 +73,7 @@ pub fn build(b: *std.Build) !void {
             .root_source_file = b.path("bench/tls.zig"),
             .target = target,
             .optimize = .fast,
-            .imports = &.{.{ .name = "peregrine", .module = lib }},
+            .imports = &.{.{ .name = "peregrine", .module = lib_fast }},
         }),
     });
     const bench_tls_step = b.step("bench-tls", "Run TLS micro-benchmarks (`-- handshake` for handshakes)");
@@ -80,7 +88,7 @@ pub fn build(b: *std.Build) !void {
             .root_source_file = b.path("bench/server.zig"),
             .target = target,
             .optimize = .fast,
-            .imports = &.{.{ .name = "peregrine", .module = lib }},
+            .imports = &.{.{ .name = "peregrine", .module = lib_fast }},
         }),
     });
     const bench_server_step = b.step("bench-server", "Build the plaintext benchmark server");

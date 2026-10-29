@@ -635,6 +635,50 @@ fn testKeepAlive(backend: Backend) !void {
     try testing.expectEqualStrings("abc", body[0..res.body_len]);
 }
 
+test "a pipelined burst beyond the request buffer is answered in order" {
+    try forEachBackend(testPipelinedBurst);
+}
+
+fn testPipelinedBurst(backend: Backend) !void {
+    // The session takes about 22 KiB at most with these limits.
+    const r = try Running.start(backend, .{ .worker_thread_count = 1, .limits = .{ .max_body_size = 1024 } });
+    defer r.stop();
+    var c = try Client.connect(r.port);
+    defer c.close();
+    var head: [4096]u8 = undefined;
+    var body: [512]u8 = undefined;
+    // One request first: on io_uring the next ones arrive through the
+    // connection's multishot receive, several buffers at a time.
+    try c.send("GET /a HTTP/1.1\r\nHost: x\r\n\r\n");
+    _ = try c.readResponse(&head, &body);
+
+    // About 80 KB in one write, every 100th request with a body.
+    const n = 2000;
+    var burst: std.ArrayList(u8) = .empty;
+    defer burst.deinit(testing.allocator);
+    for (0..n) |i| {
+        if (i % 100 == 99) {
+            try burst.print(testing.allocator, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 300\r\n\r\n", .{});
+            try burst.appendNTimes(testing.allocator, @truncate('a' + i / 100), 300);
+        } else {
+            try burst.print(testing.allocator, "GET /p{d} HTTP/1.1\r\nHost: x\r\n\r\n", .{i});
+        }
+    }
+    try c.send(burst.items);
+    var expected: [32]u8 = undefined;
+    for (0..n) |i| {
+        const res = try c.readResponse(&head, &body);
+        try testing.expectEqual(@as(u16, 200), res.status);
+        if (i % 100 == 99) {
+            try testing.expectEqual(@as(usize, 300), res.body_len);
+            try testing.expect(std.mem.allEqual(u8, body[0..300], @truncate('a' + i / 100)));
+        } else {
+            const want = try std.fmt.bufPrint(&expected, "x-path: /p{d}\r\n", .{i});
+            try testing.expect(std.mem.indexOf(u8, res.head, want) != null);
+        }
+    }
+}
+
 test "large responses survive partial writes" {
     try forEachBackend(testLargeResponses);
 }
@@ -862,6 +906,11 @@ fn testTimeouts(backend: Backend) !void {
     defer idle.close();
     try idle.send("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     _ = try idle.readResponse(&head, null);
+    // Part of a request, then nothing (io_uring then receives into the
+    // buffer holding it, and closing must cancel that receive).
+    var stalled = try Client.connect(r.port);
+    defer stalled.close();
+    try stalled.send("GET / HTTP/1.1\r\nHo");
     // Slowloris: trickle a request without finishing it.
     var slow = try Client.connect(r.port);
     defer slow.close();
@@ -871,6 +920,7 @@ fn testTimeouts(backend: Backend) !void {
     }
     const start = sys.nanoTimestamp();
     try idle.expectClosed();
+    try stalled.expectClosed();
     try slow.expectClosed();
     // Within the 5 s client receive timeout, so the server closed them.
     try testing.expect(sys.nanoTimestamp() - start < 4 * std.time.ns_per_s);
