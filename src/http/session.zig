@@ -16,12 +16,26 @@ const iovec_const = std.posix.iovec_const;
 /// Fixed-size read buffers shared by a worker's connections. A connection
 /// only holds one while it has unprocessed bytes, so idle keep-alive
 /// connections cost no buffer memory.
+///
+/// It also keeps a few larger buffers (WebSocket messages being
+/// reassembled) for the next message instead of freeing them: allocations
+/// that size are mapped from the kernel, and mapping, faulting in and
+/// unmapping a fresh buffer per message cost more than the message's own
+/// copies.
 pub const BufferPool = struct {
     const Self = @This();
+
+    /// At most this many large buffers, and this many bytes in all, wait
+    /// for reuse.
+    pub const large_cache_count = 32;
+    pub const large_cache_bytes = 4 * 1024 * 1024;
 
     buffer_size: usize,
     free: [][]u8,
     free_len: usize = 0,
+    large: [large_cache_count][]u8 = undefined,
+    large_len: usize = 0,
+    large_bytes: usize = 0,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, buffer_size: usize, count: usize) !Self {
@@ -40,6 +54,7 @@ pub const BufferPool = struct {
     pub fn deinit(self: *Self) void {
         for (self.free[0..self.free_len]) |b| self.allocator.free(b);
         self.allocator.free(self.free);
+        for (self.large[0..self.large_len]) |b| self.allocator.free(b);
     }
 
     pub fn acquire(self: *Self) ![]u8 {
@@ -58,6 +73,46 @@ pub const BufferPool = struct {
         } else {
             self.allocator.free(buf);
         }
+    }
+
+    /// A buffer of at least `min` bytes: the smallest cached one that
+    /// fits, or a new one (whole pages).
+    pub fn acquireLarge(self: *Self, min: usize) ![]u8 {
+        var best: ?usize = null;
+        for (self.large[0..self.large_len], 0..) |b, i| {
+            if (b.len >= min and (best == null or b.len < self.large[best.?].len)) best = i;
+        }
+        if (best) |i| {
+            const b = self.large[i];
+            self.large_len -= 1;
+            self.large[i] = self.large[self.large_len];
+            self.large_bytes -= b.len;
+            return b;
+        }
+        return self.allocator.alloc(u8, std.mem.alignForward(usize, min, 4096));
+    }
+
+    /// Gives back a buffer from `acquireLarge`. Smaller cached buffers
+    /// are dropped to make room for it (a larger one serves any request
+    /// they would), so the cache follows the sizes in use; it is freed if
+    /// everything cached is at least as large.
+    pub fn releaseLarge(self: *Self, buf: []u8) void {
+        if (buf.len > large_cache_bytes) return self.allocator.free(buf);
+        while (self.large_len == self.large.len or self.large_bytes + buf.len > large_cache_bytes) {
+            var smallest: usize = 0;
+            for (self.large[1..self.large_len], 1..) |b, i| {
+                if (b.len < self.large[smallest].len) smallest = i;
+            }
+            const victim = self.large[smallest];
+            if (victim.len >= buf.len) return self.allocator.free(buf);
+            self.allocator.free(victim);
+            self.large_len -= 1;
+            self.large[smallest] = self.large[self.large_len];
+            self.large_bytes -= victim.len;
+        }
+        self.large[self.large_len] = buf;
+        self.large_len += 1;
+        self.large_bytes += buf.len;
     }
 };
 
@@ -880,6 +935,44 @@ test "expect 100-continue" {
     try h.feed("hello");
     try testing.expect(std.mem.endsWith(u8, h.written.items, "\r\n\r\nhello"));
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, h.written.items, "100 Continue"));
+}
+
+test "large buffers are cached for reuse, best fit first, within limits" {
+    var pool = try BufferPool.init(testing.allocator, 1024, 1);
+    defer pool.deinit();
+    const a = try pool.acquireLarge(100 * 1024);
+    const b = try pool.acquireLarge(300 * 1024);
+    try testing.expectEqual(@as(usize, 100 * 1024), a.len);
+    pool.releaseLarge(b);
+    pool.releaseLarge(a);
+    try testing.expectEqual(@as(usize, 400 * 1024), pool.large_bytes);
+    // The smallest that fits.
+    const c = try pool.acquireLarge(50 * 1024);
+    try testing.expect(c.ptr == a.ptr);
+    const d = try pool.acquireLarge(200 * 1024);
+    try testing.expect(d.ptr == b.ptr);
+    try testing.expectEqual(@as(usize, 0), pool.large_len);
+    pool.releaseLarge(c);
+    pool.releaseLarge(d);
+    // Over the byte limit: the smallest is dropped for a larger buffer...
+    const e = try pool.acquireLarge(BufferPool.large_cache_bytes - 300 * 1024);
+    pool.releaseLarge(e);
+    try testing.expectEqual(@as(usize, 2), pool.large_len);
+    try testing.expectEqual(BufferPool.large_cache_bytes, pool.large_bytes);
+    try testing.expect((try pool.acquireLarge(1)).ptr == d.ptr);
+    pool.releaseLarge(d);
+    // ...but a smaller one is freed, as is one over the limit on its own.
+    pool.releaseLarge(try testing.allocator.alloc(u8, 64 * 1024));
+    pool.releaseLarge(try testing.allocator.alloc(u8, BufferPool.large_cache_bytes + 1));
+    try testing.expectEqual(@as(usize, 2), pool.large_len);
+    try testing.expectEqual(BufferPool.large_cache_bytes, pool.large_bytes);
+    // At the count limit, the same.
+    var many = try BufferPool.init(testing.allocator, 1024, 1);
+    defer many.deinit();
+    for (0..BufferPool.large_cache_count) |_| many.releaseLarge(try testing.allocator.alloc(u8, 4096));
+    many.releaseLarge(try testing.allocator.alloc(u8, 8192));
+    try testing.expectEqual(@as(usize, BufferPool.large_cache_count), many.large_len);
+    try testing.expectEqual(@as(usize, (BufferPool.large_cache_count - 1) * 4096 + 8192), many.large_bytes);
 }
 
 test "body larger than the pool buffer grows the buffer" {

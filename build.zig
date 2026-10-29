@@ -93,4 +93,17 @@ pub fn build(b: *std.Build) !void {
     });
     const bench_server_step = b.step("bench-server", "Build the plaintext benchmark server");
     bench_server_step.dependOn(&b.addInstallArtifact(bench_server, .{}).step);
+
+    // WebSocket load generator (Linux): zig build ws-load -Dtarget=...
+    const ws_load = b.addExecutable(.{
+        .name = "ws-load",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/ws_load.zig"),
+            .target = target,
+            .optimize = .fast,
+            .imports = &.{.{ .name = "peregrine", .module = lib_fast }},
+        }),
+    });
+    const ws_load_step = b.step("ws-load", "Build the WebSocket load generator (Linux)");
+    ws_load_step.dependOn(&b.addInstallArtifact(ws_load, .{}).step);
 }

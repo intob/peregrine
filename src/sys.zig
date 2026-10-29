@@ -282,8 +282,9 @@ pub fn accept(listener: fd_t) AcceptError!fd_t {
 pub fn setNonBlocking(fd: fd_t) !void {
     const flags = system.fcntl(fd, posix.F.GETFL, @as(c_int, 0));
     if (posix.errno(flags) != .SUCCESS) return error.Unexpected;
-    const nonblock: c_int = @bitCast(@as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
-    const rc = system.fcntl(fd, posix.F.SETFL, @as(c_int, @intCast(flags)) | nonblock);
+    const nonblock: u32 = @bitCast(posix.O{ .NONBLOCK = true });
+    const arg = @as(u32, @intCast(flags)) | nonblock;
+    const rc = system.fcntl(fd, posix.F.SETFL, if (is_linux) @as(usize, arg) else @as(c_int, @bitCast(arg)));
     if (posix.errno(rc) != .SUCCESS) return error.Unexpected;
 }
 

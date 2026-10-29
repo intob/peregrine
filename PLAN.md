@@ -53,7 +53,7 @@ Design rules that apply to every layer:
 |---|---|
 | M1. HTTP/1.1 core | ✅ done (streaming responses landed with the M5 handler API) |
 | M2. Throughput architecture | 🟡 io_uring works (opt-in; faster than epoll for keep-alive requests, 4-5% behind for pipelined requests and uploads); sendfile done (plaintext, and TLS with kTLS); NUMA open |
-| M3. WebSockets over HTTP/1.1 | ✅ reworked; permessage-deflate, Autobahn, benchmarks open |
+| M3. WebSockets over HTTP/1.1 | ✅ reworked; benchmarked against uWebSockets (even on small messages, 15-20% less CPU at 16-64 KiB); permessage-deflate, Autobahn open |
 | M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; tables for P-256 and X25519, RSA-PSS, session tickets, kTLS, 0-RTT and SNI certificates done; the rest of "faster handshakes" open |
 | M5. HTTP/2 | ✅ h2 over TLS (ALPN) and h2c on every backend, h2spec 146/146 over TLS, fuzzed, benchmarked; streamed request bodies on every protocol; WebSockets over h2 (RFC 8441); RFC 9218 priorities |
 | M6. HTTP/3 and QUIC | 🟡 HTTP/3 over QUIC v1 on every backend, interop-tested (aioquic, curl/ngtcp2, h2load), benchmarked against nginx and Caddy; WebSockets over h3 (RFC 9220); 0-RTT; migration, pacing, ECN, PMTUD open |
@@ -81,7 +81,7 @@ Source layout:
 | `src/ws/upgrader.zig` | Accepting a WebSocket: 101 for an HTTP/1.1 Upgrade, 200 for an extended CONNECT on HTTP/2 and HTTP/3 |
 | `src/tls/` | I/O-free TLS 1.3 server (M4): see below |
 | `src/server_test.zig` | End-to-end tests over real sockets, run once per available backend |
-| `bench/` | `zig build bench` (parser micro-benchmarks), `zig build bench-tls` (record protection), `zig build bench-server` (load-test target, plaintext or TLS) |
+| `bench/` | `zig build bench` (parser micro-benchmarks), `zig build bench-tls` (record protection), `zig build bench-server` (load-test target, plaintext or TLS), `zig build ws-load` (WebSocket load generator, Linux) |
 | `docs/handler-api-proposal.md` | Proposed M5 handler API: streaming, deferred responses, trailers |
 
 Tests run with `zig build test` on macOS (kqueue), Linux with Docker's default seccomp
@@ -273,7 +273,67 @@ Still open:
 - [ ] Optional idle timeout / server keepalive pings
 - [ ] io_uring: parse straight out of the provided buffer like the HTTP path does
 - [ ] Autobahn test suite, and a fuzz target over the decoder
-- [ ] Benchmark: messages/s per core vs. uWebSockets
+- [x] **Benchmark against uWebSockets.** `bench/ws_load.zig` (`zig build
+      ws-load`): threads with their own epoll, each connection upgrading
+      over HTTP/1.1, then keeping `depth` masked messages in flight and
+      answering each whole echo with another (written together with the
+      others completed in the same read); echoes are checked for opcode,
+      FIN and length, the first per connection byte by byte. uWebSockets'
+      own `benchmarks/load_test.c` is single-threaded with one message in
+      flight; six copies of it (one per client core, 20 bytes, 258
+      connections) agree: peregrine 1.42M msg/s, uWebSockets 1.38M, both
+      at 5.7 server cores.
+
+      The first run showed large messages costing twice what they cost
+      uWebSockets (256 KiB: 176-196 µs against 97-108). A message bigger
+      than the read buffer was appended to an `ArrayList` that grew by
+      remapping and, being over 64 KiB, was freed after every message, so
+      each one was mapped, faulted in and unmapped (about a third of the
+      profile, with workers contending for `mmap_lock`). Now:
+  - [x] The reassembly buffer is sized once from the frame header
+        (fragments grow it geometrically) and comes from a per-worker cache
+        in `BufferPool` (`acquireLarge`/`releaseLarge`: best fit, at most 32
+        buffers and 4 MiB, smaller ones dropped to make room for larger).
+        It goes back once the message is delivered and no input is
+        buffered, so idle connections still hold no buffers. With 8 slots
+        and no eviction, 16 KiB messages filled the cache and every 64 KiB
+        message after them missed it: io_uring then stalled at half its
+        cores (`releaseIfIdle` runs after every receive there)
+  - [x] While more of a frame is to come than the read buffer holds,
+        `readSpace` returns the rest of the reassembly buffer, so the payload
+        is read in place (io_uring receives into it instead of a provided
+        buffer, `holdsPartialFrame`). Only for frames up to 512 KiB: the
+        kernel's copy into a cold 1 MiB buffer cost 10-15% more than reading
+        through the hot read buffer and copying (64 KiB and 256 KiB: 5-15%
+        cheaper in place)
+  - [ ] `send` copies the payload into the shared queue, and `shared`/`wire`
+        keep their capacity for the life of the connection (a connection that
+        once sent 1 MiB holds 2 MiB). They are appended from any thread, so
+        the worker's cache can't hold them as it is
+  - [ ] io_uring copies small frames out of the provided buffer (1 KiB text:
+        1.45 µs against 1.33 on epoll); see "parse straight out of the
+        provided buffer" above
+  - [ ] Over TLS, and broadcast (one message to many connections)
+
+      Echo (2026-10-29; Docker on the M2 Pro, Linux 6.12 aarch64; each server
+      with 6 workers on CPUs 0-5, `ws-load` with 6 threads on 6-11, 8 s per
+      case, two interleaved rounds, host load 2-12). uWebSockets 20.74 built
+      with `-O3 -march=native -flto`, compression off, 16 MiB message and
+      backpressure limits. CPU/msg is server CPU time per echoed message.
+
+| | peregrine epoll msg/s | CPU/msg | io_uring msg/s | CPU/msg | uWebSockets msg/s | CPU/msg |
+|---|---|---|---|---|---|---|
+| 20 B, 256 conns, 1 in flight | 1.31M-1.34M | 4.24-4.28 µs | 1.31M-1.32M | 4.32-4.36 µs | 1.30M-1.33M | 4.24-4.27 µs |
+| 20 B, 1024 conns, 1 in flight | 1.37M-1.39M | 4.15-4.17 µs | 1.41M-1.42M | 4.06-4.08 µs | 1.31M-1.35M | 4.24-4.32 µs |
+| 20 B, 256 conns, 16 in flight | 19.5M-19.8M | 290-293 ns | 19.7M-19.9M | 290-291 ns | 17.2M-19.6M | 292-309 ns |
+| 1 KiB text, 256 conns, 4 in flight | 4.26M-4.30M | 1.33-1.34 µs | 3.97M-3.98M | 1.45 µs | 3.96M-3.99M | 1.45-1.46 µs |
+| 16 KiB, 64 conns, 4 in flight | 746k-761k | 7.65-7.78 µs | 695k-701k | 8.32-8.39 µs | 653k-654k | 9.07-9.10 µs |
+| 64 KiB, 32 conns, 2 in flight | 250k-254k | 21.6-21.9 µs | 200k-234k | 23.9-25.0 µs | 207k-210k | 27.0-27.2 µs |
+| 256 KiB, 16 conns, 2 in flight | 56.6k | 94-96 µs | 49.0k-60.3k | 77-106 µs | 53.3k-53.6k | 99 µs |
+| 1 MiB, 16 conns, 1 in flight | 11.7k-12.7k | 383-458 µs | 11.5k-12.3k | 396-469 µs | 12.9k-13.3k | 400-407 µs |
+
+      Before the changes above (same setup, epoll): 64 KiB 51-53 µs, 256 KiB
+      146-187 µs, 1 MiB 735-833 µs.
 - [x] WebSockets over HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220): see M5
 
 ---

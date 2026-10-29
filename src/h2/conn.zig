@@ -553,7 +553,7 @@ pub const Conn = struct {
         s.ws = null;
         const Handler = @TypeOf(ctx.handler.*);
         if (@hasDecl(Handler, "handleWSDisconn")) ctx.handler.handleWSDisconn(w);
-        w.destroy(ctx.pool);
+        w.destroy();
     }
 
     fn abortExchange(_: *Self, ctx: anytype, slot: u32) void {
@@ -837,14 +837,14 @@ pub const Conn = struct {
         const w = s.ws orelse return self.creditStream(s, d.flow_len);
         var rest = d.data;
         while (rest.len > 0 and !w.wantsClose()) {
-            const space = w.decoder.readSpace(ctx.pool) catch return self.resetStream(ctx, s, .internal_error);
+            const space = w.decoder.readSpace() catch return self.resetStream(ctx, s, .internal_error);
             const n = @min(space.len, rest.len);
             @memcpy(space[0..n], rest[0..n]);
             w.decoder.commitRead(n);
             rest = rest[n..];
             _ = w.process(Handler, ctx.handler);
         }
-        w.decoder.releaseIfIdle(ctx.pool);
+        w.decoder.releaseIfIdle();
         s.consumed += d.flow_len;
         self.pumpStream(Handler, ctx, s);
     }
@@ -1212,7 +1212,7 @@ pub const Conn = struct {
             resp.status = .service_unavailable;
             return self.respondSync(Handler, ctx, s, false);
         };
-        s.ws = ws.Conn.create(self.allocator, ctx.fd, self.opts.websocket, ctx.exchanges.mailbox, ex.mailboxEntry()) catch {
+        s.ws = ws.Conn.create(self.allocator, ctx.pool, ctx.fd, self.opts.websocket, ctx.exchanges.mailbox, ex.mailboxEntry()) catch {
             ctx.exchanges.release(ex.slot);
             return self.resetStream(ctx, s, .internal_error);
         };

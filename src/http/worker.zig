@@ -598,7 +598,7 @@ pub fn Worker(comptime Handler: type) type {
             if (c.exchange != NIL) _ = self.dropExchange(c, true);
             if (c.ws) |w| {
                 if (@hasDecl(Handler, "handleWSDisconn")) self.handler.handleWSDisconn(w);
-                w.destroy(&self.pool);
+                w.destroy();
                 c.ws = null;
             }
             if (c.h2) |conn| {
@@ -625,7 +625,7 @@ pub fn Worker(comptime Handler: type) type {
         /// this worker and speaks WebSocket from here on.
         fn upgradeConn(self: *Self, c: *Conn) void {
             if (!@hasDecl(Handler, "handleWSFrame")) return self.closeConn(c);
-            const w = WsConn.create(self.allocator, c.fd, self.opts.websocket, &self.mailbox, .{ .kind = .ws, .slot = self.slotOf(c), .gen = @intCast(c.gen & 0x7fffffff) }) catch {
+            const w = WsConn.create(self.allocator, &self.pool, c.fd, self.opts.websocket, &self.mailbox, .{ .kind = .ws, .slot = self.slotOf(c), .gen = @intCast(c.gen & 0x7fffffff) }) catch {
                 return self.closeConn(c);
             };
             c.ws = w;
@@ -1037,7 +1037,7 @@ pub fn Worker(comptime Handler: type) type {
         fn readSocket(self: *Self, c: *Conn) bool {
             const space = blk: {
                 if (c.tls) |t| break :blk t.readSpace();
-                if (c.ws) |w| break :blk w.decoder.readSpace(&self.pool);
+                if (c.ws) |w| break :blk w.decoder.readSpace();
                 if (c.h2) |conn| break :blk conn.readSpace(&self.pool);
                 break :blk c.session.readSpace(&self.pool, self.opts.session);
             } catch {
@@ -1410,7 +1410,7 @@ pub fn Worker(comptime Handler: type) type {
             }
             if (t.hasBufferedInput()) {
                 const space = blk: {
-                    if (c.ws) |w| break :blk w.decoder.readSpace(&self.pool);
+                    if (c.ws) |w| break :blk w.decoder.readSpace();
                     if (c.h2) |conn| break :blk conn.readSpace(&self.pool);
                     break :blk c.session.readSpace(&self.pool, self.opts.session);
                 } catch {
@@ -1579,7 +1579,7 @@ pub fn Worker(comptime Handler: type) type {
             const w = c.ws.?;
             _ = w.process(Handler, self.handler);
             if (!self.wsFlush(c)) return false;
-            w.decoder.releaseIfIdle(&self.pool);
+            w.decoder.releaseIfIdle();
             return true;
         }
 

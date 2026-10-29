@@ -242,9 +242,12 @@ fn utf8CompletePrefix(data: []const u8) usize {
     return data.len;
 }
 
-/// Reassembly buffers larger than this are freed after delivery, so one
-/// large message doesn't pin memory for the life of the connection.
-const msg_retain_capacity = 64 * 1024;
+/// Frames up to this size are read straight into the reassembly buffer.
+/// Larger ones go through the read buffer: the kernel's copy into a cold
+/// megabyte cost more than its copy into the hot read buffer plus ours out
+/// of it (Linux 6.12 on aarch64: 64 KiB and 256 KiB echoes 5-15% cheaper
+/// read in place, 1 MiB 10-15% dearer).
+const direct_read_max = 512 * 1024;
 
 /// Per-connection frame decoder and message assembler. Input is buffered
 /// like `Session`: the event loop reads into `readSpace`, commits, and calls
@@ -253,15 +256,21 @@ const msg_retain_capacity = 64 * 1024;
 ///
 /// An unfragmented message that fits in the buffer is delivered in place
 /// (unmasked where it lies, no copy). Fragmented or oversized messages are
-/// streamed into a growable reassembly buffer as the bytes arrive, so the
-/// read buffer never needs to hold a whole frame.
+/// streamed into a reassembly buffer as the bytes arrive, so the read
+/// buffer never needs to hold a whole frame. That buffer is sized from the
+/// frame header (fragmented messages grow it), comes from the pool's cache
+/// of large buffers and goes back to it once the message has been
+/// delivered and no input is buffered. While more of a frame (up to
+/// `direct_read_max`) is still to come than the read buffer holds,
+/// `readSpace` returns the reassembly buffer itself, so the payload is read
+/// straight into place.
 pub const Decoder = struct {
     const Self = @This();
 
     buf: []u8 = &.{},
     start: usize = 0,
     end: usize = 0,
-    allocator: std.mem.Allocator,
+    pool: *BufferPool,
     max_message_size: usize,
     state: enum(u8) { header, stream } = .header,
     /// The frame being streamed.
@@ -269,26 +278,38 @@ pub const Decoder = struct {
     key: [4]u8 = undefined,
     len: usize = 0,
     consumed: usize = 0,
-    /// The message being reassembled, if any.
-    msg: std.ArrayList(u8) = .empty,
+    /// The message being reassembled, if any: `msg_buf[0..msg_len]`.
+    msg_buf: []u8 = &.{},
+    msg_len: usize = 0,
+    /// Payload read straight into `msg_buf` after `msg_len`, still masked.
+    direct: usize = 0,
+    /// The last `readSpace` returned part of `msg_buf`.
+    reading_direct: bool = false,
     msg_opcode: ?Opcode = null,
-    /// Prefix of `msg` already validated as UTF-8 (text messages).
+    /// Prefix of the message already validated as UTF-8 (text messages).
     msg_valid: usize = 0,
-    /// `msg` holds the message returned by the last call; reset on the next.
+    /// `msg_buf` holds the message returned by the last call; reset on the next.
     msg_delivered: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, max_message_size: usize) Self {
-        return .{ .allocator = allocator, .max_message_size = max_message_size };
+    pub fn init(pool: *BufferPool, max_message_size: usize) Self {
+        return .{ .pool = pool, .max_message_size = max_message_size };
     }
 
-    pub fn deinit(self: *Self, pool: *BufferPool) void {
-        if (self.buf.len > 0) pool.release(self.buf);
-        self.msg.deinit(self.allocator);
-        self.* = .{ .allocator = self.allocator, .max_message_size = self.max_message_size };
+    pub fn deinit(self: *Self) void {
+        if (self.buf.len > 0) self.pool.release(self.buf);
+        if (self.msg_buf.len > 0) self.pool.releaseLarge(self.msg_buf);
+        self.* = .{ .pool = self.pool, .max_message_size = self.max_message_size };
     }
 
     pub inline fn buffered(self: *const Self) usize {
         return self.end - self.start;
+    }
+
+    /// Holds part of a frame, or a buffer to read the next one into: the
+    /// rest is best received straight into `readSpace` (which may be the
+    /// message itself) rather than copied there.
+    pub inline fn holdsPartialFrame(self: *const Self) bool {
+        return self.buf.len > 0 or self.state == .stream;
     }
 
     /// Takes over a buffer (from the HTTP session after an upgrade) with
@@ -301,9 +322,20 @@ pub const Decoder = struct {
     }
 
     /// Space to read into, acquiring or compacting the buffer as needed.
-    pub fn readSpace(self: *Self, pool: *BufferPool) ![]u8 {
+    pub fn readSpace(self: *Self) ![]u8 {
+        if (self.state == .stream and self.start == self.end and self.len <= direct_read_max) {
+            // The frame continues; read what the read buffer couldn't hold
+            // straight into the message (its tail comes with the next
+            // header).
+            const want = self.len - self.consumed - self.direct;
+            if (want >= self.pool.buffer_size) {
+                self.reading_direct = true;
+                return self.msg_buf[self.msg_len + self.direct ..][0..want];
+            }
+        }
+        self.reading_direct = false;
         if (self.buf.len == 0) {
-            self.buf = try pool.acquire();
+            self.buf = try self.pool.acquire();
             self.start = 0;
             self.end = 0;
         }
@@ -321,34 +353,54 @@ pub const Decoder = struct {
     }
 
     pub inline fn commitRead(self: *Self, n: usize) void {
-        self.end += n;
+        if (self.reading_direct) {
+            self.direct += n;
+            self.reading_direct = false;
+        } else {
+            self.end += n;
+        }
     }
 
-    /// Returns the buffer to the pool when nothing is buffered.
-    pub fn releaseIfIdle(self: *Self, pool: *BufferPool) void {
+    /// Returns the buffers to the pool when nothing is buffered: the read
+    /// buffer, and the reassembly buffer unless a message is in progress.
+    pub fn releaseIfIdle(self: *Self) void {
         if (self.buf.len > 0 and self.start == self.end) {
-            pool.release(self.buf);
+            self.pool.release(self.buf);
             self.buf = &.{};
             self.start = 0;
             self.end = 0;
         }
+        if (self.msg_buf.len > 0 and (self.msg_delivered or self.msg_opcode == null)) {
+            self.resetMessage();
+            self.pool.releaseLarge(self.msg_buf);
+            self.msg_buf = &.{};
+        }
+    }
+
+    fn resetMessage(self: *Self) void {
+        self.msg_delivered = false;
+        self.msg_opcode = null;
+        self.msg_valid = 0;
+        self.msg_len = 0;
+    }
+
+    /// Room in `msg_buf` for `need` bytes, keeping what it holds. Fragments
+    /// grow it geometrically (up to the message size limit).
+    fn reserve(self: *Self, need: usize) Error!void {
+        if (need <= self.msg_buf.len) return;
+        const grown = @max(need, @min(2 * self.msg_buf.len, self.max_message_size));
+        const new = try self.pool.acquireLarge(grown);
+        @memcpy(new[0..self.msg_len], self.msg_buf[0..self.msg_len]);
+        if (self.msg_buf.len > 0) self.pool.releaseLarge(self.msg_buf);
+        self.msg_buf = new;
     }
 
     /// The next complete message, or null if more input is needed. Control
     /// frames are returned as they arrive, even in the middle of a
     /// fragmented message. The returned payload is valid until the next call
-    /// to `next` or `readSpace`.
+    /// to `next`, `readSpace` or `releaseIfIdle`.
     pub fn next(self: *Self) Error!?Frame {
-        if (self.msg_delivered) {
-            self.msg_delivered = false;
-            self.msg_opcode = null;
-            self.msg_valid = 0;
-            if (self.msg.capacity > msg_retain_capacity) {
-                self.msg.clearAndFree(self.allocator);
-            } else {
-                self.msg.clearRetainingCapacity();
-            }
-        }
+        if (self.msg_delivered) self.resetMessage();
         while (true) {
             switch (self.state) {
                 .header => {
@@ -371,7 +423,7 @@ pub const Decoder = struct {
                     } else if (in_progress) {
                         return error.ProtocolError;
                     }
-                    const msg_len = self.msg.items.len + hdr.len;
+                    const msg_len = self.msg_len + hdr.len;
                     if (msg_len > self.max_message_size) return error.MessageTooBig;
                     if (hdr.fin and !in_progress and total <= self.buf.len) {
                         // Whole message, fits the buffer: deliver in place.
@@ -385,6 +437,7 @@ pub const Decoder = struct {
                         return .{ .opcode = hdr.opcode, .payload = payload };
                     }
                     // Fragmented or larger than the buffer: stream into msg.
+                    try self.reserve(msg_len);
                     if (!in_progress) self.msg_opcode = hdr.opcode;
                     self.fin = hdr.fin;
                     self.key = hdr.key;
@@ -394,11 +447,21 @@ pub const Decoder = struct {
                     self.state = .stream;
                 },
                 .stream => {
+                    // Bytes read in place come first: they were read only
+                    // when nothing was buffered.
+                    if (self.direct > 0) {
+                        applyMask(self.msg_buf[self.msg_len..][0..self.direct], self.key, self.consumed);
+                        self.msg_len += self.direct;
+                        self.consumed += self.direct;
+                        self.direct = 0;
+                        if (self.msg_opcode == .text) try self.validateUtf8Progress();
+                    }
                     const take = @min(self.end - self.start, self.len - self.consumed);
                     if (take > 0) {
                         const chunk = self.buf[self.start..][0..take];
                         applyMask(chunk, self.key, self.consumed);
-                        try self.msg.appendSlice(self.allocator, chunk);
+                        @memcpy(self.msg_buf[self.msg_len..][0..take], chunk);
+                        self.msg_len += take;
                         self.start += take;
                         self.consumed += take;
                         if (self.msg_opcode == .text) try self.validateUtf8Progress();
@@ -406,12 +469,12 @@ pub const Decoder = struct {
                     if (self.consumed < self.len) return null;
                     self.state = .header;
                     if (!self.fin) continue;
-                    if (self.msg_opcode == .text and self.msg_valid != self.msg.items.len) {
+                    if (self.msg_opcode == .text and self.msg_valid != self.msg_len) {
                         // Ends in the middle of a sequence.
                         return error.InvalidUtf8;
                     }
                     self.msg_delivered = true;
-                    return .{ .opcode = self.msg_opcode.?, .payload = self.msg.items };
+                    return .{ .opcode = self.msg_opcode.?, .payload = self.msg_buf[0..self.msg_len] };
                 },
             }
         }
@@ -420,9 +483,9 @@ pub const Decoder = struct {
     /// Validates newly appended text as far as the last complete sequence,
     /// so invalid text fails as soon as it arrives.
     fn validateUtf8Progress(self: *Self) Error!void {
-        const pending = self.msg.items[self.msg_valid..];
+        const pending = self.msg_buf[self.msg_valid..self.msg_len];
         const upto = self.msg_valid + utf8CompletePrefix(pending);
-        if (!std.unicode.utf8ValidateSlice(self.msg.items[self.msg_valid..upto])) {
+        if (!std.unicode.utf8ValidateSlice(self.msg_buf[self.msg_valid..upto])) {
             return error.InvalidUtf8;
         }
         self.msg_valid = upto;
@@ -446,13 +509,14 @@ const TestDecoder = struct {
         const t = try testing.allocator.create(TestDecoder);
         t.* = .{
             .pool = try BufferPool.init(testing.allocator, buf_size, 2),
-            .dec = Decoder.init(testing.allocator, max_message),
+            .dec = undefined,
         };
+        t.dec = Decoder.init(&t.pool, max_message);
         return t;
     }
 
     fn deinit(t: *TestDecoder) void {
-        t.dec.deinit(&t.pool);
+        t.dec.deinit();
         t.pool.deinit();
         t.log.deinit(testing.allocator);
         testing.allocator.destroy(t);
@@ -462,13 +526,13 @@ const TestDecoder = struct {
     fn feed(t: *TestDecoder, bytes: []const u8) !void {
         var rest = bytes;
         while (rest.len > 0 and t.err == null) {
-            const space = try t.dec.readSpace(&t.pool);
+            const space = try t.dec.readSpace();
             const n = @min(space.len, rest.len);
             @memcpy(space[0..n], rest[0..n]);
             t.dec.commitRead(n);
             rest = rest[n..];
             t.drain();
-            t.dec.releaseIfIdle(&t.pool);
+            t.dec.releaseIfIdle();
         }
     }
 
@@ -715,9 +779,64 @@ test "a message larger than the read buffer is streamed" {
     try testing.expectEqual(@as(?Error, null), t.err);
     try testing.expectEqual(@as(u8, 2), t.log.items[0]);
     try testing.expectEqualSlices(u8, payload, t.log.items[9..]);
-    // The large reassembly buffer was freed after delivery.
+    // The reassembly buffer went back to the pool's cache after delivery.
+    try testing.expectEqual(@as(usize, 0), t.dec.msg_buf.len);
+    try testing.expectEqual(@as(usize, 1), t.pool.large_len);
     try t.feed(frame(out, true, .text, "x"));
-    try testing.expectEqual(@as(usize, 0), t.dec.msg.capacity);
+    try testing.expectEqual(@as(usize, 1), t.pool.large_len);
+}
+
+test "the rest of a large frame is read straight into the message" {
+    const t = try TestDecoder.init(512, 1 << 20);
+    defer t.deinit();
+    const payload = try testing.allocator.alloc(u8, 70000);
+    defer testing.allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @truncate(i *% 7);
+    const out = try testing.allocator.alloc(u8, payload.len + max_header_len + 16);
+    defer testing.allocator.free(out);
+    const big = frame(out, true, .binary, payload);
+    var small_buf: [16]u8 = undefined;
+    const small = frame(&small_buf, true, .text, "x");
+    @memcpy(out[big.len..][0..small.len], small);
+    const input = out[0 .. big.len + small.len];
+
+    // The first read fills the read buffer.
+    var space = try t.dec.readSpace();
+    try testing.expectEqual(@as(usize, 512), space.len);
+    @memcpy(space, input[0..512]);
+    t.dec.commitRead(512);
+    try testing.expectEqual(@as(?Frame, null), try t.dec.next());
+    // The rest of the frame goes straight into the message buffer, up to
+    // a tail smaller than the read buffer.
+    space = try t.dec.readSpace();
+    try testing.expectEqual(big.len - 512, space.len);
+    try testing.expect(space.ptr == t.dec.msg_buf.ptr + (512 - 14));
+    const direct = big.len - 512 - 300;
+    @memcpy(space[0..direct], input[512..][0..direct]);
+    t.dec.commitRead(direct);
+    try testing.expectEqual(@as(?Frame, null), try t.dec.next());
+    // The tail, with the next frame, goes through the read buffer.
+    space = try t.dec.readSpace();
+    try testing.expect(space.ptr == t.dec.buf.ptr);
+    const rest = input[512 + direct ..];
+    @memcpy(space[0..rest.len], rest);
+    t.dec.commitRead(rest.len);
+    const msg = (try t.dec.next()).?;
+    try testing.expectEqual(Opcode.binary, msg.opcode);
+    try testing.expectEqualSlices(u8, payload, msg.payload);
+    const text = (try t.dec.next()).?;
+    try testing.expectEqualStrings("x", text.payload);
+    try testing.expectEqual(@as(?Frame, null), try t.dec.next());
+
+    // Idle: both buffers go back; the next large message reuses the cached one.
+    const cached = t.dec.msg_buf.ptr;
+    t.dec.releaseIfIdle();
+    try testing.expectEqual(@as(usize, 0), t.dec.buf.len);
+    try testing.expectEqual(@as(usize, 0), t.dec.msg_buf.len);
+    try t.feed(big);
+    try testing.expectEqual(@as(?Error, null), t.err);
+    try testing.expectEqual(@as(usize, 1), t.pool.large_len);
+    try testing.expect(t.pool.large[0].ptr == cached);
 }
 
 // The property from the HTTP state machine, for WebSockets: any split of

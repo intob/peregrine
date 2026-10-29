@@ -765,7 +765,7 @@ pub fn Worker(comptime Handler: type) type {
             std.debug.assert(!c.borrowed);
             if (c.parked.head != NIL16) return true;
             if (c.tls) |t| return t.partialRecordNeed() > 0;
-            if (c.ws) |w| return w.decoder.buf.len > 0;
+            if (c.ws) |w| return w.decoder.holdsPartialFrame();
             if (c.h2) |conn| return conn.reader.buf.len > 0;
             return c.session.buf.len > 0;
         }
@@ -776,7 +776,7 @@ pub fn Worker(comptime Handler: type) type {
             const space = if (c.tls) |t|
                 t.readSpace() catch return self.closeConn(c)
             else if (c.ws) |w|
-                w.decoder.readSpace(&self.pool) catch return self.closeConn(c)
+                w.decoder.readSpace() catch return self.closeConn(c)
             else if (c.h2) |conn|
                 conn.readSpace(&self.pool) catch return self.closeConn(c)
             else
@@ -1046,7 +1046,7 @@ pub fn Worker(comptime Handler: type) type {
             }
             if (c.ws) |w| {
                 if (@hasDecl(Handler, "handleWSDisconn")) self.handler.handleWSDisconn(w);
-                w.destroy(&self.pool);
+                w.destroy();
                 c.ws = null;
             }
             if (c.tls) |t| {
@@ -1070,7 +1070,7 @@ pub fn Worker(comptime Handler: type) type {
         /// this worker and speaks WebSocket from here on.
         fn upgradeConn(self: *Self, c: *Conn) void {
             if (!@hasDecl(Handler, "handleWSFrame")) return self.closeConn(c);
-            const w = WsConn.create(self.allocator, c.fd, self.opts.websocket, &self.mailbox, .{ .kind = .ws, .slot = self.slotOf(c), .gen = @intCast(c.gen & 0x7fffffff) }) catch {
+            const w = WsConn.create(self.allocator, &self.pool, c.fd, self.opts.websocket, &self.mailbox, .{ .kind = .ws, .slot = self.slotOf(c), .gen = @intCast(c.gen & 0x7fffffff) }) catch {
                 return self.closeConn(c);
             };
             c.ws = w;
@@ -1085,7 +1085,7 @@ pub fn Worker(comptime Handler: type) type {
                 const leftover = s.buf[s.start..s.end];
                 c.borrowed = false;
                 s.* = .{};
-                const space = w.decoder.readSpace(&self.pool) catch return self.closeConn(c);
+                const space = w.decoder.readSpace() catch return self.closeConn(c);
                 std.debug.assert(space.len >= leftover.len);
                 @memcpy(space[0..leftover.len], leftover);
                 w.decoder.commitRead(leftover.len);
@@ -1893,7 +1893,7 @@ pub fn Worker(comptime Handler: type) type {
                     continue;
                 }
                 if (c.ws) |w| {
-                    const space = w.decoder.readSpace(&self.pool) catch {
+                    const space = w.decoder.readSpace() catch {
                         self.closeConn(c);
                         return false;
                     };
@@ -2008,7 +2008,7 @@ pub fn Worker(comptime Handler: type) type {
             const w = c.ws.?;
             var rest = data;
             while (rest.len > 0) {
-                const space = w.decoder.readSpace(&self.pool) catch return self.closeConn(c);
+                const space = w.decoder.readSpace() catch return self.closeConn(c);
                 const n = @min(space.len, rest.len);
                 @memcpy(space[0..n], rest[0..n]);
                 w.decoder.commitRead(n);
@@ -2045,7 +2045,7 @@ pub fn Worker(comptime Handler: type) type {
                 return;
             }
             if (w.wantsClose() or c.peer_closed) return self.closeConn(c);
-            w.decoder.releaseIfIdle(&self.pool);
+            w.decoder.releaseIfIdle();
             if (c.tls) |t| t.releaseIfIdle();
             // Only a pending close handshake has a deadline.
             if (w.closeSent()) {

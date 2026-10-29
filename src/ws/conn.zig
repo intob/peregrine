@@ -77,21 +77,21 @@ pub const Conn = struct {
     /// Worker only: the connection was failed (protocol error, limit).
     failed: bool = false,
 
-    pub fn create(allocator: std.mem.Allocator, fd: sys.fd_t, opts: Options, mailbox: *Mailbox, post_entry: MailboxEntry) !*Self {
+    pub fn create(allocator: std.mem.Allocator, pool: *BufferPool, fd: sys.fd_t, opts: Options, mailbox: *Mailbox, post_entry: MailboxEntry) !*Self {
         const self = try allocator.create(Self);
         self.* = .{
             .fd = fd,
             .allocator = allocator,
             .opts = opts,
-            .decoder = protocol.Decoder.init(allocator, opts.max_message_size),
+            .decoder = protocol.Decoder.init(pool, opts.max_message_size),
             .mailbox = mailbox,
             .post_entry = post_entry,
         };
         return self;
     }
 
-    pub fn destroy(self: *Self, pool: *BufferPool) void {
-        self.decoder.deinit(pool);
+    pub fn destroy(self: *Self) void {
+        self.decoder.deinit();
         self.shared.deinit(self.allocator);
         self.wire.deinit(self.allocator);
         self.allocator.destroy(self);
@@ -304,12 +304,12 @@ const Harness = struct {
             .conn = undefined,
         };
         h.mailbox.bind();
-        h.conn = try Conn.create(testing.allocator, 7, opts, &h.mailbox, .{ .kind = .ws, .slot = 0, .gen = 1 });
+        h.conn = try Conn.create(testing.allocator, &h.pool, 7, opts, &h.mailbox, .{ .kind = .ws, .slot = 0, .gen = 1 });
         return h;
     }
 
     fn deinit(h: *Harness) void {
-        h.conn.destroy(&h.pool);
+        h.conn.destroy();
         h.mailbox.waker.deinit();
         h.mailbox.deinit();
         h.pool.deinit();
@@ -321,7 +321,7 @@ const Harness = struct {
     fn feed(h: *Harness, bytes: []const u8) !void {
         var rest = bytes;
         while (rest.len > 0 and h.action == .ok) {
-            const space = try h.conn.decoder.readSpace(&h.pool);
+            const space = try h.conn.decoder.readSpace();
             const n = @min(space.len, rest.len);
             @memcpy(space[0..n], rest[0..n]);
             h.conn.decoder.commitRead(n);
