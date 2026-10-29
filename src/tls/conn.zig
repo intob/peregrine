@@ -11,7 +11,9 @@ const tls = std.crypto.tls;
 const record = @import("./record.zig");
 const handshake = @import("./handshake.zig");
 const errors = @import("./errors.zig");
-const BufferPool = @import("../http/session.zig").BufferPool;
+const session = @import("../http/session.zig");
+const BufferPool = session.BufferPool;
+const FreeList = session.FreeList;
 const Protection = record.Protection;
 const ContentType = record.ContentType;
 const Level = handshake.Level;
@@ -31,49 +33,65 @@ comptime {
 }
 
 /// Per-worker buffer pools shared by its TLS connections, and connection
-/// and handshake states kept for reuse (made on demand, up to `count` of
-/// each), so that a steady-state handshake allocates nothing.
+/// and handshake states kept for reuse (made on demand), so that a
+/// steady-state handshake allocates nothing.
 pub const Pools = struct {
+    allocator: std.mem.Allocator,
     in: BufferPool,
     out: BufferPool,
-    conns: FreeList(Conn),
-    handshakes: FreeList(handshake.Handshake),
+    conns: FreeList(*Conn),
+    handshakes: FreeList(*handshake.Handshake),
+
+    /// Free handshake states kept. A handshake lasts about a round trip,
+    /// so even at thousands of handshakes a second per worker only a few
+    /// are under way at once; these cover a burst without pinning memory
+    /// after it (832 bytes each on aarch64, plus flight and reassembly
+    /// buffers of up to `Handshake.max_kept_buffer`).
+    pub const max_free_handshakes = 16;
+    /// Free connection states kept (1440 bytes each, no buffers: those
+    /// are the buffer pools'). They follow the difference between
+    /// connections closing and opening, not the number open, so a few
+    /// dozen absorb the churn of new connections.
+    pub const max_free_conns = 64;
 
     pub fn init(allocator: std.mem.Allocator, count: usize) !Pools {
         var in = try BufferPool.init(allocator, in_buffer_size, count);
         errdefer in.deinit();
         var out = try BufferPool.init(allocator, out_buffer_size, count);
         errdefer out.deinit();
-        const conns = try allocator.alloc(*Conn, count);
+        const conns = try allocator.alloc(*Conn, max_free_conns);
         errdefer allocator.free(conns);
-        return .{ .in = in, .out = out, .conns = .{ .items = conns }, .handshakes = .{ .items = try allocator.alloc(*handshake.Handshake, count) } };
+        const handshakes = try allocator.alloc(*handshake.Handshake, max_free_handshakes);
+        return .{ .allocator = allocator, .in = in, .out = out, .conns = .{ .items = conns }, .handshakes = .{ .items = handshakes } };
     }
 
     pub fn deinit(self: *Pools) void {
-        const allocator = self.in.allocator;
-        for (self.conns.items[0..self.conns.len]) |c| allocator.destroy(c);
-        for (self.handshakes.items[0..self.handshakes.len]) |hs| {
+        for (self.conns.slice()) |c| self.allocator.destroy(c);
+        for (self.handshakes.slice()) |hs| {
             hs.deinit();
-            allocator.destroy(hs);
+            self.allocator.destroy(hs);
         }
-        allocator.free(self.conns.items);
-        allocator.free(self.handshakes.items);
+        self.allocator.free(self.conns.items);
+        self.allocator.free(self.handshakes.items);
         self.in.deinit();
         self.out.deinit();
     }
 
     /// A new connection, in a reused state if one is free.
     pub fn createConn(self: *Pools, config: *const Config, entropy: *const [entropy_len]u8) !*Conn {
-        const c = self.conns.pop() orelse try self.in.allocator.create(Conn);
-        errdefer self.in.allocator.destroy(c);
-        c.* = try .init(self, config, entropy);
+        const reused = self.conns.pop();
+        const c = reused orelse try self.allocator.create(Conn);
+        c.* = Conn.init(self, config, entropy) catch |err| {
+            if (reused == null or !self.conns.push(c)) self.allocator.destroy(c);
+            return err;
+        };
         return c;
     }
 
     /// Ends a connection from `createConn`.
     pub fn destroyConn(self: *Pools, c: *Conn) void {
         c.deinit();
-        if (!self.conns.push(c)) self.in.allocator.destroy(c);
+        if (!self.conns.push(c)) self.allocator.destroy(c);
     }
 
     fn acquireHandshake(self: *Pools, config: *const Config, entropy: *const [entropy_len]u8) !*handshake.Handshake {
@@ -81,41 +99,20 @@ pub const Pools = struct {
             hs.reinit(config, entropy);
             return hs;
         }
-        const allocator = self.in.allocator;
-        const hs = try allocator.create(handshake.Handshake);
-        hs.* = .init(allocator, config, entropy);
+        const hs = try self.allocator.create(handshake.Handshake);
+        hs.* = .init(self.allocator, config, entropy);
         return hs;
     }
 
+    /// After the handshake finished or failed: wiped (secrets, transcript,
+    /// buffered messages) whether it is kept or freed.
     fn releaseHandshake(self: *Pools, hs: *handshake.Handshake) void {
-        hs.wipe();
+        hs.release();
         if (self.handshakes.push(hs)) return;
         hs.deinit();
-        self.in.allocator.destroy(hs);
+        self.allocator.destroy(hs);
     }
 };
-
-/// Objects waiting for reuse.
-fn FreeList(comptime T: type) type {
-    return struct {
-        items: []*T,
-        len: usize = 0,
-
-        fn pop(self: *@This()) ?*T {
-            if (self.len == 0) return null;
-            self.len -= 1;
-            return self.items[self.len];
-        }
-
-        /// False if the list is full.
-        fn push(self: *@This(), x: *T) bool {
-            if (self.len == self.items.len) return false;
-            self.items[self.len] = x;
-            self.len += 1;
-            return true;
-        }
-    };
-}
 
 /// Connections whose sending side went to the kernel (kTLS), process-wide.
 pub var kernel_tx_count = std.atomic.Value(u64).init(0);
@@ -646,7 +643,7 @@ pub const Conn = struct {
         } else {
             // Rare: a handshake flight larger than the buffer (a long
             // certificate chain).
-            const new_buf = try self.pools.out.allocator.alloc(u8, len + min);
+            const new_buf = try self.pools.allocator.alloc(u8, len + min);
             @memcpy(new_buf[0..len], self.wire_buf[self.wire_start..self.wire_end]);
             self.pools.out.release(self.wire_buf);
             self.wire_buf = new_buf;
@@ -1188,6 +1185,110 @@ test "a handshake on warm pools allocates nothing" {
             try testing.expectEqual(before, counting.allocations);
         }
     }
+}
+
+/// Feeds `bytes` (the client's side of a session) to a pooled connection,
+/// echoing what it decrypts. Returns the number of bytes echoed.
+fn replay(conn: *Conn, bytes: []const u8) !usize {
+    var rest = bytes;
+    var echoed: usize = 0;
+    while (rest.len > 0 and !conn.failed and !conn.peer_closed) {
+        const space = try conn.readSpace();
+        const n = @min(space.len, rest.len);
+        @memcpy(space[0..n], rest[0..n]);
+        conn.commitRead(n);
+        rest = rest[n..];
+        var plain: [256]u8 = undefined;
+        while (true) {
+            const k = conn.readPlain(&plain);
+            if (k == 0) break;
+            echoed += try conn.encrypt(&.{plain[0..k]});
+        }
+        conn.advance(conn.wireBytes().len);
+        conn.releaseIfIdle();
+    }
+    return echoed;
+}
+
+test "a failed handshake leaves its pooled state as good as new" {
+    const td = credentials.testdata;
+    var server: TestServer = undefined;
+    try server.init(td.p256_cert, td.p256_key);
+    defer server.deinit();
+    var transcript: std.ArrayList(u8) = .empty;
+    defer transcript.deinit(testing.allocator);
+    const msg = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    try runAgainstStdClient(&server, msg, &transcript);
+    const good = transcript.items;
+    // The client's first record is its ClientHello; then come its
+    // change_cipher_spec and its encrypted Finished.
+    const hello_end = record.header_len + std.mem.readInt(u16, good[3..5], .big);
+
+    var hello_buf: [2048]u8 = undefined;
+    var rec: [2048]u8 = undefined;
+    const hrr_hello = plainRecord(&rec, handshake.buildClientHello(&hello_buf, .{ .groups = &.{.x25519} }));
+    var bad_finished = try testing.allocator.dupe(u8, good);
+    defer testing.allocator.free(bad_finished);
+    bad_finished[hello_end + 6 + record.header_len + 2] ^= 1;
+    const alert = [_]u8{ 21, 3, 3, 0, 2, 2, 40 };
+    const garbage = [_]u8{ 22, 3, 1, 0, 4, 1, 0, 0, 9 };
+
+    var pools = try Pools.init(testing.allocator, 2);
+    defer pools.deinit();
+    const Case = struct { name: []const u8, parts: []const []const u8, x25519_only: bool = false };
+    const cases = [_]Case{
+        .{ .name = "malformed ClientHello", .parts = &.{&garbage} },
+        .{ .name = "bad Finished after ServerHello", .parts = &.{bad_finished} },
+        .{ .name = "alert after ServerHello", .parts = &.{ good[0..hello_end], &alert } },
+        .{ .name = "alert after HelloRetryRequest", .parts = &.{ hrr_hello, &alert }, .x25519_only = true },
+        .{ .name = "closed after HelloRetryRequest", .parts = &.{hrr_hello}, .x25519_only = true },
+    };
+    var state: ?*handshake.Handshake = null;
+    for (cases) |case| {
+        server.config.groups = if (case.x25519_only) &.{.x25519} else (Config{ .credentials = &server.creds }).groups;
+        const conn = try pools.createConn(&server.config, &testEntropy(5));
+        // After the first case, the same state comes back each time.
+        if (state) |s| try testing.expectEqual(s, conn.hs.?);
+        state = conn.hs.?;
+        try handshake.expectFresh(conn.hs.?, &server.config, &testEntropy(5));
+        for (case.parts) |part| _ = try replay(conn, part);
+        testing.expect(!conn.isEstablished()) catch |err| {
+            std.debug.print("{s}: established\n", .{case.name});
+            return err;
+        };
+        pools.destroyConn(conn);
+        try testing.expectEqual(1, pools.handshakes.len);
+        try handshake.expectReleased(pools.handshakes.items[0]);
+    }
+    // Then the good session, on the state those failures used.
+    server.config.groups = (Config{ .credentials = &server.creds }).groups;
+    const conn = try pools.createConn(&server.config, &testEntropy(5));
+    defer pools.destroyConn(conn);
+    try testing.expectEqual(state.?, conn.hs.?);
+    try handshake.expectFresh(conn.hs.?, &server.config, &testEntropy(5));
+    try testing.expectEqual(msg.len, try replay(conn, good));
+    try testing.expect(conn.isEstablished() and conn.peer_closed and !conn.failed);
+}
+
+test "a reused connection state goes back to the pool when its handshake state can't be made" {
+    const td = credentials.testdata;
+    var server: TestServer = undefined;
+    try server.init(td.p256_cert, td.p256_key);
+    defer server.deinit();
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{});
+    var pools = try Pools.init(failing.allocator(), 2);
+    defer pools.deinit();
+    // A free connection state, and no free handshake state.
+    const a = try pools.createConn(&server.config, &testEntropy(5));
+    a.freeHandshake();
+    const b = try pools.createConn(&server.config, &testEntropy(5));
+    defer pools.destroyConn(b);
+    pools.destroyConn(a);
+    try testing.expectEqual(1, pools.conns.len);
+    try testing.expectEqual(0, pools.handshakes.len);
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, pools.createConn(&server.config, &testEntropy(5)));
+    try testing.expectEqual(1, pools.conns.len);
 }
 
 fn expectAlert(input: []const u8, description: tls.Alert.Description) !void {

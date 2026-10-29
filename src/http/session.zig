@@ -24,6 +24,33 @@ const iovec_const = std.posix.iovec_const;
 /// that size are mapped from the kernel, and mapping, faulting in and
 /// unmapping a fresh buffer per message cost more than the message's own
 /// copies.
+/// A bounded stack of things waiting for reuse: BufferPool's buffers, and
+/// tls/conn.zig's connection and handshake states.
+pub fn FreeList(comptime T: type) type {
+    return struct {
+        items: []T,
+        len: usize = 0,
+
+        pub fn pop(self: *@This()) ?T {
+            if (self.len == 0) return null;
+            self.len -= 1;
+            return self.items[self.len];
+        }
+
+        /// False if the list is full.
+        pub fn push(self: *@This(), x: T) bool {
+            if (self.len == self.items.len) return false;
+            self.items[self.len] = x;
+            self.len += 1;
+            return true;
+        }
+
+        pub fn slice(self: *const @This()) []T {
+            return self.items[0..self.len];
+        }
+    };
+}
+
 pub const BufferPool = struct {
     const Self = @This();
 
@@ -33,8 +60,7 @@ pub const BufferPool = struct {
     pub const large_cache_bytes = 4 * 1024 * 1024;
 
     buffer_size: usize,
-    free: [][]u8,
-    free_len: usize = 0,
+    free: FreeList([]u8),
     large: [large_cache_count][]u8 = undefined,
     large_len: usize = 0,
     large_bytes: usize = 0,
@@ -48,18 +74,16 @@ pub const BufferPool = struct {
         var self: Self = .{
             .allocator = allocator,
             .buffer_size = buffer_size,
-            .free = try allocator.alloc([]u8, count),
+            .free = .{ .items = try allocator.alloc([]u8, count) },
         };
         errdefer self.deinit();
-        while (self.free_len < count) : (self.free_len += 1) {
-            self.free[self.free_len] = try allocator.alloc(u8, buffer_size);
-        }
+        while (self.free.len < count) _ = self.free.push(try allocator.alloc(u8, buffer_size));
         return self;
     }
 
     pub fn deinit(self: *Self) void {
-        for (self.free[0..self.free_len]) |b| self.allocator.free(b);
-        self.allocator.free(self.free);
+        for (self.free.slice()) |b| self.allocator.free(b);
+        self.allocator.free(self.free.items);
         for (self.large[0..self.large_len]) |b| self.allocator.free(b);
         if (self.ws_deflater) |d| self.allocator.destroy(d);
         if (self.ws_inflate_tables) |t| self.allocator.destroy(t);
@@ -84,21 +108,13 @@ pub const BufferPool = struct {
     }
 
     pub fn acquire(self: *Self) ![]u8 {
-        if (self.free_len > 0) {
-            self.free_len -= 1;
-            return self.free[self.free_len];
-        }
+        if (self.free.pop()) |b| return b;
         // Pool exhausted: overflow to the heap.
         return self.allocator.alloc(u8, self.buffer_size);
     }
 
     pub fn release(self: *Self, buf: []u8) void {
-        if (buf.len == self.buffer_size and self.free_len < self.free.len) {
-            self.free[self.free_len] = buf;
-            self.free_len += 1;
-        } else {
-            self.allocator.free(buf);
-        }
+        if (buf.len != self.buffer_size or !self.free.push(buf)) self.allocator.free(buf);
     }
 
     /// A buffer of at least `min` bytes: the smallest cached one that

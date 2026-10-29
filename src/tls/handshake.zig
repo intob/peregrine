@@ -143,8 +143,8 @@ pub const Handshake = struct {
     entropy: [entropy_len]u8,
     /// A handshake message split across feed calls.
     partial: std.ArrayList(u8) = .empty,
-    /// Where the encrypted flight is assembled. Like `partial`, kept by
-    /// `reinit`.
+    /// Where the encrypted flight is assembled. Like `partial`, kept for
+    /// the next handshake by `release` and `reinit`.
     flight: []u8 = &.{},
 
     suite: Suite = undefined,
@@ -187,36 +187,44 @@ pub const Handshake = struct {
         return .{ .allocator = allocator, .config = config, .entropy = entropy.* };
     }
 
-    /// `reinit` keeps buffers up to this size.
+    /// `release` keeps buffers up to this size.
     pub const max_kept_buffer = 16 * 1024;
 
     pub fn deinit(self: *Self) void {
-        self.wipe();
+        self.release();
         self.partial.deinit(self.allocator);
         self.allocator.free(self.flight);
     }
 
-    /// Clears the secrets (`deinit` does too).
-    pub fn wipe(self: *Self) void {
-        std.crypto.secureZero(u8, &self.entropy);
-        std.crypto.secureZero(u8, &self.client_handshake_secret);
-        std.crypto.secureZero(u8, &self.client_app_secret);
-        std.crypto.secureZero(u8, &self.psk);
-        std.crypto.secureZero(u8, &self.master_secret);
-    }
-
-    /// `init` again for a state that was used and wiped, keeping its
-    /// buffers (up to `max_kept_buffer`), so that a handshake on a reused
-    /// state allocates nothing (conn.zig's `Pools`).
-    pub fn reinit(self: *Self, config: *const Config, entropy: *const [entropy_len]u8) void {
+    /// Ends a handshake (finished or failed) whose state will be reused
+    /// (conn.zig's `Pools`): zeroes all of it, secrets, transcript and the
+    /// buffers' whole capacity (they held the ClientHello, with any
+    /// ticket and binders, and the flight), and frees buffers larger than
+    /// `max_kept_buffer`. `reinit` makes it usable again.
+    pub fn release(self: *Self) void {
+        const allocator = self.allocator;
         var partial = self.partial;
+        // Cleared first: in safe builds clearing marks the items undefined.
         partial.clearRetainingCapacity();
-        if (partial.capacity > max_kept_buffer) partial.clearAndFree(self.allocator);
+        if (partial.capacity > max_kept_buffer) partial.clearAndFree(allocator);
+        std.crypto.secureZero(u8, partial.allocatedSlice());
         var flight = self.flight;
+        std.crypto.secureZero(u8, flight);
         if (flight.len > max_kept_buffer) {
-            self.allocator.free(flight);
+            allocator.free(flight);
             flight = &.{};
         }
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
+        self.allocator = allocator;
+        self.partial = partial;
+        self.flight = flight;
+    }
+
+    /// `init` again for a released state, keeping its buffers, so that a
+    /// handshake on a reused state allocates nothing.
+    pub fn reinit(self: *Self, config: *const Config, entropy: *const [entropy_len]u8) void {
+        const partial = self.partial;
+        const flight = self.flight;
         self.* = .init(self.allocator, config, entropy);
         self.partial = partial;
         self.flight = flight;
@@ -1239,6 +1247,85 @@ test "ServerHello and handshake secrets match RFC 8448" {
     try std.testing.expectEqual(r.data.len, r.pos);
     try std.testing.expectEqual(Level.application, ev[4].write_secret.level);
     try std.testing.expect(!hs.isDone());
+}
+
+/// Expects a released state to hold nothing of its last handshake: every
+/// byte zero but the allocator and the buffers' bookkeeping, the buffers'
+/// whole capacity zero, and none larger than `max_kept_buffer`.
+pub fn expectReleased(hs: *const Handshake) !void {
+    const bytes = std.mem.asBytes(hs);
+    for (bytes, 0..) |b, i| {
+        const kept = inline for (.{ "allocator", "partial", "flight" }) |name| {
+            const at = @offsetOf(Handshake, name);
+            if (i >= at and i < at + @sizeOf(@FieldType(Handshake, name))) break true;
+        } else false;
+        if (!kept and b != 0) {
+            std.debug.print("byte {d} of the released state is {x}\n", .{ i, b });
+            return error.TestExpectedEqual;
+        }
+    }
+    try std.testing.expectEqual(0, hs.partial.items.len);
+    try std.testing.expect(std.mem.allEqual(u8, hs.partial.allocatedSlice(), 0));
+    try std.testing.expect(std.mem.allEqual(u8, hs.flight, 0));
+    try std.testing.expect(hs.partial.capacity <= Handshake.max_kept_buffer);
+    try std.testing.expect(hs.flight.len <= Handshake.max_kept_buffer);
+}
+
+/// Expects a reused state to start like a new one.
+pub fn expectFresh(hs: *const Handshake, config: *const Config, entropy: *const [entropy_len]u8) !void {
+    const t = std.testing;
+    const fresh = Handshake.init(hs.allocator, config, entropy);
+    try t.expectEqual(fresh.config, hs.config);
+    try t.expectEqualSlices(u8, &fresh.entropy, &hs.entropy);
+    try t.expectEqual(fresh.state, hs.state);
+    try t.expectEqual(0, hs.partial.items.len);
+    try t.expectEqual(fresh.retry_group, hs.retry_group);
+    try t.expectEqual(fresh.session_id_len, hs.session_id_len);
+    try t.expectEqual(fresh.sent_ccs, hs.sent_ccs);
+    try t.expectEqual(fresh.alpn, hs.alpn);
+    try t.expectEqual(fresh.creds_index, hs.creds_index);
+    try t.expectEqual(fresh.sni_matched, hs.sni_matched);
+    try t.expectEqual(fresh.transport_params.len, hs.transport_params.len);
+    try t.expectEqual(fresh.early_data_offered, hs.early_data_offered);
+    try t.expectEqual(fresh.early_accepted, hs.early_accepted);
+    try t.expectEqual(fresh.resumed, hs.resumed);
+    try t.expectEqual(fresh.psk_identity, hs.psk_identity);
+}
+
+test "release: nothing of the last handshake survives; big buffers are freed" {
+    var creds = try testCredentials();
+    defer creds.deinit();
+    const config: Config = .{ .credentials = &creds, .groups = &.{.x25519} };
+    const entropy: [entropy_len]u8 = @splat(7);
+    const x = X25519.recoverPublicKey(@splat(5));
+    var buf: [24 * 1024]u8 = undefined;
+    // A padding extension (21) of `pad` bytes makes the ClientHello span
+    // records: 0 keeps it small, 20000 makes it larger than the kept size.
+    for ([_]usize{ 0, 20000 }) |pad| {
+        var extra_buf: [4 + 20000]u8 = @splat(0);
+        std.mem.writeInt(u16, extra_buf[0..2], 21, .big);
+        std.mem.writeInt(u16, extra_buf[2..4], @intCast(pad), .big);
+        const hello = buildClientHello(&buf, .{
+            .shares = &.{.{ .group = .x25519, .key_exchange = &x }},
+            .session_id = &@as([32]u8, @splat(0x33)),
+            .extra = extra_buf[0 .. 4 + pad],
+        });
+        var hs = Handshake.init(std.testing.allocator, &config, &entropy);
+        defer hs.deinit();
+        for (0..2) |_| {
+            var sink: TestSink = .{ .allocator = std.testing.allocator };
+            defer sink.deinit();
+            // In two pieces, so the reassembly buffer holds the message.
+            try hs.feed(.initial, hello[0 .. hello.len / 2], &sink);
+            try hs.feed(.initial, hello[hello.len / 2 ..], &sink);
+            try std.testing.expect(hs.partial.capacity >= hello.len);
+            try std.testing.expect(hs.flight.len > 0);
+            hs.release();
+            try expectReleased(&hs);
+            hs.reinit(&config, &entropy);
+            try expectFresh(&hs, &config, &entropy);
+        }
+    }
 }
 
 /// Builds a ClientHello with the given suites, groups and key shares.
