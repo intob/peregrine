@@ -1176,8 +1176,57 @@ which RFC 9113 deprecated).
 | TLS "Hello", 256 × 1 | 160k-172k | 11.2-12.0 µs | 70k-70k | 29.9-30.8 µs |
 | TLS 64 KiB, 10 × 10 | 64k-73k (4.2-4.8 GB/s) | 31.8-34.3 µs | 10.4k-11.6k | 131-139 µs |
 
-      To do: h2o, a quiet machine, latency percentiles, and `-Dcpu` for x86_64
-- [ ] Benchmark against h2o
+      To do: a quiet machine, latency percentiles, and `-Dcpu` for x86_64. (nginx
+      needs `keepalive_requests` raised: h2load doesn't reconnect after its
+      1000-request cap, so the config above can't have been pure defaults)
+- [x] Benchmark against h2o 2.3.0-DEV (master d21e7cb; h2o has not tagged 2.3.0) and
+      nginx 1.30 in one session: `bench/scripts/h2-bench.sh h2c|tls|h3`
+      (`bench/competitors/h2o`, `bench/competitors/nginx`). 2026-10-29, Docker on the
+      M2 Pro, Linux 6.12; 6 workers pinned to CPUs 0-5 with SO_REUSEPORT listeners for
+      every server, `h2load -t6` on 6-11, 3 interleaved rounds of 10 s after a 2 s
+      warm-up, CPU/req over h2load's main phase; TLS_AES_128_GCM_SHA256 with X25519
+      pinned and checked for all; host load 7-13 plus 190-450% CPU outside Docker, so
+      ±15-20%. h2o serves both bodies from files (fd cache, pread per response; it has
+      no in-memory responder without mruby), nginx "Hello" from `return` and 64 KiB
+      from a file (open_file_cache, sendfile off); peregrine's 64 KiB rows from memory
+      and from a file. At 10 × 100 h2load is the limit (peregrine uses 0.3 cores) and
+      TLS 64 KiB is client-bound for every server: compare CPU/req. A verifier
+      reproduced the headline numbers independently
+
+| h2c | "Hello" 10 × 100 | CPU/req | "Hello" 256 × 1 | CPU/req | 64 KiB 10 × 10 | CPU/req |
+|---|---|---|---|---|---|---|
+| peregrine epoll, memory | 548k-563k | 0.50-0.59 µs | 348k-497k | 7.2-7.6 µs | 163k-237k | 17.1-24.4 µs |
+| peregrine epoll, file | | | | | 66k-71k | 37.0-40.3 µs |
+| peregrine io_uring, memory | 550k-562k | 0.51-0.57 µs | 323k-489k | 7.3-7.6 µs | 116k-144k | 30.2-34.8 µs |
+| peregrine io_uring, file | | | | | 36k-44k | 53.7-64.9 µs |
+| nginx 1.30 | 151k-174k | 5.5-7.1 µs | 95k-119k | 13.1-14.2 µs | 103k-128k | 27.6-32.6 µs |
+| h2o 2.3.0-DEV | 432k-467k | 2.0-2.5 µs | 225k-283k | 12.7-14.0 µs | 194k-217k | 15.6-20.5 µs |
+
+| TLS 1.3 | "Hello" 10 × 100 | CPU/req | "Hello" 256 × 1 | CPU/req | 64 KiB 10 × 10 | CPU/req |
+|---|---|---|---|---|---|---|
+| peregrine epoll, memory | 507k-547k | 0.57-0.74 µs | 134k-167k | 11.1-11.8 µs | 60k-84k | 32.2-36.7 µs |
+| peregrine epoll, file | | | | | 45k-60k | 42.3-53.7 µs |
+| peregrine io_uring, memory | 455k-548k | 0.58-0.84 µs | 130k-164k | 11.7-11.8 µs | 38k-67k | 44.6-75.8 µs |
+| peregrine io_uring, file | | | | | 27k-31k | 76.4-87.1 µs |
+| nginx 1.30 | 80k-136k | 4.0-4.4 µs | 65k-78k | 21.4-22.8 µs | 33k-46k | 53.0-71.0 µs |
+| h2o 2.3.0-DEV | 411k-458k | 2.3-2.7 µs | 117k-140k | 18.2-20.2 µs | 48k-77k | 29.0-37.6 µs |
+
+      Response headers per h2 response on the wire: peregrine 4.7 B (content-type,
+      content-length, date), h2o 10.7-14.3 B, nginx 52-85 B (its HPACK encoder doesn't
+      index response headers; it also sends 8 KiB DATA frames where the others send
+      16 KiB). Peregrine wins every "Hello" case (4x less CPU than h2o at 10 × 100,
+      1.7x at 256 × 1) and loses 64 KiB: from memory epoll ties h2o, from a file it
+      loses, and io_uring is 1.5-2x epoll. Cause (perf, perf stat, two A/B runs): the
+      h2 `out`/`wire` lists grow past 32 KiB, so SmpAllocator mmaps and mremaps them,
+      and `releaseIfIdle` freed them each time the streams drained (io_uring checks on
+      every write completion): 6-14 page faults and 0.3-0.7 mremap per request plus
+      mmap_lock contention; the file path adds 4 preads of 16 KiB into the same list.
+      Keeping the capacity measured h2c 11-13 µs (memory) and 16-21 (file), TLS 22-25
+      and 27-36. A one-off io_uring server death in the first run didn't reproduce in
+      129 more runs (the old script called any failed `docker exec` a death); the
+      harness now keeps a dead server and its log
+- [ ] h2 output buffers: pool them per worker, not freed each time the streams drain
+      (see the h2o benchmark); then rerun `h2-bench.sh h2c` and `tls`. In progress
 
 ## M6. HTTP/3 and QUIC 🟡
 
@@ -1307,6 +1356,14 @@ rounds; host load 5-14, so ±15%). CPU/req is server CPU time per request.
 | 64 KiB, 10 × 10 | 77k-78k (4.7 GB/s) | 40 µs | 11k-12k | 149-155 µs | 6.5k-6.7k | 387-403 µs |
 | "Hello", 256 conns × 1 stream | 44k-130k | 16-20 µs | 74k-113k | 27-34 µs | 85k-95k | 62-68 µs |
 
+h2o 2.3.0-DEV over h3, same session as the M5 h2o benchmark (host load 10-12):
+"Hello" 10 × 100 208k-255k at 3.2-4.9 µs; 64 KiB 10 × 10 42k-54k at 69-76 µs (peregrine
+epoll from a file 41-44 µs, io_uring 44-47; nginx 49-73); "Hello" 256 × 1 10k at 55-73 µs
+(h2o takes about 26 ms per request with one stream per connection under h2load, 3.6 ms at
+6 connections: timer-paced between quicly and h2load, not investigated). QPACK bytes per
+response: peregrine 61-64 (static table only, `alt-svc` and `date` as literals), h2o
+38-42 (dynamic table), nginx 56-95.
+
 At 256 × 1, h2load is the limit (it waits about 1.4 ms between requests on a
 connection, for every server), so compare CPU/req there.
 
@@ -1339,10 +1396,10 @@ connection, for every server), so compare CPU/req there.
   - [x] `wrk` keep-alive, plus pipelined ×16 (TechEmpower plaintext style)
   - [ ] Latency percentiles at a fixed rate (`wrk2`)
   - [ ] TLS: handshakes/s per core. Throughput over TLS: first numbers in M4
-  - [ ] h2/h3: h2load
+  - [x] h2/h3: h2load (`bench/scripts/h2-bench.sh`; results in M5 and M6)
   - [x] Baseline nginx; h2o, facil.io (what Zap wraps), uWebSockets and
         may-minihttp (HTTP/1.1, below). Still to do: a minimal raw-epoll C
-        server, h2o 2.3 (2.2.6 was measured), h2/h3 against h2o
+        server, HTTP/1.1 against h2o 2.3 (`comp-h2o23`; 2.2.6 was measured)
   - [x] `zig build bench`, `bench-tls` and `bench-server` build the library
         with `.fast` too. They imported the `peregrine` module, which keeps
         its own optimize mode (Debug by default), so without `-Doptimize` the
