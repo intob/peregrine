@@ -228,6 +228,7 @@ pub fn Worker(comptime Handler: type) type {
             for (free_slots, 0..) |*s, i| s.* = @intCast(opts.max_connections - 1 - i);
             var pool = try BufferPool.init(allocator, opts.read_buffer_size, opts.buffer_pool_size);
             errdefer pool.deinit();
+            h2.preparePool(&pool, opts.h2);
             const req = try Request.init(allocator);
             errdefer req.deinit();
             const resp = try Response.init(allocator, opts.response_body_buffer_size, opts.response_header_buffer_size);
@@ -330,8 +331,10 @@ pub fn Worker(comptime Handler: type) type {
             var events: [512]Poller.Event = undefined;
             while (!self.shutdown.load(.acquire)) {
                 // With no connections there are no timers to run, so block
-                // until something happens (shutdown uses the waker).
-                var timeout: i32 = if (self.open_count == 0) -1 else 1000;
+                // until something happens (shutdown uses the waker); but
+                // the tick goes on until output buffers kept for reuse are
+                // freed.
+                var timeout: i32 = if (self.open_count == 0 and !self.pool.holdsOutput()) -1 else 1000;
                 if (self.quic) |*ep| {
                     // QUIC timers need millisecond resolution; exchanges on
                     // HTTP/3 still want the per-second tick.
@@ -962,6 +965,7 @@ pub fn Worker(comptime Handler: type) type {
             // Written: buffers go back (exchange posts and deadlines end
             // here, not in h2Process).
             conn.releaseIfIdle(&self.pool);
+            if (c.tls) |t| t.releaseIfIdle();
             self.h2Timer(c);
             return true;
         }

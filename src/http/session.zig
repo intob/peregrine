@@ -88,6 +88,23 @@ pub const Recycler = struct {
     pub fn trim(self: *Recycler, allocator: std.mem.Allocator) void {
         while (self.free.len > self.peak -| self.in_use) allocator.free(self.free.pop().?);
         self.peak = self.in_use;
+        // The list shrinks with them: room for twice what is out now.
+        const count = self.in_use + self.free.len;
+        if (count == 0) {
+            allocator.free(self.free.items);
+            self.free.items = &.{};
+        } else if (self.free.items.len > 8 and self.free.items.len > 4 * count) {
+            const items = allocator.alloc([]u8, @max(8, 2 * count)) catch return;
+            @memcpy(items[0..self.free.len], self.free.slice());
+            allocator.free(self.free.items);
+            self.free.items = items;
+        }
+    }
+
+    /// Buffers in use or waiting for reuse: the worker keeps ticking (to
+    /// trim) while there are any, connections or not.
+    pub inline fn holds(self: *const Recycler) bool {
+        return self.in_use + self.free.len > 0;
     }
 
     pub fn deinit(self: *Recycler, allocator: std.mem.Allocator) void {
@@ -186,6 +203,11 @@ pub const BufferPool = struct {
         self.out_large.trim(self.allocator);
     }
 
+    /// Output buffers are held or kept: the worker must keep ticking.
+    pub inline fn holdsOutput(self: *const Self) bool {
+        return self.out_small.holds() or self.out_large.holds();
+    }
+
     /// A buffer of at least `min` bytes: the smallest cached one that
     /// fits (the one released last, of equals: it is the warmest), or a
     /// new one (whole pages).
@@ -196,8 +218,9 @@ pub const BufferPool = struct {
         }
         if (best) |i| {
             const b = self.large[i];
+            // In order, so that the newest stays last.
+            std.mem.copyForwards([]u8, self.large[i .. self.large_len - 1], self.large[i + 1 .. self.large_len]);
             self.large_len -= 1;
-            self.large[i] = self.large[self.large_len];
             self.large_bytes -= b.len;
             return b;
         }
@@ -1102,9 +1125,16 @@ test "large buffers of equal size: the one released last comes back first" {
     try testing.expect((try pool.acquireLarge(8192)).ptr == c.ptr);
     try testing.expect((try pool.acquireLarge(8192)).ptr == b.ptr);
     try testing.expect((try pool.acquireLarge(8192)).ptr == a.ptr);
+    // Taking a buffer of another size out keeps the order.
+    const x = try pool.acquireLarge(16384);
     pool.releaseLarge(a);
+    pool.releaseLarge(x);
     pool.releaseLarge(b);
     pool.releaseLarge(c);
+    try testing.expect((try pool.acquireLarge(16384)).ptr == x.ptr);
+    try testing.expect((try pool.acquireLarge(8192)).ptr == c.ptr);
+    pool.releaseLarge(c);
+    pool.releaseLarge(x);
 }
 
 test "recycler: keeps as many as were in use at once recently, frees the rest on trim" {
@@ -1133,8 +1163,9 @@ test "recycler: keeps as many as were in use at once recently, frees the rest on
     try testing.expectEqual(@as(usize, 1), r.free.len);
     r.trim(a);
     try testing.expectEqual(@as(usize, 0), r.free.len);
-    // Only the list itself is left.
-    try testing.expectEqual(counting.allocations - 1, counting.deallocations);
+    // Nothing is left, the list included.
+    try testing.expectEqual(counting.allocations, counting.deallocations);
+    try testing.expect(!r.holds());
 }
 
 test "body larger than the pool buffer grows the buffer" {

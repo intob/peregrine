@@ -403,6 +403,14 @@ pub fn Worker(comptime Handler: type) type {
         active: List,
         open_count: usize = 0,
         h2_count: usize = 0,
+        /// Submissions whose last completion hasn't arrived: each takes an
+        /// SQE (`getSqe`) and ends with a completion without F_MORE.
+        ops: usize = 0,
+        /// Nothing in flight can touch our memory: before the ring runs,
+        /// and after `quiesce` saw every operation complete. Otherwise
+        /// deinit leaks what operations might still read or write.
+        quiet: bool = true,
+        drain_ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms },
         thread: ?std.Thread = null,
         tls_pools: ?tls.Pools = null,
         /// Handshake randomness, seeded from the OS once per worker.
@@ -442,6 +450,7 @@ pub fn Worker(comptime Handler: type) type {
             for (free_slots, 0..) |*s, i| s.* = @intCast(opts.max_connections - 1 - i);
             var pool = try BufferPool.init(allocator, opts.read_buffer_size, opts.buffer_pool_size / 4 + 1);
             errdefer pool.deinit();
+            h2.preparePool(&pool, opts.h2);
             var out_pool = try BufferPool.init(allocator, out_size, opts.buffer_pool_size);
             errdefer out_pool.deinit();
             const file_buf = try allocator.alloc(u8, 16 * 1024);
@@ -520,6 +529,17 @@ pub fn Worker(comptime Handler: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            if (!self.quiet) {
+                // The kernel didn't finish in time: operations may still
+                // read our buffers (sends) or write them (receives). Leak
+                // them rather than free them under it.
+                for (self.conns) |*c| {
+                    if (c.open) sys.close(c.fd);
+                }
+                sys.close(self.listener);
+                self.ring.deinit();
+                return;
+            }
             for (self.conns) |*c| {
                 if (c.open) {
                     sys.close(c.fd);
@@ -545,7 +565,7 @@ pub fn Worker(comptime Handler: type) type {
         }
 
         fn freeBuffers(self: *Self) void {
-            if (!self.buffers_live) return;
+            if (!self.buffers_live or !self.quiet) return;
             self.buffers.deinit(self.ring.fd, self.allocator);
             self.buffers_live = false;
         }
@@ -559,6 +579,7 @@ pub fn Worker(comptime Handler: type) type {
                 std.debug.print("io_uring enable failed: {s}\n", .{@tagName(std.posix.errno(rc))});
                 return;
             }
+            self.quiet = false;
             self.armAccept();
             self.armWaker();
             if (self.quic != null) self.armUdp();
@@ -569,12 +590,15 @@ pub fn Worker(comptime Handler: type) type {
                     error.SignalInterrupt => continue,
                     else => {
                         std.debug.print("io_uring submit failed: {s}\n", .{@errorName(err)});
-                        return;
+                        break;
                     },
                 };
                 const n = self.ring.copy_cqes(&cqes, 0) catch 0;
                 self.tick();
-                for (cqes[0..n]) |cqe| self.dispatch(cqe);
+                for (cqes[0..n]) |cqe| {
+                    if (cqe.flags & linux.IORING_CQE_F_MORE == 0) self.ops -= 1;
+                    self.dispatch(cqe);
+                }
                 // WebSocket output queued by handlers during this batch, or
                 // by other threads (which also wrote the waker).
                 self.drainMailbox();
@@ -600,34 +624,52 @@ pub fn Worker(comptime Handler: type) type {
                     conn.advance(n);
                 }
             }
-            self.drainConns(&cqes);
+            self.quiesce(&cqes);
         }
 
-        /// Closes every connection and waits for the operations still in
-        /// flight (shutting the sockets down fails writes at once), so no
-        /// send is left reading a buffer after it went back or was freed.
-        /// Connections accepted meanwhile are closed. Gives up after two
-        /// seconds; deinit frees what is left.
-        fn drainConns(self: *Self, cqes: []linux.io_uring_cqe) void {
+        /// Closes every connection, cancels everything else in flight
+        /// (accept, waker, tick, HTTP/3's poll and timers), and waits until
+        /// no operation is left, so nothing is freed that a send may still
+        /// read or a receive write. Only connection completions are
+        /// handled; one accepted meanwhile is closed. Gives up after two
+        /// seconds (or if the ring fails), and deinit then leaks.
+        fn quiesce(self: *Self, cqes: []linux.io_uring_cqe) void {
             for (self.conns) |*c| {
                 if (c.open) self.closeConn(c);
             }
+            const sqe = self.getSqe();
+            sqe.prep_cancel(0, linux.IORING_ASYNC_CANCEL_ANY);
+            sqe.user_data = userData(0, SPECIAL_SLOT, .cancel);
             const deadline = sys.monotonicSeconds() + 2;
-            while (self.open_count > 0 and sys.monotonicSeconds() < deadline) {
+            var timer = false;
+            while (self.ops > 0) {
+                if (sys.monotonicSeconds() >= deadline) return;
+                // A short timeout of our own, so that waiting always ends.
+                if (!timer) {
+                    const t = self.getSqe();
+                    t.prep_timeout(&self.drain_ts, 0, 0);
+                    t.user_data = userData(0, SPECIAL_SLOT, .tick);
+                    timer = true;
+                }
                 _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
                     error.SignalInterrupt => continue,
                     else => return,
                 };
                 const n = self.ring.copy_cqes(cqes, 0) catch 0;
                 for (cqes[0..n]) |cqe| {
+                    if (cqe.flags & linux.IORING_CQE_F_MORE == 0) self.ops -= 1;
                     const op: Op = @fromBackingInt(@intCast(@as(u8, @truncate(cqe.user_data))));
-                    if (op == .accept) {
-                        if (cqe.res >= 0) sys.close(cqe.res);
-                        continue;
+                    const slot: u32 = @truncate((cqe.user_data >> 8) & 0xFF_FFFF);
+                    if (slot != SPECIAL_SLOT) {
+                        self.dispatch(cqe);
+                    } else if (op == .accept and cqe.res >= 0) {
+                        sys.close(cqe.res);
+                    } else if (op == .tick) {
+                        timer = false;
                     }
-                    self.dispatch(cqe);
                 }
             }
+            self.quiet = true;
         }
 
         fn dispatch(self: *Self, cqe: linux.io_uring_cqe) void {
@@ -689,6 +731,7 @@ pub fn Worker(comptime Handler: type) type {
         // -- SQE helpers ---------------------------------------------------
 
         fn getSqe(self: *Self) *linux.io_uring_sqe {
+            self.ops += 1;
             while (true) {
                 return self.ring.get_sqe() catch {
                     // Full: flush what we have to the kernel and retry.
@@ -741,7 +784,9 @@ pub fn Worker(comptime Handler: type) type {
 
         fn armTick(self: *Self) void {
             const quic_conns = if (self.quic) |*ep| ep.connections() else 0;
-            if (self.tick_armed or (self.open_count == 0 and quic_conns == 0)) return;
+            // No connections, no timers; but the tick goes on until output
+            // buffers kept for reuse are freed.
+            if (self.tick_armed or (self.open_count == 0 and quic_conns == 0 and !self.pool.holdsOutput())) return;
             const sqe = self.getSqe();
             sqe.prep_timeout(&self.tick_ts, 0, 0);
             sqe.user_data = userData(0, SPECIAL_SLOT, .tick);

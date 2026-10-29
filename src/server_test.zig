@@ -1755,6 +1755,49 @@ test "h2c: large bodies through flow control, both directions" {
     try forEachBackend(testH2LargeBodies);
 }
 
+test "h2c: output buffers kept for reuse are freed once every client has left" {
+    try forEachBackend(testH2OutputFreed);
+}
+
+fn testH2OutputFreed(backend: Backend) !void {
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    const r = try Running.start(backend, h2Config());
+    defer r.stop();
+    {
+        const c = try H2Client.connect(r.port);
+        defer c.close();
+        var big: H2Client.Reply = .{};
+        defer big.deinit();
+        try c.fetch(1, "GET", "/big", null, &big);
+        try testing.expectEqual(@as(usize, big_body_len), big.body.items.len);
+    }
+    // With no connections the workers would wait for events with no
+    // timeout; they tick on until what they kept is freed (two ticks).
+    // Read from this thread while the workers run: counts only, polled.
+    var tries: u32 = 0;
+    while (workersHoldOutput(r.srv)) : (tries += 1) {
+        if (tries == 60) return error.OutputBuffersKept;
+        sleepMs(100);
+    }
+}
+
+fn workersHoldOutput(srv: *Server(TestHandler)) bool {
+    for (srv.workers) |*w| switch (w.*) {
+        .poll => |*p| if (poolHoldsOutput(&p.pool)) return true,
+        .uring => |*u| if (sys.is_linux) {
+            if (poolHoldsOutput(&u.pool)) return true;
+        },
+    };
+    return false;
+}
+
+fn poolHoldsOutput(pool: anytype) bool {
+    inline for (.{ &pool.out_small, &pool.out_large }) |r| {
+        if (@atomicLoad(usize, &r.in_use, .monotonic) + @atomicLoad(usize, &r.free.len, .monotonic) > 0) return true;
+    }
+    return false;
+}
+
 fn testH2LargeBodies(backend: Backend) !void {
     for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
     const r = try Running.start(backend, h2Config());
