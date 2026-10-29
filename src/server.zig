@@ -161,7 +161,8 @@ pub const Config = struct {
     /// an exchange slot (`max_exchanges_per_worker`).
     websocket_max_message_size: usize = 16 * 1024 * 1024,
     /// Unsent WebSocket output per connection before `Conn.send` fails with
-    /// SendQueueFull. A connection whose peer stops reading is closed after
+    /// SendQueueFull (an empty queue takes one frame of any size). A
+    /// connection whose peer stops reading is closed after
     /// `request_timeout_s` without write progress.
     websocket_max_send_queue_bytes: usize = 4 * 1024 * 1024,
     /// Requests a worker may hold open at once through `resp.later()` or

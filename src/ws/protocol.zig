@@ -242,6 +242,39 @@ fn utf8CompletePrefix(data: []const u8) usize {
     return data.len;
 }
 
+/// Whether `tail`, an incomplete final sequence, can still become valid
+/// UTF-8: a lead byte, then continuation bytes, the first of them in the
+/// range that rules out overlong forms, surrogates and code points past
+/// U+10FFFF.
+fn isUtf8Prefix(tail: []const u8) bool {
+    if (tail.len == 0) return true;
+    const b0 = tail[0];
+    if (b0 < 0xC2 or b0 > 0xF4) return false;
+    if (tail.len >= 2) {
+        const lo: u8, const hi: u8 = switch (b0) {
+            0xE0 => .{ 0xA0, 0xBF },
+            0xED => .{ 0x80, 0x9F },
+            0xF0 => .{ 0x90, 0xBF },
+            0xF4 => .{ 0x80, 0x8F },
+            else => .{ 0x80, 0xBF },
+        };
+        if (tail[1] < lo or tail[1] > hi) return false;
+    }
+    for (tail[@min(tail.len, 2)..]) |b| if (b & 0xC0 != 0x80) return false;
+    return true;
+}
+
+/// Validates text that is still arriving: `data[valid.*..]` up to the last
+/// complete sequence (advancing `valid`), and that what follows can still
+/// complete, so invalid text fails as soon as it arrives (fail fast,
+/// RFC 6455 §8.1).
+fn validateUtf8Partial(data: []const u8, valid: *usize) Error!void {
+    const upto = valid.* + utf8CompletePrefix(data[valid.*..]);
+    if (!std.unicode.utf8ValidateSlice(data[valid.*..upto])) return error.InvalidUtf8;
+    if (!isUtf8Prefix(data[upto..])) return error.InvalidUtf8;
+    valid.* = upto;
+}
+
 /// Frames up to this size are read straight into the reassembly buffer.
 /// Larger ones go through the read buffer: the kernel's copy into a cold
 /// megabyte cost more than its copy into the hot read buffer plus ours out
@@ -290,6 +323,10 @@ pub const Decoder = struct {
     msg_valid: usize = 0,
     /// `msg_buf` holds the message returned by the last call; reset on the next.
     msg_delivered: bool = false,
+    /// A text frame being held whole while it arrives: payload bytes
+    /// unmasked so far, and the prefix of them validated.
+    part_masked: usize = 0,
+    part_valid: usize = 0,
 
     pub fn init(pool: *BufferPool, max_message_size: usize) Self {
         return .{ .pool = pool, .max_message_size = max_message_size };
@@ -427,12 +464,22 @@ pub const Decoder = struct {
                     if (msg_len > self.max_message_size) return error.MessageTooBig;
                     if (hdr.fin and !in_progress and total <= self.buf.len) {
                         // Whole message, fits the buffer: deliver in place.
-                        if (data.len < total) return null;
-                        const payload = data[hdr.hdr_len..total];
-                        applyMask(payload, hdr.key, 0);
-                        if (hdr.opcode == .text and !std.unicode.utf8ValidateSlice(payload)) {
+                        // Text is unmasked and checked as it arrives.
+                        const payload = data[hdr.hdr_len..@min(data.len, total)];
+                        if (data.len < total) {
+                            if (hdr.opcode == .text) {
+                                applyMask(payload[self.part_masked..], hdr.key, self.part_masked);
+                                self.part_masked = payload.len;
+                                try validateUtf8Partial(payload, &self.part_valid);
+                            }
+                            return null;
+                        }
+                        applyMask(payload[self.part_masked..], hdr.key, self.part_masked);
+                        if (hdr.opcode == .text and !std.unicode.utf8ValidateSlice(payload[self.part_valid..])) {
                             return error.InvalidUtf8;
                         }
+                        self.part_masked = 0;
+                        self.part_valid = 0;
                         self.start += total;
                         return .{ .opcode = hdr.opcode, .payload = payload };
                     }
@@ -483,12 +530,7 @@ pub const Decoder = struct {
     /// Validates newly appended text as far as the last complete sequence,
     /// so invalid text fails as soon as it arrives.
     fn validateUtf8Progress(self: *Self) Error!void {
-        const pending = self.msg_buf[self.msg_valid..self.msg_len];
-        const upto = self.msg_valid + utf8CompletePrefix(pending);
-        if (!std.unicode.utf8ValidateSlice(self.msg_buf[self.msg_valid..upto])) {
-            return error.InvalidUtf8;
-        }
-        self.msg_valid = upto;
+        try validateUtf8Partial(self.msg_buf[0..self.msg_len], &self.msg_valid);
     }
 };
 
@@ -721,6 +763,42 @@ test "invalid UTF-8 in text is rejected, also across fragments and early" {
         try t.feed(f[0..8]);
         try testing.expectEqual(@as(?Error, error.InvalidUtf8), t.err);
     }
+    // So does an incomplete sequence that can't be completed (Autobahn
+    // 6.4.2 and 6.4.4), in a fragment and in one frame still arriving.
+    const doomed = [_][]const u8{ "ok\xf4\x90", "\xe0\x80", "\xed\xa0", "\xf0\x80", "\xc1", "\xf5", "\xe2\x82a" };
+    for (doomed) |d| {
+        for ([_]bool{ false, true }) |one_frame| {
+            const t = try TestDecoder.init(4096, 1 << 20);
+            defer t.deinit();
+            var buf: [128]u8 = undefined;
+            var payload: [64]u8 = undefined;
+            @memcpy(payload[0..d.len], d);
+            @memcpy(payload[d.len..][0..8], "\x80\x80tail..");
+            // Header and mask, then the payload up to the doomed bytes: the
+            // whole of a first fragment, or part of a longer single frame.
+            const f = if (one_frame)
+                frame(&buf, true, .text, payload[0 .. d.len + 8])
+            else
+                frame(&buf, false, .text, d);
+            try t.feed(f[0 .. 6 + d.len]);
+            try testing.expectEqual(@as(?Error, error.InvalidUtf8), t.err);
+        }
+    }
+    // A valid frame arriving in pieces is unmasked and checked as it comes,
+    // and delivered whole.
+    {
+        const t = try TestDecoder.init(4096, 1 << 20);
+        defer t.deinit();
+        var buf: [128]u8 = undefined;
+        const text = "h\xc3\xa9llo \xe2\x82\xac \xf0\x9f\x98\x80!";
+        const f = frame(&buf, true, .text, text);
+        for (f, 0..) |_, i| {
+            try t.feed(f[i..][0..1]);
+            try testing.expectEqual(@as(?Error, null), t.err);
+        }
+        try testing.expectEqual(@as(usize, 1), t.count);
+        try testing.expectEqualSlices(u8, text, t.log.items[9..]);
+    }
 }
 
 test "messages over the limit are rejected from the header" {
@@ -893,4 +971,159 @@ test "random splits produce identical messages" {
         try testing.expectEqual(@as(?Error, null), t.err);
         try testing.expectEqualSlices(u8, ref.log.items, t.log.items);
     }
+}
+
+// Fuzz target: a stream of client frames, decoded with a buffer that holds
+// every frame whole and again with a small one, read in arbitrary pieces
+// (which streams large frames and reads them in place). Both must deliver
+// the same messages and fail the same way. Most inputs are valid streams,
+// whose messages are also checked against what was encoded; the rest mix in
+// mangled frames (bad bits, opcodes, lengths, missing masks, truncation).
+fn fuzzDecoder(_: void, smith: *std.testing.Smith) anyerror!void {
+    const a = testing.allocator;
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(a);
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(a);
+    const valid = smith.value(u8) & 3 != 0;
+    var count: usize = 0;
+    while (count < 8 and !smith.eos()) : (count += 1) {
+        if (valid or smith.value(u8) & 1 == 0) {
+            try fuzzMessage(smith, &input, &expected);
+        } else {
+            try fuzzMangledFrame(smith, &input);
+        }
+    }
+    const max_message = 4096;
+
+    const whole = try TestDecoder.init(8192, max_message);
+    defer whole.deinit();
+    try whole.feed(input.items);
+    if (valid) {
+        try testing.expectEqual(@as(?Error, null), whole.err);
+        try testing.expectEqualSlices(u8, expected.items, whole.log.items);
+    }
+
+    const sizes = [_]usize{ 256, 512, 1024 };
+    const split = try TestDecoder.init(sizes[smith.value(u8) % sizes.len], max_message);
+    defer split.deinit();
+    var rest: []const u8 = input.items;
+    while (rest.len > 0 and split.err == null) {
+        const n = @min(rest.len, 1 + @as(usize, smith.value(u8)) * 8);
+        try split.feed(rest[0..n]);
+        rest = rest[n..];
+    }
+    try testing.expectEqualSlices(u8, whole.log.items, split.log.items);
+    // Streamed text is validated as it arrives, so invalid UTF-8 in a frame
+    // the input cuts short fails only there.
+    if (!(whole.err == null and split.err == @as(?Error, error.InvalidUtf8))) {
+        try testing.expectEqual(whole.err, split.err);
+    }
+}
+
+/// Appends one valid message: a ping or pong, or text or binary in up to
+/// three fragments with control frames between them, and logs it as
+/// `TestDecoder` does.
+fn fuzzMessage(smith: *std.testing.Smith, input: *std.ArrayList(u8), expected: *std.ArrayList(u8)) !void {
+    const a = testing.allocator;
+    var payload: [2048]u8 = undefined;
+    var scratch: [2048 + max_header_len]u8 = undefined;
+    var key: [4]u8 = undefined;
+    smith.bytes(&key);
+    if (smith.value(u8) % 4 == 0) {
+        const op: Opcode = if (smith.value(u8) & 1 == 0) .ping else .pong;
+        const p = payload[0..smith.slice(payload[0..max_control_payload])];
+        try input.appendSlice(a, encodeFrame(&scratch, true, op, p, key));
+        try fuzzLog(expected, op, p);
+        return;
+    }
+    const text = smith.value(u8) & 1 == 0;
+    var len: usize = 0;
+    if (text) {
+        const pieces = [_][]const u8{ "a", "hello ", "\xc3\xa9", "\xe2\x82\xac", "\xf0\x9f\x98\x80", "\x00", "\xef\xbf\xbf" };
+        const target = @as(usize, smith.value(u16)) % payload.len;
+        while (len < target) {
+            const pc = pieces[smith.value(u8) % pieces.len];
+            if (len + pc.len > payload.len) break;
+            @memcpy(payload[len..][0..pc.len], pc);
+            len += pc.len;
+        }
+    } else {
+        len = smith.slice(&payload);
+    }
+    const message = payload[0..len];
+    // Fragment boundaries anywhere, splitting UTF-8 sequences too.
+    const fragments = 1 + smith.value(u8) % 3;
+    var at: usize = 0;
+    for (0..fragments) |i| {
+        const last = i + 1 == fragments;
+        const end = if (last) len else at + (if (len - at == 0) 0 else smith.value(u16) % (len - at + 1));
+        const op: Opcode = if (i > 0) .continuation else if (text) .text else .binary;
+        try input.appendSlice(a, encodeFrame(&scratch, last, op, message[at..end], key));
+        at = end;
+        if (!last and smith.value(u8) % 4 == 0) {
+            var ping: [16]u8 = undefined;
+            const p = ping[0..smith.slice(&ping)];
+            try input.appendSlice(a, encodeFrame(&scratch, true, .ping, p, key));
+            try fuzzLog(expected, .ping, p);
+        }
+    }
+    try fuzzLog(expected, if (text) .text else .binary, message);
+}
+
+/// Appends a frame that may break any rule, or end early.
+fn fuzzMangledFrame(smith: *std.testing.Smith, input: *std.ArrayList(u8)) !void {
+    const a = testing.allocator;
+    var payload: [600]u8 = undefined;
+    const p = payload[0..smith.slice(&payload)];
+    var b0 = smith.value(u8);
+    // Mostly a known opcode with RSV clear, so later checks are reached.
+    if (smith.value(u8) & 3 != 0) b0 &= 0x8f;
+    var b1: u8 = if (smith.value(u8) % 8 != 0) 0x80 else 0;
+    var ext: [8]u8 = undefined;
+    var ext_len: usize = 0;
+    switch (smith.value(u8) % 4) {
+        0, 1 => b1 |= @intCast(@min(p.len, 125)),
+        2 => {
+            b1 |= 126;
+            std.mem.writeInt(u16, ext[0..2], smith.value(u16), .big);
+            ext_len = 2;
+        },
+        else => {
+            b1 |= 127;
+            std.mem.writeInt(u64, &ext, smith.value(u64) >> @intCast(smith.value(u8) % 64), .big);
+            ext_len = 8;
+        },
+    }
+    try input.append(a, b0);
+    try input.append(a, b1);
+    try input.appendSlice(a, ext[0..ext_len]);
+    if (b1 & 0x80 != 0) {
+        var key: [4]u8 = undefined;
+        smith.bytes(&key);
+        try input.appendSlice(a, &key);
+    }
+    try input.appendSlice(a, p);
+}
+
+fn fuzzLog(log: *std.ArrayList(u8), op: Opcode, payload: []const u8) !void {
+    const a = testing.allocator;
+    try log.append(a, @backingInt(op));
+    var len_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_buf, payload.len, .little);
+    try log.appendSlice(a, &len_buf);
+    try log.appendSlice(a, payload);
+}
+
+test "fuzz: ws decoder" {
+    try std.testing.fuzz({}, fuzzDecoder, .{
+        .corpus = &.{
+            // A text message, a ping, a binary message in two fragments.
+            &[_]u8{ 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x02, 0x10, 0x00, 0x05, 0x40, 0x00 },
+            // Mostly mangled frames.
+            &[_]u8{ 0x00, 0x01, 0x00, 0x01, 0x81, 0x03, 0x00, 0x01, 0xff, 0xff, 0x00, 0x02, 0x03 },
+            // Larger messages: streamed and read in place with the small buffer.
+            &[_]u8{ 0x01, 0x07, 0xff, 0xff, 0xff, 0xff, 0x01, 0x01, 0xff, 0x07, 0x01, 0x02, 0x00, 0xf0, 0x07, 0x80, 0x03 },
+        },
+    });
 }

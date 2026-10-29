@@ -53,7 +53,7 @@ Design rules that apply to every layer:
 |---|---|
 | M1. HTTP/1.1 core | ✅ done (streaming responses landed with the M5 handler API) |
 | M2. Throughput architecture | 🟡 io_uring works (opt-in; faster than epoll for keep-alive requests, 4-5% behind for pipelined requests and uploads); sendfile done (plaintext, and TLS with kTLS); NUMA open |
-| M3. WebSockets over HTTP/1.1 | ✅ reworked; benchmarked against uWebSockets (even on small messages, 15-20% less CPU at 16-64 KiB); permessage-deflate, Autobahn open |
+| M3. WebSockets over HTTP/1.1 | ✅ reworked; benchmarked against uWebSockets (even on small messages, 15-20% less CPU at 16-64 KiB); Autobahn 301/301 strict on every backend, plain and TLS; decoder fuzzed; permessage-deflate open |
 | M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; tables for P-256 and X25519, RSA-PSS, session tickets, kTLS, 0-RTT and SNI certificates done; the rest of "faster handshakes" open |
 | M5. HTTP/2 | ✅ h2 over TLS (ALPN) and h2c on every backend, h2spec 146/146 over TLS, fuzzed, benchmarked; streamed request bodies on every protocol; WebSockets over h2 (RFC 8441); RFC 9218 priorities |
 | M6. HTTP/3 and QUIC | 🟡 HTTP/3 over QUIC v1 on every backend, interop-tested (aioquic, curl/ngtcp2, h2load), benchmarked against nginx and Caddy; WebSockets over h3 (RFC 9220); 0-RTT; migration, pacing, ECN, PMTUD open |
@@ -272,7 +272,36 @@ Still open:
       takeover; `std.compress.flate` covers decompression)
 - [ ] Optional idle timeout / server keepalive pings
 - [ ] io_uring: parse straight out of the provided buffer like the HTTP path does
-- [ ] Autobahn test suite, and a fuzz target over the decoder
+- [x] **Autobahn testsuite** (25.10.1, `wstest -m fuzzingclient` against
+      `bench-server`'s `/ws` echo, cases 1-10; 12 and 13 are
+      permessage-deflate): 301 of 301 OK (3 of them INFORMATIONAL by
+      design, the close-code cases 7.1.6 and 7.13.x), every close clean, on
+      epoll and io_uring, over `ws://` and `wss://`. uWebSockets 20.74 on
+      cases 1-7: 232 OK, 11 NON-STRICT. The image is amd64 only and runs
+      under Rosetta; set `PYTHONUNBUFFERED=1`, or its progress lines lag
+      far behind the case being run. What it found:
+  - [x] A message bigger than `max_send_queue_bytes` (4 MiB) could never be
+        sent: `send` returned SendQueueFull even on an empty queue, so 9.1.4
+        to 9.2.6 (4-16 MiB echoes) waited for Autobahn's timeout. An empty
+        queue now takes one frame of any size (the queue holds at most the
+        limit or one frame), close to uWebSockets' rule (drop only when
+        what is already buffered is over the limit)
+  - [x] Fail fast on UTF-8 (6.4.2-6.4.4, NON-STRICT before): text is
+        rejected as soon as the incomplete final sequence can't become
+        valid (`f4 90`, `ed a0`, `e0 80`, ...), and a text frame held whole
+        while it arrives is unmasked and checked as each piece lands, not
+        once complete
+- [x] **Fuzz target** `fuzz: ws decoder`: structure-aware, a stream of up to
+      eight messages or mangled frames (bad RSV bits and opcodes, missing
+      masks, oversized and non-minimal lengths, truncation). Valid streams
+      (three in four) must decode to exactly the messages encoded: text
+      built from 1-4 byte sequences, fragment boundaries anywhere (also
+      inside sequences), pings between fragments. Every stream is decoded
+      with a buffer that holds each frame whole and again with a 256-1024
+      byte buffer read in arbitrary pieces (streamed, read in place), and
+      both must deliver the same messages and fail the same way. On Linux
+      with 3 jobs: 20 minutes before the fail-fast change, 10 after, no
+      failures
 - [x] **Benchmark against uWebSockets.** `bench/ws_load.zig` (`zig build
       ws-load`): threads with their own epoll, each connection upgrading
       over HTTP/1.1, then keeping `depth` masked messages in flight and
@@ -1055,8 +1084,8 @@ connection, for every server), so compare CPU/req there.
 - [x] TLS fuzz target over `tls.Conn` (see M4)
 - [ ] Structure-aware fuzzing (grammar-based request generation)
 - [ ] Differential parser testing (HTTP Garden) for smuggling discrepancies
-- [ ] Protocol suites: Autobahn (WebSockets), tlsfuzzer/BoGo (TLS), h2spec (h2),
-      quic-interop-runner (QUIC/h3)
+- [ ] Protocol suites: tlsfuzzer/BoGo (TLS), quic-interop-runner (QUIC/h3).
+      Done: Autobahn (WebSockets, M3), h2spec (h2, M5), h3spec (h3, M6)
 - [ ] Response correctness (REDbot)
 - [x] **The occasional "1 tests leaked memory" on Linux** (seen twice on
       2026-10-28, never reproduced on demand): caught with the full log in a

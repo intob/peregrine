@@ -23,6 +23,8 @@ pub const Options = struct {
     /// Messages larger than this fail the connection with 1009.
     max_message_size: usize = 16 * 1024 * 1024,
     /// Unsent output per connection before `send` fails with SendQueueFull.
+    /// An empty queue takes one frame of any size, so the queue holds at
+    /// most this or one frame, whichever is larger.
     max_send_queue_bytes: usize = 4 * 1024 * 1024,
 };
 
@@ -142,8 +144,10 @@ pub const Conn = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
             if (self.close_sent) return error.Closed;
-            // A close frame always fits: it ends the connection.
-            if (opcode != .close and self.queued + total > self.opts.max_send_queue_bytes) {
+            // A close frame always fits: it ends the connection. So does
+            // any frame when nothing is queued, or a message larger than
+            // the limit could never be sent.
+            if (opcode != .close and self.queued > 0 and self.queued + total > self.opts.max_send_queue_bytes) {
                 return error.SendQueueFull;
             }
             try self.shared.ensureUnusedCapacity(self.allocator, total);
@@ -445,6 +449,11 @@ test "send queue limit and control frame size" {
     // Writing makes room again.
     try h.flush();
     try h.conn.send(&big, true);
+    // An empty queue takes a frame larger than the limit, but nothing more.
+    try h.flush();
+    const huge: [300]u8 = @splat('h');
+    try h.conn.send(&huge, true);
+    try testing.expectError(error.SendQueueFull, h.conn.send("x", true));
     // A close frame is accepted even when the queue is full.
     try h.conn.close(1000, "");
     try testing.expectEqual(@as(usize, 1), h.drainMailbox());
