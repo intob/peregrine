@@ -263,10 +263,11 @@ pub const Pacer = struct {
     }
 
     /// When a held-back datagram of `size` bytes is due, as of the last
-    /// `refill`: null if it may go now.
-    pub fn nextSend(self: *const Self, size: u64, cc: *const Congestion, rtt: *const Rtt) ?u64 {
+    /// `refill`: null if it may go now. `room` is what the congestion
+    /// window has left: no point waiting for more tokens than that.
+    pub fn nextSend(self: *const Self, size: u64, room: u64, cc: *const Congestion, rtt: *const Rtt) ?u64 {
         if (self.tokens >= size) return null;
-        const want = @max(self.capacity(cc, rtt) / 2, size);
+        const want = @max(@min(self.capacity(cc, rtt) / 2, room), size);
         // (want - tokens) / rate, rounded up.
         const wait = mulDivCeil(want - self.tokens, rate_den * @max(rtt.smoothed, 1), rate_num * @max(cc.window, 1));
         return self.last +| wait;
@@ -354,12 +355,16 @@ test "pacer: burst allowance, then the paced rate" {
     try testing.expectEqual(@as(u64, 12000), p.capacity(&cc, &rtt));
     p.refill(1_000_000, &cc, &rtt);
     for (0..10) |_| {
-        try testing.expectEqual(@as(?u64, null), p.nextSend(1200, &cc, &rtt));
+        try testing.expectEqual(@as(?u64, null), p.nextSend(1200, std.math.maxInt(u64), &cc, &rtt));
         p.onSent(1200);
     }
     // Empty: due once half the bucket is back. The rate is
     // 1.25 · 12000 / 100 ms = 0.15 bytes/µs, so 6000 bytes take 40 ms.
-    try testing.expectEqual(@as(?u64, 1_000_000 + 40_000), p.nextSend(1200, &cc, &rtt));
+    try testing.expectEqual(@as(?u64, 1_000_000 + 40_000), p.nextSend(1200, std.math.maxInt(u64), &cc, &rtt));
+    // With room for only two datagrams in the window, only that long; for
+    // less than one, a datagram's worth.
+    try testing.expectEqual(@as(?u64, 1_000_000 + 16_000), p.nextSend(1200, 2400, &cc, &rtt));
+    try testing.expectEqual(@as(?u64, 1_000_000 + 8_000), p.nextSend(1200, 100, &cc, &rtt));
     try testing.expectEqual(@as(u64, 1200), p.available(1_008_000, &cc, &rtt));
     try testing.expectEqual(@as(u64, 6000), p.available(1_040_000, &cc, &rtt));
     // Idle time refills it to the burst, no further.
@@ -368,7 +373,7 @@ test "pacer: burst allowance, then the paced rate" {
     p.refill(1_020_000, &cc, &rtt);
     try testing.expectEqual(@as(u64, 3000), p.tokens);
     p.onSent(2400);
-    try testing.expectEqual(@as(?u64, 1_020_000 + 36_000), p.nextSend(1200, &cc, &rtt));
+    try testing.expectEqual(@as(?u64, 1_020_000 + 36_000), p.nextSend(1200, std.math.maxInt(u64), &cc, &rtt));
 }
 
 test "pacer: the rate follows the window and the RTT" {
@@ -383,11 +388,11 @@ test "pacer: the rate follows the window and the RTT" {
     p.onSent(p.tokens);
     try testing.expectEqual(@as(u64, 3000), p.available(200, &cc, &rtt));
     // Half the bucket, 15000 bytes, is back in 1 ms.
-    try testing.expectEqual(@as(?u64, 1000), p.nextSend(1200, &cc, &rtt));
+    try testing.expectEqual(@as(?u64, 1000), p.nextSend(1200, std.math.maxInt(u64), &cc, &rtt));
     // Twice the window: twice the rate (and twice the bucket).
     cc.window = 2_400_000;
     try testing.expectEqual(@as(u64, 6000), p.available(200, &cc, &rtt));
-    try testing.expectEqual(@as(?u64, 1000), p.nextSend(1200, &cc, &rtt));
+    try testing.expectEqual(@as(?u64, 1000), p.nextSend(1200, std.math.maxInt(u64), &cc, &rtt));
     // Twice the RTT: half the rate.
     cc.window = 1_200_000;
     rtt = .{};

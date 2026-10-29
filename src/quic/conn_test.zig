@@ -531,7 +531,7 @@ test "QUIC pacing: ACKs and probes don't wait; the pacer's timer releases data" 
     try testing.expectEqual(@as(usize, 0), s.send(&buf, h.now));
     try testing.expect(s.paced_waits > 0);
     const due = s.deadline().?;
-    try testing.expectEqual(s.pacer.nextSend(s.max_datagram, &s.cc, &s.rtt).?, due);
+    try testing.expectEqual(s.pacing_hold.?, due);
     try testing.expect(due > h.now and due < h.now + s.cfg.max_ack_delay_ms * 1000);
 
     // Two more ack-eliciting packets: the ACK is due now and goes alone.
@@ -577,4 +577,101 @@ test "QUIC pacing: ACKs and probes don't wait; the pacer's timer releases data" 
     // And the rest still follows when the pacer allows.
     try h.run(400);
     try testing.expectEqual(@as(usize, 200_000), h.client.readAll(id).len);
+}
+
+test "QUIC pacing: no busy loop while the amplification limit leaves a few bytes" {
+    const h = try Harness.init(.{}, noTweak);
+    defer h.deinit();
+    // Only the client's first datagram arrives; the client then goes quiet.
+    var buf: [1500]u8 = undefined;
+    try h.toServer(buf[0..try h.client.send(&buf)]);
+    const s = h.server.?;
+    while (s.send(&buf, h.now) > 0) {}
+    // 30 bytes of budget left (a long first flight), the pacer dry.
+    s.bytes_sent = 3 * s.bytes_received - 30;
+    s.pacer.tokens = 0;
+    for (0..20) |_| {
+        // A probe timeout makes the handshake data pending again, but too
+        // little budget is left to send any of it.
+        try testing.expectEqual(@as(usize, 0), s.send(&buf, h.now));
+        // Every deadline is ahead: a timer that fires doesn't come straight
+        // back with nothing to do.
+        const d = s.deadline() orelse break;
+        try testing.expect(d > h.now);
+        h.now = d;
+        s.onTimeout(h.now);
+        if (s.isClosed()) break;
+    }
+}
+
+test "QUIC pacing: a small window waits only for the room it has" {
+    const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20 }, noTweak);
+    defer h.deinit();
+    try h.run(10);
+    const s = h.server.?;
+    // After persistent congestion on a 100 ms path: two datagrams of window.
+    s.rtt = .{};
+    s.rtt.update(100_000, 0);
+    s.cc.onPersistentCongestion();
+    s.pacer.tokens = 0;
+    s.pacer.last = h.now;
+    var buf: [1500]u8 = undefined;
+    const id = try h.client.openBidi();
+    try h.client.write(id, "big 100000", true);
+    try h.toServer(buf[0..try h.client.send(&buf)]);
+    // Two more ack-eliciting packets so the ACK goes now and doesn't set
+    // the next deadline.
+    for (0..2) |_| {
+        try h.client.injectFrames(&.{0x01});
+        try h.toServer(buf[0..try h.client.send(&buf)]);
+    }
+    while (s.send(&buf, h.now) > 0) {}
+    try testing.expect(s.cc.in_flight < s.cc.window);
+    // 1.25 · 2400 bytes / 100 ms is 0.03 bytes/µs: the window's room comes
+    // back in at most 80 ms (half the ten-datagram bucket would take 200).
+    const d = s.deadline().?;
+    try testing.expect(d > h.now and d <= h.now + 80_000);
+    h.now = d;
+    s.onTimeout(h.now);
+    const in_flight = s.cc.in_flight;
+    try testing.expect(s.send(&buf, h.now) > 0);
+    try testing.expect(s.cc.in_flight > in_flight);
+}
+
+test "QUIC pacing: streams blocked by flow control don't arm the pacer's timer" {
+    const h = try Harness.init(.{ .max_data = 20_000 }, noTweak);
+    defer h.deinit();
+    try h.run(10);
+    const s = h.server.?;
+    const id = try h.client.openBidi();
+    try h.client.write(id, "big 100000", true);
+    try h.run(50);
+    // The response waits for connection credit the client never gives.
+    try testing.expect(h.client.readAll(id).len < 100_000);
+    try testing.expectEqual(s.tx_max_data, s.tx_data);
+    var buf: [1500]u8 = undefined;
+    while (s.send(&buf, h.now) > 0) {}
+    const before = s.deadline();
+    const waits = s.paced_waits;
+    s.pacer.tokens = 0;
+    s.pacer.last = h.now;
+    try testing.expectEqual(@as(usize, 0), s.send(&buf, h.now));
+    try testing.expectEqual(before, s.deadline());
+    try testing.expectEqual(waits, s.paced_waits);
+}
+
+test "QUIC pacing: a PATH_RESPONSE doesn't wait for the pacer" {
+    const h = try Harness.init(.{}, noTweak);
+    defer h.deinit();
+    try h.run(10);
+    const s = h.server.?;
+    s.pacer.tokens = 0;
+    s.pacer.last = h.now;
+    var buf: [1500]u8 = undefined;
+    try h.client.injectFrames(&.{ 0x1a, 1, 2, 3, 4, 5, 6, 7, 8 }); // PATH_CHALLENGE
+    try h.toServer(buf[0..try h.client.send(&buf)]);
+    const n = s.send(&buf, h.now);
+    try testing.expect(n > 0);
+    try h.client.recv(buf[0..n]);
+    try testing.expectEqual(@as(u32, 1), h.client.path_responses);
 }

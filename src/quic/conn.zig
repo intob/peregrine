@@ -17,9 +17,9 @@
 //! goes once a 1-RTT packet arrives (RFC 9001 §4.9.3).
 //!
 //! Sending is paced (RFC 9002 §7.7, recovery.Pacer): a datagram carrying
-//! data waits while the pacer has no room for it, and `deadline()` names
-//! the time it may go, so the worker's timer brings the connection back
-//! to `send`. ACKs and probes don't wait.
+//! data waits while the pacer has no room for it, and `send` records when
+//! it may go for `deadline()`, so the worker's timer brings the connection
+//! back to `send`. ACKs, probes and PATH_RESPONSE don't wait.
 //!
 //! Not yet: connection migration and NEW_CONNECTION_ID, Retry tokens
 //! (the worker's job), ECN, PMTU discovery, DATAGRAM frames.
@@ -345,8 +345,10 @@ pub const Conn = struct {
     path_response: ?[8]u8 = null,
     lost_packets: u64 = 0,
     packets_received: u64 = 0,
-    /// Sends that found data held back by the pacer.
+    /// Sends that held data back for the pacer.
     paced_waits: u64 = 0,
+    /// When the data the last `send` held back for the pacer may go.
+    pacing_hold: ?u64 = null,
 
     pub const InitOptions = struct {
         /// The client's Initial: its DCID, SCID.
@@ -1103,26 +1105,8 @@ pub const Conn = struct {
             }
         }
         if (self.prev_keys_until) |d| t = min(t, d);
-        if (self.pacingDeadline()) |d| t = min(t, d);
+        if (self.pacing_hold) |d| t = min(t, d);
         return t;
-    }
-
-    /// When the pacer lets data it is holding back go, if it is holding
-    /// any (as of the last `send`, which brought the pacer up to date).
-    fn pacingDeadline(self: *const Self) ?u64 {
-        if (!self.cfg.pacing or self.pacer.tokens >= self.max_datagram) return null;
-        if (self.cc.in_flight >= self.cc.window or self.amplificationBlocked()) return null;
-        if (!self.dataWaiting()) return null;
-        return self.pacer.nextSend(self.max_datagram, &self.cc, &self.rtt);
-    }
-
-    /// Ack-eliciting data waiting in some space with keys.
-    fn dataWaiting(self: *const Self) bool {
-        for ([_]Space{ .initial, .handshake, .application }) |space| {
-            const sp = &self.spaces[@backingInt(space)];
-            if (sp.tx != null and !sp.discarded and self.hasData(space)) return true;
-        }
-        return false;
     }
 
     fn min(a: ?u64, b: u64) u64 {
@@ -1531,6 +1515,7 @@ pub const Conn = struct {
     /// Fills `out` with the next datagram. Returns its length, 0 when there
     /// is nothing to send now.
     pub fn send(self: *Self, out: []u8, now: u64) usize {
+        self.pacing_hold = null;
         switch (self.state) {
             .closed, .draining => return 0,
             .closing => return self.sendClose(out, now),
@@ -1544,13 +1529,10 @@ pub const Conn = struct {
         if (max < 64) return 0;
         var b: Builder = .{ .out = out[0..max] };
         if (self.cfg.pacing) {
-            // A datagram's worth of room, or only ACKs and probes go.
+            // A datagram's worth of room, or only ACKs, probes and
+            // PATH_RESPONSE go.
             self.pacer.refill(now, &self.cc, &self.rtt);
             b.paced = self.pacer.tokens >= self.max_datagram;
-            if (!b.paced and self.cc.in_flight < self.cc.window and self.dataWaiting()) {
-                self.paced_waits += 1;
-                if (builtin.is_test) _ = test_paced_waits.fetchAdd(1, .monotonic);
-            }
         }
         var has_initial = false;
         for ([_]Space{ .initial, .handshake, .application }) |space| {
@@ -1565,6 +1547,11 @@ pub const Conn = struct {
                 },
             };
             if (space == .initial and b.packets > before and b.last_eliciting) has_initial = true;
+        }
+        if (b.held) {
+            self.pacing_hold = self.pacer.nextSend(self.max_datagram, self.cc.window -| self.cc.in_flight, &self.cc, &self.rtt);
+            self.paced_waits += 1;
+            if (builtin.is_test) _ = test_paced_waits.fetchAdd(1, .monotonic);
         }
         if (b.packets == 0) return 0;
         // §14.1: datagrams with ack-eliciting Initial packets are padded.
@@ -1596,6 +1583,8 @@ pub const Conn = struct {
         rec_mark: u64 = 0,
         /// The pacer has room for data in this datagram.
         paced: bool = true,
+        /// Data that could have gone was held back for the pacer.
+        held: bool = false,
 
         fn room(b: *const Builder) usize {
             return b.out.len - b.pos;
@@ -1662,8 +1651,28 @@ pub const Conn = struct {
         if (sp.crypto_tx.hasPending()) return true;
         if (space != .application) return false;
         if (self.handshake_done_pending or self.max_data_pending or self.max_streams_bidi_pending or
-            self.max_streams_uni_pending or self.path_response != null) return true;
+            self.max_streams_uni_pending) return true;
         return self.send_queue.items.len > 0;
+    }
+
+    /// Whether the frame writers would put ack-eliciting frames from this
+    /// space in a packet now, the window and the pacer aside (`hasData`
+    /// counts streams that are blocked, or whose data must wait for the
+    /// handshake).
+    fn wouldSend(self: *const Self, space: Space) bool {
+        const sp = &self.spaces[@backingInt(space)];
+        if (sp.crypto_tx.next(1 << 14, std.math.maxInt(u64))) |c| if (c.data.len > 0) return true;
+        if (space != .application) return false;
+        if (self.handshake_done_pending or self.max_data_pending or self.max_streams_bidi_pending or
+            self.max_streams_uni_pending) return true;
+        if (!self.handshake_complete and !self.inEarlyData()) return false;
+        const credit = self.tx_max_data -| self.tx_data;
+        for (self.send_queue.items) |slot| {
+            const st = &self.streams[slot];
+            if ((st.reset_code != null and !st.reset_sent) or (st.stop_code != null and !st.stop_sent) or st.max_data_pending) return true;
+            if (st.reset_code == null and st.send.next(1 << 14, credit) != null) return true;
+        }
+        return false;
     }
 
     fn buildPacket(self: *Self, b: *Builder, space: Space, now: u64) Allocator.Error!void {
@@ -1671,9 +1680,15 @@ pub const Conn = struct {
         const want_ack = sp.ack_wanted and !sp.rx_ranges.isEmpty();
         const ack_due = want_ack and ackDue(sp, now);
         const probing = sp.probes > 0;
-        const cwnd_ok = (self.cc.in_flight < self.cc.window and b.paced) or probing;
-        const data = cwnd_ok and self.hasData(space);
-        if (!ack_due and !data and !probing) return;
+        const window_ok = self.cc.in_flight < self.cc.window;
+        // Ack-eliciting frames go when the window and the pacer have room,
+        // or as probes.
+        const may_send = (window_ok and b.paced) or probing;
+        const data = may_send and self.hasData(space);
+        if (window_ok and !b.paced and !probing and self.wouldSend(space)) b.held = true;
+        // RFC 9000 §8.2.2: a PATH_RESPONSE waits for the window only.
+        const path_response = space == .application and self.path_response != null and (window_ok or probing);
+        if (!ack_due and !data and !probing and !path_response) return;
 
         // Seal the previous packet in the datagram first.
         self.sealLast(b, now);
@@ -1720,6 +1735,11 @@ pub const Conn = struct {
         var fw: packet.Writer = .{ .buf = w.buf[0..limit], .pos = header_end };
 
         if (want_ack) try self.writeAck(sp, &fw, now);
+        if (path_response and fw.left() >= 9) {
+            frame.writePathResponse(&fw, self.path_response.?);
+            self.path_response = null;
+            try sp.sent.addRecord(self.allocator, .ping);
+        }
         if (data or probing) {
             if (space == .application) try self.writeControl(&fw);
             try self.writeCrypto(sp, &fw);
@@ -1778,13 +1798,6 @@ pub const Conn = struct {
             w.byte(0x1e);
             try sp.sent.addRecord(a, .handshake_done);
             self.handshake_done_pending = false;
-        }
-        if (self.path_response) |data| {
-            if (w.left() >= 9) {
-                frame.writePathResponse(w, data);
-                self.path_response = null;
-                try sp.sent.addRecord(a, .ping);
-            }
         }
         if (self.max_data_pending and w.left() >= 9) {
             frame.writeMaxData(w, self.rx_max_data);
@@ -1948,21 +1961,6 @@ pub const Conn = struct {
         sp.sent.add(self.allocator, sp.sent.recordMark(), 0, @intCast(end), false, false) catch {};
         if (sp.sent.get(pn)) |p| sp.sent.remove(p);
         return end;
-    }
-
-    /// Whether `send` would produce something now (the worker's hint).
-    pub fn wantsSend(self: *Self, now: u64) bool {
-        if (self.state == .closing) return self.close_pending;
-        if (self.state != .handshake and self.state != .established) return false;
-        for ([_]Space{ .initial, .handshake, .application }) |space| {
-            const sp = &self.spaces[@backingInt(space)];
-            if (sp.tx == null or sp.discarded) continue;
-            if (sp.probes > 0) return true;
-            if (sp.ack_wanted and ackDue(sp, now)) return true;
-            const paced = !self.cfg.pacing or self.pacer.available(now, &self.cc, &self.rtt) >= self.max_datagram;
-            if (self.cc.in_flight < self.cc.window and paced and self.hasData(space)) return true;
-        }
-        return false;
     }
 
     /// Starts a key update of our own when the current keys have been used
