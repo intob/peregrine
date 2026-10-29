@@ -1,7 +1,8 @@
 # comp-h2o23: h2o 2.3.0-DEV (master at d21e7cb, 2026-10-07; h2o has not tagged
 # 2.3.0 past beta2) with HTTP/1.1, h2c, TLS h2 and HTTP/3 (quicly), built 2026-10-29:
 #   docker build -t comp-h2o23 bench/competitors/h2o
-# Run: h2o -c /etc/h2o.conf, with the repository's bench/ mounted at /bench for
+# Run: h2o -c /etc/h2o.conf (h2-bench.sh uses /bench/competitors/h2o/h2o.conf),
+# with the repository's bench/ mounted at /bench for
 # the certificate (bench/scripts/h2-bench.sh does this). h2c on 8080, TLS
 # and QUIC on 8443, 6 threads, static files.
 FROM alpine:3.21
