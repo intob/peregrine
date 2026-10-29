@@ -9,12 +9,13 @@ BIN=$OUT/linux/bin
 B=${1:-epoll}; shift
 docker image inspect peregrine-h3load >/dev/null 2>&1 ||
     { echo "no peregrine-h3load image: docker build -t peregrine-h3load $ROOT/bench/h3"; exit 1; }
-"$LOCK" wait mac-bench
-build_linux_bins || exit 1
 N=h3i-$B-$TAG
+# Not next to a benchmark, building included.
+"$LOCK" share mac-bench "h3-interop $B ($ROOT)"
+trap 'docker stop -t 1 "$N" >/dev/null 2>&1; "$LOCK" unshare mac-bench' EXIT
+build_linux_bins || exit 1
 docker run --rm -d --name "$N" --security-opt seccomp="$SECCOMP" -v "$BIN":/b -v "$ROOT/bench/h3":/h3 \
     peregrine-h3load /b/bench-server 4 "$B" 8443 h3 "$@" >/dev/null || exit 1
-trap 'docker stop -t 1 "$N" >/dev/null' EXIT
 sleep 1
 docker logs "$N" 2>&1 | head -1
 U=https://127.0.0.1:8443

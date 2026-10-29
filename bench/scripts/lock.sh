@@ -2,9 +2,10 @@
 # Locks shared by every session and agent on this Mac (worktrees too), so
 # benchmarks get the machine to themselves:
 #   mac-bench  the Mac's 12 cores: a benchmark holds it exclusively (acquire;
-#              ws-bench.sh also waits for other peregrine containers); test,
-#              Autobahn and local fuzz jobs share it (share), so they run side
-#              by side but never next to a benchmark
+#              ws-bench.sh and h3-netem.sh also wait for other peregrine
+#              containers); test, Autobahn, HTTP/3 interop and local fuzz jobs
+#              share it (share), so they run side by side but never next to a
+#              benchmark
 #   pi1, pi5   a Pi (fuzz.sh on a Pi takes it; a two-machine benchmark takes
 #              both: pi.sh lock / pi.sh unlock)
 # Callers queue in arrival order: a benchmark that releases and acquires again
