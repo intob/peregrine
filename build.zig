@@ -94,6 +94,19 @@ pub fn build(b: *std.Build) !void {
     const bench_server_step = b.step("bench-server", "Build the plaintext benchmark server");
     bench_server_step.dependOn(&b.addInstallArtifact(bench_server, .{}).step);
 
+    // Body-checking server for HTTP/2 churn tests: zig build verify-server
+    const verify_server = b.addExecutable(.{
+        .name = "verify-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/verify_server.zig"),
+            .target = target,
+            .optimize = .fast,
+            .imports = &.{.{ .name = "peregrine", .module = lib_fast }},
+        }),
+    });
+    const verify_server_step = b.step("verify-server", "Build the body-checking server for HTTP/2 churn tests");
+    verify_server_step.dependOn(&b.addInstallArtifact(verify_server, .{}).step);
+
     // WebSocket load generator (Linux): zig build ws-load -Dtarget=...
     const ws_load = b.addExecutable(.{
         .name = "ws-load",

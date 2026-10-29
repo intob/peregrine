@@ -3547,6 +3547,110 @@ test "output buffers: a slow reader, many streams, a reset mid-response, windows
     }
 }
 
+/// Fails the `fail_at`th allocation or growth from when it is armed (and,
+/// `sticky`, every one after it).
+const FlakyAllocator = struct {
+    inner: std.mem.Allocator,
+    count: usize = 0,
+    fail_at: usize = std.math.maxInt(usize),
+    sticky: bool = false,
+    failed: usize = 0,
+
+    fn allocator(self: *FlakyAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn fails(self: *FlakyAllocator) bool {
+        const i = self.count;
+        self.count += 1;
+        if (i == self.fail_at or (self.sticky and i > self.fail_at)) {
+            self.failed += 1;
+            return true;
+        }
+        return false;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *FlakyAllocator = @ptrCast(@alignCast(ctx));
+        if (self.fails()) return null;
+        return self.inner.rawAlloc(len, alignment, ra);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *FlakyAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and self.fails()) return false;
+        return self.inner.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *FlakyAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and self.fails()) return null;
+        return self.inner.rawRemap(memory, alignment, new_len, ra);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *FlakyAllocator = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(memory, alignment, ra);
+    }
+};
+
+/// Three bursts of 10 x 64 KiB (the second to a slow reader) with one
+/// allocation failing `k` allocations in. Returns whether the connection
+/// survived (and then every response must be whole).
+fn flakyBursts(flaky: *FlakyAllocator, big: []const u8, k: usize, sticky: bool) !void {
+    flaky.fail_at = std.math.maxInt(usize);
+    flaky.sticky = false;
+    const h = try Harness.initWith(.{}, flaky.allocator(), 16 * 1024);
+    defer h.deinit();
+    h.handler.big = big;
+    h.check_body = big;
+    try h.preface();
+    try openWindows(h);
+    flaky.fail_at = flaky.count + k;
+    flaky.sticky = sticky;
+    for (0..3) |round| {
+        h.write_max = if (round == 1) 1000 else std.math.maxInt(usize);
+        getBurst(h, @intCast(1 + 20 * round), 10, "/big") catch |err| switch (err) {
+            error.OutOfMemory => return,
+            else => return err,
+        };
+        if (h.conn.failed) return;
+        drainSlowly(h) catch |err| switch (err) {
+            error.OutOfMemory => return,
+            else => return err,
+        };
+        if (h.conn.failed) return;
+        // A PING between bursts: its ACK needs an output buffer too.
+        var buf: [frame.header_len + 8]u8 = undefined;
+        h.feed(buf[0..try frame.writePing(&buf, false, "abcdefgh")]) catch |err| switch (err) {
+            error.OutOfMemory => return,
+            else => return err,
+        };
+    }
+    if (h.conn.failed or sticky) return;
+    // One failure the connection survived: nothing was lost or torn
+    // (`collect` parses every frame, `check_body` every byte).
+    try testing.expectEqual(@as(u32, 0), h.conn.activeStreams());
+    try testing.expectEqual(30 * big.len, h.data_out.items.len);
+    try testing.expectEqual(@as(usize, 30), std.mem.count(u8, h.events.items, "end=true"));
+    try testing.expectEqual(@as(usize, 0), h.conn.out.capacity + h.conn.wire.capacity);
+}
+
+test "output buffers: an allocation failing anywhere leaves whole frames, right bytes and no leak" {
+    const big = try testBody(64 * 1024);
+    defer testing.allocator.free(big);
+    var flaky: FlakyAllocator = .{ .inner = testing.allocator };
+    for ([_]bool{ false, true }) |sticky| {
+        var k: usize = 0;
+        while (k < 400) : (k += 1) {
+            flaky.failed = 0;
+            try flakyBursts(&flaky, big, k, sticky);
+            if (flaky.failed == 0) break; // past the last allocation
+        }
+        try testing.expect(k > 0 and k < 400);
+    }
+}
+
 fn fdOpen(fd: sys.fd_t) bool {
     return std.posix.errno(std.posix.system.fcntl(fd, std.posix.F.GETFD, @as(usize, 0))) != .BADF;
 }
