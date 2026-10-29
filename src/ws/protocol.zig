@@ -10,6 +10,7 @@
 const std = @import("std");
 const BufferPool = @import("../http/session.zig").BufferPool;
 const deflate = @import("./deflate.zig");
+const inflate = @import("./inflate.zig");
 
 pub const Opcode = enum(u4) {
     continuation = 0x0,
@@ -338,7 +339,9 @@ pub const Decoder = struct {
     /// The client compresses each message on its own, so the inflate
     /// stream is dropped after each.
     deflate_no_takeover: bool = false,
-    inflater: ?*deflate.Inflater = null,
+    /// The client's window between messages (context takeover), made at
+    /// the first compressed message.
+    window: ?*inflate.Window = null,
     /// The message being reassembled is compressed.
     msg_compressed: bool = false,
     /// The last compressed message, inflated: `inf_buf[0..inf_len]`.
@@ -353,7 +356,7 @@ pub const Decoder = struct {
         if (self.buf.len > 0) self.pool.release(self.buf);
         if (self.msg_buf.len > 0) self.pool.releaseLarge(self.msg_buf);
         if (self.inf_buf.len > 0) self.pool.releaseLarge(self.inf_buf);
-        if (self.inflater) |i| i.destroy(self.pool);
+        if (self.window) |w| self.pool.allocator.destroy(w);
         self.* = .{ .pool = self.pool, .max_message_size = self.max_message_size };
     }
 
@@ -450,42 +453,25 @@ pub const Decoder = struct {
     fn inflateMessage(self: *Self, with_room: []u8, opcode: Opcode) Error!Frame {
         const n = with_room.len - deflate.trailer.len;
         @memcpy(with_room[n..], &deflate.trailer);
-        const inf = self.inflater orelse blk: {
-            self.inflater = try deflate.Inflater.create(self.pool);
-            break :blk self.inflater.?;
+        const tables = try self.pool.wsInflateTables();
+        const window: ?*inflate.Window = if (self.deflate_no_takeover) null else self.window orelse blk: {
+            const w = try self.pool.allocator.create(inflate.Window);
+            w.* = .{};
+            self.window = w;
+            break :blk w;
         };
-        inf.inflate(with_room, InflateSink{ .dec = self }) catch |err| return switch (err) {
+        var out: inflate.Out = .{ .buf = self.inf_buf, .max = self.max_message_size, .pool = self.pool };
+        defer self.inf_buf = out.buf;
+        _ = inflate.inflate(tables, window, with_room, &out) catch |err| return switch (err) {
             error.InvalidData => error.InvalidCompressedData,
             else => |e| e,
         };
-        if (self.deflate_no_takeover) {
-            inf.destroy(self.pool);
-            self.inflater = null;
-        }
-        const payload = self.inf_buf[0..self.inf_len];
+        self.inf_len = out.len;
+        const payload = out.buf[0..out.len];
         if (opcode == .text and !std.unicode.utf8ValidateSlice(payload)) return error.InvalidUtf8;
         self.msg_delivered = true;
         return .{ .opcode = opcode, .payload = payload };
     }
-
-    const InflateSink = struct {
-        dec: *Self,
-
-        pub fn append(sink: InflateSink, bytes: []const u8) deflate.InflateError!void {
-            const d = sink.dec;
-            const need = d.inf_len + bytes.len;
-            if (need > d.max_message_size) return error.MessageTooBig;
-            if (need > d.inf_buf.len) {
-                const grown = @max(need, @min(2 * d.inf_buf.len, d.max_message_size), 16 * 1024);
-                const new = try d.pool.acquireLarge(grown);
-                @memcpy(new[0..d.inf_len], d.inf_buf[0..d.inf_len]);
-                if (d.inf_buf.len > 0) d.pool.releaseLarge(d.inf_buf);
-                d.inf_buf = new;
-            }
-            @memcpy(d.inf_buf[d.inf_len..][0..bytes.len], bytes);
-            d.inf_len = need;
-        }
-    };
 
     /// Room in `msg_buf` for `need` bytes, keeping what it holds. Fragments
     /// grow it geometrically (up to the message size limit).

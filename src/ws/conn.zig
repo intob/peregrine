@@ -14,6 +14,7 @@ const std = @import("std");
 const sys = @import("../sys.zig");
 const protocol = @import("./protocol.zig");
 const deflate = @import("./deflate.zig");
+const inflate = @import("./inflate.zig");
 const BufferPool = @import("../http/session.zig").BufferPool;
 
 pub const Frame = protocol.Frame;
@@ -580,8 +581,7 @@ test "permessage-deflate: sends are compressed on the way to the wire" {
         // Every byte queued has been written.
         try testing.expectEqual(@as(usize, 0), h.conn.queued);
 
-        const inf = try deflate.Inflater.create(&h.pool);
-        defer inf.destroy(&h.pool);
+        const tables = try h.pool.wsInflateTables();
         const want = [_]struct { op: u8, compressed: bool, payload: []const u8 }{
             .{ .op = 1, .compressed = true, .payload = &big },
             .{ .op = 1, .compressed = false, .payload = "short" },
@@ -603,20 +603,14 @@ test "permessage-deflate: sends are compressed on the way to the wire" {
                 continue;
             }
             try testing.expect(n < w.payload.len / 2);
-            // Each stands alone (server_no_context_takeover).
-            inf.reset();
+            // Each stands alone (server_no_context_takeover): it inflates
+            // with no window.
             const with_trailer = try std.mem.concat(testing.allocator, u8, &.{ payload, &deflate.trailer });
             defer testing.allocator.free(with_trailer);
-            var got: std.ArrayList(u8) = .empty;
-            defer got.deinit(testing.allocator);
-            const Sink = struct {
-                list: *std.ArrayList(u8),
-                pub fn append(sk: @This(), bytes: []const u8) deflate.InflateError!void {
-                    try sk.list.appendSlice(testing.allocator, bytes);
-                }
-            };
-            try inf.inflate(with_trailer, Sink{ .list = &got });
-            try testing.expectEqualSlices(u8, w.payload, got.items);
+            var got: inflate.Out = .{ .buf = &.{}, .max = 1 << 20, .pool = &h.pool };
+            defer if (got.buf.len > 0) h.pool.releaseLarge(got.buf);
+            _ = try inflate.inflate(tables, null, with_trailer, &got);
+            try testing.expectEqualSlices(u8, w.payload, got.buf[0..got.len]);
         }
         try testing.expectEqual(@as(usize, 0), rest.len);
     }

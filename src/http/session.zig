@@ -12,6 +12,7 @@ const Status = @import("../status.zig").Status;
 const Header = @import("../header.zig").Header;
 const exchange = @import("./exchange.zig");
 const ws_deflate = @import("../ws/deflate.zig");
+const ws_inflate = @import("../ws/inflate.zig");
 const iovec_const = std.posix.iovec_const;
 
 /// Fixed-size read buffers shared by a worker's connections. A connection
@@ -37,8 +38,10 @@ pub const BufferPool = struct {
     large: [large_cache_count][]u8 = undefined,
     large_len: usize = 0,
     large_bytes: usize = 0,
-    /// The worker's WebSocket compressor, made on first use.
+    /// The worker's WebSocket compressor and inflate tables, made on
+    /// first use.
     ws_deflater: ?*ws_deflate.Deflater = null,
+    ws_inflate_tables: ?*ws_inflate.Tables = null,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, buffer_size: usize, count: usize) !Self {
@@ -59,6 +62,16 @@ pub const BufferPool = struct {
         self.allocator.free(self.free);
         for (self.large[0..self.large_len]) |b| self.allocator.free(b);
         if (self.ws_deflater) |d| self.allocator.destroy(d);
+        if (self.ws_inflate_tables) |t| self.allocator.destroy(t);
+    }
+
+    /// The worker's inflate tables (permessage-deflate), about 95 KiB.
+    pub fn wsInflateTables(self: *Self) !*ws_inflate.Tables {
+        if (self.ws_inflate_tables) |t| return t;
+        const t = try self.allocator.create(ws_inflate.Tables);
+        t.init();
+        self.ws_inflate_tables = t;
+        return t;
     }
 
     /// The worker's WebSocket compressor (permessage-deflate).

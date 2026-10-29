@@ -7,15 +7,16 @@
 //!   (`compress.Compressor`) serves all its connections and a connection
 //!   holds no compression state. Back references stay within the window the
 //!   client allows (`server_max_window_bits`).
-//! - It keeps the client's window between messages (context takeover), at
-//!   64 KiB plus 3 KiB per connection while compressed messages arrive, or,
-//!   with `Options.client_no_context_takeover`, asks the client not to and
-//!   keeps nothing between messages.
+//! - It keeps the client's window between messages (context takeover), 32
+//!   KiB per connection once a compressed message has arrived
+//!   (`inflate.Window`), or, with `Options.client_no_context_takeover`, asks
+//!   the client not to and keeps nothing between messages.
 const std = @import("std");
 const flate = std.compress.flate;
 const Request = @import("../request.zig").Request;
 const BufferPool = @import("../http/session.zig").BufferPool;
 const compress = @import("./compress.zig");
+const inflate = @import("./inflate.zig");
 
 pub const Options = struct {
     /// Messages shorter than this are sent uncompressed (DEFLATE rarely
@@ -115,74 +116,6 @@ fn windowBits(v: []const u8) ?u8 {
     return if (n >= 8 and n <= 15) n else null;
 }
 
-pub const InflateError = error{ InvalidData, MessageTooBig, OutOfMemory };
-
-/// Where the inflate stream reads when no message is being inflated.
-var no_input: std.Io.Reader = .fixed(&.{});
-
-/// The client-to-server DEFLATE stream of one connection. Its window
-/// (the last 32 KiB of output) carries over from message to message unless
-/// the client compresses each on its own.
-pub const Inflater = struct {
-    d: flate.Decompress,
-    window: []u8,
-
-    pub fn create(pool: *BufferPool) !*Inflater {
-        const window = try pool.acquireLarge(flate.max_window_len);
-        errdefer pool.releaseLarge(window);
-        const self = try pool.allocator.create(Inflater);
-        self.* = .{ .d = .init(&no_input, .raw, window), .window = window };
-        return self;
-    }
-
-    pub fn destroy(self: *Inflater, pool: *BufferPool) void {
-        pool.releaseLarge(self.window);
-        pool.allocator.destroy(self);
-    }
-
-    /// Inflates one message's payload, which must be followed in memory by
-    /// the 4 bytes 00 00 ff ff that the sender left off (`input` includes
-    /// them), calling `out.append` with the output as it is produced.
-    pub fn inflate(self: *Inflater, input: []const u8, out: anytype) InflateError!void {
-        var in: std.Io.Reader = .fixed(input);
-        const d = &self.d;
-        d.input = &in;
-        d.err = null;
-        defer d.input = &no_input;
-        const r = &d.reader;
-        var ended = false;
-        while (true) {
-            const ready = r.buffered();
-            if (ready.len > 0) {
-                try out.append(ready);
-                r.toss(ready.len);
-            }
-            if (ended) break;
-            r.fillMore() catch |err| switch (err) {
-                // A final block ended the stream: the next message starts a
-                // new one, with an empty window.
-                error.EndOfStream => ended = true,
-                // Out of input where the next block would start: the empty
-                // stored block that ends every message. Anything else (a
-                // block cut short, bad codes) is corrupt.
-                error.ReadFailed => {
-                    if (d.err != @as(?flate.Decompress.Error, error.EndOfStream) or d.state != .block_header or in.bufferedLen() != 0) {
-                        self.reset();
-                        return error.InvalidData;
-                    }
-                    ended = true;
-                },
-            };
-        }
-        if (d.state == .end) self.reset();
-    }
-
-    /// Starts a new stream with an empty window.
-    pub fn reset(self: *Inflater) void {
-        self.d = .init(&no_input, .raw, self.window);
-    }
-};
-
 /// The trailer the sender leaves off each message (RFC 7692 §7.2.1).
 pub const trailer = [4]u8{ 0x00, 0x00, 0xff, 0xff };
 
@@ -250,15 +183,6 @@ test "negotiation: accepted offers and the response" {
     }
 }
 
-const TestSink = struct {
-    out: std.ArrayList(u8) = .empty,
-    max: usize = 1 << 20,
-    pub fn append(self: *TestSink, bytes: []const u8) InflateError!void {
-        if (self.out.items.len + bytes.len > self.max) return error.MessageTooBig;
-        try self.out.appendSlice(testing.allocator, bytes);
-    }
-};
-
 /// A client's stream with context takeover: one compressor across
 /// messages, flushed after each, the empty stored block appended and its
 /// last four bytes dropped (what zlib's Z_SYNC_FLUSH gives). For tests.
@@ -282,88 +206,13 @@ pub const TestClient = struct {
     }
 };
 
-test "inflate: messages with context takeover, final blocks, corrupt input, size limit" {
-    var pool = try BufferPool.init(testing.allocator, 1024, 1);
-    defer pool.deinit();
-    const inf = try Inflater.create(&pool);
-    defer inf.destroy(&pool);
-
-    var client: TestClient = undefined;
-    try client.init();
-    defer client.out.deinit();
-    const text = "Hello, hello, hello! The same words again and again compress well. ";
-    var sizes: [3]usize = undefined;
-    for (0..3) |i| {
-        const m = try client.message(text);
-        defer testing.allocator.free(m);
-        sizes[i] = m.len - 4;
-        var sink: TestSink = .{};
-        defer sink.out.deinit(testing.allocator);
-        try inf.inflate(m, &sink);
-        try testing.expectEqualStrings(text, sink.out.items);
-    }
-    // Later messages refer back to the first: much smaller.
-    try testing.expect(sizes[1] < sizes[0] / 2);
-
-    // A message ending in a final block (no trailer needed, but it is
-    // appended anyway): inflated, then the next starts a fresh stream.
-    {
-        var out: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 1 << 16);
-        defer out.deinit();
-        var buf: [flate.max_window_len]u8 = undefined;
-        var c = try flate.Compress.init(&out.writer, &buf, .raw, .default);
-        try c.writer.writeAll("final");
-        try c.finish();
-        try out.writer.writeAll(&trailer);
-        var sink: TestSink = .{};
-        defer sink.out.deinit(testing.allocator);
-        try inf.inflate(out.written(), &sink);
-        try testing.expectEqualStrings("final", sink.out.items);
-    }
-    {
-        var fresh: TestClient = undefined;
-        try fresh.init();
-        defer fresh.out.deinit();
-        const m = try fresh.message("after a reset");
-        defer testing.allocator.free(m);
-        var sink: TestSink = .{};
-        defer sink.out.deinit(testing.allocator);
-        try inf.inflate(m, &sink);
-        try testing.expectEqualStrings("after a reset", sink.out.items);
-    }
-    // Corrupt: a block type of 3, and a stored block cut short.
-    {
-        var sink: TestSink = .{};
-        defer sink.out.deinit(testing.allocator);
-        try testing.expectError(error.InvalidData, inf.inflate(&.{ 0x07, 0x00, 0x00, 0xff, 0xff }, &sink));
-        try testing.expectError(error.InvalidData, inf.inflate(&.{ 0x00, 0x10, 0x00, 0xef, 0xff, 'a', 0x00, 0x00, 0xff, 0xff }, &sink));
-    }
-    // A bomb: a megabyte of zeros in a few hundred bytes stops at the limit.
-    {
-        var fresh: TestClient = undefined;
-        try fresh.init();
-        defer fresh.out.deinit();
-        const zeros = try testing.allocator.alloc(u8, 1 << 20);
-        defer testing.allocator.free(zeros);
-        @memset(zeros, 0);
-        const m = try fresh.message(zeros);
-        defer testing.allocator.free(m);
-        try testing.expect(m.len < 4096);
-        inf.reset();
-        var sink: TestSink = .{ .max = 64 * 1024 };
-        defer sink.out.deinit(testing.allocator);
-        try testing.expectError(error.MessageTooBig, inf.inflate(m, &sink));
-    }
-}
-
 test "deflate: messages round-trip on their own, in small windows too, and incompressible ones are refused" {
     const d = try testing.allocator.create(Deflater);
     defer testing.allocator.destroy(d);
     d.init();
     var pool = try BufferPool.init(testing.allocator, 1024, 1);
     defer pool.deinit();
-    const inf = try Inflater.create(&pool);
-    defer inf.destroy(&pool);
+    const tables = try pool.wsInflateTables();
 
     var big: [5000]u8 = undefined;
     for (&big, 0..) |*b, i| b.* = "abcdefgh"[i % 8] + @as(u8, @intCast(i / 1000));
@@ -373,13 +222,12 @@ test "deflate: messages round-trip on their own, in small windows too, and incom
         for (messages) |m| {
             const n = d.compress(m, out[0..m.len], bits).?;
             try testing.expect(n < m.len);
-            // Each message stands alone: a fresh inflater reads it.
-            inf.reset();
+            // Each message stands alone: it inflates with no window.
             @memcpy(out[n..][0..4], &trailer);
-            var sink: TestSink = .{};
-            defer sink.out.deinit(testing.allocator);
-            try inf.inflate(out[0 .. n + 4], &sink);
-            try testing.expectEqualSlices(u8, m, sink.out.items);
+            var got: inflate.Out = .{ .buf = &.{}, .max = 1 << 20, .pool = &pool };
+            defer if (got.buf.len > 0) pool.releaseLarge(got.buf);
+            _ = try inflate.inflate(tables, null, out[0 .. n + 4], &got);
+            try testing.expectEqualSlices(u8, m, got.buf[0..got.len]);
         }
     }
     var noise: [600]u8 = undefined;

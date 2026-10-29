@@ -53,7 +53,7 @@ Design rules that apply to every layer:
 |---|---|
 | M1. HTTP/1.1 core | ✅ done (streaming responses landed with the M5 handler API) |
 | M2. Throughput architecture | 🟡 io_uring works (opt-in; faster than epoll for keep-alive requests, 4-5% behind for pipelined requests and uploads); sendfile done (plaintext, and TLS with kTLS); NUMA open |
-| M3. WebSockets over HTTP/1.1 | ✅ reworked; benchmarked against uWebSockets (even on small messages, 15-20% less CPU at 16-64 KiB); Autobahn 301/301 strict on every backend, plain and TLS; decoder fuzzed; permessage-deflate (Autobahn 517/517; even with uWebSockets' zlib on small messages, 3-5x less CPU at 16-64 KiB) |
+| M3. WebSockets over HTTP/1.1 | ✅ reworked; benchmarked against uWebSockets (even on small messages, 15-20% less CPU at 16-64 KiB); Autobahn 301/301 strict on every backend, plain and TLS; decoder fuzzed; permessage-deflate (Autobahn 517/517; with compression both ways 18-30% less CPU than uWebSockets' zlib on small messages, 4-7x less at 16-64 KiB) |
 | M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; tables for P-256 and X25519, RSA-PSS, session tickets, kTLS, 0-RTT and SNI certificates done; the rest of "faster handshakes" open |
 | M5. HTTP/2 | ✅ h2 over TLS (ALPN) and h2c on every backend, h2spec 146/146 over TLS, fuzzed, benchmarked; streamed request bodies on every protocol; WebSockets over h2 (RFC 8441); RFC 9218 priorities |
 | M6. HTTP/3 and QUIC | 🟡 HTTP/3 over QUIC v1 on every backend, interop-tested (aioquic, curl/ngtcp2, h2load), benchmarked against nginx and Caddy; WebSockets over h3 (RFC 9220); 0-RTT; migration, pacing, ECN, PMTUD open |
@@ -284,12 +284,13 @@ Still open:
     (`server_max_window_bits`) is kept to: back references never reach
     further. Messages under `min_size` (64 bytes) aren't compressed
   - Client to server: the client's window is kept between messages
-    (context takeover): a std `Decompress` with its 64 KiB window per
-    connection, made at the first compressed message, fed each message
-    with 00 00 ff ff appended and resumed where the empty stored block
-    left it (a final block restarts the stream). With
-    `client_no_context_takeover` (asked by the client, or by
-    `Options.client_no_context_takeover`) it is dropped after each message.
+    (context takeover): a 32 KiB ring of the last output per connection
+    (`inflate.Window`), made at the first compressed message; each message
+    is inflated with 00 00 ff ff appended (a final block restarts the
+    stream, emptying the window). With `client_no_context_takeover` (asked
+    by the client, or by `Options.client_no_context_takeover`) there is no
+    window at all. (First a std `Decompress` with its 64 KiB window, resumed
+    where each message's empty stored block left it; replaced, see below.)
     Inflated output goes to a buffer from the pool's large-buffer cache,
     bounded by `websocket_max_message_size` (decompression bombs fail with
     1009); corrupt data fails with 1007; RSV1 on control frames or
@@ -344,8 +345,51 @@ Still open:
 | 16 KiB, 64 conns, 2 in flight | 17.0-17.3 µs | 16.2-18.2 µs | 54.1-54.5 µs |
 | 64 KiB, 32 conns, 1 in flight | 41.2-41.3 µs | 40.3-44.6 µs | 228-230 µs |
 
-  - [ ] Inflating is std's `Decompress`, now the larger part of a small
-    compressed echo; a faster inflater would be next
+  - [x] **Inflater** (`src/ws/inflate.zig`), replacing std's
+    `Decompress`. Messages are whole in memory and end at a block
+    boundary (the sync flush), so a connection keeps only its window
+    between messages (32 KiB instead of 68). Tables are rebuilt per block
+    in a worker's scratch (`BufferPool.wsInflateTables`, about 95 KiB):
+    two-level lookups, 9 bits then the rest for literals and lengths, 8
+    for distances, symbols visited in canonical order so a complete code
+    needs no clearing; bits read 64 at a time; output straight into the
+    message buffer. What made it fast: keeping the reader's and the
+    output's state in locals in the decoding loop (stores into the output
+    could alias them, forcing reloads each symbol: 1.1x std's speed
+    before, 2x after), and counting code lengths as the dynamic header is
+    decoded instead of over all 316 entries afterwards (a chain of
+    dependent increments: a dynamic block's header and tables 2.85 → 1.3
+    µs; a fixed block takes 0.07). Alone (M2 Pro, our compressor's
+    output of JSON with varying digits): 200 B 1.34 µs against std's 2.73,
+    1 KiB 1.91 against 4.22, 16 KiB 8.6 against 18.5, 64 KiB 22.7 against
+    50.5. Proof: messages from std's compressor at levels 1, 4 and 9 and
+    from ours (empty, noise, 100 KB), a context-takeover stream across the
+    ring's wrap, a final block emptying the window, corruption, distances
+    reaching before the window, the size limit; `fuzz: ws inflate`,
+    differential against std's decompressor (raw bytes, and std's output
+    flipped, cut or overwritten), 15 minutes. Its first runs found two
+    messages cut short that the reference took for clean ends, not bugs
+    here: a stored header after a fixed block (std reads LEN and NLEN in
+    its block-header state, so running out there looked like a block
+    boundary; the old std-based inflater accepted such messages too), and,
+    once the reference appended a final block to every message, a final
+    block that read on into it. The reference now accepts the end of a
+    final block within the message, or running out at a block header
+    only if an appended final empty fixed block (03 00) is then read as
+    one with the output unchanged. Autobahn 517/517
+    with compression (epoll), cases 12-13 on io_uring TLS and with
+    `client_no_context_takeover`
+
+      End to end, the same echoes (two interleaved rounds, host load
+      5-12): server CPU per message before (our compressor, std's
+      inflater) and after, epoll; and uWebSockets:
+
+| | before | after (epoll) | after (io_uring) | uWebSockets |
+|---|---|---|---|---|
+| 200 B, 256 conns, 1 in flight | 12.2-12.9 µs | 9.56-9.59 µs | 9.13-9.35 µs | 11.7-11.8 µs |
+| 1 KiB, 256 conns, 4 in flight | 9.63-9.77 µs | 7.10-7.47 µs | 6.57-8.02 µs | 10.3-12.5 µs |
+| 16 KiB, 64 conns, 2 in flight | 18.0-18.4 µs | 12.7-12.9 µs | 12.2-15.1 µs | 53.0-67.3 µs |
+| 64 KiB, 32 conns, 1 in flight | 43.5-47.0 µs | 30.3-32.1 µs | 30.3-35.7 µs | 224-247 µs |
 
 - [ ] Optional idle timeout / server keepalive pings
 - [ ] io_uring: parse straight out of the provided buffer like the HTTP path does
