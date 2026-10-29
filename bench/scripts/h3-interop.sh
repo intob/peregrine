@@ -28,8 +28,11 @@ check "curl 64 KiB" "65536" "$(x "curl -sk --http3-only $U/64k | wc -c" | tr -d 
 check "curl 1 MiB" "1048576" "$(x "curl -sk --http3-only $U/1m | wc -c" | tr -d ' ')"
 check "curl POST 1 MiB" "3 200" "$(x "head -c 1048576 /dev/zero | curl -sk --http3-only --data-binary @- -o /dev/null -w '%{http_version} %{http_code}' $U/")"
 check "curl 50 parallel 1 MiB" "50" "$(x "curl -sk --http3-only --parallel --parallel-max 50 \$(for i in \$(seq 50); do printf -- '-o /dev/null $U/1m '; done) -w '%{size_download}\n' | grep -c '^1048576\$'")"
-check "aioquic 60 concurrent GETs" "60" "$(x "python3 /h3/aioquic_client.py 127.0.0.1 8443 /1m /64k / -n 20" | grep -c ' 200 ')"
-check "aioquic 5 POSTs of 1 MiB" "5" "$(x "python3 /h3/aioquic_client.py 127.0.0.1 8443 / -n 5 -d 1048576" | grep -c ' 200 ')"
+# Whole responses: 200 and each path's body size (aioquic_client.py prints
+# path, status, length).
+whole() { awk '$2 == 200 && (($1 == "/1m" && $3 == 1048576) || ($1 == "/64k" && $3 == 65536) || ($1 == "/" && $3 == 13)) {n++} END {print n + 0}'; }
+check "aioquic 60 concurrent GETs" "60" "$(x "python3 /h3/aioquic_client.py 127.0.0.1 8443 /1m /64k / -n 20" | whole)"
+check "aioquic 5 POSTs of 1 MiB" "5" "$(x "python3 /h3/aioquic_client.py 127.0.0.1 8443 / -n 5 -d 1048576" | whole)"
 for args in "20000 -c10 -m100 $U/" "2000 -c10 -m10 $U/64k" "200 -c4 -m4 $U/1m"; do
     n=${args%% *}
     check "h2load -n $args" "$n" "$(x "h2load --alpn-list=h3 -t2 -n $args" | awk '/^status codes:/{print $3}')"

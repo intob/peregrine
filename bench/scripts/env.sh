@@ -7,6 +7,15 @@ mkdir -p "$OUT"
 # Container names carry this, so parallel agents don't collide.
 TAG=${TAG:-$$}
 LOCK=$ROOT/bench/scripts/lock.sh
+# Containers these scripts start are named with one of these prefixes
+# (linux-test, autobahn, fuzz, ws-bench, h3-interop, h3-netem).
+JOB_CONTAINERS='^(lt-|ab-|fuzz-|wsb-|h3i-|h3n-)'
+
+# For benchmarks, after taking mac-bench: wait for other jobs' containers
+# (started before the lock was taken) to finish.
+wait_for_jobs() {
+    while docker ps --format '{{.Names}}' | grep -qE "$JOB_CONTAINERS"; do sleep 10; done
+}
 
 # Linux binaries for Docker on the M2 (aarch64 with its AES and SHA).
 build_linux_bins() {

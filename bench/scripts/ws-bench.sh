@@ -14,7 +14,7 @@ DUR=${DUR:-8}
 # The machine to itself: wait for other peregrine jobs, hold the lock.
 "$LOCK" acquire mac-bench "ws-bench $label ($ROOT)"
 trap '"$LOCK" release mac-bench' EXIT
-while docker ps --format '{{.Names}}' | grep -qE '^(lt-|ab-|fuzz-|wsb-)'; do sleep 10; done
+wait_for_jobs
 docker run --rm -d --name wsb-srv-$TAG --cpuset-cpus 0-5 --ulimit nofile=65536:65536 \
   --security-opt seccomp="$SECCOMP" -v "$BIN":/b "$img" sh -c "$cmd" >/dev/null || exit 1
 sleep 1.5

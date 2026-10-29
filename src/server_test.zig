@@ -2681,6 +2681,8 @@ fn testHttp3Pacing(backend: Backend) !void {
     defer cl.close();
     cl.delay_ns = 20 * std.time.ns_per_ms;
     try cl.start();
+    // Process-wide, but tests run one at a time and each stops (joins) its
+    // server before returning: only this test's server moves it now.
     const waits = quic_conn.test_paced_waits.load(.monotonic);
     const id = try cl.request("GET", "/big", "");
     // With the window spread over the round trip, the server waits for

@@ -212,13 +212,23 @@ pub const Congestion = struct {
 /// packets take nothing and don't wait; probes take tokens but don't wait.
 ///
 /// Once the bucket runs dry, the next send is due when it is half full
-/// again rather than when one datagram's worth is back: a wait releases a
+/// again (or holds what the window has room for, if less) rather than
+/// when one datagram's worth is back: a wait releases a
 /// burst that GSO sends at once, costs one timer per burst instead of one
 /// per packet, and keeps the full rate behind an event loop whose timers
 /// have millisecond resolution (half of 2 ms of the rate is back after
 /// 1 ms, and a late wake-up still finds room in the bucket). On paths with a
 /// smoothed RTT under `burst_us` the bucket holds more than a window, so
 /// the congestion window, not the pacer, is what limits.
+///
+/// Bursts may exceed the initial window, which §7.7 says senders SHOULD
+/// keep to unless they know the path absorbs more: a wait releases 1 ms of
+/// the rate, 2 ms after idle (12 and 25 datagrams of 1200 bytes at a
+/// window of 1.2 MB over 100 ms; on paths under 2 ms, a window). That is
+/// the timer's resolution: the event loops wake in whole milliseconds, and
+/// ten datagrams per wake-up would cap a connection that ACKs don't clock
+/// at 13.5 MB/s (108 Mbit/s). Linux's TCP pacing makes the same trade
+/// (about 1 ms of the rate per TSO burst).
 pub const Pacer = struct {
     const Self = @This();
 
@@ -226,6 +236,9 @@ pub const Pacer = struct {
     tokens: u64,
     /// When `tokens` was last brought up to date.
     last: u64 = 0,
+    /// What is left of a byte since then, in units of 1 / (rate_den ·
+    /// smoothed_rtt): frequent refills at low rates would lose it each time.
+    frac: u64 = 0,
     burst_us: u64,
 
     /// N in N · cwnd / smoothed_rtt, as a fraction.
@@ -240,21 +253,54 @@ pub const Pacer = struct {
 
     /// The bucket's size for the current window and RTT.
     pub fn capacity(self: *const Self, cc: *const Congestion, rtt: *const Rtt) u64 {
-        const burst = mulDiv(cc.window * rate_num, self.burst_us, rate_den * @max(rtt.smoothed, 1));
-        return @max(min_burst_packets * cc.mss, burst);
+        const burst = mulDiv(rateNum(cc), self.burst_us, rateDen(rtt));
+        return @max(min_burst_packets *| cc.mss, burst);
+    }
+
+    /// The rate is rateNum / rateDen bytes per microsecond.
+    fn rateNum(cc: *const Congestion) u64 {
+        return @max(cc.window, 1) *| rate_num;
+    }
+
+    fn rateDen(rtt: *const Rtt) u64 {
+        return @max(rtt.smoothed, 1) *| rate_den;
+    }
+
+    const Level = struct { tokens: u64, frac: u64 };
+
+    /// The tokens (and what is left of a byte) at `now`.
+    fn level(self: *const Self, now: u64, cc: *const Congestion, rtt: *const Rtt) Level {
+        const cap = self.capacity(cc, rtt);
+        if (now <= self.last) return .{ .tokens = @min(self.tokens, cap), .frac = self.frac };
+        const num = rateNum(cc);
+        const den = rateDen(rtt);
+        var add: u64 = undefined;
+        var frac: u64 = undefined;
+        const p = @mulWithOverflow(now - self.last, num);
+        if (p[1] == 0) {
+            const t = p[0] +| self.frac;
+            add = t / den;
+            frac = t % den;
+        } else {
+            const t = @as(u128, now - self.last) * num + self.frac;
+            add = @intCast(@min(t / den, std.math.maxInt(u64)));
+            frac = @intCast(t % den);
+        }
+        const tokens = self.tokens +| add;
+        if (tokens >= cap) return .{ .tokens = cap, .frac = 0 };
+        return .{ .tokens = tokens, .frac = frac };
     }
 
     /// The tokens at `now` (not before `last`).
     pub fn available(self: *const Self, now: u64, cc: *const Congestion, rtt: *const Rtt) u64 {
-        const cap = self.capacity(cc, rtt);
-        if (now <= self.last) return @min(self.tokens, cap);
-        const add = mulDiv(cc.window * rate_num, now - self.last, rate_den * @max(rtt.smoothed, 1));
-        return @min(self.tokens +| add, cap);
+        return self.level(now, cc, rtt).tokens;
     }
 
     /// Brings the tokens up to `now`.
     pub fn refill(self: *Self, now: u64, cc: *const Congestion, rtt: *const Rtt) void {
-        self.tokens = self.available(now, cc, rtt);
+        const l = self.level(now, cc, rtt);
+        self.tokens = l.tokens;
+        self.frac = l.frac;
         self.last = @max(self.last, now);
     }
 
@@ -268,9 +314,11 @@ pub const Pacer = struct {
     pub fn nextSend(self: *const Self, size: u64, room: u64, cc: *const Congestion, rtt: *const Rtt) ?u64 {
         if (self.tokens >= size) return null;
         const want = @max(@min(self.capacity(cc, rtt) / 2, room), size);
-        // (want - tokens) / rate, rounded up.
-        const wait = mulDivCeil(want - self.tokens, rate_den * @max(rtt.smoothed, 1), rate_num * @max(cc.window, 1));
-        return self.last +| wait;
+        // (want - tokens - frac) / rate, rounded up. Rare: 128 bits.
+        const num = rateNum(cc);
+        const need = (@as(u128, want - self.tokens) * rateDen(rtt)) -| self.frac;
+        const wait = (need + num - 1) / num;
+        return self.last +| @as(u64, @intCast(@min(wait, std.math.maxInt(u64))));
     }
 
     /// a · b / c, saturating; 64-bit arithmetic unless a · b overflows
@@ -279,11 +327,6 @@ pub const Pacer = struct {
         const p = @mulWithOverflow(a, b);
         if (p[1] == 0) return p[0] / c;
         return @intCast(@min(@as(u128, a) * b / c, std.math.maxInt(u64)));
-    }
-
-    fn mulDivCeil(a: u64, b: u64, c: u64) u64 {
-        const q = mulDiv(a, b, c);
-        return if (@as(u128, q) * c < @as(u128, a) * b) q +| 1 else q;
     }
 };
 
@@ -374,6 +417,53 @@ test "pacer: burst allowance, then the paced rate" {
     try testing.expectEqual(@as(u64, 3000), p.tokens);
     p.onSent(2400);
     try testing.expectEqual(@as(?u64, 1_020_000 + 36_000), p.nextSend(1200, std.math.maxInt(u64), &cc, &rtt));
+}
+
+test "pacer: frequent refills at a low rate keep the rate" {
+    // The minimum window over 100 ms: 1.25 · 2400 / 100 ms = 0.03 bytes/µs,
+    // with an upload's datagrams (or a stream of ACKs) refilling every 10 µs.
+    var cc = Congestion.init(1200, .cubic);
+    cc.onPersistentCongestion();
+    var rtt: Rtt = .{};
+    rtt.update(100_000, 0);
+    var p = Pacer.init(1200, Pacer.default_burst_us);
+    p.refill(1_000_000, &cc, &rtt);
+    p.onSent(p.tokens);
+    var t: u64 = 1_000_000;
+    while (t < 1_200_000) {
+        t += 10;
+        p.refill(t, &cc, &rtt);
+    }
+    // 200 ms of the rate: 6000 bytes, as if refilled once.
+    try testing.expectEqual(@as(u64, 6000), p.tokens);
+    // At an irregular rate too: 1.25 · 2400 / 70 ms is 3/70 bytes per µs.
+    rtt = .{};
+    rtt.update(70_000, 0);
+    p.onSent(p.tokens);
+    const start = t;
+    var step: u64 = 1;
+    while (t < start + 70_000) {
+        t += step;
+        step = step % 13 + 1;
+        p.refill(t, &cc, &rtt);
+    }
+    try testing.expectEqual(@as(u64, 3 * (t - start) / 70), p.tokens);
+}
+
+test "pacer: no overflow at absurd windows and RTTs" {
+    var cc = Congestion.init(1200, .cubic);
+    var rtt: Rtt = .{};
+    rtt.update(std.math.maxInt(u64) / 2, 0);
+    var p = Pacer.init(1200, Pacer.default_burst_us);
+    cc.window = std.math.maxInt(u64);
+    p.refill(std.math.maxInt(u64) - 1, &cc, &rtt);
+    p.onSent(p.tokens);
+    _ = p.nextSend(1200, std.math.maxInt(u64), &cc, &rtt);
+    _ = p.available(std.math.maxInt(u64), &cc, &rtt);
+    rtt.smoothed = 0;
+    cc.window = 0;
+    _ = p.capacity(&cc, &rtt);
+    _ = p.nextSend(1200, 0, &cc, &rtt);
 }
 
 test "pacer: the rate follows the window and the RTT" {

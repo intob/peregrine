@@ -675,3 +675,31 @@ test "QUIC pacing: a PATH_RESPONSE doesn't wait for the pacer" {
     try h.client.recv(buf[0..n]);
     try testing.expectEqual(@as(u32, 1), h.client.path_responses);
 }
+
+test "QUIC pacing: a hold is timed after the datagram's last packet, and counted once" {
+    const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20 }, noTweak);
+    defer h.deinit();
+    try h.run(10);
+    const s = h.server.?;
+    var buf: [1500]u8 = undefined;
+    const id = try h.client.openBidi();
+    try h.client.write(id, "big 100000", true);
+    try h.toServer(buf[0..try h.client.send(&buf)]);
+    // A path where the wait is for half the bucket (the window has room
+    // for much more), and not quite a datagram's worth of tokens: the
+    // response waits, but a PATH_RESPONSE goes, and it takes its tokens.
+    s.rtt = .{};
+    s.rtt.update(100_000, 0);
+    s.cc.window = 1_200_000;
+    s.pacer.tokens = s.max_datagram - 100;
+    s.pacer.last = h.now;
+    try h.client.injectFrames(&.{ 0x1a, 1, 2, 3, 4, 5, 6, 7, 8 });
+    try h.toServer(buf[0..try h.client.send(&buf)]);
+    const waits = s.paced_waits;
+    try testing.expect(s.send(&buf, h.now) > 0);
+    try testing.expect(s.pacer.tokens < s.max_datagram - 100);
+    try testing.expectEqual(s.pacer.nextSend(s.max_datagram, s.cc.window - s.cc.in_flight, &s.cc, &s.rtt), s.pacing_hold);
+    // More sends while it waits are the same wait.
+    for (0..5) |_| try testing.expectEqual(@as(usize, 0), s.send(&buf, h.now));
+    try testing.expectEqual(waits + 1, s.paced_waits);
+}

@@ -345,7 +345,7 @@ pub const Conn = struct {
     path_response: ?[8]u8 = null,
     lost_packets: u64 = 0,
     packets_received: u64 = 0,
-    /// Sends that held data back for the pacer.
+    /// Times data was held back for the pacer (once per wait).
     paced_waits: u64 = 0,
     /// When the data the last `send` held back for the pacer may go.
     pacing_hold: ?u64 = null,
@@ -1515,6 +1515,7 @@ pub const Conn = struct {
     /// Fills `out` with the next datagram. Returns its length, 0 when there
     /// is nothing to send now.
     pub fn send(self: *Self, out: []u8, now: u64) usize {
+        const was_holding = self.pacing_hold != null;
         self.pacing_hold = null;
         switch (self.state) {
             .closed, .draining => return 0,
@@ -1548,20 +1549,29 @@ pub const Conn = struct {
             };
             if (space == .initial and b.packets > before and b.last_eliciting) has_initial = true;
         }
-        if (b.held) {
-            self.pacing_hold = self.pacer.nextSend(self.max_datagram, self.cc.window -| self.cc.in_flight, &self.cc, &self.rtt);
-            self.paced_waits += 1;
-            if (builtin.is_test) _ = test_paced_waits.fetchAdd(1, .monotonic);
+        if (b.packets == 0) {
+            self.notePacingHold(&b, was_holding);
+            return 0;
         }
-        if (b.packets == 0) return 0;
         // §14.1: datagrams with ack-eliciting Initial packets are padded.
         if (has_initial and b.pos < 1200 and out.len >= 1200 and max >= 1200) b.padTo(1200);
         // A nearly full datagram is padded to the full size, so runs of
         // them are equal and go out as one GSO send.
         if (b.open and b.space == .application and b.pos + protection.tag_len + 64 >= max and b.pos + protection.tag_len < max) b.padTo(max);
         self.sealLast(&b, now);
+        self.notePacingHold(&b, was_holding);
         self.bytes_sent += b.pos;
         return b.pos;
+    }
+
+    /// After the datagram is sealed (its last packet has taken its
+    /// tokens): when the data it held back may go.
+    fn notePacingHold(self: *Self, b: *const Builder, was_holding: bool) void {
+        if (!b.held) return;
+        self.pacing_hold = self.pacer.nextSend(self.max_datagram, self.cc.window -| self.cc.in_flight, &self.cc, &self.rtt);
+        if (was_holding or self.pacing_hold == null) return;
+        self.paced_waits += 1;
+        if (builtin.is_test) _ = test_paced_waits.fetchAdd(1, .monotonic);
     }
 
     /// A datagram under construction: packets are sealed one behind, so the
@@ -1645,20 +1655,10 @@ pub const Conn = struct {
         return if (sp.ack_deadline) |d| now >= d else false;
     }
 
-    /// Something ack-eliciting to send in this space (ignoring the window).
-    fn hasData(self: *const Self, space: Space) bool {
-        const sp = &self.spaces[@backingInt(space)];
-        if (sp.crypto_tx.hasPending()) return true;
-        if (space != .application) return false;
-        if (self.handshake_done_pending or self.max_data_pending or self.max_streams_bidi_pending or
-            self.max_streams_uni_pending) return true;
-        return self.send_queue.items.len > 0;
-    }
-
     /// Whether the frame writers would put ack-eliciting frames from this
-    /// space in a packet now, the window and the pacer aside (`hasData`
-    /// counts streams that are blocked, or whose data must wait for the
-    /// handshake).
+    /// space in a packet now, the window and the pacer aside: not for
+    /// streams blocked by flow control, or whose data must wait for the
+    /// handshake. Stops at the first.
     fn wouldSend(self: *const Self, space: Space) bool {
         const sp = &self.spaces[@backingInt(space)];
         if (sp.crypto_tx.next(1 << 14, std.math.maxInt(u64))) |c| if (c.data.len > 0) return true;
@@ -1684,8 +1684,8 @@ pub const Conn = struct {
         // Ack-eliciting frames go when the window and the pacer have room,
         // or as probes.
         const may_send = (window_ok and b.paced) or probing;
-        const data = may_send and self.hasData(space);
-        if (window_ok and !b.paced and !probing and self.wouldSend(space)) b.held = true;
+        const data = may_send and self.wouldSend(space);
+        if (!may_send and window_ok and !b.held and self.wouldSend(space)) b.held = true;
         // RFC 9000 §8.2.2: a PATH_RESPONSE waits for the window only.
         const path_response = space == .application and self.path_response != null and (window_ok or probing);
         if (!ack_due and !data and !probing and !path_response) return;

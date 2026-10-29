@@ -16,10 +16,7 @@ ROUNDS=${1:-2}; RATE=${2:-100mbit}; QUEUE=${3:-40kb}; DELAY=${4:-20ms}; B=${5:-e
 IMG=peregrine-h3load-netem
 docker image inspect peregrine-h3load >/dev/null 2>&1 ||
     { echo "no peregrine-h3load image: docker build -t peregrine-h3load $ROOT/bench/h3"; exit 1; }
-docker image inspect $IMG >/dev/null 2>&1 ||
-    docker build -q -t $IMG -f "$ROOT/bench/h3/Dockerfile.netem" "$ROOT/bench/h3" >/dev/null || exit 1
-build_linux_bins || exit 1
-# Timing runs: the machine to ourselves.
+# Timing runs: the machine to ourselves (building included).
 "$LOCK" acquire mac-bench "h3-netem ($ROOT)"
 NET=h3n-$TAG; SRV=h3n-srv-$TAG; CLI=h3n-cli-$TAG
 cleanup() {
@@ -28,6 +25,10 @@ cleanup() {
     "$LOCK" release mac-bench
 }
 trap cleanup EXIT
+wait_for_jobs
+docker image inspect $IMG >/dev/null 2>&1 ||
+    docker build -q -t $IMG -f "$ROOT/bench/h3/Dockerfile.netem" "$ROOT/bench/h3" >/dev/null || exit 1
+build_linux_bins || exit 1
 docker network create "$NET" >/dev/null || exit 1
 docker run -d --name "$CLI" --network "$NET" --cap-add NET_ADMIN --cpuset-cpus 6-11 $IMG sleep 3600 >/dev/null || exit 1
 docker exec "$CLI" tc qdisc add dev eth0 root netem delay "$DELAY" limit 100000 || exit 1
