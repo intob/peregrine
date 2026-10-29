@@ -1431,10 +1431,118 @@ test "a pooled handshake state holds nothing from its handshake once released" {
     // The state is in the pools, waiting for the next connection.
     try testing.expectEqual(hs, pools.handshakes.items[0]);
     // Built in release modes, where nothing overwrites freed capacity.
-    var found = countWindows(&set, std.mem.asBytes(hs), "the state");
+    // The state's own bytes, but not the allocator and buffer slices it
+    // keeps: pointers (which the transcript's union padding may hold
+    // copies of) aren't secrets.
+    const bytes = std.mem.asBytes(hs);
+    var kept: [3][2]usize = undefined;
+    inline for (.{ "allocator", "partial", "flight" }, 0..) |name, i| {
+        const at = @offsetOf(handshake.Handshake, name);
+        kept[i] = .{ at, at + @sizeOf(@FieldType(handshake.Handshake, name)) };
+    }
+    std.mem.sort([2]usize, &kept, {}, struct {
+        fn lt(_: void, a: [2]usize, b: [2]usize) bool {
+            return a[0] < b[0];
+        }
+    }.lt);
+    var found: usize = 0;
+    var from: usize = 0;
+    for (kept) |range| {
+        found += countWindows(&set, bytes[from..range[0]], "the state");
+        from = range[1];
+    }
+    found += countWindows(&set, bytes[from..], "the state");
     found += countWindows(&set, hs.flight, "the flight buffer");
     found += countWindows(&set, hs.partial.allocatedSlice(), "the partial-message buffer");
     try testing.expectEqual(0, found);
+}
+
+/// An allocator that looks through all memory given back to it (freed, or
+/// cut off by a shrinking resize) for windows of a secret set. It never
+/// remaps, so growth goes through alloc, copy and free, as it would with
+/// an allocator that can't grow in place.
+const ScanningAllocator = struct {
+    backing: std.mem.Allocator,
+    set: *const std.AutoHashMap([16]u8, []const u8),
+    found: usize = 0,
+
+    fn allocator(self: *ScanningAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *ScanningAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing.rawAlloc(len, a, ra);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *ScanningAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len < memory.len) self.found += countWindows(self.set, memory[new_len..], "memory given back by a resize");
+        return self.backing.rawResize(memory, a, new_len, ra);
+    }
+
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *ScanningAllocator = @ptrCast(@alignCast(ctx));
+        self.found += countWindows(self.set, memory, "freed memory");
+        self.backing.rawFree(memory, a, ra);
+    }
+};
+
+test "a handshake state frees nothing of its ClientHello unzeroed, even a big one" {
+    const td = credentials.testdata;
+    var server: TestServer = undefined;
+    try server.init(td.p256_cert, td.p256_key);
+    defer server.deinit();
+    // A ClientHello of about 40 KiB (a big unknown extension), in records
+    // of up to 16 KiB, so the partial-message buffer grows past the size
+    // the pools keep.
+    var prng = std.Random.DefaultPrng.init(0x40);
+    const big = try testing.allocator.alloc(u8, 40000);
+    defer testing.allocator.free(big);
+    prng.random().bytes(big);
+    big[0..4].* = .{ 0xfa, 0xfa, @intCast((big.len - 4) >> 8), @truncate(big.len - 4) };
+    const share = std.crypto.dh.X25519.recoverPublicKey(@splat(9));
+    const hello_buf = try testing.allocator.alloc(u8, 48 * 1024);
+    defer testing.allocator.free(hello_buf);
+    const hello = handshake.buildClientHello(hello_buf, .{ .shares = &.{.{ .group = .x25519, .key_exchange = &share }}, .extra = big });
+
+    var set = std.AutoHashMap([16]u8, []const u8).init(testing.allocator);
+    defer set.deinit();
+    try addWindows(&set, big[4..], "the ClientHello");
+    var scanning: ScanningAllocator = .{ .backing = testing.allocator, .set = &set };
+    {
+        var pools = try Pools.init(scanning.allocator(), 2);
+        defer pools.deinit();
+        for (0..2) |_| {
+            const conn = try pools.createConn(&server.config, &testEntropy(5));
+            var rest = hello;
+            var rec: [record.max_plaintext + record.header_len]u8 = undefined;
+            while (rest.len > 0) {
+                const n = @min(rest.len, record.max_plaintext);
+                const r = plainRecord(&rec, rest[0..n]);
+                rest = rest[n..];
+                var off: usize = 0;
+                while (off < r.len) {
+                    const space = try conn.readSpace();
+                    const k = @min(space.len, r.len - off);
+                    @memcpy(space[0..k], r[off..][0..k]);
+                    conn.commitRead(k);
+                    off += k;
+                    var plain: [64]u8 = undefined;
+                    _ = conn.readPlain(&plain);
+                    conn.advance(conn.wireBytes().len);
+                }
+            }
+            // The server answered and waits for the client's Finished.
+            try testing.expect(!conn.failed and conn.isHandshaking());
+            pools.destroyConn(conn);
+        }
+    }
+    try testing.expectEqual(0, scanning.found);
 }
 
 fn expectAlert(input: []const u8, description: tls.Alert.Description) !void {
