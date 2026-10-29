@@ -603,7 +603,12 @@ fn inflateAll(deflated: []const u8, out: *std.ArrayList(u8)) !void {
         d.reader.fillMore() catch |err| switch (err) {
             error.EndOfStream => return error.UnexpectedFinal,
             error.ReadFailed => {
-                if (d.err != @as(?flate.Decompress.Error, error.EndOfStream) or d.state != .block_header or in.bufferedLen() != 0) return error.Corrupt;
+                // Not `d.err != @as(?Error, error.EndOfStream)`: Zig 0.17's
+                // own x86_64 backend (Debug builds) compares two optional
+                // error sets as if each had a null flag after it, and reads
+                // stack garbage for both flags.
+                const ran_out = if (d.err) |e| e == error.EndOfStream else false;
+                if (!ran_out or d.state != .block_header or in.bufferedLen() != 0) return error.Corrupt;
                 const rest = d.reader.buffered();
                 try out.appendSlice(testing.allocator, rest);
                 return;
@@ -621,6 +626,33 @@ fn roundTrip(c: *Compressor, input: []const u8, window_bits: u4) !?usize {
     try inflateAll(out[0..n], &got);
     try testing.expectEqualSlices(u8, input, got.items);
     return n;
+}
+
+test "the test inflater accepts a clean end and rejects a cut-off one" {
+    const c = try testing.allocator.create(Compressor);
+    defer testing.allocator.destroy(c);
+    c.init();
+    // Stored, fixed and dynamic blocks, each followed by the empty stored
+    // block's header.
+    var long: [3000]u8 = undefined;
+    for (&long, 0..) |*b, i| b.* = "the quick brown fox "[i % 20] +% @as(u8, @intCast(i % 7));
+    var noise: [300]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(1);
+    prng.random().bytes(&noise);
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(testing.allocator);
+    for ([_][]const u8{ &noise, "hello, hello, hello", &long }, 0..) |m, block_type| {
+        var out: [4000]u8 = undefined;
+        const n = c.compress(m, &out, 15).?;
+        try testing.expectEqual(block_type, (out[0] >> 1) & 3);
+        got.clearRetainingCapacity();
+        try inflateAll(out[0..n], &got);
+        try testing.expectEqualSlices(u8, m, got.items);
+    }
+    // A stored block of 10 bytes holding 3: with the 00 00 ff ff appended,
+    // the input runs out inside it.
+    got.clearRetainingCapacity();
+    try testing.expectError(error.Corrupt, inflateAll(&.{ 0x00, 0x0a, 0x00, 0xf5, 0xff, 'a', 'b', 'c' }, &got));
 }
 
 test "distance and length codes" {

@@ -450,7 +450,9 @@ fn stdRun(window: []u8, input: []const u8, out: *std.ArrayList(u8)) !bool {
         d.reader.fillMore() catch |err| switch (err) {
             error.EndOfStream => return true,
             error.ReadFailed => {
-                if (d.err != @as(?flate.Decompress.Error, error.EndOfStream) or d.state != .block_header) return error.Corrupt;
+                // Unwrapped first: see `inflateAll` in compress.zig.
+                const ran_out = if (d.err) |e| e == error.EndOfStream else false;
+                if (!ran_out or d.state != .block_header) return error.Corrupt;
                 const rest = d.reader.buffered();
                 try out.appendSlice(testing.allocator, rest);
                 return false;
