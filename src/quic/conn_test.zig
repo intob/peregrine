@@ -802,7 +802,7 @@ fn runLossy(h: *Harness, delay: u64, loss: u8, id: u64) !void {
 var lossy_hold_wakeups: usize = 0;
 var lossy_idle_wakeups: usize = 0;
 
-test "verify pacing: downloads complete with loss over delayed paths, paced not much slower" {
+test "verify pacing: downloads complete with loss over delayed paths, paced within 2x" {
     const Case = struct { delay: u64, loss: u8, size: usize };
     const cases = [_]Case{
         .{ .delay = 10_000, .loss = 5, .size = 1_000_000 },
@@ -834,7 +834,11 @@ test "verify pacing: downloads complete with loss over delayed paths, paced not 
                 durations[pi] = h.now - began;
                 try testing.expectEqual(cs.size, h.client.readAll(id).len);
             }
-            std.debug.print("delay={d} loss={d} seed={d}: paced {d} ms, unpaced {d} ms; pacing wakeups {d}, of them sending nothing {d}\n", .{ cs.delay, cs.loss, seed, durations[0] / 1000, durations[1] / 1000, lossy_hold_wakeups, lossy_idle_wakeups });
+            // Paced is 0-15% slower on clean long paths (slow start at 1.25 ·
+            // cwnd / srtt), up to 57% at a 500 ms RTT with 3% loss.
+            try testing.expect(durations[0] <= 2 * durations[1] + 4 * cs.delay);
+            // Every time the pacer's timer fired, there was something to send.
+            try testing.expectEqual(@as(usize, 0), lossy_idle_wakeups);
             lossy_hold_wakeups = 0;
             lossy_idle_wakeups = 0;
         }
@@ -885,7 +889,6 @@ test "verify pacing: a stream blocked by flow control doesn't keep the timer bus
             try EchoApp.run(s);
         };
     }
-    std.debug.print("flow-blocked: {d} bytes read, {d} timer wakeups in 3 s, paced_waits {d}\n", .{ h.client.readAll(id).len, wakeups, s.paced_waits });
     try testing.expect(wakeups < 50);
 }
 
@@ -1075,7 +1078,6 @@ test "verify pacing: random paths, losses and stream mixes all complete without 
             var req: [32]u8 = undefined;
             try h.client.write(ids[i], try std.fmt.bufPrint(&req, "big {d}", .{sizes[i]}), true);
         }
-        const began = h.now;
         runLossyMulti(h, delay, loss, ids[0..n]) catch |e| {
             var got: usize = 0;
             for (0..n) |i| got += h.client.readAll(ids[i]).len;
@@ -1086,7 +1088,6 @@ test "verify pacing: random paths, losses and stream mixes all complete without 
             fails += 1;
             continue;
         };
-        if (iter % 25 == 0) std.debug.print("iter {d} pacing {}: {d} ms\n", .{ iter, pacing, (h.now - began) / 1000 });
         for (0..n) |i| try testing.expectEqual(sizes[i], h.client.readAll(ids[i]).len);
     };
     try testing.expectEqual(@as(usize, 0), fails);
