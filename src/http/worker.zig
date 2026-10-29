@@ -789,7 +789,7 @@ pub fn Worker(comptime Handler: type) type {
         /// session already holds (the preface, perhaps more).
         fn attachH2(self: *Self, c: *Conn) bool {
             const conn = self.allocator.create(H2Conn) catch return false;
-            conn.* = H2Conn.init(self.allocator, self.opts.h2) catch {
+            conn.* = H2Conn.init(self.allocator, self.opts.h2, &self.pool) catch {
                 self.allocator.destroy(conn);
                 return false;
             };

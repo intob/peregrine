@@ -100,8 +100,9 @@ pub fn Context(comptime Handler: type) type {
     };
 }
 
-/// Output capacity kept per idle connection.
-const idle_capacity = 16 * 1024;
+/// Room for what may go into `out` on top of the DATA that `out_limit`
+/// and two frames allow: header blocks, trailers, control frames.
+const out_slack = 16 * 1024;
 
 const StreamState = enum(u8) {
     /// Request head or body still arriving.
@@ -289,9 +290,23 @@ pub const Conn = struct {
     /// Serialised output being appended. `wireBytes` swaps it into `wire`
     /// once the wire is drained, so frames can be queued while a write of
     /// the wire is in flight (as ws.Conn does).
+    ///
+    /// Both live in the worker's buffers (`pool`), held only while they
+    /// have unsent bytes, so an idle connection holds none. Output starts
+    /// in a read buffer and moves to a large one (`large_size`, kept for
+    /// reuse in the pool's cache) when it outgrows that: allocations that
+    /// size are mapped from the kernel, and mapping, faulting in and
+    /// unmapping fresh ones for each burst of large responses cost about a
+    /// quarter of the server's CPU.
     out: std.ArrayList(u8) = .empty,
     wire: std.ArrayList(u8) = .empty,
     wire_pos: usize = 0,
+    pool: *BufferPool,
+    /// Room for everything `out_limit` lets `out` hold.
+    large_size: usize,
+    /// The last batch written outgrew a read buffer: start the next in a
+    /// large one rather than copying over.
+    out_large: bool = false,
     state: State = .preface,
     failed: bool = false,
     goaway_sent: bool = false,
@@ -342,7 +357,9 @@ pub const Conn = struct {
     idle_prio: []IdlePriority,
     idle_prio_len: u32 = 0,
 
-    pub fn init(allocator: std.mem.Allocator, opts: Options) !Self {
+    /// `pool` is the worker's: output buffers come from it and go back
+    /// to it (see `out`).
+    pub fn init(allocator: std.mem.Allocator, opts: Options, pool: *BufferPool) !Self {
         var decoder = try hpack.Decoder.init(allocator, opts.hpack);
         errdefer decoder.deinit();
         var encoder = try hpack.Encoder.init(allocator, hpack.default_table_size);
@@ -363,8 +380,10 @@ pub const Conn = struct {
             .streams = streams,
             .order = order,
             .idle_prio = idle_prio,
+            .pool = pool,
+            .large_size = std.mem.alignForward(usize, opts.out_limit + 2 * opts.max_frame_size + out_slack, 4096),
         };
-        errdefer self.out.deinit(allocator);
+        errdefer self.giveBack(&self.out);
         // Our preface: SETTINGS, then a larger connection window.
         var buf: [64]u8 = undefined;
         const settings = [_]frame.Setting{
@@ -381,8 +400,7 @@ pub const Conn = struct {
             n += try frame.writeWindowUpdate(buf[n..], 0, @intCast(@min(opts.connection_window, frame.max_window_size) - 65535));
             self.recv_window = @min(opts.connection_window, frame.max_window_size);
         }
-        try self.out.appendSlice(allocator, buf[0..n]);
-        try self.out.ensureTotalCapacity(allocator, idle_capacity);
+        try self.append(buf[0..n]);
         try self.enc_buf.ensureTotalCapacity(allocator, 4096);
         return self;
     }
@@ -398,8 +416,8 @@ pub const Conn = struct {
         self.allocator.free(self.idle_prio);
         self.decoder.deinit();
         self.encoder.deinit();
-        self.out.deinit(self.allocator);
-        self.wire.deinit(self.allocator);
+        self.giveBack(&self.out);
+        self.giveBack(&self.wire);
         self.hb_buf.deinit(self.allocator);
         self.enc_buf.deinit(self.allocator);
     }
@@ -414,17 +432,14 @@ pub const Conn = struct {
         self.reader.commitRead(n);
     }
 
-    /// Returns the input buffer when nothing is buffered, and trims
-    /// output buffers that grew for a large response once the connection
-    /// is idle.
+    /// Returns the buffers that hold nothing: the input buffer when
+    /// everything read was processed, the output buffers once written.
     pub fn releaseIfIdle(self: *Self, pool: *BufferPool) void {
         self.reader.releaseIfIdle(pool);
-        if (self.stream_count == 0 and !self.hasWire()) {
-            if (self.out.capacity > 2 * idle_capacity) {
-                self.out.clearAndFree(self.allocator);
-                self.out.ensureTotalCapacity(self.allocator, idle_capacity) catch {};
-            }
-            if (self.wire.capacity > 2 * idle_capacity) self.wire.clearAndFree(self.allocator);
+        if (self.out.items.len == 0) self.giveBack(&self.out);
+        if (self.wire_pos == self.wire.items.len) {
+            self.giveBack(&self.wire);
+            self.wire_pos = 0;
         }
     }
 
@@ -439,7 +454,9 @@ pub const Conn = struct {
     /// Not to be called while a write of the previous bytes is in flight.
     pub fn wireBytes(self: *Self) []const u8 {
         if (self.wire_pos == self.wire.items.len) {
-            self.wire.clearRetainingCapacity();
+            // Written: the buffer goes back.
+            if (self.wire.items.len > 0) self.out_large = self.wire.items.len > self.pool.buffer_size;
+            self.giveBack(&self.wire);
             self.wire_pos = 0;
             std.mem.swap(std.ArrayList(u8), &self.out, &self.wire);
         }
@@ -459,6 +476,44 @@ pub const Conn = struct {
         return self.out.items.len + (self.wire.items.len - self.wire_pos);
     }
 
+    /// Room for `n` more bytes in `out`: a read buffer while that is
+    /// enough, then a large one (larger still, for header blocks beyond
+    /// `out_slack`), the bytes so far copied over.
+    fn reserve(self: *Self, n: usize) !void {
+        const out = &self.out;
+        if (out.capacity - out.items.len >= n) return;
+        const need = out.items.len + n;
+        const buf = if (need <= self.pool.buffer_size and !self.out_large)
+            try self.pool.acquire()
+        else
+            try self.pool.acquireLarge(@max(need, self.large_size, 2 * out.capacity));
+        var grown: std.ArrayList(u8) = .initBuffer(buf);
+        grown.appendSliceAssumeCapacity(out.items);
+        self.giveBack(out);
+        out.* = grown;
+    }
+
+    fn append(self: *Self, bytes: []const u8) !void {
+        try self.reserve(bytes.len);
+        self.out.appendSliceAssumeCapacity(bytes);
+    }
+
+    /// A frame whole, or nothing.
+    fn appendFrame(self: *Self, hdr: *const [frame.header_len]u8, payload: []const u8) !void {
+        try self.reserve(hdr.len + payload.len);
+        self.out.appendSliceAssumeCapacity(hdr);
+        self.out.appendSliceAssumeCapacity(payload);
+    }
+
+    /// Returns `out`'s or `wire`'s buffer to the pool, whose read buffers
+    /// are told from large ones by their size.
+    fn giveBack(self: *Self, list: *std.ArrayList(u8)) void {
+        if (list.capacity == 0) return;
+        const buf = list.allocatedSlice();
+        if (buf.len == self.pool.buffer_size) self.pool.release(buf) else self.pool.releaseLarge(buf);
+        list.* = .empty;
+    }
+
     /// The connection should be closed once `out` is written.
     pub fn wantsClose(self: *const Self) bool {
         return self.failed or ((self.goaway_sent or self.goaway_received) and self.stream_count == 0);
@@ -474,7 +529,7 @@ pub const Conn = struct {
     fn writeGoaway(self: *Self, code: ErrorCode) void {
         var buf: [frame.header_len + 8]u8 = undefined;
         const n = frame.writeGoaway(&buf, self.last_stream_id, code, "") catch unreachable;
-        self.out.appendSlice(self.allocator, buf[0..n]) catch {};
+        self.append(buf[0..n]) catch {};
     }
 
     /// A connection error (§5.4.1): GOAWAY with the code, then close.
@@ -488,7 +543,7 @@ pub const Conn = struct {
     fn writeRst(self: *Self, stream_id: u31, code: ErrorCode) void {
         var buf: [frame.header_len + 4]u8 = undefined;
         const n = frame.writeRstStream(&buf, stream_id, code) catch unreachable;
-        self.out.appendSlice(self.allocator, buf[0..n]) catch {};
+        self.append(buf[0..n]) catch {};
     }
 
     // -- Streams ------------------------------------------------------------
@@ -670,7 +725,7 @@ pub const Conn = struct {
                 if (p.ack) return;
                 var buf: [frame.header_len + 8]u8 = undefined;
                 const n = frame.writePing(&buf, true, p.data) catch unreachable;
-                self.out.appendSlice(self.allocator, buf[0..n]) catch {};
+                self.append(buf[0..n]) catch {};
             },
             .goaway => |g| {
                 self.countControl();
@@ -706,7 +761,7 @@ pub const Conn = struct {
         }
         var buf: [frame.header_len]u8 = undefined;
         _ = frame.writeSettingsAck(&buf) catch unreachable;
-        self.out.appendSlice(self.allocator, &buf) catch {};
+        self.append(&buf) catch {};
         self.pumpAll(Handler, ctx);
     }
 
@@ -822,7 +877,7 @@ pub const Conn = struct {
         if (s.state != .open or s.consumed < self.opts.initial_window_size / 2) return;
         var buf: [frame.header_len + 4]u8 = undefined;
         const len = frame.writeWindowUpdate(&buf, s.id, @intCast(s.consumed)) catch unreachable;
-        self.out.appendSlice(self.allocator, buf[0..len]) catch {};
+        self.append(buf[0..len]) catch {};
         s.recv_window += s.consumed;
         s.consumed = 0;
     }
@@ -905,7 +960,7 @@ pub const Conn = struct {
         if (self.consumed >= window / 2) {
             var buf: [frame.header_len + 4]u8 = undefined;
             const len = frame.writeWindowUpdate(&buf, 0, @intCast(self.consumed)) catch unreachable;
-            self.out.appendSlice(self.allocator, buf[0..len]) catch {};
+            self.append(buf[0..len]) catch {};
             self.recv_window += self.consumed;
             self.consumed = 0;
         }
@@ -1268,7 +1323,6 @@ pub const Conn = struct {
     /// Writes a HEADERS frame (with CONTINUATIONs if the block is larger
     /// than the peer's maximum frame size). `lines` are "name: value\r\n".
     fn writeHead(self: *Self, ctx: anytype, s: *Stream, status: Status, lines: []const u8, content_length: ?usize, end_stream: bool) void {
-        const a = self.allocator;
         self.enc_buf.clearRetainingCapacity();
         self.encodeField(":status", statusText(status)) catch return self.fail(.internal_error);
         var rest = lines;
@@ -1301,8 +1355,7 @@ pub const Conn = struct {
             if (last) flags |= frame.flag.end_headers;
             var hdr: [frame.header_len]u8 = undefined;
             frame.writeHeader(&hdr, @intCast(n), if (first) .headers else .continuation, flags, s.id);
-            self.out.appendSlice(a, &hdr) catch return self.fail(.internal_error);
-            self.out.appendSlice(a, block[0..n]) catch return self.fail(.internal_error);
+            self.appendFrame(&hdr, block[0..n]) catch return self.fail(.internal_error);
             block = block[n..];
             first = false;
             if (last) break;
@@ -1337,8 +1390,7 @@ pub const Conn = struct {
             if (n == 0 and !(last and end)) break;
             var hdr: [frame.header_len]u8 = undefined;
             frame.writeHeader(&hdr, @intCast(n), .data, if (last and end) frame.flag.end_stream else 0, s.id);
-            self.out.appendSlice(self.allocator, &hdr) catch return sent;
-            self.out.appendSlice(self.allocator, data[sent..][0..n]) catch return sent;
+            self.appendFrame(&hdr, data[sent..][0..n]) catch return sent;
             sent += n;
             s.send_window -= @intCast(n);
             self.send_window -= @intCast(n);
@@ -1556,7 +1608,9 @@ pub const Conn = struct {
             const window = @min(s.send_window, self.send_window);
             const room = self.opts.out_limit + 2 * self.opts.max_frame_size -| self.unsent();
             var max = @min(@as(usize, if (window > 0) @intCast(window) else 0), self.peer_max_frame_size, room -| frame.header_len, budget - sent);
-            if (is_head) max = self.peer_max_frame_size;
+            // HEAD drops the data: any size will do, and the peer's
+            // maximum frame size (up to 16 MiB) would make room for it.
+            if (is_head) max = frame.min_max_frame_size;
             if (max == 0) {
                 self.setBlocked(s, s.send_window > 0);
                 self.noteStall(ctx, s, false);
@@ -1565,7 +1619,7 @@ pub const Conn = struct {
             }
             // Reserve a DATA frame and poll straight into it.
             const start = self.out.items.len;
-            self.out.ensureUnusedCapacity(self.allocator, frame.header_len + max) catch return self.fail(.internal_error);
+            self.reserve(frame.header_len + max) catch return self.fail(.internal_error);
             self.out.items.len = start + frame.header_len + max;
             r = exchange.h2Poll(ex, self.out.items[start + frame.header_len ..][0..max], ctx.now);
             if (r.aborted) {
@@ -1594,7 +1648,7 @@ pub const Conn = struct {
                     // An empty DATA frame carries the END_STREAM.
                     var hdr: [frame.header_len]u8 = undefined;
                     frame.writeHeader(&hdr, 0, .data, frame.flag.end_stream, s.id);
-                    self.out.appendSlice(self.allocator, &hdr) catch return self.fail(.internal_error);
+                    self.append(&hdr) catch return self.fail(.internal_error);
                 }
                 self.output_streams -= 1;
                 ctx.exchanges.release(s.exchange);
@@ -1621,7 +1675,7 @@ pub const Conn = struct {
                 return self.noteStall(ctx, s, false);
             }
             const start = self.out.items.len;
-            self.out.ensureUnusedCapacity(self.allocator, frame.header_len + max) catch return self.fail(.internal_error);
+            self.reserve(frame.header_len + max) catch return self.fail(.internal_error);
             self.out.items.len = start + frame.header_len + max;
             const got = sys.pread(f.fd, self.out.items[start + frame.header_len ..][0..max], f.offset) catch 0;
             if (got < max) {
@@ -1677,7 +1731,7 @@ pub const Conn = struct {
         if (!w.wantsClose() and s.state == .open) return;
         var hdr: [frame.header_len]u8 = undefined;
         frame.writeHeader(&hdr, 0, .data, frame.flag.end_stream, s.id);
-        self.out.appendSlice(self.allocator, &hdr) catch return self.fail(.internal_error);
+        self.append(&hdr) catch return self.fail(.internal_error);
         self.finishStream(ctx, s);
     }
 
@@ -1703,8 +1757,7 @@ pub const Conn = struct {
             if (last) flags |= frame.flag.end_headers;
             var hdr: [frame.header_len]u8 = undefined;
             frame.writeHeader(&hdr, @intCast(n), if (first) .headers else .continuation, flags, s.id);
-            self.out.appendSlice(self.allocator, &hdr) catch return self.fail(.internal_error);
-            self.out.appendSlice(self.allocator, block[0..n]) catch return self.fail(.internal_error);
+            self.appendFrame(&hdr, block[0..n]) catch return self.fail(.internal_error);
             block = block[n..];
             first = false;
             if (last) break;
@@ -2051,13 +2104,25 @@ const Harness = struct {
     /// Server frames per stream (ordered within a stream), for comparing
     /// runs that may interleave streams differently.
     per_stream: std.AutoHashMap(u32, std.ArrayList(u8)),
+    /// The most a "write" takes (a slow reader below the maximum).
+    write_max: usize = std.math.maxInt(usize),
+    /// When set, every stream's DATA must be this body, in order: how far
+    /// each stream got.
+    check_body: ?[]const u8 = null,
+    body_pos: std.AutoHashMapUnmanaged(u32, usize) = .empty,
 
     fn init(opts: Options) !*Harness {
+        return initWith(opts, testing.allocator, 1024);
+    }
+
+    /// The connection and its pool use `allocator` (the harness's own
+    /// bookkeeping doesn't).
+    fn initWith(opts: Options, allocator: std.mem.Allocator, read_buffer_size: usize) !*Harness {
         const a = testing.allocator;
         const h = try a.create(Harness);
         errdefer a.destroy(h);
         h.* = .{
-            .pool = try BufferPool.init(a, 1024, 2),
+            .pool = try BufferPool.init(allocator, read_buffer_size, 2),
             .conn = undefined,
             .req = try Request.init(a),
             .resp = try Response.init(a, 64 * 1024, 2048),
@@ -2072,7 +2137,7 @@ const Harness = struct {
         h.slab = try exchange.Slab.init(a, 8, &h.mailbox, .{});
         h.resp.exchanges = &h.slab;
         h.resp.now = &h.now;
-        h.conn = try Conn.init(a, opts);
+        h.conn = try Conn.init(allocator, opts, &h.pool);
         date.formatHeader(&h.date_line, 784111777);
         try h.collect();
         return h;
@@ -2102,6 +2167,7 @@ const Harness = struct {
         var it = h.per_stream.valueIterator();
         while (it.next()) |l| l.deinit(a);
         h.per_stream.deinit();
+        h.body_pos.deinit(a);
         a.destroy(h);
     }
 
@@ -2123,7 +2189,10 @@ const Harness = struct {
     /// Takes what the server wrote and parses it into events.
     fn collect(h: *Harness) !void {
         const a = testing.allocator;
-        const bytes = h.conn.wireBytes();
+        // Output stays within one large buffer.
+        try testing.expect(h.conn.unsent() <= h.conn.large_size);
+        const all = h.conn.wireBytes();
+        const bytes = all[0..@min(all.len, h.write_max)];
         try h.out.appendSlice(a, bytes);
         var rest = bytes;
         while (rest.len > 0) {
@@ -2151,6 +2220,14 @@ const Harness = struct {
                         stream = d.stream_id;
                         try line.print(a, "data {d} len={d} end={}", .{ d.stream_id, d.data.len, d.end_stream });
                         try h.data_out.appendSlice(a, d.data);
+                        if (h.check_body) |body| {
+                            const pos = try h.body_pos.getOrPut(a, d.stream_id);
+                            if (!pos.found_existing) pos.value_ptr.* = 0;
+                            try testing.expect(pos.value_ptr.* + d.data.len <= body.len);
+                            try testing.expectEqualSlices(u8, body[pos.value_ptr.*..][0..d.data.len], d.data);
+                            pos.value_ptr.* += d.data.len;
+                            if (d.end_stream) try testing.expectEqual(body.len, pos.value_ptr.*);
+                        }
                     },
                     .headers => |x| {
                         stream = x.stream_id;
@@ -2224,6 +2301,8 @@ const Harness = struct {
             if (h.last != .flush) break;
         }
         h.conn.releaseIfIdle(&h.pool);
+        // Everything written: no output buffer is held.
+        if (!h.conn.hasWire()) try testing.expectEqual(@as(usize, 0), h.conn.out.capacity + h.conn.wire.capacity);
     }
 
     fn drainMailbox(h: *Harness) !void {
@@ -3165,6 +3244,152 @@ test "output backpressure: process stops parsing above out_limit" {
     try testing.expectEqual(@as(u32, 0), h.conn.activeStreams());
 }
 
+/// Client settings for large downloads: 1 MiB stream windows and a
+/// connection window that doesn't run out.
+fn openWindows(h: *Harness) !void {
+    try h.settings(&.{.{ .id = .initial_window_size, .value = 1 << 20 }});
+    try h.window(0, frame.max_window_size - 65535);
+}
+
+/// `count` GETs in one read, as h2load sends them.
+fn getBurst(h: *Harness, first: u31, count: u31, path: []const u8) !void {
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    for (0..count) |i| try appendGet(h, &frames, first + 2 * @as(u31, @intCast(i)), path, null);
+    try h.feed(frames.items);
+}
+
+/// A body whose bytes tell where they are.
+fn testBody(len: usize) ![]u8 {
+    const body = try testing.allocator.alloc(u8, len);
+    for (body, 0..) |*b, i| b.* = @truncate(i *% 7 +% i / 251);
+    return body;
+}
+
+/// The worker's loop for a reader that takes `write_max` bytes per
+/// write: write, pump once drained, give back what is empty.
+fn drainSlowly(h: *Harness) !void {
+    while (h.conn.hasWire() or h.conn.output_streams > 0) {
+        try h.collect();
+        if (!h.conn.hasWire()) {
+            const c = h.ctx();
+            h.conn.pump(TestHandler, &c);
+            if (!h.conn.hasWire()) break; // waiting for a window
+        }
+        h.conn.releaseIfIdle(&h.pool);
+        try testing.expect(h.conn.out.capacity <= h.conn.large_size and h.conn.wire.capacity <= h.conn.large_size);
+    }
+    h.conn.releaseIfIdle(&h.pool);
+}
+
+test "output buffers: bursts of large responses allocate nothing once warm, an idle connection holds none" {
+    // h2load with 10 streams of 64 KiB per connection: `out` and `wire`
+    // were freed whenever the streams drained and grown again by the next
+    // burst, mapping and faulting in fresh pages every time.
+    var counting = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const h = try Harness.initWith(.{}, counting.allocator(), 16 * 1024);
+    defer h.deinit();
+    const big = try testBody(64 * 1024);
+    defer testing.allocator.free(big);
+    h.handler.big = big;
+    h.check_body = big;
+    try h.preface();
+    try openWindows(h);
+    var warm: usize = 0;
+    for (0..12) |round| {
+        if (round == 2) warm = counting.allocations + counting.resize_index;
+        try getBurst(h, @intCast(1 + 20 * round), 10, "/big");
+        try h.flushAll();
+        h.conn.releaseIfIdle(&h.pool);
+        try testing.expectEqual(@as(u32, 0), h.conn.activeStreams());
+        try testing.expectEqual(10 * big.len, h.data_out.items.len);
+        h.data_out.clearRetainingCapacity();
+        h.out.clearRetainingCapacity();
+        h.events.clearRetainingCapacity();
+        // Idle: no output buffer held; the large ones wait in the pool.
+        try testing.expectEqual(@as(usize, 0), h.conn.out.capacity + h.conn.wire.capacity);
+        try testing.expect(h.pool.large_len >= 1 and h.pool.large_len <= 2);
+    }
+    // Small responses go out of read buffers.
+    h.check_body = null;
+    for (0..3) |round| {
+        try getBurst(h, @intCast(241 + 200 * round), 100, "/");
+        try h.flushAll();
+        try testing.expectEqual(@as(usize, 100 * "Hello, World!".len), h.data_out.items.len);
+        h.data_out.clearRetainingCapacity();
+        try testing.expectEqual(@as(usize, 0), h.conn.out.capacity + h.conn.wire.capacity);
+    }
+    try testing.expectEqual(warm, counting.allocations + counting.resize_index);
+}
+
+test "output buffers: a slow reader, many streams, a reset mid-response, windows, closing with output queued" {
+    const big = try testBody(64 * 1024);
+    defer testing.allocator.free(big);
+    {
+        // 100 streams to a reader that takes 1000 bytes per write: the
+        // output stays within one large buffer (`collect` checks), and
+        // what is written is given back.
+        const h = try Harness.initWith(.{}, testing.allocator, 16 * 1024);
+        defer h.deinit();
+        h.handler.big = big;
+        h.check_body = big;
+        try h.preface();
+        try openWindows(h);
+        h.write_max = 1000;
+        try getBurst(h, 1, 100, "/big");
+        try drainSlowly(h);
+        try testing.expectEqual(@as(u32, 0), h.conn.activeStreams());
+        try testing.expectEqual(100 * big.len, h.data_out.items.len);
+        try testing.expectEqual(@as(usize, 0), h.conn.out.capacity + h.conn.wire.capacity);
+        // A reset while the stream waits for room: what was queued for it
+        // still goes, the rest never does.
+        h.data_out.clearRetainingCapacity();
+        h.events.clearRetainingCapacity();
+        try getBurst(h, 201, 10, "/big");
+        try testing.expect(h.conn.activeStreams() > 0);
+        try h.rst(219, .cancel);
+        try drainSlowly(h);
+        try testing.expectEqual(@as(u32, 0), h.conn.activeStreams());
+        try testing.expectEqual(@as(usize, 9), std.mem.count(u8, h.events.items, "end=true"));
+        try testing.expect(h.data_out.items.len < 10 * big.len);
+        try testing.expectEqual(@as(usize, 0), h.conn.out.capacity + h.conn.wire.capacity);
+    }
+    {
+        // The default windows: responses wait for WINDOW_UPDATEs, and
+        // the connection holds no output buffer meanwhile.
+        const h = try Harness.initWith(.{}, testing.allocator, 16 * 1024);
+        defer h.deinit();
+        h.handler.big = big;
+        h.check_body = big;
+        try h.preface();
+        try getBurst(h, 1, 3, "/big");
+        try testing.expectEqual(@as(u32, 3), h.conn.activeStreams());
+        try testing.expectEqual(@as(usize, 0), h.conn.out.capacity + h.conn.wire.capacity);
+        try h.window(0, 3 * 65536);
+        try testing.expectEqual(@as(usize, 0), h.conn.out.capacity + h.conn.wire.capacity);
+        for ([_]u31{ 1, 3, 5 }) |id| try h.window(id, 1);
+        try h.flushAll();
+        try testing.expectEqual(@as(u32, 0), h.conn.activeStreams());
+        try testing.expectEqual(3 * big.len, h.data_out.items.len);
+        try testing.expectEqual(@as(usize, 0), h.conn.out.capacity + h.conn.wire.capacity);
+    }
+    {
+        // Closed with a write in flight and more queued: both buffers go
+        // back (the testing allocator finds leaks).
+        const h = try Harness.initWith(.{}, testing.allocator, 16 * 1024);
+        defer h.deinit();
+        h.handler.big = big;
+        try h.preface();
+        try openWindows(h);
+        h.write_max = 1000;
+        try getBurst(h, 1, 10, "/big");
+        const c = h.ctx();
+        h.conn.pump(TestHandler, &c);
+        try testing.expect(h.conn.wire_pos < h.conn.wire.items.len and h.conn.out.items.len > 0);
+        try testing.expect(h.conn.wire.capacity == h.conn.large_size and h.conn.out.capacity == h.conn.large_size);
+    }
+}
+
 fn fdOpen(fd: sys.fd_t) bool {
     return std.posix.errno(std.posix.system.fcntl(fd, std.posix.F.GETFD, @as(usize, 0))) != .BADF;
 }
@@ -3211,7 +3436,7 @@ test "file bodies: DATA frames through the windows, HEAD, a reset closes the own
     h.conn.abortAll(&h.ctx());
     h.conn.deinit(&h.pool);
     try testing.expect(!fdOpen(h.handler.owned_fd));
-    h.conn = try Conn.init(testing.allocator, .{});
+    h.conn = try Conn.init(testing.allocator, .{}, &h.pool);
 }
 
 /// A GET with an optional `priority` header, as frame bytes.
