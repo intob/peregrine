@@ -1,0 +1,5 @@
+# peregrine-h3load-netem: peregrine-h3load with tc (netem, tbf) for
+# bottleneck runs (bench/scripts/h3-netem.sh; containers need NET_ADMIN).
+#   docker build -t peregrine-h3load-netem -f bench/h3/Dockerfile.netem bench/h3
+FROM peregrine-h3load:latest
+RUN apk add --no-cache iproute2 iproute2-tc

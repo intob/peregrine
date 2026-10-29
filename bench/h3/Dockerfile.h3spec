@@ -1,0 +1,8 @@
+# h3spec 0.1.14 (HTTP/3 conformance; amd64 only, so it runs under Rosetta).
+#   docker build --platform linux/amd64 -t h3spec:0.1.14 -f bench/h3/Dockerfile.h3spec bench/h3
+# On macOS the release binary h3spec-mac-arm64 runs natively.
+FROM --platform=linux/amd64 debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates libgmp10 && \
+    curl -fsSL -o /usr/local/bin/h3spec https://github.com/kazu-yamamoto/h3spec/releases/download/v0.1.14/h3spec-linux-x86_64 && \
+    chmod +x /usr/local/bin/h3spec && apt-get purge -y curl && rm -rf /var/lib/apt/lists/*
+ENTRYPOINT ["/usr/local/bin/h3spec"]
