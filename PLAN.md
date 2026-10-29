@@ -391,6 +391,21 @@ Still open:
 | 16 KiB, 64 conns, 2 in flight | 18.0-18.4 µs | 12.7-12.9 µs | 12.2-15.1 µs | 53.0-67.3 µs |
 | 64 KiB, 32 conns, 1 in flight | 43.5-47.0 µs | 30.3-32.1 µs | 30.3-35.7 µs | 224-247 µs |
 
+- [x] x86_64 Debug: "fixed codes" failed with Corrupt on the Hetzner box only. Not the
+      compressor: Zig 0.17's own x86_64 backend (the default for Debug there) compares
+      two optional error sets (`?E == ?E`) by reading a null flag that doesn't exist
+      from stack garbage, so the test inflater's end-of-stream check was random. The
+      three such test comparisons (`inflateAll`, `stdRun`, the decoder fuzz target)
+      unwrap first, and a test pins the inflater (clean stored/fixed/dynamic ends
+      accepted; a cut stored block and a 5-byte input std rejects mid-header both
+      Corrupt). No production code compares optional error sets. Proof: x86_64 Debug
+      303/303 on the box, macOS and Linux epoll/io_uring pass, the ws decoder, inflate
+      and compress fuzz targets 15 min each on x86_64 and aarch64, Autobahn with
+      deflate 517/517 on epoll and io_uring
+- [ ] An x86_64 Debug pass in `linux-test.sh` (cross-compile `-target
+      x86_64-linux-musl`, run under `docker --platform linux/amd64` and pin the alpine
+      image by digest so the shared arm64 tag isn't replaced): the only Mac-local way to
+      catch backend bugs like the one above
 - [ ] Optional idle timeout / server keepalive pings
 - [ ] io_uring: parse straight out of the provided buffer like the HTTP path does
 - [x] **Autobahn testsuite** (25.10.1, `wstest -m fuzzingclient` against
