@@ -1240,8 +1240,55 @@ which RFC 9113 deprecated).
       and 27-36. A one-off io_uring server death in the first run didn't reproduce in
       129 more runs (the old script called any failed `docker exec` a death); the
       harness now keeps a dead server and its log
-- [ ] h2 output buffers: pool them per worker, not freed each time the streams drain
-      (see the h2o benchmark); then rerun `h2-bench.sh h2c` and `tls`. In progress
+- [x] **h2 output buffers from per-worker free lists.** `out` and `wire` grew from
+      16 KiB by doubling and were freed whenever the streams drained (every burst with
+      h2load -m10, every write completion on io_uring); past 32 KiB that is mmap/munmap
+      and fresh pages (6.4 minor faults per request on epoll, 13-14 on io_uring, a
+      quarter of the CPU on 64 KiB responses). Now they come from two free lists in the
+      worker's BufferPool, a small size (one frame + 16 KiB) and a large one (out_limit
+      + 2 frames + 16 KiB), and go back as soon as they hold nothing (a written wire,
+      or one taken into TLS records, at once); each list keeps as many as were in use
+      at once in the last second, trimmed on the worker's tick, which keeps running
+      while buffers are held, so bursts on any number of connections allocate nothing
+      and an idle worker frees them all within two seconds. Idle connections, waiting
+      exchanges (polls reserve at most the small buffer's room) and connections waiting
+      for a window hold no output buffer. Header blocks are reserved whole and nothing
+      follows a GOAWAY (RFC 9113 §6.10). io_uring shutdown counts every SQE to its last
+      completion, cancels them all and frees nothing until the ring is quiet; if the
+      kernel hasn't finished in 2 s it closes every descriptor and leaks the memory
+      rather than free it under the kernel. Proof: a counting allocator over repeated
+      bursts; an allocation failing at every point in three bursts (whole frames, right
+      bytes, no leak); a random Recycler test; slow reader, many streams, reset
+      mid-response, windows, closing with output queued, empty exchange and HEAD polls,
+      a 16 MiB peer frame size; an idle worker draining its lists on every backend;
+      shutdown with sends stuck while clients keep connecting (looped 25x per backend);
+      the harness checks after every run (split invariance and the fuzz target too;
+      fuzzed 15 min on a Pi, twice); h2spec unchanged; a byte-checked churn of ~16k
+      requests and 3.5 GB with partial writes on epoll and io_uring, h2c and TLS
+      (`zig build verify-server`, `bench/scripts/h2-churn.sh`). Three review rounds and
+      an adversarial verifier who couldn't break it. h2load 64 KiB, µs of server CPU per
+      request (before → after; h2o 2.3 in the same runs; host load 6-14):
+
+| | before | after | h2o 2.3 |
+|---|---|---|---|
+| h2c 10 × 10, epoll | 20.7-22.4 | 10.0-11.6 | 17.8-18.2 |
+| h2c 10 × 10, io_uring | 36.6-37.0 | 11.3-12.7 | |
+| h2c 100 × 10, epoll | 20.4-23.5 | 12.6-14.3 | 19.8-23.0 |
+| h2c 100 × 10, io_uring | 36.4-45.7 | 13.3-16.3 | |
+| TLS 100 × 10, epoll | 35.6-39.2 | 25.7-28.9 | 31.7-37.4 |
+| TLS 100 × 10, io_uring | 58.6-68.6 | 25.2-31.1 | |
+| minor faults per request | 6.4-13.9 | 0-0.004 | 0.08-0.41 |
+
+      h2c 100 × 10 throughput 130-238K → 328-350K req/s (h2o 234-238K). "Hello" within
+      noise. With this the 64 KiB rows in the h2o table above go to peregrine
+- [ ] Per-connection h2 memory: Stream slots (~168 KB allocated and cleared at init,
+      128 inline slots with `hdr[MAX_HEADERS]`), Stream.req/pending and the 4 KiB
+      enc_buf kept for the connection's life
+- [ ] h3/QUIC stream buffers (`SendStream`/`RecvStream`, up to `stream_buffer` per
+      slot) and ws.Conn queues (`shared`, `wire`, `deflated`) keep their capacity while
+      the connection lives: same treatment as the h2 output buffers
+- [ ] 64 KiB from a file over h2 (pread per 16 KiB frame) is still behind h2o; rerun
+      `FILE=1 h2-bench.sh h2c` now that the output buffers are pooled
 
 ## M6. HTTP/3 and QUIC 🟡
 
