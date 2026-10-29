@@ -735,6 +735,16 @@ test "verify pacing: an amplification budget under 64 bytes leaves no deadline i
     // A deadline that stays due while send can do nothing is a busy loop
     // (the endpoint polls with a 0 ms timeout).
     if (wakeups >= 5) std.debug.print("amplification: {d} wakeups with the deadline already due (deadline {d} us, now {d} us)\n", .{ wakeups, s.deadline().?, h.now });
+    // It lasts until the connection gives up (nothing else changes).
+    var due_ms: usize = 0;
+    while (!s.isClosed()) {
+        const d = s.deadline() orelse break;
+        if (d <= h.now) due_ms += 1;
+        h.now = @max(h.now + 1000, d);
+        s.onTimeout(h.now);
+        _ = s.send(&buf, h.now);
+    }
+    if (wakeups >= 5) std.debug.print("amplification: still due in {d} of the following 1 ms steps, until closed at {d} s\n", .{ due_ms, (h.now - start) / std.time.us_per_s });
     try testing.expect(wakeups < 5);
 }
 
