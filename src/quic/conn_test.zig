@@ -914,3 +914,47 @@ test "verify pacing: pacer arithmetic at extremes" {
     p0.onSent(12000);
     try testing.expect(p0.nextSend(1200, &cc, &rtt).? > 0);
 }
+
+test "verify pacing: CONNECTION_CLOSE goes at once while the pacer holds data back" {
+    const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20 }, noTweak);
+    defer h.deinit();
+    try h.run(10);
+    const s = h.server.?;
+    var buf: [1500]u8 = undefined;
+    const id = try h.client.openBidi();
+    try h.client.write(id, "big 200000", true);
+    try h.toServer(buf[0..try h.client.send(&buf)]);
+    s.pacer.tokens = 0;
+    s.pacer.last = h.now;
+    try testing.expectEqual(@as(usize, 0), s.send(&buf, h.now));
+    try testing.expect(s.deadline().? > h.now);
+    s.closeApp(0x100, "bye", h.now);
+    const n = s.send(&buf, h.now);
+    try testing.expect(n > 0);
+    try h.client.recv(buf[0..n]);
+    try testing.expect(h.client.closed != null);
+    // Closing: the deadline is the close timer, not the pacer.
+    try testing.expectEqual(s.close_deadline, s.deadline());
+}
+
+test "verify pacing: a key update in the middle of a paced download over a 40 ms path" {
+    const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20 }, noTweak);
+    defer h.deinit();
+    var bursts: std.ArrayList(Burst) = .empty;
+    defer bursts.deinit(testing.allocator);
+    try h.runDelayed(20_000, {}, established, &bursts);
+    const id = try h.client.openBidi();
+    try h.client.write(id, "big 3000000", true);
+    const Half = struct {
+        fn f(want: u64, hh: *Harness) bool {
+            return hh.client.readAll(want).len > 1_000_000;
+        }
+    };
+    try h.runDelayed(20_000, id, Half.f, &bursts);
+    h.client.initiateKeyUpdate();
+    h.client.followKeyUpdate();
+    try h.runDelayed(20_000, id, finishedStream, &bursts);
+    try testing.expectEqual(@as(usize, 3_000_000), h.client.readAll(id).len);
+    try testing.expectEqual(@as(u1, 1), h.server.?.rx_phase);
+    try testing.expect(h.server.?.paced_waits > 0);
+}

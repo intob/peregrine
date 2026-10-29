@@ -71,6 +71,10 @@ pub const Client = struct {
     /// NewSessionTickets received (not used to resume).
     tickets: u32 = 0,
     key_phase: u1 = 0,
+    /// The phase of the receive keys, and the keys before the last update
+    /// (packets of the old phase can still be on their way).
+    rx_phase: u1 = 0,
+    prev_rx_packet: ?@FieldType(Keys, "packet") = null,
     // Connection state.
     streams: std.AutoHashMapUnmanaged(u64, *Stream) = .empty,
     next_bidi: u64 = 0,
@@ -230,7 +234,8 @@ pub const Client = struct {
             const keys = sp.rx orelse continue;
             const pn_info = keys.header.unprotect(pkt, h.pn_offset) catch continue;
             const pn = packet.decodePn(sp.largest_rx, pn_info.truncated, pn_info.len);
-            const payload = keys.packet.open(pkt, h.pn_offset + pn_info.len, pn) catch return error.Undecryptable;
+            const pk = if (idx == 2 and ((pkt[0] >> 2) & 1) != self.rx_phase and self.prev_rx_packet != null) self.prev_rx_packet.? else keys.packet;
+            const payload = pk.open(pkt, h.pn_offset + pn_info.len, pn) catch return error.Undecryptable;
             if (sp.largest_rx == null or pn > sp.largest_rx.?) sp.largest_rx = pn;
             sp.rx_pns.insert(self.a, pn, pn + 1, 1 << 20) catch unreachable;
             var r: packet.Reader = .{ .data = payload };
@@ -483,6 +488,8 @@ pub const Client = struct {
     /// Accepts a server key update: the next receive keys.
     pub fn followKeyUpdate(self: *Self) void {
         self.app_rx_secret = protection.nextSecret(.aes_128_gcm_sha256, &self.app_rx_secret)[0..32].*;
+        self.prev_rx_packet = self.spaces[2].rx.?.packet;
+        self.rx_phase ^= 1;
         self.spaces[2].rx.?.packet = .init(.aes_128_gcm_sha256, &self.app_rx_secret);
     }
 
