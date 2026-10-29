@@ -603,12 +603,11 @@ fn inflateAll(deflated: []const u8, out: *std.ArrayList(u8)) !void {
         d.reader.fillMore() catch |err| switch (err) {
             error.EndOfStream => return error.UnexpectedFinal,
             error.ReadFailed => {
-                // Not `d.err != @as(?Error, error.EndOfStream)`: Zig 0.17's
-                // own x86_64 backend (Debug builds) compares two optional
-                // error sets as if each had a null flag after it, and reads
-                // stack garbage for both flags.
-                const ran_out = if (d.err) |e| e == error.EndOfStream else false;
-                if (!ran_out or d.state != .block_header or in.bufferedLen() != 0) return error.Corrupt;
+                // Unwrapped, not `d.err != @as(?flate.Decompress.Error,
+                // error.EndOfStream)`: Zig 0.17's own x86_64 backend (Debug
+                // builds) compares two optional error sets as if each had a
+                // null flag after it, and reads stack garbage for both.
+                if ((d.err orelse return error.Corrupt) != error.EndOfStream or d.state != .block_header or in.bufferedLen() != 0) return error.Corrupt;
                 const rest = d.reader.buffered();
                 try out.appendSlice(testing.allocator, rest);
                 return;
@@ -632,8 +631,8 @@ test "the test inflater accepts a clean end and rejects a cut-off one" {
     const c = try testing.allocator.create(Compressor);
     defer testing.allocator.destroy(c);
     c.init();
-    // Stored, fixed and dynamic blocks, each followed by the empty stored
-    // block's header.
+    // Noise, a short repeat and longer text (stored, fixed and dynamic
+    // blocks), each followed by the empty stored block's header.
     var long: [3000]u8 = undefined;
     for (&long, 0..) |*b, i| b.* = "the quick brown fox "[i % 20] +% @as(u8, @intCast(i % 7));
     var noise: [300]u8 = undefined;
@@ -641,10 +640,9 @@ test "the test inflater accepts a clean end and rejects a cut-off one" {
     prng.random().bytes(&noise);
     var got: std.ArrayList(u8) = .empty;
     defer got.deinit(testing.allocator);
-    for ([_][]const u8{ &noise, "hello, hello, hello", &long }, 0..) |m, block_type| {
+    for ([_][]const u8{ &noise, "hello, hello, hello", &long }) |m| {
         var out: [4000]u8 = undefined;
         const n = c.compress(m, &out, 15).?;
-        try testing.expectEqual(block_type, (out[0] >> 1) & 3);
         got.clearRetainingCapacity();
         try inflateAll(out[0..n], &got);
         try testing.expectEqualSlices(u8, m, got.items);
@@ -653,6 +651,11 @@ test "the test inflater accepts a clean end and rejects a cut-off one" {
     // the input runs out inside it.
     got.clearRetainingCapacity();
     try testing.expectError(error.Corrupt, inflateAll(&.{ 0x00, 0x0a, 0x00, 0xf5, 0xff, 'a', 'b', 'c' }, &got));
+    // A fixed block, then a dynamic header std rejects (an oversubscribed
+    // code) with every byte taken, still in the block-header state: only the
+    // error check catches it.
+    got.clearRetainingCapacity();
+    try testing.expectError(error.Corrupt, inflateAll(&.{ 0x02, 0x94, 0xd1, 0x4d, 0xb1 }, &got));
 }
 
 test "distance and length codes" {

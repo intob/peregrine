@@ -1217,10 +1217,8 @@ fn fuzzDecoder(_: void, smith: *std.testing.Smith) anyerror!void {
     try testing.expectEqualSlices(u8, whole.log.items, split.log.items);
     // Streamed text is validated as it arrives, so invalid UTF-8 in a frame
     // the input cuts short fails only there.
-    // `split.err` unwrapped, not compared with `@as(?Error, ...)`: see
-    // `inflateAll` in compress.zig.
-    const split_utf8 = if (split.err) |e| e == error.InvalidUtf8 else false;
-    if (!(whole.err == null and split_utf8)) {
+    // `split.err` unwrapped: see `inflateAll` in compress.zig.
+    if (whole.err != null or split.err == null or split.err.? != error.InvalidUtf8) {
         try testing.expectEqual(whole.err, split.err);
     }
 }
