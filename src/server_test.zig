@@ -2064,6 +2064,48 @@ fn testH2Goaway(backend: Backend) !void {
     try c.tcp.expectClosed();
 }
 
+test "h2c: shutdown with sends stuck on readers that stopped, while clients keep connecting" {
+    try forEachBackend(testH2ShutdownStuck);
+}
+
+fn testH2ShutdownStuck(backend: Backend) !void {
+    const r = try Running.start(backend, h2Config());
+    // Clients that ask for 8 MiB bodies with huge windows and never read:
+    // the worker's writes fill the sockets and stay pending (on io_uring,
+    // sends in flight on the output buffers).
+    var clients: [6]*H2Client = undefined;
+    for (&clients) |*c| {
+        c.* = try H2Client.connect(r.port);
+        var buf: [64]u8 = undefined;
+        const n = try h2frame.writeSettings(&buf, &.{.{ .id = .initial_window_size, .value = h2frame.max_window_size }});
+        try c.*.tcp.send(buf[0..n]);
+        try c.*.sendWindow(0, h2frame.max_window_size - 65535);
+        for (0..3) |i| try c.*.request(@intCast(1 + 2 * i), "GET", "/big", null);
+    }
+    defer for (clients) |c| c.close();
+    sleepMs(300);
+    // New connections arrive while the worker shuts down and drains.
+    const Connector = struct {
+        fn run(port: u16, stop: *std.atomic.Value(bool)) void {
+            while (!stop.load(.acquire)) {
+                var c = Client.connect(port) catch return;
+                c.send(h2frame.preface) catch {};
+                c.close();
+            }
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const t = try std.Thread.spawn(.{}, Connector.run, .{ r.port, &stop });
+    sleepMs(20);
+    const start = sys.nanoTimestamp();
+    r.stop();
+    const took = sys.nanoTimestamp() - start;
+    stop.store(true, .release);
+    t.join();
+    // Prompt: shutting the sockets down fails the pending writes.
+    try testing.expect(took < 3 * std.time.ns_per_s);
+}
+
 test "h2c: the client's GOAWAY closes the connection, and the worker goes on" {
     try forEachBackend(testH2ClientGoaway);
 }

@@ -33,7 +33,12 @@ for backend in $BACKENDS; do
             pids+=($!)
         done
         for pid in "${pids[@]}"; do wait "$pid" || status=1; done
-        for p in $(seq 1 "$PROCS"); do grep -E "seed|FAIL|requests=" "$OUT/churn-$TAG-$p.log" | head -12; done
+        # Wrong bytes, torn frames and protocol errors first: they are the
+        # point. Timeouts and resets of slow readers are counted.
+        cat "$OUT"/churn-$TAG-*.log > "$OUT/churn-$TAG-$backend-$mode.log"
+        grep -E "wrong byte|length [0-9]+ !=|Protocol|FrameTooLarge|FlowControl|Invalid|Traceback" "$OUT/churn-$TAG-$backend-$mode.log" | grep -v "^  " | head -20
+        grep -E "^FAIL" "$OUT/churn-$TAG-$backend-$mode.log" | sed -E 's/[0-9]+/N/g' | cut -c1-90 | sort | uniq -c | sort -rn | head -12
+        grep -h "requests=" "$OUT"/churn-$TAG-*.log
         if [ -z "$(docker ps -q -f name="^$name\$")" ]; then
             echo "SERVER DIED"; status=1; continue
         fi

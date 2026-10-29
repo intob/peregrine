@@ -1137,6 +1137,57 @@ test "large buffers of equal size: the one released last comes back first" {
     pool.releaseLarge(x);
 }
 
+test "recycler: random acquires, releases, trims and failing allocations keep the books" {
+    // Every buffer handed out is distinct and stays allocated until it
+    // comes back (a send may be reading it); free + held never exceeds
+    // the most held at once since the trim before last; nothing leaks.
+    var prng: std.Random.DefaultPrng = .init(0x5eed);
+    const rand = prng.random();
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const a = failing.allocator();
+    var r: Recycler = .{ .size = 64 };
+    defer r.deinit(a);
+    var held: std.ArrayList([]u8) = .empty;
+    defer held.deinit(testing.allocator);
+    var peak_prev: usize = 0;
+    var peak_now: usize = 0;
+    for (0..20000) |_| {
+        switch (rand.uintLessThan(u8, 10)) {
+            0...4 => {
+                // Now and then an allocation fails: nothing changes.
+                failing.fail_index = if (rand.uintLessThan(u8, 8) == 0) failing.alloc_index else std.math.maxInt(usize);
+                const in_use = r.in_use;
+                const b = r.acquire(a) catch {
+                    try testing.expectEqual(in_use, r.in_use);
+                    continue;
+                };
+                failing.fail_index = std.math.maxInt(usize);
+                for (held.items) |h| try testing.expect(h.ptr != b.ptr);
+                @memset(b, 0xAB);
+                try held.append(testing.allocator, b);
+                peak_now = @max(peak_now, held.items.len);
+            },
+            5...8 => if (held.items.len > 0) {
+                const b = held.swapRemove(rand.uintLessThan(usize, held.items.len));
+                for (b) |x| try testing.expectEqual(@as(u8, 0xAB), x);
+                r.release(b);
+            },
+            else => {
+                r.trim(a);
+                peak_prev = peak_now;
+                peak_now = held.items.len;
+            },
+        }
+        try testing.expectEqual(held.items.len, r.in_use);
+        try testing.expect(r.free.len + r.in_use <= r.free.items.len);
+        try testing.expect(r.free.len + r.in_use <= @max(peak_prev, peak_now));
+    }
+    for (held.items) |b| r.release(b);
+    r.trim(a);
+    r.trim(a);
+    try testing.expectEqual(@as(usize, 0), r.free.len);
+}
+
 test "recycler: keeps as many as were in use at once recently, frees the rest on trim" {
     var counting = std.testing.FailingAllocator.init(testing.allocator, .{});
     const a = counting.allocator();
