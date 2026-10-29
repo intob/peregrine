@@ -126,7 +126,10 @@ benchmark next to fuzzing or test containers: the numbers would be noise.
   for other peregrine containers); test, Autobahn, interop and local fuzz
   jobs hold it shared (`share`/`unshare`, builds included). The queue is
   fair: a benchmark that releases and re-acquires goes behind waiting
-  jobs, so new scripts must use `share`, not `wait`.
+  jobs, so new scripts must use `share`, not `wait`. Native macOS test
+  runs and builds count too: run them under `share` (e.g. `bash -c
+  '"$LOCK" share mac-bench "zig test"; trap ... EXIT; zig test ...'`),
+  or a benchmark next to them measures a loaded host.
   Other heavy work on this Mac (check `uptime`) skews numbers too.
 - **Raspberry Pis 1 and 5** (`pi1-wg`, `pi5-wg`; Pi 5 Model B, 4 A76 cores,
   8 GB, gigabit LAN between them, 0.35 ms): the user's machines, lent when
