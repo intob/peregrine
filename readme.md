@@ -193,6 +193,9 @@ const srv = try per.Server(Handler).init(gpa, 443, .{
 });
 ```
 
+### Deploy
+[docs/deployment.md](docs/deployment.md) compares three ways to host an app: behind a Cloudflare Tunnel, behind Cloudflare's proxy with an Origin CA certificate, and exposed directly with Peregrine's own TLS, HTTP/2 and HTTP/3.
+
 ### Stream or defer a response
 `resp.stream()` sends the status and headers now and returns an `Exchange` for the body; `resp.later()` sends nothing until `ex.respond` or `ex.startStream`, from any thread. Handles are values that stay safe after the exchange ends (calls return `error.Closed`).
 ```zig
