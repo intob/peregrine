@@ -229,5 +229,7 @@ test "verify: x25519 shared secret vs std, random and structured" {
             },
         }
         try expectSameAsStd(sk, u);
+        // The table's public key, for the same structured scalars.
+        try testing.expectEqualSlices(u8, &X25519.recoverPublicKey(sk), &x25519.publicKey(sk));
     }
 }
