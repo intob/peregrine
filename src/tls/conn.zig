@@ -1355,6 +1355,88 @@ test "a reused connection state goes back to the pool when its handshake state c
     try testing.expectEqual(1, pools.conns.len);
 }
 
+/// Every 16-byte window of `bytes` that isn't a run of one byte value.
+fn addWindows(set: *std.AutoHashMap([16]u8, []const u8), bytes: []const u8, what: []const u8) !void {
+    if (bytes.len < 16) return;
+    for (0..bytes.len - 15) |i| {
+        const w = bytes[i..][0..16].*;
+        if (std.mem.allEqual(u8, &w, w[0])) continue;
+        try set.put(w, what);
+    }
+}
+
+/// How many 16-byte windows of `memory` are in `set`; prints the first.
+fn countWindows(set: *const std.AutoHashMap([16]u8, []const u8), memory: []const u8, where: []const u8) usize {
+    if (memory.len < 16) return 0;
+    var n: usize = 0;
+    for (0..memory.len - 15) |i| {
+        if (set.get(memory[i..][0..16].*)) |what| {
+            if (n == 0) std.debug.print("{s} at {s}+{d} survived the handshake's release\n", .{ what, where, i });
+            n += 1;
+        }
+    }
+    return n;
+}
+
+test "a pooled handshake state holds nothing from its handshake once released" {
+    const td = credentials.testdata;
+    var server: TestServer = undefined;
+    try server.init(td.p256_cert, td.p256_key);
+    defer server.deinit();
+    var transcript: std.ArrayList(u8) = .empty;
+    defer transcript.deinit(testing.allocator);
+    try runAgainstStdClient(&server, "GET / HTTP/1.1\r\nHost: x\r\n\r\n", &transcript);
+    // The ClientHello split across two records, so it goes through the
+    // partial-message buffer.
+    const ch_len = std.mem.readInt(u16, transcript.items[3..5], .big);
+    const k = ch_len / 2;
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(testing.allocator);
+    try input.appendSlice(testing.allocator, &.{ 0x16, 0x03, 0x01, @intCast(k >> 8), @truncate(k) });
+    try input.appendSlice(testing.allocator, transcript.items[5..][0..k]);
+    try input.appendSlice(testing.allocator, &.{ 0x16, 0x03, 0x01, @intCast((ch_len - k) >> 8), @truncate(ch_len - k) });
+    try input.appendSlice(testing.allocator, transcript.items[5 + k ..]);
+
+    var pools = try Pools.init(testing.allocator, 1);
+    defer pools.deinit();
+    var set = std.AutoHashMap([16]u8, []const u8).init(testing.allocator);
+    defer set.deinit();
+    try addWindows(&set, transcript.items[5..][0..ch_len], "the ClientHello");
+    const conn = try pools.createConn(&server.config, &testEntropy(5));
+    const hs = conn.hs.?;
+    try addWindows(&set, &hs.entropy, "entropy");
+    var rest = input.items;
+    while (rest.len > 0) {
+        const space = try conn.readSpace();
+        const n = @min(space.len, rest.len, 64);
+        @memcpy(space[0..n], rest[0..n]);
+        conn.commitRead(n);
+        rest = rest[n..];
+        var plain: [256]u8 = undefined;
+        while (conn.readPlain(&plain) > 0) {}
+        // Everything secret the state holds, while it holds it.
+        if (conn.hs != null) {
+            try addWindows(&set, &hs.client_handshake_secret, "client_handshake_secret");
+            try addWindows(&set, &hs.client_app_secret, "client_app_secret");
+            try addWindows(&set, &hs.master_secret, "master_secret");
+            try addWindows(&set, &hs.expected_finished, "expected_finished");
+            try addWindows(&set, std.mem.asBytes(&hs.transcript), "the transcript hash state");
+            if (hs.flight.len > 0 and hs.state != .client_hello) try addWindows(&set, hs.flight, "the server flight");
+        }
+        conn.advance(conn.wireBytes().len);
+        try testing.expect(!conn.failed);
+    }
+    try testing.expect(conn.isEstablished());
+    pools.destroyConn(conn);
+    // The state is in the pools, waiting for the next connection.
+    try testing.expectEqual(hs, pools.handshakes.items[0]);
+    // Built in release modes, where nothing overwrites freed capacity.
+    var found = countWindows(&set, std.mem.asBytes(hs), "the state");
+    found += countWindows(&set, hs.flight, "the flight buffer");
+    found += countWindows(&set, hs.partial.allocatedSlice(), "the partial-message buffer");
+    try testing.expectEqual(0, found);
+}
+
 fn expectAlert(input: []const u8, description: tls.Alert.Description) !void {
     const td = credentials.testdata;
     var server: TestServer = undefined;

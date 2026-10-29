@@ -1530,6 +1530,11 @@ fn appBytes(a: Allocator, len: usize, seed: usize) ![]u8 {
     return b;
 }
 
+/// Tests set these: the pools every run uses (to run inputs on states
+/// left by other inputs), and where the first run's output digest goes.
+var shared_pools: ?*conn_mod.Pools = null;
+var ref_digest: ?*[32]u8 = null;
+
 fn fuzzOne(_: void, smith: *Smith) anyerror!void {
     const fx = try fixtures();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1571,10 +1576,11 @@ fn fuzzOne(_: void, smith: *Smith) anyerror!void {
     var configs: [3]conn_mod.Config = @splat(config);
     for (&configs, &guards) |*c, *g| c.replay = g;
 
-    var pools = try conn_mod.Pools.init(testing.allocator, 2);
-    defer pools.deinit();
+    var own_pools = try conn_mod.Pools.init(testing.allocator, 2);
+    defer own_pools.deinit();
+    const pools = shared_pools orelse &own_pools;
 
-    var probe = try Run.init(&pools, &configs[0], record.max_plaintext);
+    var probe = try Run.init(pools, &configs[0], record.max_plaintext);
     defer probe.deinit();
     var view: View = .{ .fx = fx, .a = a, .tickets = tickets, .max_early = max_early, .alpn_list = config.alpn };
     var exp: Expect = .{};
@@ -1634,6 +1640,14 @@ fn fuzzOne(_: void, smith: *Smith) anyerror!void {
     try view.pump(probe.result.wire.items);
     var ref = probe.finish();
     defer ref.deinit();
+    if (ref_digest) |d| {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update(ref.wire.items);
+        h.update(&.{ 0xff, @intFromBool(ref.failed), @intFromBool(ref.peer_closed), @intFromBool(ref.established) });
+        h.update(ref.plain.items);
+        h.update(ref.alpn orelse "-");
+        d.* = h.finalResult();
+    }
     try checkStructure(&ref);
     if (as_recorded and std.mem.eql(u8, ch1, fx.hello)) {
         // The unmodified recording: a complete, valid session.
@@ -1646,7 +1660,7 @@ fn fuzzOne(_: void, smith: *Smith) anyerror!void {
     const n_sizes = smith.valueRangeAtMost(u8, 1, read_sizes.len);
     for (read_sizes[0..n_sizes]) |*s| s.* = if (smith.boolWeighted(1, 1)) smith.valueRangeAtMost(u16, 1, 32) else smith.valueRangeAtMost(u16, 1, 20000);
     {
-        var run = try Run.init(&pools, &configs[1], smith.valueRangeAtMost(u16, 1, record.max_plaintext));
+        var run = try Run.init(pools, &configs[1], smith.valueRangeAtMost(u16, 1, record.max_plaintext));
         defer run.deinit();
         try run.feed(script.stream.items, read_sizes[0..n_sizes]);
         var res = run.finish();
@@ -1659,7 +1673,7 @@ fn fuzzOne(_: void, smith: *Smith) anyerror!void {
         var frag_stream: std.ArrayList(u8) = .empty;
         var ser: Serializer = .{ .keys = &view.keys };
         for (script.recs.items) |rec| try ser.write(a, &frag_stream, rec, true);
-        var run = try Run.init(&pools, &configs[2], 1 + smith.valueRangeAtMost(u16, 0, 15));
+        var run = try Run.init(pools, &configs[2], 1 + smith.valueRangeAtMost(u16, 0, 15));
         defer run.deinit();
         try run.feed(frag_stream.items, &.{1});
         var res = run.finish();
@@ -2187,6 +2201,57 @@ test "tls harness: accepted 0-RTT, within and past max_early_data" {
         try earlySession(suite, 0);
         try earlySession(suite, 1000);
         try earlySession(suite, 1001);
+    }
+}
+
+fn pseudoRandomInput(random: std.Random, input: *[256]u64) void {
+    for (input) |*v| v.* = std.mem.nativeToLittle(u64, switch (random.uintLessThan(u8, 20)) {
+        0...7 => random.uintLessThan(u64, 2),
+        8...13 => random.uintLessThan(u64, 8),
+        14...16 => random.uintLessThan(u64, 32),
+        17, 18 => random.uintLessThan(u64, 1024),
+        else => random.int(u16),
+    });
+}
+
+test "tls fuzz harness: a state reused from other inputs' handshakes gives the same output as a fresh one" {
+    // One connection and one handshake state in the pools, so every run
+    // gets the state the previous run (often another input, ending at any
+    // point: done, failed, HelloRetryRequest, 0-RTT) left behind.
+    var pools = try conn_mod.Pools.init(testing.allocator, 1);
+    defer pools.deinit();
+    defer shared_pools = null;
+    defer ref_digest = null;
+    var prng = std.Random.DefaultPrng.init(0x9001);
+    const random = prng.random();
+    var inputs: [48][256]u64 = undefined;
+    for (&inputs) |*in| pseudoRandomInput(random, in);
+    var fresh: [inputs.len][32]u8 = undefined;
+    for (&inputs, &fresh) |*in, *d| {
+        shared_pools = null;
+        ref_digest = d;
+        var smith: Smith = .{ .in = std.mem.sliceAsBytes(in) };
+        try fuzzOne({}, &smith);
+    }
+    // In order, then shuffled, on the shared pools.
+    var order: [inputs.len]usize = undefined;
+    for (&order, 0..) |*o, i| o.* = i;
+    for (0..3) |pass| {
+        if (pass > 0) random.shuffle(usize, &order);
+        for (order) |i| {
+            var d: [32]u8 = undefined;
+            shared_pools = &pools;
+            ref_digest = &d;
+            var smith: Smith = .{ .in = std.mem.sliceAsBytes(&inputs[i]) };
+            fuzzOne({}, &smith) catch |err| {
+                std.debug.print("input {d} on a reused state failed: {s}\n", .{ i, @errorName(err) });
+                return err;
+            };
+            if (!std.mem.eql(u8, &d, &fresh[i])) {
+                std.debug.print("input {d}: output on a reused state differs from a fresh one\n", .{i});
+                return error.ReusedStateChangedOutput;
+            }
+        }
     }
 }
 
