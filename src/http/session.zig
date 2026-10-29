@@ -1185,7 +1185,12 @@ test "recycler: random acquires, releases, trims and failing allocations keep th
     for (held.items) |b| r.release(b);
     r.trim(a);
     r.trim(a);
+    // Two quiet trims (what an idle worker's ticks do): nothing held or
+    // kept, the list itself included, every allocation freed.
     try testing.expectEqual(@as(usize, 0), r.free.len);
+    try testing.expect(!r.holds());
+    try testing.expectEqual(@as(usize, 0), r.free.items.len);
+    try testing.expectEqual(failing.allocations, failing.deallocations);
 }
 
 test "recycler: keeps as many as were in use at once recently, frees the rest on trim" {
