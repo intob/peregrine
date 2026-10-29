@@ -80,6 +80,8 @@ fn buildTable() void {
 
 /// p + q, q from the table (twisted Edwards, a = −1: complete).
 fn madd(p: Point, q: Niels) Point {
+    // No overflow checks: they would branch on secret values.
+    @setRuntimeSafety(false);
     const abc = F.mulN(3, .{ p.y.sub(p.x), p.y.add(p.x), p.t }, .{ q.ymx, q.ypx, q.xy2d });
     const d = p.z.add(p.z);
     const e = abc[1].sub(abc[0]);
@@ -90,8 +92,10 @@ fn madd(p: Point, q: Niels) Point {
     return .{ .x = r[0], .y = r[1], .z = r[2], .t = r[3] };
 }
 
-/// A scalar below 2^253 as 65 digits in [-8, 8), the last 0 or 1.
+/// A 256-bit scalar as 65 digits in [-8, 8), the last 0 or 1.
 fn recode(s: [32]u8) [rows]i8 {
+    // No overflow checks: they would branch on secret values.
+    @setRuntimeSafety(false);
     var e: [rows]i8 = undefined;
     for (s, 0..) |x, i| {
         e[i * 2] = @as(i8, @as(u4, @truncate(x)));
@@ -107,8 +111,10 @@ fn recode(s: [32]u8) [rows]i8 {
     return e;
 }
 
-/// s × B in constant time, for a scalar reduced mod L.
+/// s × B in constant time, for any 256-bit little-endian s.
 fn mulBase(s: [32]u8) Point {
+    // No overflow checks: they would branch on secret values.
+    @setRuntimeSafety(false);
     const t = baseTable();
     const e = recode(s);
     var q: Point = .{ .x = F.zero, .y = F.one, .z = F.one, .t = F.zero };
@@ -136,10 +142,13 @@ fn mulBase(s: [32]u8) Point {
 /// The public key for an X25519 secret key: the same as std's
 /// `X25519.recoverPublicKey`.
 pub fn publicKey(secret_key: [32]u8) [32]u8 {
+    // No overflow checks: they would branch on secret values.
+    @setRuntimeSafety(false);
     var s = secret_key;
     Edwards25519.scalar.clamp(&s);
-    // B has order L, so the clamped scalar works reduced.
-    const p = mulBase(Edwards25519.scalar.reduce(s));
+    // Not reduced mod L first (std's reduction has overflow checks on
+    // the secret in safe builds): any 256-bit scalar fits the 65 digits.
+    const p = mulBase(s);
     // u = (1 + y) / (1 − y) = (Z + Y) / (Z − Y).
     return p.z.add(p.y).mul(p.z.sub(p.y).invert()).toBytes();
 }
@@ -149,6 +158,8 @@ pub fn publicKey(secret_key: [32]u8) [32]u8 {
 /// is zero (a low-order point). In constant time: the scalar's bits only
 /// make masks for conditional swaps.
 pub fn sharedSecret(secret_key: [32]u8, public_key: [32]u8) error{IdentityElement}![32]u8 {
+    // No overflow checks: they would branch on secret values.
+    @setRuntimeSafety(false);
     var s = secret_key;
     Edwards25519.scalar.clamp(&s);
     defer std.crypto.secureZero(u8, &s);
