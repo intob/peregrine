@@ -16,9 +16,15 @@
 //! written before the handshake completes (`inEarlyData`). The early key
 //! goes once a 1-RTT packet arrives (RFC 9001 §4.9.3).
 //!
+//! Sending is paced (RFC 9002 §7.7, recovery.Pacer): a datagram carrying
+//! data waits while the pacer has no room for it, and `deadline()` names
+//! the time it may go, so the worker's timer brings the connection back
+//! to `send`. ACKs and probes don't wait.
+//!
 //! Not yet: connection migration and NEW_CONNECTION_ID, Retry tokens
-//! (the worker's job), pacing, ECN, PMTU discovery, DATAGRAM frames.
+//! (the worker's job), ECN, PMTU discovery, DATAGRAM frames.
 const std = @import("std");
+const builtin = @import("builtin");
 const packet = @import("./packet.zig");
 const protection = @import("./protection.zig");
 const frame = @import("./frame.zig");
@@ -38,6 +44,10 @@ const TransportError = frame.TransportError;
 const RecvStream = stream_mod.RecvStream;
 const SendStream = stream_mod.SendStream;
 const Cid = tp.Cid;
+
+/// Sends that found data held back by a pacer, in every connection of the
+/// process: end-to-end tests can't reach the connections. Tests only.
+pub var test_paced_waits: std.atomic.Value(u64) = .init(0);
 
 pub const Config = struct {
     tls: *const handshake.Config,
@@ -59,6 +69,11 @@ pub const Config = struct {
     /// Largest UDP payload we send (until PMTU discovery exists).
     max_datagram_size: u16 = 1200,
     congestion: recovery.Algorithm = .cubic,
+    /// Pace sending (RFC 9002 §7.7) at 1.25 · cwnd / smoothed RTT, in
+    /// bursts of at most `pacing_burst_us` of that rate (and at least ten
+    /// datagrams).
+    pacing: bool = true,
+    pacing_burst_us: u64 = recovery.Pacer.default_burst_us,
     /// Length of the connection IDs we issue.
     cid_len: u8 = 8,
     /// Out-of-order CRYPTO data held per encryption level.
@@ -279,6 +294,7 @@ pub const Conn = struct {
 
     rtt: recovery.Rtt = .{},
     cc: recovery.Congestion,
+    pacer: recovery.Pacer,
     pto_count: u32 = 0,
     loss_timer: ?u64 = null,
     last_activity: u64,
@@ -329,6 +345,8 @@ pub const Conn = struct {
     path_response: ?[8]u8 = null,
     lost_packets: u64 = 0,
     packets_received: u64 = 0,
+    /// Sends that found data held back by the pacer.
+    paced_waits: u64 = 0,
 
     pub const InitOptions = struct {
         /// The client's Initial: its DCID, SCID.
@@ -361,6 +379,7 @@ pub const Conn = struct {
             .retry_scid = if (opts.retry_scid) |r| Cid.init(r) else null,
             .max_datagram = cfg.max_datagram_size,
             .cc = .init(cfg.max_datagram_size, cfg.congestion),
+            .pacer = .init(cfg.max_datagram_size, cfg.pacing_burst_us),
             .last_activity = opts.now,
             .streams = streams,
             .max_bidi = cfg.max_streams_bidi,
@@ -1084,7 +1103,26 @@ pub const Conn = struct {
             }
         }
         if (self.prev_keys_until) |d| t = min(t, d);
+        if (self.pacingDeadline()) |d| t = min(t, d);
         return t;
+    }
+
+    /// When the pacer lets data it is holding back go, if it is holding
+    /// any (as of the last `send`, which brought the pacer up to date).
+    fn pacingDeadline(self: *const Self) ?u64 {
+        if (!self.cfg.pacing or self.pacer.tokens >= self.max_datagram) return null;
+        if (self.cc.in_flight >= self.cc.window or self.amplificationBlocked()) return null;
+        if (!self.dataWaiting()) return null;
+        return self.pacer.nextSend(self.max_datagram, &self.cc, &self.rtt);
+    }
+
+    /// Ack-eliciting data waiting in some space with keys.
+    fn dataWaiting(self: *const Self) bool {
+        for ([_]Space{ .initial, .handshake, .application }) |space| {
+            const sp = &self.spaces[@backingInt(space)];
+            if (sp.tx != null and !sp.discarded and self.hasData(space)) return true;
+        }
+        return false;
     }
 
     fn min(a: ?u64, b: u64) u64 {
@@ -1505,6 +1543,15 @@ pub const Conn = struct {
         }
         if (max < 64) return 0;
         var b: Builder = .{ .out = out[0..max] };
+        if (self.cfg.pacing) {
+            // A datagram's worth of room, or only ACKs and probes go.
+            self.pacer.refill(now, &self.cc, &self.rtt);
+            b.paced = self.pacer.tokens >= self.max_datagram;
+            if (!b.paced and self.cc.in_flight < self.cc.window and self.dataWaiting()) {
+                self.paced_waits += 1;
+                if (builtin.is_test) _ = test_paced_waits.fetchAdd(1, .monotonic);
+            }
+        }
         var has_initial = false;
         for ([_]Space{ .initial, .handshake, .application }) |space| {
             const sp = &self.spaces[@backingInt(space)];
@@ -1547,6 +1594,8 @@ pub const Conn = struct {
         last_eliciting: bool = false,
         last_in_flight: bool = false,
         rec_mark: u64 = 0,
+        /// The pacer has room for data in this datagram.
+        paced: bool = true,
 
         fn room(b: *const Builder) usize {
             return b.out.len - b.pos;
@@ -1587,7 +1636,10 @@ pub const Conn = struct {
             self.fail(.internal_error, 0, now);
             return;
         };
-        if (b.last_eliciting or b.last_in_flight) self.cc.onSent(size);
+        if (b.last_eliciting or b.last_in_flight) {
+            self.cc.onSent(size);
+            self.pacer.onSent(size);
+        }
         if (b.last_eliciting) {
             sp.last_ack_eliciting_time = now;
             if (!self.sent_since_rx) {
@@ -1605,7 +1657,7 @@ pub const Conn = struct {
     }
 
     /// Something ack-eliciting to send in this space (ignoring the window).
-    fn hasData(self: *Self, space: Space) bool {
+    fn hasData(self: *const Self, space: Space) bool {
         const sp = &self.spaces[@backingInt(space)];
         if (sp.crypto_tx.hasPending()) return true;
         if (space != .application) return false;
@@ -1619,7 +1671,7 @@ pub const Conn = struct {
         const want_ack = sp.ack_wanted and !sp.rx_ranges.isEmpty();
         const ack_due = want_ack and ackDue(sp, now);
         const probing = sp.probes > 0;
-        const cwnd_ok = self.cc.in_flight < self.cc.window or probing;
+        const cwnd_ok = (self.cc.in_flight < self.cc.window and b.paced) or probing;
         const data = cwnd_ok and self.hasData(space);
         if (!ack_due and !data and !probing) return;
 
@@ -1907,7 +1959,8 @@ pub const Conn = struct {
             if (sp.tx == null or sp.discarded) continue;
             if (sp.probes > 0) return true;
             if (sp.ack_wanted and ackDue(sp, now)) return true;
-            if (self.cc.in_flight < self.cc.window and self.hasData(space)) return true;
+            const paced = !self.cfg.pacing or self.pacer.available(now, &self.cc, &self.rtt) >= self.max_datagram;
+            if (self.cc.in_flight < self.cc.window and paced and self.hasData(space)) return true;
         }
         return false;
     }

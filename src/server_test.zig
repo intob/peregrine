@@ -2472,6 +2472,7 @@ test "tls: bad credentials fail init" {
 // -- HTTP/3 over UDP ------------------------------------------------------------
 
 const quic_test_client = @import("./quic/test_client.zig");
+const quic_conn = @import("./quic/conn.zig");
 const h3frame = @import("./h3/frame.zig");
 const qpack = @import("./h3/qpack.zig");
 const quic_packet = @import("./quic/packet.zig");
@@ -2480,6 +2481,12 @@ const quic_packet = @import("./quic/packet.zig");
 const H3Client = struct {
     fd: sys.fd_t,
     c: *quic_test_client.Client,
+    /// Datagrams to the server wait this long (a path with a round trip
+    /// of at least this), in `queue`.
+    delay_ns: u64 = 0,
+    queue: std.ArrayList(Delayed) = .empty,
+
+    const Delayed = struct { due: u64, len: usize, buf: [1500]u8 };
 
     fn connect(port: u16) !H3Client {
         const nonblock: u32 = if (sys.is_linux) std.os.linux.SOCK.NONBLOCK else 0;
@@ -2500,6 +2507,7 @@ const H3Client = struct {
     }
 
     fn close(self: *H3Client) void {
+        self.queue.deinit(testing.allocator);
         self.c.deinit();
         sys.close(self.fd);
     }
@@ -2514,8 +2522,18 @@ const H3Client = struct {
             while (true) {
                 const n = try self.c.send(&buf);
                 if (n == 0) break;
-                _ = sys.write(self.fd, buf[0..n]) catch {};
+                if (self.delay_ns == 0) {
+                    _ = sys.write(self.fd, buf[0..n]) catch {};
+                } else {
+                    try self.queue.append(testing.allocator, .{ .due = sys.nanoTimestamp() + self.delay_ns, .len = n, .buf = buf[0..1500].* });
+                }
             }
+            var due: usize = 0;
+            while (due < self.queue.items.len and self.queue.items[due].due <= sys.nanoTimestamp()) : (due += 1) {
+                const d = &self.queue.items[due];
+                _ = sys.write(self.fd, d.buf[0..d.len]) catch {};
+            }
+            self.queue.replaceRangeAssumeCapacity(0, due, &.{});
             var got = false;
             while (true) {
                 const n = sys.read(self.fd, &buf) catch break;
@@ -2648,6 +2666,37 @@ const H3Client = struct {
         return r;
     }
 };
+
+test "http3: pacing over a path with a 20 ms round trip" {
+    try forEachBackend(testHttp3Pacing);
+}
+
+fn testHttp3Pacing(backend: Backend) !void {
+    var cfg = tlsConfig();
+    cfg.http3 = .{};
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    var cl = try H3Client.connect(r.srv.getQuicPort());
+    defer cl.close();
+    cl.delay_ns = 20 * std.time.ns_per_ms;
+    try cl.start();
+    const waits = quic_conn.test_paced_waits.load(.monotonic);
+    const id = try cl.request("GET", "/big", "");
+    // With the window spread over the round trip, the server waits for
+    // its pacer between bursts, and its worker's timer resumes it: 8 MB
+    // in under a second here, 15 s with only probe timeouts to resume it.
+    try cl.runUntil(10_000, id, struct {
+        fn f(want: u64, h: *H3Client) bool {
+            return h.c.finished(want);
+        }
+    }.f);
+    var a = try cl.response(id);
+    defer a.body.deinit(testing.allocator);
+    try testing.expectEqualStrings("200", &a.status);
+    try testing.expect(std.mem.eql(u8, &big_body, a.body.items));
+    try testing.expect(quic_conn.test_paced_waits.load(.monotonic) > waits);
+}
 
 test "http3: streamed uploads, a held body resumed from another thread" {
     try forEachBackend(testHttp3Uploads);

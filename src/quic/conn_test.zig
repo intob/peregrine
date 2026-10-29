@@ -181,9 +181,71 @@ const Harness = struct {
             }
         }
     }
+
+    /// Runs both ends over a path with a one-way delay of `delay` µs, the
+    /// clock jumping from event to event (arrivals and the server's
+    /// deadlines), until `done` holds. A connection with nothing in
+    /// flight and no deadline before its idle timeout has stalled. Records
+    /// what the server sent at each instant.
+    fn runDelayed(h: *Harness, delay: u64, ctx: anytype, comptime done: fn (@TypeOf(ctx), *Harness) bool, bursts: *std.ArrayList(Burst)) !void {
+        var queue: std.ArrayList(Flight) = .empty;
+        defer queue.deinit(h.a);
+        var head: usize = 0;
+        const limit = h.now + 60 * std.time.us_per_s;
+        var buf: [1500]u8 = undefined;
+        while (!done(ctx, h)) {
+            if (h.now > limit) return error.Timeout;
+            while (true) {
+                const n = try h.client.send(&buf);
+                if (n == 0) break;
+                try queue.append(h.a, .{ .at = h.now + delay, .to_server = true, .len = n, .buf = buf });
+            }
+            if (h.server) |s| {
+                if (s.isClosed()) return error.Closed;
+                const tokens = s.pacer.available(h.now, &s.cc, &s.rtt);
+                var bytes: u64 = 0;
+                while (true) {
+                    const in_flight = s.cc.in_flight;
+                    const n = s.send(&buf, h.now);
+                    if (n == 0) break;
+                    bytes += s.cc.in_flight - in_flight;
+                    try queue.append(h.a, .{ .at = h.now + delay, .to_server = false, .len = n, .buf = buf });
+                }
+                if (bytes > 0) try bursts.append(h.a, .{ .at = h.now, .bytes = bytes, .tokens = tokens, .window = s.cc.window });
+            }
+            var next: ?u64 = if (head < queue.items.len) queue.items[head].at else null;
+            var timer: ?u64 = null;
+            if (h.server) |s| {
+                if (s.deadline()) |d| if (d < h.now + 2 * std.time.us_per_s) {
+                    timer = @max(d, h.now);
+                    next = if (next) |x| @min(x, timer.?) else timer;
+                };
+            }
+            h.now = next orelse return error.Stalled;
+            while (head < queue.items.len and queue.items[head].at <= h.now) : (head += 1) {
+                const f = &queue.items[head];
+                if (f.to_server) try h.toServer(f.buf[0..f.len]) else try h.client.recv(f.buf[0..f.len]);
+            }
+            if (timer) |t| if (t <= h.now) {
+                h.server.?.onTimeout(h.now);
+                try EchoApp.run(h.server.?);
+            };
+        }
+    }
 };
 
+/// A datagram on its way over a delayed path.
+const Flight = struct { at: u64, to_server: bool, len: usize, buf: [1500]u8 };
+
+/// In-flight bytes the server sent at one instant, what its pacer had
+/// then, and its congestion window.
+const Burst = struct { at: u64, bytes: u64, tokens: u64, window: u64 };
+
 fn noTweak(_: *conn_mod.Config) void {}
+
+fn noPacing(c: *conn_mod.Config) void {
+    c.pacing = false;
+}
 
 test "QUIC handshake: keys, ALPN, transport parameters, HANDSHAKE_DONE" {
     const h = try Harness.init(.{}, noTweak);
@@ -395,4 +457,124 @@ test "QUIC idle timeout closes the connection" {
     h.now += 31 * std.time.us_per_s;
     s.onTimeout(h.now);
     try testing.expect(s.isClosed());
+}
+
+fn established(_: void, h: *Harness) bool {
+    return h.client.handshake_done and h.server != null and h.server.?.isEstablished();
+}
+
+fn finishedStream(id: u64, h: *Harness) bool {
+    return h.client.finished(id);
+}
+
+test "QUIC pacing: a download over a 50 ms path leaves in paced bursts" {
+    var largest_paced: u64 = 0;
+    var duration_paced: u64 = 0;
+    inline for (.{ true, false }) |pacing| {
+        const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20 }, if (pacing) noTweak else noPacing);
+        defer h.deinit();
+        var bursts: std.ArrayList(Burst) = .empty;
+        defer bursts.deinit(testing.allocator);
+        try h.runDelayed(25_000, {}, established, &bursts);
+        const s = h.server.?;
+        try testing.expect(s.rtt.smoothed >= 50_000);
+        const id = try h.client.openBidi();
+        try h.client.write(id, "big 1500000", true);
+        bursts.clearRetainingCapacity();
+        const began = h.now;
+        // Completing at all shows the pacer's deadline brings the
+        // connection back: with everything acknowledged and data held
+        // back, nothing else would.
+        try h.runDelayed(25_000, id, finishedStream, &bursts);
+        const duration = h.now - began;
+        const got = h.client.readAll(id);
+        try testing.expectEqual(@as(usize, 1_500_000), got.len);
+        for (got, 0..) |b, i| try testing.expectEqual(@as(u8, @truncate(i)), b);
+        var largest: u64 = 0;
+        for (bursts.items) |b| largest = @max(largest, b.bytes);
+        // No probe timeouts, no spurious losses: every packet arrived.
+        try testing.expectEqual(@as(u64, 0), s.lost_packets);
+        if (pacing) {
+            try testing.expect(s.paced_waits > 0);
+            for (bursts.items) |b| {
+                // Never more than the pacer had at that instant, which is
+                // at most 2 ms of 1.25 · cwnd / 50 ms (and at least ten
+                // datagrams).
+                try testing.expect(b.bytes <= b.tokens);
+                try testing.expect(b.tokens <= @max(10 * @as(u64, s.max_datagram), b.window / 20 + s.max_datagram));
+            }
+            largest_paced = largest;
+            duration_paced = duration;
+        } else {
+            // Unpaced, slow start sends each round trip's window at once.
+            try testing.expectEqual(@as(u64, 0), s.paced_waits);
+            try testing.expect(largest > 4 * largest_paced);
+            // Pacing costs at most a little time.
+            try testing.expect(duration_paced < duration + duration / 4 + 50_000);
+        }
+    }
+}
+
+test "QUIC pacing: ACKs and probes don't wait; the pacer's timer releases data" {
+    const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20 }, noTweak);
+    defer h.deinit();
+    try h.run(10);
+    const s = h.server.?;
+    var buf: [1500]u8 = undefined;
+    const id = try h.client.openBidi();
+    try h.client.write(id, "big 200000", true);
+    try h.toServer(buf[0..try h.client.send(&buf)]);
+    // An empty pacer holds the response back; the request alone doesn't
+    // make an ACK due yet.
+    s.pacer.tokens = 0;
+    s.pacer.last = h.now;
+    try testing.expectEqual(@as(usize, 0), s.send(&buf, h.now));
+    try testing.expect(s.paced_waits > 0);
+    const due = s.deadline().?;
+    try testing.expectEqual(s.pacer.nextSend(s.max_datagram, &s.cc, &s.rtt).?, due);
+    try testing.expect(due > h.now and due < h.now + s.cfg.max_ack_delay_ms * 1000);
+
+    // Two more ack-eliciting packets: the ACK is due now and goes alone.
+    for (0..2) |_| {
+        try h.client.injectFrames(&.{0x01}); // PING
+        try h.toServer(buf[0..try h.client.send(&buf)]);
+    }
+    const in_flight = s.cc.in_flight;
+    const ack = s.send(&buf, h.now);
+    try testing.expect(ack > 0);
+    try testing.expectEqual(in_flight, s.cc.in_flight);
+    try h.client.recv(buf[0..ack]);
+    try testing.expect(!s.spaces[2].ack_wanted);
+    try testing.expectEqual(@as(usize, 0), s.send(&buf, h.now));
+    try testing.expectEqual(due, s.deadline().?);
+
+    // The timer fires: the data goes, a burst of it.
+    h.now = due;
+    s.onTimeout(h.now);
+    var sent: usize = 0;
+    while (true) {
+        const n = s.send(&buf, h.now);
+        if (n == 0) break;
+        sent += 1;
+    }
+    try testing.expect(sent >= 2);
+    try testing.expect(s.cc.in_flight > in_flight);
+
+    // All of it is lost. The probe timeout's probes go out though the
+    // pacer is empty again.
+    const pto = s.loss_timer.?;
+    h.now = pto;
+    s.onTimeout(h.now);
+    s.pacer.tokens = 0;
+    s.pacer.last = h.now;
+    for (0..2) |_| {
+        const before = s.cc.in_flight;
+        try testing.expect(s.send(&buf, h.now) > 0);
+        try testing.expect(s.cc.in_flight > before);
+    }
+    try testing.expectEqual(@as(u8, 0), s.spaces[2].probes);
+    try testing.expectEqual(@as(usize, 0), s.send(&buf, h.now));
+    // And the rest still follows when the pacer allows.
+    try h.run(400);
+    try testing.expectEqual(@as(usize, 200_000), h.client.readAll(id).len);
 }

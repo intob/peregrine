@@ -1,7 +1,7 @@
 //! Loss detection and congestion control (RFC 9002, RFC 9438): the RTT
-//! estimator, the loss and probe timeouts' arithmetic, and CUBIC with a
-//! NewReno fallback. Times are microseconds; sizes are bytes. Which
-//! packets are in flight is tracked by sent.zig and conn.zig.
+//! estimator, the loss and probe timeouts' arithmetic, CUBIC with a
+//! NewReno fallback, and the pacer. Times are microseconds; sizes are
+//! bytes. Which packets are in flight is tracked by sent.zig and conn.zig.
 const std = @import("std");
 
 pub const granularity: u64 = 1000;
@@ -204,6 +204,88 @@ pub const Congestion = struct {
     }
 };
 
+/// Pacing (RFC 9002 §7.7): a token bucket filled at N · cwnd /
+/// smoothed_rtt (N = 1.25) holding at most `burst_us` of that rate, and
+/// never less than ten datagrams (the initial window, the burst §7.7
+/// allows). Packets in flight take their size from it as they are sent;
+/// a datagram waits while fewer tokens than its size are left. ACK-only
+/// packets take nothing and don't wait; probes take tokens but don't wait.
+///
+/// Once the bucket runs dry, the next send is due when it is half full
+/// again rather than when one datagram's worth is back: a wait releases a
+/// burst that GSO sends at once, costs one timer per burst instead of one
+/// per packet, and keeps the full rate behind an event loop whose timers
+/// have millisecond resolution (half of 2 ms of the rate is back after
+/// 1 ms, and a late wake-up still finds room in the bucket). On paths with a
+/// smoothed RTT under `burst_us` the bucket holds more than a window, so
+/// the congestion window, not the pacer, is what limits.
+pub const Pacer = struct {
+    const Self = @This();
+
+    /// Bytes that may be sent now.
+    tokens: u64,
+    /// When `tokens` was last brought up to date.
+    last: u64 = 0,
+    burst_us: u64,
+
+    /// N in N · cwnd / smoothed_rtt, as a fraction.
+    const rate_num = 5;
+    const rate_den = 4;
+    pub const min_burst_packets = 10;
+    pub const default_burst_us = 2000;
+
+    pub fn init(mss: u64, burst_us: u64) Self {
+        return .{ .tokens = min_burst_packets * mss, .burst_us = burst_us };
+    }
+
+    /// The bucket's size for the current window and RTT.
+    pub fn capacity(self: *const Self, cc: *const Congestion, rtt: *const Rtt) u64 {
+        const burst = mulDiv(cc.window * rate_num, self.burst_us, rate_den * @max(rtt.smoothed, 1));
+        return @max(min_burst_packets * cc.mss, burst);
+    }
+
+    /// The tokens at `now` (not before `last`).
+    pub fn available(self: *const Self, now: u64, cc: *const Congestion, rtt: *const Rtt) u64 {
+        const cap = self.capacity(cc, rtt);
+        if (now <= self.last) return @min(self.tokens, cap);
+        const add = mulDiv(cc.window * rate_num, now - self.last, rate_den * @max(rtt.smoothed, 1));
+        return @min(self.tokens +| add, cap);
+    }
+
+    /// Brings the tokens up to `now`.
+    pub fn refill(self: *Self, now: u64, cc: *const Congestion, rtt: *const Rtt) void {
+        self.tokens = self.available(now, cc, rtt);
+        self.last = @max(self.last, now);
+    }
+
+    pub fn onSent(self: *Self, bytes: u64) void {
+        self.tokens -|= bytes;
+    }
+
+    /// When a held-back datagram of `size` bytes is due, as of the last
+    /// `refill`: null if it may go now.
+    pub fn nextSend(self: *const Self, size: u64, cc: *const Congestion, rtt: *const Rtt) ?u64 {
+        if (self.tokens >= size) return null;
+        const want = @max(self.capacity(cc, rtt) / 2, size);
+        // (want - tokens) / rate, rounded up.
+        const wait = mulDivCeil(want - self.tokens, rate_den * @max(rtt.smoothed, 1), rate_num * @max(cc.window, 1));
+        return self.last +| wait;
+    }
+
+    /// a · b / c, saturating; 64-bit arithmetic unless a · b overflows
+    /// (it runs for every datagram sent).
+    fn mulDiv(a: u64, b: u64, c: u64) u64 {
+        const p = @mulWithOverflow(a, b);
+        if (p[1] == 0) return p[0] / c;
+        return @intCast(@min(@as(u128, a) * b / c, std.math.maxInt(u64)));
+    }
+
+    fn mulDivCeil(a: u64, b: u64, c: u64) u64 {
+        const q = mulDiv(a, b, c);
+        return if (@as(u128, q) * c < @as(u128, a) * b) q +| 1 else q;
+    }
+};
+
 const testing = std.testing;
 
 test "RTT estimator follows RFC 9002 §5.3" {
@@ -261,4 +343,65 @@ test "slow start, a loss, recovery, then growth again" {
         c.onPersistentCongestion();
         try testing.expectEqual(c.minWindow(), c.window);
     }
+}
+
+test "pacer: burst allowance, then the paced rate" {
+    var cc = Congestion.init(1200, .cubic);
+    var rtt: Rtt = .{};
+    rtt.update(100_000, 0);
+    var p = Pacer.init(1200, Pacer.default_burst_us);
+    // The bucket starts with ten datagrams (2 ms of the rate is less).
+    try testing.expectEqual(@as(u64, 12000), p.capacity(&cc, &rtt));
+    p.refill(1_000_000, &cc, &rtt);
+    for (0..10) |_| {
+        try testing.expectEqual(@as(?u64, null), p.nextSend(1200, &cc, &rtt));
+        p.onSent(1200);
+    }
+    // Empty: due once half the bucket is back. The rate is
+    // 1.25 · 12000 / 100 ms = 0.15 bytes/µs, so 6000 bytes take 40 ms.
+    try testing.expectEqual(@as(?u64, 1_000_000 + 40_000), p.nextSend(1200, &cc, &rtt));
+    try testing.expectEqual(@as(u64, 1200), p.available(1_008_000, &cc, &rtt));
+    try testing.expectEqual(@as(u64, 6000), p.available(1_040_000, &cc, &rtt));
+    // Idle time refills it to the burst, no further.
+    try testing.expectEqual(@as(u64, 12000), p.available(5_000_000, &cc, &rtt));
+    // A partly used bucket waits only for what is missing.
+    p.refill(1_020_000, &cc, &rtt);
+    try testing.expectEqual(@as(u64, 3000), p.tokens);
+    p.onSent(2400);
+    try testing.expectEqual(@as(?u64, 1_020_000 + 36_000), p.nextSend(1200, &cc, &rtt));
+}
+
+test "pacer: the rate follows the window and the RTT" {
+    var cc = Congestion.init(1200, .cubic);
+    var rtt: Rtt = .{};
+    rtt.update(100_000, 0);
+    var p = Pacer.init(1200, Pacer.default_burst_us);
+    cc.window = 1_200_000;
+    // 1.25 · 1.2 MB / 100 ms is 15 bytes/µs: 2 ms of it is 30000 bytes.
+    try testing.expectEqual(@as(u64, 30000), p.capacity(&cc, &rtt));
+    p.refill(0, &cc, &rtt);
+    p.onSent(p.tokens);
+    try testing.expectEqual(@as(u64, 3000), p.available(200, &cc, &rtt));
+    // Half the bucket, 15000 bytes, is back in 1 ms.
+    try testing.expectEqual(@as(?u64, 1000), p.nextSend(1200, &cc, &rtt));
+    // Twice the window: twice the rate (and twice the bucket).
+    cc.window = 2_400_000;
+    try testing.expectEqual(@as(u64, 6000), p.available(200, &cc, &rtt));
+    try testing.expectEqual(@as(?u64, 1000), p.nextSend(1200, &cc, &rtt));
+    // Twice the RTT: half the rate.
+    cc.window = 1_200_000;
+    rtt = .{};
+    rtt.update(200_000, 0);
+    try testing.expectEqual(@as(u64, 15000), p.capacity(&cc, &rtt));
+    try testing.expectEqual(@as(u64, 1500), p.available(200, &cc, &rtt));
+    // A window shrunk by a loss shrinks the bucket at once (to its floor
+    // of ten datagrams here).
+    p.refill(10_000, &cc, &rtt);
+    try testing.expectEqual(@as(u64, 15000), p.tokens);
+    cc.onCongestionEvent(0, 10_000);
+    try testing.expectEqual(@as(u64, 12000), p.available(10_000, &cc, &rtt));
+    // A tiny RTT (loopback): the bucket holds more than the window.
+    rtt = .{};
+    rtt.update(100, 0);
+    try testing.expect(p.capacity(&cc, &rtt) > cc.window);
 }

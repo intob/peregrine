@@ -45,6 +45,9 @@ pub const Http3Options = struct {
     /// Milliseconds without traffic before a connection is closed.
     idle_timeout_ms: u64 = 30_000,
     congestion: recovery.Algorithm = .cubic,
+    /// Spread each congestion window over the round trip (RFC 9002 §7.7)
+    /// instead of sending it in bursts as acknowledgements open it.
+    pacing: bool = true,
     /// Connection receive window, and per request stream.
     max_data: u64 = 16 * 1024 * 1024,
     max_stream_data: u64 = 1024 * 1024,
@@ -540,6 +543,7 @@ pub fn Server(comptime Handler: type) type {
                     .max_streams_bidi = o.max_streams,
                     .max_datagram_size = o.max_datagram_size,
                     .congestion = o.congestion,
+                    .pacing = o.pacing,
                 },
                 .h3 = h3_opts,
                 .max_connections = o.max_connections_per_worker,
