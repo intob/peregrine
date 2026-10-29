@@ -56,7 +56,7 @@ Design rules that apply to every layer:
 | M3. WebSockets over HTTP/1.1 | ✅ reworked; benchmarked against uWebSockets (even on small messages, 15-20% less CPU at 16-64 KiB); Autobahn 301/301 strict on every backend, plain and TLS; decoder fuzzed; permessage-deflate (Autobahn 517/517; with compression both ways 18-30% less CPU than uWebSockets' zlib on small messages, 4-7x less at 16-64 KiB) |
 | M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; tables for P-256 and X25519, RSA-PSS, session tickets, kTLS, 0-RTT and SNI certificates done; the rest of "faster handshakes" open |
 | M5. HTTP/2 | ✅ h2 over TLS (ALPN) and h2c on every backend, h2spec 146/146 over TLS, fuzzed, benchmarked; streamed request bodies on every protocol; WebSockets over h2 (RFC 8441); RFC 9218 priorities |
-| M6. HTTP/3 and QUIC | 🟡 HTTP/3 over QUIC v1 on every backend, interop-tested (aioquic, curl/ngtcp2, h2load), benchmarked against nginx and Caddy; WebSockets over h3 (RFC 9220); 0-RTT; migration, pacing, ECN, PMTUD open |
+| M6. HTTP/3 and QUIC | 🟡 HTTP/3 over QUIC v1 on every backend, interop-tested (aioquic, curl/ngtcp2, h2load), benchmarked against nginx and Caddy; WebSockets over h3 (RFC 9220); 0-RTT; pacing; migration, ECN, PMTUD open |
 | M7. Verification and benchmarking | 🟡 ongoing for each milestone |
 
 Source layout:
@@ -1129,7 +1129,7 @@ Done on the `m6-h3` branch, as I/O-free layers like the rest:
 | `src/quic/protection.zig` | Initial secrets, packet and header protection from TLS secrets, key updates, Retry integrity tags |
 | `src/quic/frame.zig` | Every QUIC frame, with the RFC's encoding errors and per-packet-type rules |
 | `src/quic/transport_params.zig` | Client parameters checked, ours encoded |
-| `src/quic/recovery.zig`, `sent.zig`, `ranges.zig`, `stream.zig` | RTT, loss and probe timeouts, CUBIC/NewReno; sent packets with frame records; reassembly, flow control and retransmission bookkeeping |
+| `src/quic/recovery.zig`, `sent.zig`, `ranges.zig`, `stream.zig` | RTT, loss and probe timeouts, CUBIC/NewReno, the pacer; sent packets with frame records; reassembly, flow control and retransmission bookkeeping |
 | `src/quic/conn.zig` | One server connection: packet number spaces, TLS over CRYPTO, ACKs, loss recovery, streams, key updates, closing |
 | `src/quic/endpoint.zig`, `udp.zig` | A worker's UDP socket and connections: routing by connection ID, timers, VN, stateless reset, Retry, recvmmsg, GSO, BPF steering |
 | `src/h3/qpack.zig`, `frame.zig`, `conn.zig` | QPACK (static table), HTTP/3 frames and SETTINGS, HTTP/3 over a QUIC connection through the handler API |
@@ -1154,7 +1154,62 @@ Done on the `m6-h3` branch, as I/O-free layers like the rest:
 - [x] Loss detection and congestion control (RFC 9002): packet and time
       thresholds, probe timeouts with backoff, persistent congestion, CUBIC
       (RFC 9438) with a NewReno option
-- [ ] Pacing, ECN, PMTU discovery (DPLPMTUD); `max_datagram_size` is 1350
+- [x] Pacing (RFC 9002 §7.7, `recovery.Pacer`, `Http3Options.pacing`, on by
+      default): a token bucket filled at 1.25 · cwnd / smoothed RTT, keeping
+      the fractional remainder between refills, holding 2 ms of that rate (at
+      least ten datagrams). Data waits for it; ACKs, probes, CONNECTION_CLOSE
+      and PATH_RESPONSE (RFC 9000 §8.2.2) don't. `send()` records the time a
+      held datagram may go (`pacing_hold`, set only when frames would really
+      have been written: one predicate, `wouldSend`, for both) and
+      `deadline()` returns it, so every backend's QUIC timer resumes the
+      connection. Once dry, the next send is due when half the bucket is back
+      or, with a small window, when the window's room is: a wait releases a
+      GSO burst and costs one timer per burst. Bursts can exceed §7.7's
+      initial-window SHOULD (12-25 datagrams at a 1.2 MB window over 100 ms;
+      a whole window under 2 ms RTT): the event loops wake in whole
+      milliseconds, and ten datagrams per wake would cap an un-ACK-clocked
+      connection at 13.5 MB/s (Linux's TCP pacing makes the same trade, about
+      1 ms of rate per TSO burst). On loopback the window, not the pacer,
+      limits: no CPU cost in the HTTP/3 benchmark (epoll "Hello" 10×100
+      1.96-2.00 µs/req vs 1.91-2.01 before; 64 KiB 10×10 34.6-37.8 vs
+      37.1-38.3; confirmed by the verifier, host load 9-14). Behind a
+      100 Mbit/s bottleneck with a 40 KB queue and a 20 ms RTT
+      (`bench/scripts/h3-netem.sh`): ten 1 MiB downloads in 2.3 s instead of
+      6.4-7.0 s, four connections 40 × 1 MiB in 4.3 s instead of 9.6-10.6;
+      about even with a BDP-sized queue. Tests: in memory over a simulated
+      50 ms path (bursts 45x smaller than unpaced, no slower), ACKs, probes,
+      PATH_RESPONSE and CONNECTION_CLOSE with the pacer empty, no busy loop
+      with an amplification budget under 64 bytes, a small window waiting
+      only for its room, flow-blocked streams arming no timer, frequent
+      refills at a low rate keeping the rate (the first version lost the
+      fractions and stopped), arithmetic at extremes, a key update during a
+      paced download, 150 random paths/losses/stream mixes with no stall or
+      idle wake-up (paced within 2x of unpaced under loss, worst 1.57x); end
+      to end on every backend (8 MB with client datagrams delayed 20 ms);
+      h3spec 77/77 and `bench/scripts/h3-interop.sh` (curl, aioquic,
+      h2load) on epoll and io_uring; `fuzz: h3 connection` 30 min on a Pi
+- [ ] Pacing, what's left: slow start overshoots a shallow queue (a new
+      connection behind a 40 KB tbf loses ~15% of its packets vs 3-4%
+      unpaced, though it finishes 3x sooner) and is 7-14% slower than
+      unpaced on long clean paths, because N=1.25 applies in slow start too
+      (Linux uses 2x there, `tcp_pacing_ss_ratio`; N=2 alone recovered only a
+      third of the gap in memory: 500 ms RTT 2840 → 2717 ms vs 2500 unpaced);
+      microsecond timers (epoll_pwait2, kqueue/io_uring timespecs) would
+      allow smaller bursts. Measuring: netem's random loss in Docker drops
+      whole GSO packets and tbf counts drops per skb, so compare completion
+      times, not drop counts
+- [ ] ECN: ACK_ECN counts are parsed (`frame.zig`) but ignored; needs ECT(0)
+      on the socket (IP_TOS / IPV6_TCLASS), IP_RECVTOS / IPV6_RECVTCLASS with
+      per-datagram control buffers in `udp.RecvBatch` (recvmsg on macOS),
+      per-space counts in our ACKs, and validation (RFC 9000 §13.4.2)
+- [ ] PMTU discovery (DPLPMTUD); `max_datagram_size` is 1350. Needs DF
+      (IP_MTU_DISCOVER=IP_PMTUDISC_PROBE, IPV6_DONTFRAG, IP_DONTFRAG on
+      macOS), PING+PADDING probes flagged in `sent.zig` so a lost probe isn't
+      congestion, a send path for probes larger than the GSO segment; `cc.mss`
+      and the pacer's floor should follow the negotiated `max_datagram`
+- [ ] Quirk: a duplicate STREAM frame on an already complete receive stream
+      raises `stream_readable` again (`onStream` → `markReadable`); h3
+      tolerates it
 - [x] UDP batching: recvmmsg, GSO (datagrams nearly full are padded to the
       segment size so runs go out in one sendmsg). GRO still to do
 - [x] HTTP/3 (RFC 9114) and QPACK (RFC 9204, static table, capacity 0):

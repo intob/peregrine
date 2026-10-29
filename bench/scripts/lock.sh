@@ -82,5 +82,5 @@ list)
     for f in "$LOCKS"/*.s/*; do [ -f "$f" ] && echo "$(basename "$(dirname "$f")" .s) shared: $(sed -n 2p "$f")"; done
     for f in "$LOCKS"/*.q/*; do [ -f "$f" ] && echo "$(basename "$(dirname "$f")" .q) queued ($(sed -n 2p "$f")): $(sed -n 3p "$f")"; done
     true ;;
-*) sed -n '2,17p' "$0"; exit 1 ;;
+*) sed -n '2,18p' "$0"; exit 1 ;;
 esac
