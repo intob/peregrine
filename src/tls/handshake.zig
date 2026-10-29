@@ -160,6 +160,9 @@ pub const Handshake = struct {
     transcript: Transcript = undefined,
     /// Group chosen in a HelloRetryRequest.
     retry_group: ?NamedGroup = null,
+    /// After a HelloRetryRequest: a digest of what ClientHello2 must repeat
+    /// (see `repeatedDigest`).
+    retry_digest: [32]u8 = undefined,
     session_id_buf: [32]u8 = undefined,
     session_id_len: u8 = 0,
     sent_ccs: bool = false,
@@ -346,6 +349,8 @@ pub const Handshake = struct {
             if (!std.mem.eql(u8, hello.session_id, self.session_id_buf[0..self.session_id_len]))
                 return error.IllegalParameter;
             if (!listHas(u16, hello.suites, @backingInt(self.suite))) return error.IllegalParameter;
+            const digest = repeatedDigest(hello);
+            if (!std.mem.eql(u8, &digest, &self.retry_digest)) return error.IllegalParameter;
         } else {
             self.suite = for (self.config.suites) |s| {
                 if (listHas(u16, hello.suites, @backingInt(s))) break s;
@@ -403,6 +408,7 @@ pub const Handshake = struct {
             const group = for (self.config.groups) |g| {
                 if (listHas(u16, groups, @backingInt(g))) break g;
             } else return error.HandshakeFailure;
+            self.retry_digest = repeatedDigest(hello);
             return self.sendHelloRetryRequest(msg, group, sink);
         }
 
@@ -430,6 +436,25 @@ pub const Handshake = struct {
         self.transcript.update(msg);
         if (self.early_accepted) try self.sendEarlySecret(sink);
         try self.sendServerFlight(chosen.?, sink);
+    }
+
+    /// RFC 8446 §4.1.2: ClientHello2 is ClientHello1 but for key_share,
+    /// early_data, cookie, pre_shared_key and padding. Of the rest, these
+    /// are what the handshake uses: server_name chose the certificate
+    /// (from ClientHello1), ALPN, groups and signature algorithms are
+    /// read from ClientHello2. The suites and session ID are compared
+    /// directly.
+    fn repeatedDigest(hello: ClientHello) [32]u8 {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        for ([_]?[]const u8{ hello.server_name, hello.alpn, hello.supported_groups, hello.signature_algorithms }) |field| {
+            const bytes: []const u8 = field orelse "";
+            var len: [5]u8 = undefined;
+            len[0] = @intFromBool(field != null);
+            std.mem.writeInt(u32, len[1..5], @intCast(bytes.len), .big);
+            h.update(&len);
+            h.update(bytes);
+        }
+        return h.finalResult();
     }
 
     fn checkSignatureScheme(self: *const Self, hello: ClientHello) Error!void {
@@ -1570,6 +1595,51 @@ test "HelloRetryRequest when no usable key share was sent" {
     // ServerHello, then no second change_cipher_spec.
     try std.testing.expect(sink.events.items[2] == .data);
     try std.testing.expect(sink.events.items[3] == .write_secret);
+}
+
+test "HelloRetryRequest: ClientHello2 may change only what RFC 8446 §4.1.2 lets it" {
+    const td = credentials.testdata;
+    var default = try testCredentials();
+    defer default.deinit();
+    var more = [_]Credentials{try .fromPem(std.testing.allocator, td.sni_a_cert, td.sni_a_key)};
+    defer for (&more) |*c| c.deinit();
+    const config: Config = .{ .credentials = &default, .sni_credentials = &more, .groups = &.{.x25519}, .alpn = &.{ "h2", "http/1.1" } };
+    const entropy: [entropy_len]u8 = @splat(9);
+    const x = X25519.recoverPublicKey(@splat(5));
+    const share: []const KeyShare = &.{.{ .group = .x25519, .key_exchange = &x }};
+    const sni = comptime sniExt("a.example");
+    const Hello = struct { extra: []const u8 = sni, groups: []const NamedGroup = &.{ .secp256r1, .x25519 }, alpn: ?[]const u8 = "\x02h2", sig_algs: []const u16 = &.{0x0403} };
+    const cases = [_]struct { ch2: Hello, ok: bool }{
+        .{ .ch2 = .{}, .ok = true },
+        // server_name dropped or changed: the certificate was chosen by
+        // ClientHello1's.
+        .{ .ch2 = .{ .extra = "" }, .ok = false },
+        .{ .ch2 = .{ .extra = comptime sniExt("b.example") }, .ok = false },
+        .{ .ch2 = .{ .alpn = "\x08http/1.1" }, .ok = false },
+        .{ .ch2 = .{ .alpn = null }, .ok = false },
+        .{ .ch2 = .{ .groups = &.{.x25519} }, .ok = false },
+        .{ .ch2 = .{ .sig_algs = &.{ 0x0403, 0x0804 } }, .ok = false },
+    };
+    var buf: [2048]u8 = undefined;
+    for (cases) |case| {
+        var hs = Handshake.init(std.testing.allocator, &config, &entropy);
+        defer hs.deinit();
+        var sink: TestSink = .{ .allocator = std.testing.allocator };
+        defer sink.deinit();
+        // No key share: a HelloRetryRequest.
+        const d: Hello = .{};
+        try hs.feed(.initial, buildClientHello(&buf, .{ .groups = d.groups, .alpn = d.alpn, .sig_algs = d.sig_algs, .extra = d.extra }), &sink);
+        try std.testing.expect(hs.isRetrying());
+        const c = case.ch2;
+        const ch2 = buildClientHello(&buf, .{ .groups = c.groups, .shares = share, .alpn = c.alpn, .sig_algs = c.sig_algs, .extra = c.extra });
+        if (case.ok) {
+            try hs.feed(.initial, ch2, &sink);
+            const facts = try flightFacts(&sink);
+            try std.testing.expect(facts.sni_ack);
+        } else {
+            try std.testing.expectError(error.IllegalParameter, hs.feed(.initial, ch2, &sink));
+        }
+    }
 }
 
 test "every group and suite completes against a reference client computation" {

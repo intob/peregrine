@@ -1776,6 +1776,16 @@ fn runScript(
                 const requested = n == 1 and list[0].group == g and std.mem.eql(u8, list[0].kx, fx.share(g).?);
                 if (!r2.benign or !r2.padding_only or !requested) mres.benign = false;
                 if (!r2.framed) mres.framed = false;
+                // §4.1.2: a valid ClientHello2 that changed what it must
+                // repeat (server_name, ALPN, groups, signature algorithms)
+                // is refused.
+                var changed = false;
+                for ([_]u16{ ext_server_name, ext_alpn, ext_supported_groups, ext_signature_algorithms }) |t| {
+                    const before = hello.ext(t);
+                    const after = h2.ext(t);
+                    if ((before == null) != (after == null) or (before != null and !std.mem.eql(u8, before.?, after.?))) changed = true;
+                }
+                if (changed and r2.benign and requested) retry_fault = .illegal_parameter;
             },
         }
         if (retry_fault) |d| {
@@ -2112,6 +2122,11 @@ const corpus = [_][]const u8{
     // Harness: an extension length that lies, carried into ClientHello2,
     // failed its parsing before the expected illegal_parameter.
     @embedFile("testdata/fuzz/retry-8.bin"),
+    // ClientHello2 without ClientHello1's server_name (found on the Pis):
+    // the server answered server_name for ClientHello1's certificate; now
+    // illegal_parameter (§4.1.2).
+    @embedFile("testdata/fuzz/retry-drop-sni-1.bin"),
+    @embedFile("testdata/fuzz/retry-drop-sni-2.bin"),
 };
 
 test "fuzz: tls.Conn handshake and record mutations" {
