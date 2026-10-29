@@ -445,10 +445,7 @@ pub const Conn = struct {
     pub fn releaseIfIdle(self: *Self, pool: *BufferPool) void {
         self.reader.releaseIfIdle(pool);
         if (self.out.items.len == 0) self.giveBack(&self.out);
-        if (self.wire_pos == self.wire.items.len) {
-            self.giveBack(&self.wire);
-            self.wire_pos = 0;
-        }
+        if (self.wire_pos == self.wire.items.len) self.retireWire();
     }
 
     /// Whether a frame is partially received (for timeouts).
@@ -1713,7 +1710,9 @@ pub const Conn = struct {
                     // An empty DATA frame carries the END_STREAM.
                     var hdr: [frame.header_len]u8 = undefined;
                     frame.writeHeader(&hdr, 0, .data, frame.flag.end_stream, s.id);
-                    self.append(&hdr) catch return self.fail(.internal_error);
+                    // Failing, the stream is still done with its
+                    // exchange: it must not be aborted later.
+                    self.append(&hdr) catch self.fail(.internal_error);
                 }
                 self.output_streams -= 1;
                 ctx.exchanges.release(s.exchange);

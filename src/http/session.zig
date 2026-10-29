@@ -141,6 +141,9 @@ pub const BufferPool = struct {
     /// queue. Sizes are set by the first connection.
     out_small: Recycler = .{},
     out_large: Recycler = .{},
+    /// Output buffers held or kept, as of the last trim, for other
+    /// threads (tests) to read.
+    output_held: std.atomic.Value(usize) = .init(0),
     /// The worker's WebSocket compressor and inflate tables, made on
     /// first use.
     ws_deflater: ?*ws_deflate.Deflater = null,
@@ -201,6 +204,8 @@ pub const BufferPool = struct {
     pub fn trim(self: *Self) void {
         self.out_small.trim(self.allocator);
         self.out_large.trim(self.allocator);
+        const held = self.out_small.in_use + self.out_small.free.len + self.out_large.in_use + self.out_large.free.len;
+        self.output_held.store(held, .release);
     }
 
     /// Output buffers are held or kept: the worker must keep ticking.

@@ -63,6 +63,8 @@ const Op = enum(u8) {
     quic_timer,
     /// The socket has room again, for a file body sent with sendfile.
     write_ready,
+    /// The shutdown drain's own timeout (see `quiesce`).
+    drain,
 };
 
 inline fn userData(gen: u32, slot: u32, op: Op) u64 {
@@ -410,6 +412,14 @@ pub fn Worker(comptime Handler: type) type {
         /// and after `quiesce` saw every operation complete. Otherwise
         /// deinit leaks what operations might still read or write.
         quiet: bool = true,
+        /// Shutting down: a ring that won't take submissions stops the
+        /// drain instead of being retried for ever (`getSqe`).
+        stopping: bool = false,
+        /// Set when that happened.
+        ring_broken: bool = false,
+        /// What `getSqe` hands out once the ring is broken: written,
+        /// never submitted.
+        dead_sqe: linux.io_uring_sqe = undefined,
         drain_ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms },
         thread: ?std.Thread = null,
         tls_pools: ?tls.Pools = null,
@@ -533,10 +543,15 @@ pub fn Worker(comptime Handler: type) type {
                 // The kernel didn't finish in time: operations may still
                 // read our buffers (sends) or write them (receives). Leak
                 // them rather than free them under it.
+                // Descriptors are safe to close (operations hold their own
+                // references): all of them go, and only memory stays.
                 for (self.conns) |*c| {
                     if (c.open) sys.close(c.fd);
                 }
                 sys.close(self.listener);
+                if (self.quic) |*ep| ep.deinit();
+                if (self.udp >= 0) sys.close(self.udp);
+                self.waker.deinit();
                 self.ring.deinit();
                 return;
             }
@@ -634,21 +649,22 @@ pub fn Worker(comptime Handler: type) type {
         /// handled; one accepted meanwhile is closed. Gives up after two
         /// seconds (or if the ring fails), and deinit then leaks.
         fn quiesce(self: *Self, cqes: []linux.io_uring_cqe) void {
+            self.stopping = true;
             for (self.conns) |*c| {
                 if (c.open) self.closeConn(c);
             }
             const sqe = self.getSqe();
             sqe.prep_cancel(0, linux.IORING_ASYNC_CANCEL_ANY);
             sqe.user_data = userData(0, SPECIAL_SLOT, .cancel);
-            const deadline = sys.monotonicSeconds() + 2;
+            const deadline = sys.nanoTimestamp() + 2 * std.time.ns_per_s;
             var timer = false;
             while (self.ops > 0) {
-                if (sys.monotonicSeconds() >= deadline) return;
+                if (self.ring_broken or sys.nanoTimestamp() >= deadline) return;
                 // A short timeout of our own, so that waiting always ends.
                 if (!timer) {
                     const t = self.getSqe();
                     t.prep_timeout(&self.drain_ts, 0, 0);
-                    t.user_data = userData(0, SPECIAL_SLOT, .tick);
+                    t.user_data = userData(0, SPECIAL_SLOT, .drain);
                     timer = true;
                 }
                 _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
@@ -664,7 +680,7 @@ pub fn Worker(comptime Handler: type) type {
                         self.dispatch(cqe);
                     } else if (op == .accept and cqe.res >= 0) {
                         sys.close(cqe.res);
-                    } else if (op == .tick) {
+                    } else if (op == .drain) {
                         timer = false;
                     }
                 }
@@ -690,6 +706,8 @@ pub fn Worker(comptime Handler: type) type {
                     if (cqe.flags & linux.IORING_CQE_F_MORE == 0) self.armUdp();
                     return;
                 },
+                // Only quiesce has one, and handles it.
+                .drain => return,
                 .quic_timer => {
                     // Timers run after the batch; arm the next one then.
                     if (self.quic_timer_at) |at| {
@@ -731,14 +749,19 @@ pub fn Worker(comptime Handler: type) type {
         // -- SQE helpers ---------------------------------------------------
 
         fn getSqe(self: *Self) *linux.io_uring_sqe {
-            self.ops += 1;
-            while (true) {
-                return self.ring.get_sqe() catch {
-                    // Full: flush what we have to the kernel and retry.
-                    _ = self.ring.submit() catch {};
-                    continue;
+            var tries: u32 = 0;
+            while (!self.ring_broken) : (tries += 1) {
+                if (self.ring.get_sqe()) |sqe| {
+                    self.ops += 1;
+                    return sqe;
+                } else |_| {}
+                // Full: flush what we have to the kernel and retry. While
+                // shutting down, a ring that keeps refusing is given up.
+                _ = self.ring.submit() catch {
+                    if (self.stopping and tries >= 3) self.ring_broken = true;
                 };
             }
+            return &self.dead_sqe;
         }
 
         fn armAccept(self: *Self) void {
