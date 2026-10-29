@@ -3,11 +3,10 @@
 //!
 //! What the server agrees to:
 //! - It compresses each message on its own (`server_no_context_takeover`,
-//!   always in the response), so one compressor per worker serves all its
-//!   connections and a connection holds no compression state. When the
-//!   client limits the server's window below 32 KiB (`server_max_window_bits`),
-//!   messages go out as Huffman-only blocks, which refer to nothing before
-//!   them.
+//!   always in the response), so one compressor per worker
+//!   (`compress.Compressor`) serves all its connections and a connection
+//!   holds no compression state. Back references stay within the window the
+//!   client allows (`server_max_window_bits`).
 //! - It keeps the client's window between messages (context takeover), at
 //!   64 KiB plus 3 KiB per connection while compressed messages arrive, or,
 //!   with `Options.client_no_context_takeover`, asks the client not to and
@@ -16,17 +15,16 @@ const std = @import("std");
 const flate = std.compress.flate;
 const Request = @import("../request.zig").Request;
 const BufferPool = @import("../http/session.zig").BufferPool;
+const compress = @import("./compress.zig");
 
 pub const Options = struct {
     /// Messages shorter than this are sent uncompressed (DEFLATE rarely
-    /// shrinks them, and compressing costs a reset of the compressor).
+    /// shrinks them).
     min_size: usize = 64,
     /// Ask clients to compress each message on its own, so no inflate
     /// window is kept per connection between messages, at some cost in
     /// how well clients' messages compress.
     client_no_context_takeover: bool = false,
-    /// Compression effort for messages sent.
-    level: flate.Compress.Options = .level_4,
 };
 
 /// What was negotiated for one WebSocket.
@@ -34,9 +32,8 @@ pub const Agreement = struct {
     enabled: bool = false,
     /// The client compresses each message on its own: no window is kept.
     client_no_context_takeover: bool = false,
-    /// The client limited the server's window below 32 KiB: messages are
-    /// sent as Huffman-only blocks.
-    huffman_only: bool = false,
+    /// The server's window: back references reach at most 2^this bytes.
+    server_window_bits: u4 = 15,
 };
 
 /// Longest response element we write.
@@ -105,7 +102,7 @@ fn acceptOffer(offer: []const u8, opts: Options, buf: *[max_response_len]u8) ?Ne
         .agreement = .{
             .enabled = true,
             .client_no_context_takeover = client_no_takeover,
-            .huffman_only = if (server_bits) |b| b < 15 else false,
+            .server_window_bits = @intCast(server_bits orelse 15),
         },
         .response = w.buffered(),
     };
@@ -190,65 +187,8 @@ pub const Inflater = struct {
 pub const trailer = [4]u8{ 0x00, 0x00, 0xff, 0xff };
 
 /// A worker's compressor: every message it sends is compressed on its own,
-/// so one serves all the worker's connections. About 290 KiB, allocated the
-/// first time a message is compressed.
-pub const Deflater = struct {
-    level: flate.Compress.Options,
-    /// `c` has been initialised once; later messages reset it in place.
-    ready: bool = false,
-    /// `c.writer`'s vtable from that init: a failed write (output that
-    /// didn't fit) leaves the writer `.failing`.
-    vtable: *const std.Io.Writer.VTable = undefined,
-    c: flate.Compress,
-    huffman: flate.Compress.Huffman,
-    buffer: [flate.max_window_len]u8,
-
-    /// `Compress.init` for a new stream, without building the 230 KiB
-    /// struct anew each message (it costs more than compressing a small
-    /// message): what init sets, set in place, keeping its vtable.
-    fn begin(self: *Deflater, w: *std.Io.Writer) void {
-        if (!self.ready) {
-            self.c = flate.Compress.init(w, &self.buffer, .raw, self.level) catch unreachable; // raw: no header to write
-            self.vtable = self.c.writer.vtable;
-            self.ready = true;
-            return;
-        }
-        const c = &self.c;
-        c.writer = .{ .buffer = &self.buffer, .vtable = self.vtable };
-        c.history_len = 0;
-        c.history_end_unhashed = false;
-        c.bit_writer = .init(w);
-        c.buffered_tokens.pos = 0;
-        c.buffered_tokens.n = 0;
-        c.buffered_tokens.lit_freqs = @splat(0);
-        c.buffered_tokens.dist_freqs = @splat(0);
-        c.lookup.head = @splat(.{ .value = std.math.maxInt(u15), .is_null = true });
-        c.lookup.chain_pos = std.math.maxInt(u15);
-        c.hasher = .init(.raw);
-    }
-
-    /// Compresses `payload` into `out` as one message (ending with an empty
-    /// stored block, its last four bytes left off). Returns the length, or
-    /// null if it doesn't fit in `out`; pass `out` no longer than the
-    /// payload to keep only output that is smaller.
-    pub fn compress(self: *Deflater, payload: []const u8, out: []u8, huffman_only: bool) ?usize {
-        if (out.len <= 8) return null;
-        var w: std.Io.Writer = .fixed(out);
-        const writer = if (huffman_only) blk: {
-            self.huffman = flate.Compress.Huffman.init(&w, &self.buffer, .raw) catch return null;
-            break :blk &self.huffman.writer;
-        } else blk: {
-            self.begin(&w);
-            break :blk &self.c.writer;
-        };
-        writer.writeAll(payload) catch return null;
-        // Flushing ends on a byte boundary; then the empty stored block's
-        // header byte, without its LEN and NLEN.
-        writer.flush() catch return null;
-        w.writeByte(0) catch return null;
-        return w.end;
-    }
-};
+/// so one serves all the worker's connections.
+pub const Deflater = compress.Compressor;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -282,11 +222,11 @@ test "negotiation: accepted offers and the response" {
             .response = "permessage-deflate; server_no_context_takeover; client_no_context_takeover",
             .agreement = .{ .enabled = true, .client_no_context_takeover = true },
         },
-        // A smaller server window: accepted, sent Huffman-only.
+        // A smaller server window: accepted, and kept to.
         .{
             .offer = &.{"permessage-deflate; server_max_window_bits=9; client_max_window_bits=\"10\""},
             .response = "permessage-deflate; server_no_context_takeover; server_max_window_bits=9",
-            .agreement = .{ .enabled = true, .huffman_only = true },
+            .agreement = .{ .enabled = true, .server_window_bits = 9 },
         },
         .{ .offer = &.{"permessage-deflate;server_max_window_bits=15"}, .response = "permessage-deflate; server_no_context_takeover; server_max_window_bits=15" },
         // Unknown extensions and unacceptable offers are skipped.
@@ -416,11 +356,10 @@ test "inflate: messages with context takeover, final blocks, corrupt input, size
     }
 }
 
-test "deflate: messages round-trip on their own, Huffman-only too, and incompressible ones are refused" {
+test "deflate: messages round-trip on their own, in small windows too, and incompressible ones are refused" {
     const d = try testing.allocator.create(Deflater);
     defer testing.allocator.destroy(d);
-    d.level = .default;
-    d.ready = false;
+    d.init();
     var pool = try BufferPool.init(testing.allocator, 1024, 1);
     defer pool.deinit();
     const inf = try Inflater.create(&pool);
@@ -430,9 +369,9 @@ test "deflate: messages round-trip on their own, Huffman-only too, and incompres
     for (&big, 0..) |*b, i| b.* = "abcdefgh"[i % 8] + @as(u8, @intCast(i / 1000));
     const messages = [_][]const u8{ "a message that repeats, a message that repeats, a message that repeats", &big };
     var out: [8192]u8 = undefined;
-    for ([_]bool{ false, true }) |huffman| {
+    for ([_]u4{ 15, 9 }) |bits| {
         for (messages) |m| {
-            const n = d.compress(m, out[0..m.len], huffman).?;
+            const n = d.compress(m, out[0..m.len], bits).?;
             try testing.expect(n < m.len);
             // Each message stands alone: a fresh inflater reads it.
             inf.reset();
@@ -446,5 +385,5 @@ test "deflate: messages round-trip on their own, Huffman-only too, and incompres
     var noise: [600]u8 = undefined;
     var prng = std.Random.DefaultPrng.init(1);
     prng.random().bytes(&noise);
-    try testing.expectEqual(@as(?usize, null), d.compress(&noise, out[0..noise.len], false));
+    try testing.expectEqual(@as(?usize, null), d.compress(&noise, out[0..noise.len], 15));
 }

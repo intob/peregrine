@@ -269,7 +269,7 @@ pub const Conn = struct {
         // Frames only shrink, and a frame is compressed after a gap the size
         // of the longest header.
         out.ensureTotalCapacity(self.allocator, src.len + 10) catch return self.uncompressWire();
-        const d = self.decoder.pool.wsDeflater(self.opts.deflate.?.level) catch null;
+        const d = self.decoder.pool.wsDeflater() catch null;
         var i: usize = 0;
         while (i < src.len) {
             const b1 = src[i + 1] & 0x7f;
@@ -289,7 +289,7 @@ pub const Conn = struct {
                 if (d) |deflater| {
                     const room = out.unusedCapacitySlice();
                     // Only output smaller than the payload is kept.
-                    if (deflater.compress(frame[hl..], room[10..][0 .. n - 1], self.deflate.huffman_only)) |c| {
+                    if (deflater.compress(frame[hl..], room[10..][0 .. n - 1], self.deflate.server_window_bits)) |c| {
                         var hdr: [10]u8 = undefined;
                         const h = protocol.encodeHeader(&hdr, true, @fromBackingInt(@as(u4, @truncate(frame[0]))), c);
                         @memcpy(room[0..h.len], h);
@@ -562,10 +562,10 @@ test "send queue limit and control frame size" {
 }
 
 test "permessage-deflate: sends are compressed on the way to the wire" {
-    for ([_]bool{ false, true }) |huffman_only| {
+    for ([_]u4{ 15, 9 }) |window_bits| {
         const h = try Harness.init(.{ .deflate = .{ .min_size = 32 } });
         defer h.deinit();
-        h.conn.enableDeflate(.{ .enabled = true, .huffman_only = huffman_only });
+        h.conn.enableDeflate(.{ .enabled = true, .server_window_bits = window_bits });
         var big: [3000]u8 = undefined;
         for (&big, 0..) |*b, i| b.* = "compress me please "[i % 19];
         var noise: [200]u8 = undefined;

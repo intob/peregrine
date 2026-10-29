@@ -53,7 +53,7 @@ Design rules that apply to every layer:
 |---|---|
 | M1. HTTP/1.1 core | ✅ done (streaming responses landed with the M5 handler API) |
 | M2. Throughput architecture | 🟡 io_uring works (opt-in; faster than epoll for keep-alive requests, 4-5% behind for pipelined requests and uploads); sendfile done (plaintext, and TLS with kTLS); NUMA open |
-| M3. WebSockets over HTTP/1.1 | ✅ reworked; benchmarked against uWebSockets (even on small messages, 15-20% less CPU at 16-64 KiB); Autobahn 301/301 strict on every backend, plain and TLS; decoder fuzzed; permessage-deflate (Autobahn 517/517), compression 1.2-1.7x the CPU of uWebSockets' zlib |
+| M3. WebSockets over HTTP/1.1 | ✅ reworked; benchmarked against uWebSockets (even on small messages, 15-20% less CPU at 16-64 KiB); Autobahn 301/301 strict on every backend, plain and TLS; decoder fuzzed; permessage-deflate (Autobahn 517/517; even with uWebSockets' zlib on small messages, 3-5x less CPU at 16-64 KiB) |
 | M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; tables for P-256 and X25519, RSA-PSS, session tickets, kTLS, 0-RTT and SNI certificates done; the rest of "faster handshakes" open |
 | M5. HTTP/2 | ✅ h2 over TLS (ALPN) and h2c on every backend, h2spec 146/146 over TLS, fuzzed, benchmarked; streamed request bodies on every protocol; WebSockets over h2 (RFC 8441); RFC 9218 priorities |
 | M6. HTTP/3 and QUIC | 🟡 HTTP/3 over QUIC v1 on every backend, interop-tested (aioquic, curl/ngtcp2, h2load), benchmarked against nginx and Caddy; WebSockets over h3 (RFC 9220); 0-RTT; migration, pacing, ECN, PMTUD open |
@@ -270,19 +270,19 @@ reading).
 Still open:
 - [x] **permessage-deflate** (RFC 7692, `Config.websocket_deflate`, off by
       default; `src/ws/deflate.zig`), over HTTP/1.1, HTTP/2 and HTTP/3,
-      with std's DEFLATE (`std.compress.flate`, which has a compressor in
-      0.17). Negotiated in `upgrader.handleUpgrade` from the server's
+      with our own compressor for whole messages (`src/ws/compress.zig`)
+      and std's decompressor. Negotiated in `upgrader.handleUpgrade` from the server's
       options (`Response.ws_deflate_options`), carried to `ws.Conn` by the
       session (HTTP/1.1) or the stream (h2/h3). What is agreed:
   - Server to client: every message compressed on its own
     (`server_no_context_takeover`, always in the response), so one
-    compressor per worker (`BufferPool.wsDeflater`, about 290 KiB) serves
+    compressor per worker (`BufferPool.wsDeflater`, about 260 KiB) serves
     every connection and a connection holds no compression state. Messages
     from `send` (any thread) are queued marked with RSV1 and compressed by
     the worker as they move to the wire; one that doesn't shrink goes out
-    uncompressed. An offer limiting the server's window below 15 bits is
-    accepted with Huffman-only blocks (no back references), not declined.
-    Messages under `min_size` (64 bytes) aren't compressed
+    uncompressed. An offer limiting the server's window
+    (`server_max_window_bits`) is kept to: back references never reach
+    further. Messages under `min_size` (64 bytes) aren't compressed
   - Client to server: the client's window is kept between messages
     (context takeover): a std `Decompress` with its 64 KiB window per
     connection, made at the first compressed message, fed each message
@@ -305,10 +305,9 @@ Still open:
     with compression on: 517 of 517 cases (1-13), every close clean, on
     epoll and io_uring, plain and TLS; cases 12-13 also with
     `client_no_context_takeover`
-  - Fixed on the way: std's compressor leaves its writer `.failing` after
-    output that didn't fit, so resetting it in place (instead of building
-    the 230 KiB struct anew per message, 2 µs) restores the writer
-  - [ ] **Speed.** Echoes of JSON-like text with compression both ways
+  - [x] **Speed.** First with std's compressor (reset in place per
+    message, which must restore its writer: a write that doesn't fit
+    leaves it `.failing`). Echoes of JSON-like text with compression both ways
     (`ws-load ... text /ws deflate`, which sends a precompressed message;
     uWebSockets 20.74 with `SHARED_COMPRESSOR | DEDICATED_DECOMPRESSOR`
     and `send(..., compress = true)`; note that `send` defaults to
@@ -316,8 +315,37 @@ Still open:
     11.3; 1 KiB 17.2-17.8 µs against 10.1; 16 KiB 63-65 µs against 52.
     At 1 KiB, std's compressor spends 26% building Huffman tables for
     each message, 19% clearing its 64 KiB hash head, 13% matching;
-    inflating is 16%. A compressor made for whole small messages (a hash
-    table that needs no clearing, cheap Huffman codes) is the next step
+    inflating is 16%. So `src/ws/compress.zig`: greedy matching over hash
+    chains of 4 (as zlib's fastest levels), tables holding positions plus a
+    running base so nothing is cleared per message, per block (16K tokens)
+    the cheapest of dynamic, fixed or stored from the symbol counts, code
+    lengths by Moffat-Katajainen in place with the length limit folded as
+    in zlib and miniz. Alone (M2 Pro, JSON with varying digits): 200 B 2.5
+    µs against std's 6.3, 1 KiB 3.5 against 9.1, 16 KiB 15 against 54, 64
+    KiB 49 against 204; output between zlib's level 1 and 6 (16 KiB: 1922
+    bytes, zlib 2054 and 1388; 64 KiB: 5378, smaller than std's 6010).
+    Fixed codes come from all 288 lengths: built from the 286 used, every
+    9-bit code shifted, which Autobahn's small binary messages (12.2, 12.3,
+    12.5) found, as did the fuzzer; a test forces fixed blocks with high
+    bytes. Proof: round trips through std's decompressor (empty, noise,
+    200 KB over many blocks, windows of 2^8 to 2^15), code-length
+    completeness and limits, `fuzz: ws compress` (random pieces and
+    repeats, any window, two messages per run; 15 minutes, no failures),
+    Autobahn 517/517 again (epoll plain, cases 12-13 on io_uring TLS)
+
+      Server CPU per echoed message with compression both ways (same setup
+      as the echo table below, two interleaved rounds, host load 4-8;
+      uWebSockets uses zlib at its default level, so its output is smaller):
+
+| | peregrine epoll | io_uring | uWebSockets |
+|---|---|---|---|
+| 200 B, 256 conns, 1 in flight | 11.4-12.3 µs | 10.5-11.3 µs | 10.7-11.6 µs |
+| 1 KiB, 256 conns, 4 in flight | 9.1-10.0 µs | 8.3-9.3 µs | 9.9-10.7 µs |
+| 16 KiB, 64 conns, 2 in flight | 17.0-17.3 µs | 16.2-18.2 µs | 54.1-54.5 µs |
+| 64 KiB, 32 conns, 1 in flight | 41.2-41.3 µs | 40.3-44.6 µs | 228-230 µs |
+
+  - [ ] Inflating is std's `Decompress`, now the larger part of a small
+    compressed echo; a faster inflater would be next
 
 - [ ] Optional idle timeout / server keepalive pings
 - [ ] io_uring: parse straight out of the provided buffer like the HTTP path does

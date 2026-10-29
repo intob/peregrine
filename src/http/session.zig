@@ -62,11 +62,10 @@ pub const BufferPool = struct {
     }
 
     /// The worker's WebSocket compressor (permessage-deflate).
-    pub fn wsDeflater(self: *Self, level: std.compress.flate.Compress.Options) !*ws_deflate.Deflater {
+    pub fn wsDeflater(self: *Self) !*ws_deflate.Deflater {
         if (self.ws_deflater) |d| return d;
         const d = try self.allocator.create(ws_deflate.Deflater);
-        d.level = level;
-        d.ready = false;
+        d.init();
         self.ws_deflater = d;
         return d;
     }

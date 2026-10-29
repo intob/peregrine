@@ -8,6 +8,7 @@
 pub const upgrader = @import("./upgrader.zig");
 pub const protocol = @import("./protocol.zig");
 pub const deflate = @import("./deflate.zig");
+pub const compress = @import("./compress.zig");
 pub const Conn = @import("./conn.zig").Conn;
 pub const Options = @import("./conn.zig").Options;
 pub const SendError = @import("./conn.zig").SendError;
