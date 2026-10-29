@@ -11,7 +11,8 @@ B=$1; M=${2:-plain}; CASES=${3:-'["*"]'}; X=${4:-}; N=$B-$M${X:+-$X}
 EXCL='["12.*", "13.*"]'; [ -n "$X" ] && EXCL='[]'
 scheme=ws; [ "$M" = tls ] && scheme=wss
 A=$OUT/autobahn; mkdir -p "$A"; rm -rf "$A/reports-$N"
-"$LOCK" wait mac-bench
+"$LOCK" share mac-bench "autobahn $N ($ROOT)"
+trap '"$LOCK" unshare mac-bench' EXIT
 cat > "$A/fc-$N.json" <<J
 { "outdir": "/ab/reports-$N", "servers": [{ "agent": "peregrine-$N", "url": "$scheme://127.0.0.1:8080/ws" }],
   "cases": $CASES, "exclude-cases": $EXCL, "exclude-agent-cases": {} }

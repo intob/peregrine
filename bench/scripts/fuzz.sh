@@ -14,7 +14,8 @@ run="../zig/zig build test --fuzz=200 -Doptimize=ReleaseSafe -Dtest-filter='$T' 
  echo exit=\$? >> fuzz.log; tr '\r' '\n' < fuzz.log | grep -E 'failed with|panic|error:' | head -5; tail -1 fuzz.log;
  if [ -f .zig-cache/f/crash ]; then echo CRASH; xxd -p .zig-cache/f/crash | tr -d '\n'; echo; else echo clean; fi"
 if [ "$HOST" = local ]; then
-    "$LOCK" wait mac-bench
+    "$LOCK" share mac-bench "fuzz $T ($ROOT)"
+    trap '"$LOCK" unshare mac-bench' EXIT
     D=$OUT/fuzz-$name; ZL=$(zig_linux) || exit 1
     mkdir -p "$D/w"; rm -rf "$D/w/src"; (cd "$ROOT" && tar -c src build.zig build.zig.zon) | tar -x -C "$D/w"
     docker run --rm --name "fuzz-$name-$TAG" -v "$D/w":/w/src -v "$ZL":/w/zig -v "$D/cache":/root/.cache/zig -w /w/src alpine:3.21 sh -c "$run"
