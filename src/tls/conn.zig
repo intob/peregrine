@@ -30,22 +30,92 @@ comptime {
     std.debug.assert(in_buffer_size >= record.max_record);
 }
 
-/// Per-worker buffer pools shared by its TLS connections.
+/// Per-worker buffer pools shared by its TLS connections, and connection
+/// and handshake states kept for reuse (made on demand, up to `count` of
+/// each), so that a steady-state handshake allocates nothing.
 pub const Pools = struct {
     in: BufferPool,
     out: BufferPool,
+    conns: FreeList(Conn),
+    handshakes: FreeList(handshake.Handshake),
 
     pub fn init(allocator: std.mem.Allocator, count: usize) !Pools {
         var in = try BufferPool.init(allocator, in_buffer_size, count);
         errdefer in.deinit();
-        return .{ .in = in, .out = try BufferPool.init(allocator, out_buffer_size, count) };
+        var out = try BufferPool.init(allocator, out_buffer_size, count);
+        errdefer out.deinit();
+        const conns = try allocator.alloc(*Conn, count);
+        errdefer allocator.free(conns);
+        return .{ .in = in, .out = out, .conns = .{ .items = conns }, .handshakes = .{ .items = try allocator.alloc(*handshake.Handshake, count) } };
     }
 
     pub fn deinit(self: *Pools) void {
+        const allocator = self.in.allocator;
+        for (self.conns.items[0..self.conns.len]) |c| allocator.destroy(c);
+        for (self.handshakes.items[0..self.handshakes.len]) |hs| {
+            hs.deinit();
+            allocator.destroy(hs);
+        }
+        allocator.free(self.conns.items);
+        allocator.free(self.handshakes.items);
         self.in.deinit();
         self.out.deinit();
     }
+
+    /// A new connection, in a reused state if one is free.
+    pub fn createConn(self: *Pools, config: *const Config, entropy: *const [entropy_len]u8) !*Conn {
+        const c = self.conns.pop() orelse try self.in.allocator.create(Conn);
+        errdefer self.in.allocator.destroy(c);
+        c.* = try .init(self, config, entropy);
+        return c;
+    }
+
+    /// Ends a connection from `createConn`.
+    pub fn destroyConn(self: *Pools, c: *Conn) void {
+        c.deinit();
+        if (!self.conns.push(c)) self.in.allocator.destroy(c);
+    }
+
+    fn acquireHandshake(self: *Pools, config: *const Config, entropy: *const [entropy_len]u8) !*handshake.Handshake {
+        if (self.handshakes.pop()) |hs| {
+            hs.reinit(config, entropy);
+            return hs;
+        }
+        const allocator = self.in.allocator;
+        const hs = try allocator.create(handshake.Handshake);
+        hs.* = .init(allocator, config, entropy);
+        return hs;
+    }
+
+    fn releaseHandshake(self: *Pools, hs: *handshake.Handshake) void {
+        hs.wipe();
+        if (self.handshakes.push(hs)) return;
+        hs.deinit();
+        self.in.allocator.destroy(hs);
+    }
 };
+
+/// Objects waiting for reuse.
+fn FreeList(comptime T: type) type {
+    return struct {
+        items: []*T,
+        len: usize = 0,
+
+        fn pop(self: *@This()) ?*T {
+            if (self.len == 0) return null;
+            self.len -= 1;
+            return self.items[self.len];
+        }
+
+        /// False if the list is full.
+        fn push(self: *@This(), x: *T) bool {
+            if (self.len == self.items.len) return false;
+            self.items[self.len] = x;
+            self.len += 1;
+            return true;
+        }
+    };
+}
 
 /// Connections whose sending side went to the kernel (kTLS), process-wide.
 pub var kernel_tx_count = std.atomic.Value(u64).init(0);
@@ -110,9 +180,10 @@ pub const Conn = struct {
     /// `kernelNextKey`.
     kernel_key_update: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, pools: *Pools, config: *const Config, entropy: *const [entropy_len]u8) !Self {
-        const hs = try allocator.create(handshake.Handshake);
-        hs.* = .init(allocator, config, entropy);
+    /// See also `Pools.createConn`. The handshake state comes from the
+    /// pools and goes back once the handshake is done.
+    pub fn init(pools: *Pools, config: *const Config, entropy: *const [entropy_len]u8) !Self {
+        const hs = try pools.acquireHandshake(config, entropy);
         return .{ .pools = pools, .hs = hs, .key_update_limit = test_key_update_limit orelse key_update_after };
     }
 
@@ -127,9 +198,7 @@ pub const Conn = struct {
 
     fn freeHandshake(self: *Self) void {
         if (self.hs) |hs| {
-            const allocator = hs.allocator;
-            hs.deinit();
-            allocator.destroy(hs);
+            self.pools.releaseHandshake(hs);
             self.hs = null;
         }
     }
@@ -805,7 +874,7 @@ pub fn runAgainstStdClient(server: *TestServer, msg: []const u8, transcript: ?*s
     defer sys.close(fds[0]);
     var client_err: ?anyerror = null;
     const t = try std.Thread.spawn(.{}, stdClient, .{ fds[1], msg, 1, &client_err });
-    var conn = try Conn.init(testing.allocator, &server.pools, &server.config, &testEntropy(5));
+    var conn = try Conn.init(&server.pools, &server.config, &testEntropy(5));
     defer conn.deinit();
     conn.key_update_limit = server.key_update_limit;
     const result = echoServer(&conn, fds[0], msg.len, transcript);
@@ -979,7 +1048,7 @@ test "split invariance: any split of the client's bytes gives identical output, 
         };
 
         fn run(srv: *TestServer, bytes: []const u8, splits: []const usize, mode: Mode, wire: *std.ArrayList(u8), plain_out: *std.ArrayList(u8)) !void {
-            var conn = try Conn.init(testing.allocator, &srv.pools, &srv.config, &testEntropy(5));
+            var conn = try Conn.init(&srv.pools, &srv.config, &testEntropy(5));
             defer conn.deinit();
             var pos: usize = 0;
             var si: usize = 0;
@@ -1071,12 +1140,62 @@ fn handshakeLen(wire: []const u8) usize {
     return pos;
 }
 
+test "a handshake on warm pools allocates nothing" {
+    const td = credentials.testdata;
+    var server: TestServer = undefined;
+    try server.init(td.p256_cert, td.p256_key);
+    defer server.deinit();
+    // A recorded session (deterministic, as in the split test), replayed
+    // on pools whose allocations are counted.
+    var transcript: std.ArrayList(u8) = .empty;
+    defer transcript.deinit(testing.allocator);
+    const msg = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    try runAgainstStdClient(&server, msg, &transcript);
+
+    var counting: std.testing.FailingAllocator = .init(testing.allocator, .{});
+    var pools = try Pools.init(counting.allocator(), 2);
+    defer pools.deinit();
+    for (0..3) |round| {
+        const before = counting.allocations;
+        const conn = try pools.createConn(&server.config, &testEntropy(5));
+        var rest = transcript.items;
+        var echoed: usize = 0;
+        while (rest.len > 0) {
+            const space = try conn.readSpace();
+            const n = @min(space.len, rest.len);
+            @memcpy(space[0..n], rest[0..n]);
+            conn.commitRead(n);
+            rest = rest[n..];
+            var plain: [256]u8 = undefined;
+            while (true) {
+                const k = conn.readPlain(&plain);
+                if (k == 0) break;
+                echoed += try conn.encrypt(&.{plain[0..k]});
+            }
+            conn.advance(conn.wireBytes().len);
+            conn.releaseIfIdle();
+            try testing.expect(!conn.failed);
+        }
+        try testing.expect(conn.peer_closed);
+        try testing.expect(conn.isEstablished());
+        try testing.expectEqual(msg.len, echoed);
+        pools.destroyConn(conn);
+        // The first round makes the connection and handshake states and
+        // the flight buffer; later rounds reuse them.
+        if (round == 0) {
+            try testing.expect(counting.allocations > before);
+        } else {
+            try testing.expectEqual(before, counting.allocations);
+        }
+    }
+}
+
 fn expectAlert(input: []const u8, description: tls.Alert.Description) !void {
     const td = credentials.testdata;
     var server: TestServer = undefined;
     try server.init(td.p256_cert, td.p256_key);
     defer server.deinit();
-    var conn = try Conn.init(testing.allocator, &server.pools, &server.config, &testEntropy(5));
+    var conn = try Conn.init(&server.pools, &server.config, &testEntropy(5));
     defer conn.deinit();
     const space = try conn.readSpace();
     @memcpy(space[0..input.len], input);
@@ -1111,7 +1230,7 @@ test "KeyUpdate in both directions" {
     var server: TestServer = undefined;
     try server.init(td.p256_cert, td.p256_key);
     defer server.deinit();
-    var conn = try Conn.init(testing.allocator, &server.pools, &server.config, &testEntropy(5));
+    var conn = try Conn.init(&server.pools, &server.config, &testEntropy(5));
     defer conn.deinit();
     // Pretend the handshake finished with known secrets.
     conn.freeHandshake();
@@ -1179,7 +1298,7 @@ test "0-RTT data after a HelloRetryRequest is skipped until ClientHello2" {
     try server.init(td.p256_cert, td.p256_key);
     defer server.deinit();
     server.config.groups = &.{.x25519};
-    var conn = try Conn.init(testing.allocator, &server.pools, &server.config, &testEntropy(5));
+    var conn = try Conn.init(&server.pools, &server.config, &testEntropy(5));
     defer conn.deinit();
 
     var hello_buf: [2048]u8 = undefined;
@@ -1215,7 +1334,7 @@ test "KeyUpdate before the record limit of a key" {
     try server.init(td.p256_cert, td.p256_key);
     defer server.deinit();
     inline for (.{ Suite.aes_128_gcm_sha256, Suite.aes_256_gcm_sha384, Suite.chacha20_poly1305_sha256 }) |suite| {
-        var conn = try Conn.init(testing.allocator, &server.pools, &server.config, &testEntropy(5));
+        var conn = try Conn.init(&server.pools, &server.config, &testEntropy(5));
         defer conn.deinit();
         conn.freeHandshake();
         const secret: [48]u8 = @splat(2);
@@ -1271,7 +1390,7 @@ test "close_notify from the peer ends input" {
     var server: TestServer = undefined;
     try server.init(td.p256_cert, td.p256_key);
     defer server.deinit();
-    var conn = try Conn.init(testing.allocator, &server.pools, &server.config, &testEntropy(5));
+    var conn = try Conn.init(&server.pools, &server.config, &testEntropy(5));
     defer conn.deinit();
     conn.freeHandshake();
     const secret: [32]u8 = @splat(1);

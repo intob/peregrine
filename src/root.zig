@@ -61,6 +61,7 @@ test {
     _ = @import("./tls/credentials.zig");
     _ = @import("./tls/p256.zig");
     _ = @import("./tls/x25519.zig");
+    _ = @import("./tls/field25519.zig");
     _ = @import("./tls/rsa.zig");
     _ = @import("./tls/ticket.zig");
     _ = @import("./tls/handshake.zig");

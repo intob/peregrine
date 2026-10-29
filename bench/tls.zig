@@ -257,6 +257,28 @@ fn handshakes() !void {
             reportOp(try std.fmt.bufPrint(&name_buf, "handshake {s}, {s}", .{ c[0], @tagName(g[0]) }), iterations, sys.nanoTimestamp() - start);
         }
     }
+    // As tls.Conn does with its pools: one state, wiped and reused, so the
+    // handshake allocates nothing.
+    {
+        var creds = try credentials.Credentials.fromPem(gpa, td.p256_cert, td.p256_key);
+        defer creds.deinit();
+        const config: handshake.Config = .{ .credentials = &creds, .alpn = &.{"h2"} };
+        for (groups) |g| {
+            const hello = clientHello(&hello_buf, g[0], g[1]);
+            var hs = handshake.Handshake.init(gpa, &config, &entropy);
+            defer hs.deinit();
+            const iterations = 2000;
+            const start = sys.nanoTimestamp();
+            for (0..iterations) |_| {
+                hs.wipe();
+                hs.reinit(&config, &entropy);
+                var sink: NullSink = .{};
+                try hs.feed(.initial, hello, &sink);
+            }
+            var name_buf: [64]u8 = undefined;
+            reportOp(try std.fmt.bufPrint(&name_buf, "handshake ECDSA P-256, {s}, reused", .{@tagName(g[0])}), iterations, sys.nanoTimestamp() - start);
+        }
+    }
     std.debug.print("\n", .{});
     const n = 2000;
     var seed: [32]u8 = @splat(5);
@@ -274,9 +296,25 @@ fn handshakes() !void {
         for (0..n) |i| {
             seed[0] = @truncate(i);
             std.mem.doNotOptimizeAway(x25519.publicKey(seed));
-            std.mem.doNotOptimizeAway(try X25519.scalarmult(seed, x_kp.public_key));
+            std.mem.doNotOptimizeAway(try x25519.sharedSecret(seed, x_kp.public_key));
         }
         reportOp("X25519 key pair (table) + shared secret", n, sys.nanoTimestamp() - start);
+    }
+    {
+        const start = sys.nanoTimestamp();
+        for (0..n) |i| {
+            seed[0] = @truncate(i);
+            std.mem.doNotOptimizeAway(try X25519.scalarmult(seed, x_kp.public_key));
+        }
+        reportOp("X25519 shared secret (std)", n, sys.nanoTimestamp() - start);
+    }
+    {
+        const start = sys.nanoTimestamp();
+        for (0..n) |i| {
+            seed[0] = @truncate(i);
+            std.mem.doNotOptimizeAway(try x25519.sharedSecret(seed, x_kp.public_key));
+        }
+        reportOp("X25519 shared secret", n, sys.nanoTimestamp() - start);
     }
     {
         const start = sys.nanoTimestamp();

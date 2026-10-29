@@ -967,10 +967,7 @@ pub fn Worker(comptime Handler: type) type {
             var entropy: [tls.entropy_len]u8 = undefined;
             self.rng.fill(&entropy);
             defer std.crypto.secureZero(u8, &entropy);
-            const t = try self.allocator.create(TlsConn);
-            errdefer self.allocator.destroy(t);
-            t.* = try TlsConn.init(self.allocator, &self.tls_pools.?, cfg, &entropy);
-            c.tls = t;
+            c.tls = try self.tls_pools.?.createConn(cfg, &entropy);
         }
 
         /// Close after the final response, lingering if the session asks.
@@ -1051,8 +1048,7 @@ pub fn Worker(comptime Handler: type) type {
                 c.ws = null;
             }
             if (c.tls) |t| {
-                t.deinit();
-                self.allocator.destroy(t);
+                self.tls_pools.?.destroyConn(t);
                 c.tls = null;
             }
         }

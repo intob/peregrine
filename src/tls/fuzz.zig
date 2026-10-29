@@ -1414,7 +1414,7 @@ const Run = struct {
     plain_buf_len: usize,
 
     fn init(pools: *conn_mod.Pools, config: *const conn_mod.Config, plain_buf_len: usize) !Run {
-        return .{ .conn = try Conn.init(testing.allocator, pools, config, &conn_mod.testEntropy(5)), .plain_buf_len = plain_buf_len };
+        return .{ .conn = try Conn.init(pools, config, &conn_mod.testEntropy(5)), .plain_buf_len = plain_buf_len };
     }
 
     fn deinit(r: *Run) void {

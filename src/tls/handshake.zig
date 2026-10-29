@@ -143,6 +143,9 @@ pub const Handshake = struct {
     entropy: [entropy_len]u8,
     /// A handshake message split across feed calls.
     partial: std.ArrayList(u8) = .empty,
+    /// Where the encrypted flight is assembled. Like `partial`, kept by
+    /// `reinit`.
+    flight: []u8 = &.{},
 
     suite: Suite = undefined,
     transcript: Transcript = undefined,
@@ -184,13 +187,39 @@ pub const Handshake = struct {
         return .{ .allocator = allocator, .config = config, .entropy = entropy.* };
     }
 
+    /// `reinit` keeps buffers up to this size.
+    pub const max_kept_buffer = 16 * 1024;
+
     pub fn deinit(self: *Self) void {
+        self.wipe();
         self.partial.deinit(self.allocator);
+        self.allocator.free(self.flight);
+    }
+
+    /// Clears the secrets (`deinit` does too).
+    pub fn wipe(self: *Self) void {
         std.crypto.secureZero(u8, &self.entropy);
         std.crypto.secureZero(u8, &self.client_handshake_secret);
         std.crypto.secureZero(u8, &self.client_app_secret);
         std.crypto.secureZero(u8, &self.psk);
         std.crypto.secureZero(u8, &self.master_secret);
+    }
+
+    /// `init` again for a state that was used and wiped, keeping its
+    /// buffers (up to `max_kept_buffer`), so that a handshake on a reused
+    /// state allocates nothing (conn.zig's `Pools`).
+    pub fn reinit(self: *Self, config: *const Config, entropy: *const [entropy_len]u8) void {
+        var partial = self.partial;
+        partial.clearRetainingCapacity();
+        if (partial.capacity > max_kept_buffer) partial.clearAndFree(self.allocator);
+        var flight = self.flight;
+        if (flight.len > max_kept_buffer) {
+            self.allocator.free(flight);
+            flight = &.{};
+        }
+        self.* = .init(self.allocator, config, entropy);
+        self.partial = partial;
+        self.flight = flight;
     }
 
     pub fn isDone(self: *const Self) bool {
@@ -227,7 +256,7 @@ pub const Handshake = struct {
                 if (key_change and left > 0) return error.UnexpectedMessage;
             }
         }
-        if (self.state == .done) self.partial.clearAndFree(self.allocator);
+        if (self.state == .done) self.partial.clearRetainingCapacity();
     }
 
     fn messageLen(data: []const u8) Error!?usize {
@@ -610,9 +639,12 @@ pub const Handshake = struct {
         var chain_len: usize = 0;
         for (creds.chain) |c| chain_len += 3 + c.len + 2;
         const flight_len = 64 + 300 + self.transport_params.len + chain_len + credentials.max_signature_len + record.max_hash_len;
-        const flight = self.allocator.alloc(u8, flight_len) catch return error.InternalError;
-        defer self.allocator.free(flight);
-        var w: Writer = .{ .buf = flight };
+        if (self.flight.len < flight_len) {
+            self.allocator.free(self.flight);
+            self.flight = &.{};
+            self.flight = self.allocator.alloc(u8, flight_len) catch return error.InternalError;
+        }
+        var w: Writer = .{ .buf = self.flight[0..flight_len] };
 
         // EncryptedExtensions
         var start = w.pos;
@@ -835,9 +867,10 @@ const KeyExchange = struct {
 
     fn x25519(self: *KeyExchange, client: []const u8, seed: *const [32]u8) Error!void {
         if (client.len != X25519.public_length) return error.IllegalParameter;
-        // The public key from a table (std's ladder gives the same).
+        // The public key from a table, the shared secret from our ladder
+        // (both equal std's).
         const public = x25519_base.publicKey(seed.*);
-        const shared = X25519.scalarmult(seed.*, client[0..32].*) catch return error.IllegalParameter;
+        const shared = x25519_base.sharedSecret(seed.*, client[0..32].*) catch return error.IllegalParameter;
         @memcpy(self.share_buf[self.share_len..][0..32], &public);
         self.share_len += 32;
         @memcpy(self.shared_buf[self.shared_len..][0..32], &shared);
