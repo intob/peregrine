@@ -81,7 +81,7 @@ Source layout:
 | `src/ws/upgrader.zig` | Accepting a WebSocket: 101 for an HTTP/1.1 Upgrade, 200 for an extended CONNECT on HTTP/2 and HTTP/3 |
 | `src/tls/` | I/O-free TLS 1.3 server (M4): see below |
 | `src/server_test.zig` | End-to-end tests over real sockets, run once per available backend |
-| `bench/` | `zig build bench` (parser micro-benchmarks), `zig build bench-tls` (record protection), `zig build bench-server` (load-test target, plaintext or TLS), `zig build ws-load` (WebSocket load generator, Linux) |
+| `bench/` | `zig build bench` (parser micro-benchmarks), `zig build bench-tls` (record protection), `zig build bench-server` (load-test target, plaintext or TLS), `zig build ws-load` (WebSocket load generator, Linux); `bench/scripts/` (Linux tests in Docker, WebSocket benchmarks, Autobahn, fuzzing locally or on the Pis, two-machine Pi benchmarks, locks shared by parallel agents); `bench/competitors/` (how comparison servers were built) |
 | `docs/handler-api-proposal.md` | Proposed M5 handler API: streaming, deferred responses, trailers |
 
 Tests run with `zig build test` on macOS (kqueue), Linux with Docker's default seccomp

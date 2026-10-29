@@ -1,0 +1,5 @@
+# uWebSockets echo with SHARED_COMPRESSOR | DEDICATED_DECOMPRESSOR; send(..., compress = true).
+FROM comp-uws-ws:latest
+WORKDIR /src
+COPY ws-echo-deflate.cpp /src/ws-echo-deflate.cpp
+RUN g++ -O3 -march=native -flto -std=c++20 -DLIBUS_NO_SSL -IuSockets/src -Isrc ws-echo-deflate.cpp uSockets/*.o -o /usr/local/bin/uws-ws-echo-deflate -lpthread -lz
