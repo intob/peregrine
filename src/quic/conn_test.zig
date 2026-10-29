@@ -755,6 +755,7 @@ fn runLossy(h: *Harness, delay: u64, loss: u8, id: u64) !void {
     var head: usize = 0;
     const limit = h.now + 120 * std.time.us_per_s;
     var buf: [1500]u8 = undefined;
+    var hold_woke = false;
     while (!h.client.finished(id)) {
         if (h.now > limit) return error.Timeout;
         while (true) {
@@ -764,12 +765,18 @@ fn runLossy(h: *Harness, delay: u64, loss: u8, id: u64) !void {
         }
         const s = h.server.?;
         if (s.isClosed()) return error.Closed;
+        var sent_now: usize = 0;
         while (true) {
             const n = s.send(&buf, h.now);
             if (n == 0) break;
+            sent_now += 1;
             if (h.prng.random().uintLessThan(u8, 100) < loss) continue;
             try queue.append(h.a, .{ .at = h.now + delay, .to_server = false, .len = n, .buf = buf });
         }
+        // A hold is always ahead of the send that set it.
+        if (s.pacing_hold) |d| try testing.expect(d > h.now);
+        if (hold_woke and sent_now == 0) lossy_idle_wakeups += 1;
+        hold_woke = false;
         var next: ?u64 = if (head < queue.items.len) queue.items[head].at else null;
         var timer: ?u64 = null;
         if (s.deadline()) |d| if (d < h.now + 10 * std.time.us_per_s) {
@@ -782,11 +789,18 @@ fn runLossy(h: *Harness, delay: u64, loss: u8, id: u64) !void {
             if (f.to_server) try h.toServer(f.buf[0..f.len]) else try h.client.recv(f.buf[0..f.len]);
         }
         if (timer) |t| if (t <= h.now) {
+            if (s.pacing_hold) |ph| if (ph == t) {
+                hold_woke = true;
+                lossy_hold_wakeups += 1;
+            };
             s.onTimeout(h.now);
             try EchoApp.run(s);
         };
     }
 }
+
+var lossy_hold_wakeups: usize = 0;
+var lossy_idle_wakeups: usize = 0;
 
 test "verify pacing: downloads complete with loss over delayed paths, paced not much slower" {
     const Case = struct { delay: u64, loss: u8, size: usize };
@@ -820,7 +834,9 @@ test "verify pacing: downloads complete with loss over delayed paths, paced not 
                 durations[pi] = h.now - began;
                 try testing.expectEqual(cs.size, h.client.readAll(id).len);
             }
-            std.debug.print("delay={d} loss={d} seed={d}: paced {d} ms, unpaced {d} ms\n", .{ cs.delay, cs.loss, seed, durations[0] / 1000, durations[1] / 1000 });
+            std.debug.print("delay={d} loss={d} seed={d}: paced {d} ms, unpaced {d} ms; pacing wakeups {d}, of them sending nothing {d}\n", .{ cs.delay, cs.loss, seed, durations[0] / 1000, durations[1] / 1000, lossy_hold_wakeups, lossy_idle_wakeups });
+            lossy_hold_wakeups = 0;
+            lossy_idle_wakeups = 0;
         }
     }
 }
@@ -888,7 +904,7 @@ test "verify pacing: pacer arithmetic at extremes" {
     try testing.expect(p.tokens >= 12000);
     p.onSent(std.math.maxInt(u64));
     try testing.expectEqual(@as(u64, 0), p.tokens);
-    const n = p.nextSend(1200, &cc, &rtt).?;
+    const n = p.nextSend(1200, std.math.maxInt(u64), &cc, &rtt).?;
     try testing.expectEqual(@as(u64, std.math.maxInt(u64)), n);
     // Clock going backwards: no refill, no underflow.
     p.refill(5, &cc, &rtt);
@@ -900,7 +916,7 @@ test "verify pacing: pacer arithmetic at extremes" {
     p = recovery.Pacer.init(1200, recovery.Pacer.default_burst_us);
     p.refill(1000, &cc, &rtt);
     p.onSent(12000);
-    const due = p.nextSend(1200, &cc, &rtt).?;
+    const due = p.nextSend(1200, std.math.maxInt(u64), &cc, &rtt).?;
     // 6000 bytes at 1.25 · 2400 B / hour.
     try testing.expect(due > 1000 + 3600 * std.time.us_per_s);
     // Long idle gap after.
@@ -912,7 +928,10 @@ test "verify pacing: pacer arithmetic at extremes" {
     try testing.expectEqual(@as(u64, 12000), p0.capacity(&cc, &rtt));
     p0.refill(0, &cc, &rtt);
     p0.onSent(12000);
-    try testing.expect(p0.nextSend(1200, &cc, &rtt).? > 0);
+    try testing.expect(p0.nextSend(1200, std.math.maxInt(u64), &cc, &rtt).? > 0);
+    // No room in the window at all, and a zero-byte datagram.
+    try testing.expect(p0.nextSend(1200, 0, &cc, &rtt).? > 0);
+    try testing.expectEqual(@as(?u64, null), p0.nextSend(0, 0, &cc, &rtt));
 }
 
 test "verify pacing: CONNECTION_CLOSE goes at once while the pacer holds data back" {
@@ -957,4 +976,118 @@ test "verify pacing: a key update in the middle of a paced download over a 40 ms
     try testing.expectEqual(@as(usize, 3_000_000), h.client.readAll(id).len);
     try testing.expectEqual(@as(u1, 1), h.server.?.rx_phase);
     try testing.expect(h.server.?.paced_waits > 0);
+}
+
+/// Like runLossy over several streams, checking after every send loop that
+/// no deadline is already due while the server had nothing to send (a busy
+/// loop in the worker) and that a hold is ahead of now.
+fn runLossyMulti(h: *Harness, delay: u64, loss: u8, ids: []const u64) !void {
+    var queue: std.ArrayList(Flight) = .empty;
+    defer queue.deinit(h.a);
+    var head: usize = 0;
+    const limit = h.now + 300 * std.time.us_per_s;
+    var buf: [1500]u8 = undefined;
+    while (true) {
+        var all = true;
+        for (ids) |id| all = all and h.client.finished(id);
+        if (all) return;
+        if (h.now > limit) return error.Timeout;
+        while (true) {
+            const n = try h.client.send(&buf);
+            if (n == 0) break;
+            try queue.append(h.a, .{ .at = h.now + delay, .to_server = true, .len = n, .buf = buf });
+        }
+        const s = h.server.?;
+        if (s.isClosed()) return error.Closed;
+        while (true) {
+            const n = s.send(&buf, h.now);
+            if (n == 0) break;
+            if (h.prng.random().uintLessThan(u8, 100) < loss) continue;
+            try queue.append(h.a, .{ .at = h.now + delay, .to_server = false, .len = n, .buf = buf });
+        }
+        if (s.pacing_hold) |d| try testing.expect(d > h.now);
+        if (s.deadline()) |d| if (d <= h.now) {
+            // Due already: the worker would come straight back. Only fine
+            // if that next send does something.
+            s.onTimeout(h.now);
+            const n = s.send(&buf, h.now);
+            if (n == 0 and !s.isClosed()) if (s.deadline()) |d2| if (d2 <= h.now) return error.BusyLoop;
+            if (n > 0) try queue.append(h.a, .{ .at = h.now + delay, .to_server = false, .len = n, .buf = buf });
+        };
+        var next: ?u64 = if (head < queue.items.len) queue.items[head].at else null;
+        var timer: ?u64 = null;
+        if (s.deadline()) |d| if (d < h.now + 10 * std.time.us_per_s) {
+            timer = @max(d, h.now);
+            next = if (next) |x| @min(x, timer.?) else timer;
+        };
+        h.now = next orelse return error.Stalled;
+        while (head < queue.items.len and queue.items[head].at <= h.now) : (head += 1) {
+            const f = &queue.items[head];
+            if (f.to_server) try h.toServer(f.buf[0..f.len]) else try h.client.recv(f.buf[0..f.len]);
+        }
+        if (timer) |t| if (t <= h.now) {
+            s.onTimeout(h.now);
+            try EchoApp.run(s);
+        };
+    }
+}
+
+var random_burst_us: u64 = 0;
+var random_pacing = true;
+fn randomBurst(c: *conn_mod.Config) void {
+    c.pacing_burst_us = random_burst_us;
+    c.pacing = random_pacing;
+}
+
+test "verify pacing: random paths, losses and stream mixes all complete without a busy loop" {
+    var prng: std.Random.DefaultPrng = .init(0x9ace);
+    const r = prng.random();
+    var fails: usize = 0;
+    for (0..150) |iter| for ([_]bool{ true, false }) |pacing| {
+        random_pacing = pacing;
+        if (!pacing) prng = .init(0x9ace + iter * 1000) else prng = .init(0x9ace + iter * 1000);
+        const delay: u64 = switch (r.uintLessThan(u8, 4)) {
+            0 => 1 + r.uintLessThan(u64, 500),
+            1 => 1000 + r.uintLessThan(u64, 5000),
+            2 => 10_000 + r.uintLessThan(u64, 40_000),
+            else => 50_000 + r.uintLessThan(u64, 150_000),
+        };
+        const loss = r.uintLessThan(u8, 12);
+        random_burst_us = switch (r.uintLessThan(u8, 3)) {
+            0 => 0,
+            1 => 2000,
+            else => 20_000,
+        };
+        const max_data: u64 = if (r.boolean()) 16 << 20 else 600_000;
+        const h = try Harness.init(.{ .seed = @intCast(iter % 200 + 1), .max_stream_data = 4 << 20, .max_data = max_data }, randomBurst);
+        defer h.deinit();
+        h.prng = .init(iter);
+        var bursts: std.ArrayList(Burst) = .empty;
+        defer bursts.deinit(testing.allocator);
+        try h.runDelayed(delay, {}, established, &bursts);
+        var ids: [8]u64 = undefined;
+        var sizes: [8]usize = undefined;
+        // Within the connection's credit: the test client never extends it.
+        const n = 1 + r.uintLessThan(usize, 8);
+        for (0..n) |i| {
+            ids[i] = try h.client.openBidi();
+            sizes[i] = 1 + r.uintLessThan(usize, if (r.boolean()) 4000 else if (max_data < 1 << 20) 70_000 else 250_000);
+            var req: [32]u8 = undefined;
+            try h.client.write(ids[i], try std.fmt.bufPrint(&req, "big {d}", .{sizes[i]}), true);
+        }
+        const began = h.now;
+        runLossyMulti(h, delay, loss, ids[0..n]) catch |e| {
+            var got: usize = 0;
+            for (0..n) |i| got += h.client.readAll(ids[i]).len;
+            var want: usize = 0;
+            for (0..n) |i| want += sizes[i];
+            const s = h.server.?;
+            std.debug.print("iter {d} pacing {}: delay {d} loss {d} burst {d} streams {d} max_data {d}: {s}; got {d}/{d}; window {d} in_flight {d} srtt {d} lost {d} pto_count {d} hold {?d} deadline {?d} now {d}\n", .{ iter, pacing, delay, loss, random_burst_us, n, max_data, @errorName(e), got, want, s.cc.window, s.cc.in_flight, s.rtt.smoothed, s.lost_packets, s.pto_count, s.pacing_hold, s.deadline(), h.now });
+            fails += 1;
+            continue;
+        };
+        if (iter % 25 == 0) std.debug.print("iter {d} pacing {}: {d} ms\n", .{ iter, pacing, (h.now - began) / 1000 });
+        for (0..n) |i| try testing.expectEqual(sizes[i], h.client.readAll(ids[i]).len);
+    };
+    try testing.expectEqual(@as(usize, 0), fails);
 }
