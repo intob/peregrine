@@ -519,7 +519,8 @@ Ed25519, `std.crypto.tls` enums and `hkdfExpandLabel`.
 | `record.zig` | Record protection: AEAD with per-record nonce (IV xor sequence number), record header as AAD, inner content type and padding removal, record size limits |
 | `conn.zig` | `tls.Conn`: one TLS-over-TCP connection. Buffers ciphertext like `Session` does (pooled, held only while unprocessed), drives the handshake, decrypts application data for the HTTP/WebSocket layers and encrypts their output into a wire buffer |
 | `credentials.zig` | PEM/DER loading of the certificate chain and private key; signing CertificateVerify |
-| `p256.zig`, `x25519.zig` | Base-point tables: ECDSA P-256 signing, P-256 ECDHE key pairs, X25519 public keys |
+| `p256.zig`, `x25519.zig` | Base-point tables: ECDSA P-256 signing, P-256 ECDHE key pairs, X25519 public keys; X25519's shared secret |
+| `field25519.zig` | X25519's field: four 64-bit limbs |
 | `rsa.zig` | RSA private keys and RSASSA-PSS signing |
 | `ticket.zig` | Session tickets: resumption state sealed with a rotating key |
 | `fuzz.zig` | Fuzz target over `tls.Conn`: a scripted client (see the checklist) |
@@ -679,10 +680,62 @@ Later in M4:
       114 → 40, X25519 key pair + shared secret 60 → 41. Interop: OpenSSL
       3.5 verifies the CertificateVerify with each group, curl over HTTP/2
       and HTTP/3
-- [ ] Faster handshakes, next: the X25519 shared secret (std's ladder,
-      ~30 µs), P-256's variable-base `mul` for ECDHE, ML-KEM-768
-      encapsulation (25 µs), the per-handshake allocations (handshake state,
-      flight buffer); P-384 signing (315 µs) if P-384 certificates matter
+- [x] **Faster handshakes**, step 2: the X25519 shared secret, and no
+      allocation per handshake. `src/tls/field25519.zig`: GF(2^255 − 19)
+      in four 64-bit limbs (16 products per multiplication plus 4 to fold
+      with 2^256 ≡ 38; values kept below 2^256, reduced only for output)
+      instead of std's five 51-bit limbs (25 products).
+      `x25519.sharedSecret` is std's ladder step for step over it; the
+      public-key table uses the same field (50 KB, was 62 KB) and takes the
+      clamped scalar unreduced (B has order L). The ladder waits on
+      dependencies, not on the multipliers: on the M2 the order of the
+      step's operations alone moved it between 22.6 and 33.8 µs; starting
+      the chains through DA/CB → z3 and AA/BB → z2 first and interleaving
+      independent products (`mulN`, `sqN`) gave the best result. A two-lane
+      NEON ladder (radix 2^25.5) reached only ~25 µs and was dropped.
+      Constant time in every build: runtime safety is on only in Debug in
+      the field and ladder (its overflow checks would branch on secret
+      carries in ReleaseSafe), the table lookup scans every entry with
+      csel/cmov, and the clamped scalar and its recoded digits are zeroed.
+      Equal to std byte for byte and error for error: RFC 7748's vectors
+      (iterated 1 and 1000 times), random pairs, non-canonical u, bit 255,
+      the low-order points; a u512 reference over limb patterns, ranges
+      around p and 2^256 and 5000-op chains (`x25519_verify.zig`, also 20x
+      on x86_64 EPYC); mutants of the folds caught; fuzz targets `fuzz:
+      x25519 shared secret against std` and `fuzz: field25519 against std`
+      (15 min each on a Pi). `tls.Pools` keeps connection and handshake
+      states for reuse up to the buffer count; retained handshake buffers
+      are bounded (the first 16 states keep 16 KiB, the rest 4 KiB: about
+      1 MiB per worker worst case at the default 64); everything a
+      handshake held is zeroed when it ends and before any buffer is freed
+      or grown (found by a scanning allocator in ReleaseFast, where std's
+      0xaa fill on free doesn't hide it). A TLS-over-TCP handshake on a
+      warm worker allocates nothing, a burst of 40 at once included.
+      `bench-tls handshake`, Linux, one core of the M2 Pro, interleaved
+      rounds, confirmed by a second agent (µs, before → after): X25519
+      shared secret 31.2-31.4 → 22.1-22.4, key pair + shared secret
+      42.7-43.2 → 30.9-31.1; handshake with a P-256 certificate and X25519
+      85.6-86.7 → 77.8-78.8 (about 75 on a reused state), with
+      X25519MLKEM768 113-114 → 101.6-101.8. Interop
+      (`bench/scripts/tls-interop.sh`): OpenSSL 3.5 and curl 8.23 with
+      X25519 and X25519MLKEM768 over HTTP/1.1, h2 and h3, a
+      HelloRetryRequest, 480 new h2 connections per group, epoll and
+      io_uring. Found by fuzzing and fixed along the way: after a
+      HelloRetryRequest, a ClientHello2 must repeat every extension but
+      key_share, early_data, cookie, pre_shared_key and padding (RFC 8446
+      §4.1.2; a digest of the rest, in order, is kept from ClientHello1);
+      before, one that dropped server_name still got ClientHello1's
+      certificate and server_name acknowledged
+- [ ] Faster handshakes, next: P-256's variable-base `mul` for ECDHE
+      (P-256 key pair + shared secret ~138 µs), ML-KEM-768 encapsulation
+      (25 µs), P-384 signing (~324 µs) if P-384 certificates matter; the
+      field on x86_64 (correct, speed unmeasured). QUIC: `quic.Conn` still
+      allocates a handshake state and its flight per connection; the pooling
+      in `tls.Pools` (FreeList, release/reinit) could move to a module both
+      share
+- [ ] TLS input buffers (BufferPool) keep plaintext ClientHello records and
+      in-place-decrypted application data after release, never zeroed:
+      zeroing 16 KiB per release is a hot-path cost to measure first
 - [x] Send KeyUpdate before the AES-GCM record limit: after 2^24 records under one
       key (the power of two below §5.5's 2^24.5), for every suite (only AES-GCM needs
       it, one rule is simpler), `update_not_requested`, only when the wire buffer has
@@ -832,6 +885,13 @@ Later in M4:
       aioquic over HTTP/3 on epoll and io_uring (`bench-server ... sni`).
       Linear in the number of certificates
 - [ ] OCSP stapling
+- [ ] **kTLS KeyUpdate missed on x86_64.** "tls: kernel TLS … a file with
+      sendfile, close_notify" fails on the Hetzner box (Ubuntu 6.8, no
+      kernel rekey) in ReleaseSafe every time, Debug passes: with
+      `test_key_update_limit = 4` the 8 MiB download completes instead of
+      closing. Records sent through the kernel are counted only after each
+      write, so a single sendfile that fills the socket never stops for the
+      KeyUpdate (`kernel_tx_count` rose by 1). Count or cap per sendfile call
 - [x] **kTLS on Linux** (`TlsOptions.ktls`, on by default): the sending side of
       an HTTP/1.1 connection goes to the kernel (TCP_ULP "tls", TLS_TX with the
       current key, IV split into salt and the rest, and record sequence number)
