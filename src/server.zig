@@ -18,6 +18,7 @@ pub const Backend = enum {
     io_uring,
 };
 const ws = @import("./ws/conn.zig");
+const ws_deflate = @import("./ws/deflate.zig");
 const tls_conn = @import("./tls/conn.zig");
 pub const H2Options = @import("./h2/conn.zig").Options;
 const Credentials = @import("./tls/credentials.zig").Credentials;
@@ -165,6 +166,10 @@ pub const Config = struct {
     /// connection whose peer stops reading is closed after
     /// `request_timeout_s` without write progress.
     websocket_max_send_queue_bytes: usize = 4 * 1024 * 1024,
+    /// permessage-deflate (RFC 7692) for clients that offer it, over
+    /// HTTP/1.1, HTTP/2 and HTTP/3. Null: not offered. See `ws.deflate` for
+    /// what is agreed and what it costs.
+    websocket_deflate: ?ws_deflate.Options = null,
     /// Requests a worker may hold open at once through `resp.later()` or
     /// `resp.stream()`; beyond this they fail with TooManyExchanges.
     max_exchanges_per_worker: u32 = 1024,
@@ -515,6 +520,7 @@ pub fn Server(comptime Handler: type) type {
             return .{
                 .max_message_size = srv.cfg.websocket_max_message_size,
                 .max_send_queue_bytes = srv.cfg.websocket_max_send_queue_bytes,
+                .deflate = srv.cfg.websocket_deflate,
             };
         }
 

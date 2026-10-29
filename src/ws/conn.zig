@@ -13,6 +13,7 @@
 const std = @import("std");
 const sys = @import("../sys.zig");
 const protocol = @import("./protocol.zig");
+const deflate = @import("./deflate.zig");
 const BufferPool = @import("../http/session.zig").BufferPool;
 
 pub const Frame = protocol.Frame;
@@ -26,6 +27,9 @@ pub const Options = struct {
     /// An empty queue takes one frame of any size, so the queue holds at
     /// most this or one frame, whichever is larger.
     max_send_queue_bytes: usize = 4 * 1024 * 1024,
+    /// permessage-deflate (RFC 7692), negotiated with clients that offer
+    /// it. Null: not offered.
+    deflate: ?deflate.Options = null,
 };
 
 pub const SendError = error{
@@ -74,6 +78,15 @@ pub const Conn = struct {
     /// Bytes being written. Owned by the worker.
     wire: std.ArrayList(u8) = .empty,
     wire_pos: usize = 0,
+    /// permessage-deflate, as negotiated. Set before the handler sees the
+    /// connection, then only read.
+    deflate: deflate.Agreement = .{},
+    /// Guarded by `mutex`: `shared` holds messages to compress (marked
+    /// with RSV1 and still uncompressed).
+    to_compress: bool = false,
+    /// Worker only: where compressed frames are assembled before they
+    /// replace `wire`.
+    deflated: std.ArrayList(u8) = .empty,
     /// Worker only: the peer sent a close frame.
     close_received: bool = false,
     /// Worker only: the connection was failed (protocol error, limit).
@@ -96,7 +109,17 @@ pub const Conn = struct {
         self.decoder.deinit();
         self.shared.deinit(self.allocator);
         self.wire.deinit(self.allocator);
+        self.deflated.deinit(self.allocator);
         self.allocator.destroy(self);
+    }
+
+    /// Applies what the upgrade negotiated, before the handler sees the
+    /// connection.
+    pub fn enableDeflate(self: *Self, agreement: deflate.Agreement) void {
+        if (!agreement.enabled or self.opts.deflate == null) return;
+        self.deflate = agreement;
+        self.decoder.deflate = true;
+        self.decoder.deflate_no_takeover = agreement.client_no_context_takeover;
     }
 
     // -- Sending (any thread) -------------------------------------------
@@ -140,6 +163,11 @@ pub const Conn = struct {
         var hdr: [10]u8 = undefined;
         const h = protocol.encodeHeader(&hdr, true, opcode, payload.len);
         const total = h.len + payload.len;
+        // Messages to compress are queued as they are, marked with RSV1;
+        // the worker compresses them on their way to the wire (it has the
+        // compressor, and `send` may run on any thread).
+        const compress = self.deflate.enabled and !opcode.isControl() and payload.len >= self.opts.deflate.?.min_size;
+        if (compress) hdr[0] |= 0x40;
         const post = blk: {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -154,6 +182,7 @@ pub const Conn = struct {
             self.shared.appendSliceAssumeCapacity(h);
             self.shared.appendSliceAssumeCapacity(payload);
             self.queued += total;
+            if (compress) self.to_compress = true;
             if (opcode == .close) self.close_sent = true;
             const post = !self.posted;
             self.posted = true;
@@ -223,9 +252,82 @@ pub const Conn = struct {
             self.wire_pos = 0;
             self.mutex.lock();
             std.mem.swap(std.ArrayList(u8), &self.shared, &self.wire);
+            const compress = self.to_compress;
+            self.to_compress = false;
             self.mutex.unlock();
+            if (compress) self.compressWire();
         }
         return self.wire.items[self.wire_pos..];
+    }
+
+    /// Compresses the messages marked in `wire`. One that doesn't shrink,
+    /// or meets a failure, goes out as it is (RSV1 cleared).
+    fn compressWire(self: *Self) void {
+        const src = self.wire.items;
+        const out = &self.deflated;
+        out.clearRetainingCapacity();
+        // Frames only shrink, and a frame is compressed after a gap the size
+        // of the longest header.
+        out.ensureTotalCapacity(self.allocator, src.len + 10) catch return self.uncompressWire();
+        const d = self.decoder.pool.wsDeflater(self.opts.deflate.?.level) catch null;
+        var i: usize = 0;
+        while (i < src.len) {
+            const b1 = src[i + 1] & 0x7f;
+            const hl: usize = switch (b1) {
+                126 => 4,
+                127 => 10,
+                else => 2,
+            };
+            const n: usize = switch (b1) {
+                126 => std.mem.readInt(u16, src[i + 2 ..][0..2], .big),
+                127 => @intCast(std.mem.readInt(u64, src[i + 2 ..][0..8], .big)),
+                else => b1,
+            };
+            const frame = src[i..][0 .. hl + n];
+            i += frame.len;
+            if (frame[0] & 0x40 != 0) {
+                if (d) |deflater| {
+                    const room = out.unusedCapacitySlice();
+                    // Only output smaller than the payload is kept.
+                    if (deflater.compress(frame[hl..], room[10..][0 .. n - 1], self.deflate.huffman_only)) |c| {
+                        var hdr: [10]u8 = undefined;
+                        const h = protocol.encodeHeader(&hdr, true, @fromBackingInt(@as(u4, @truncate(frame[0]))), c);
+                        @memcpy(room[0..h.len], h);
+                        room[0] |= 0x40;
+                        std.mem.copyForwards(u8, room[h.len..][0..c], room[10..][0..c]);
+                        out.items.len += h.len + c;
+                        continue;
+                    }
+                }
+            }
+            out.appendSliceAssumeCapacity(frame);
+            out.items[out.items.len - frame.len] &= ~@as(u8, 0x40);
+        }
+        self.mutex.lock();
+        self.queued = self.queued - src.len + out.items.len;
+        self.mutex.unlock();
+        std.mem.swap(std.ArrayList(u8), &self.wire, &self.deflated);
+    }
+
+    /// Sends the marked messages uncompressed.
+    fn uncompressWire(self: *Self) void {
+        var i: usize = 0;
+        const w = self.wire.items;
+        while (i < w.len) {
+            w[i] &= ~@as(u8, 0x40);
+            const b1 = w[i + 1] & 0x7f;
+            const hl: usize = switch (b1) {
+                126 => 4,
+                127 => 10,
+                else => 2,
+            };
+            const n: usize = switch (b1) {
+                126 => std.mem.readInt(u16, w[i + 2 ..][0..2], .big),
+                127 => @intCast(std.mem.readInt(u64, w[i + 2 ..][0..8], .big)),
+                else => b1,
+            };
+            i += hl + n;
+        }
     }
 
     pub fn advance(self: *Self, n: usize) void {
@@ -457,6 +559,67 @@ test "send queue limit and control frame size" {
     // A close frame is accepted even when the queue is full.
     try h.conn.close(1000, "");
     try testing.expectEqual(@as(usize, 1), h.drainMailbox());
+}
+
+test "permessage-deflate: sends are compressed on the way to the wire" {
+    for ([_]bool{ false, true }) |huffman_only| {
+        const h = try Harness.init(.{ .deflate = .{ .min_size = 32 } });
+        defer h.deinit();
+        h.conn.enableDeflate(.{ .enabled = true, .huffman_only = huffman_only });
+        var big: [3000]u8 = undefined;
+        for (&big, 0..) |*b, i| b.* = "compress me please "[i % 19];
+        var noise: [200]u8 = undefined;
+        var prng = std.Random.DefaultPrng.init(7);
+        prng.random().bytes(&noise);
+        try h.conn.send(&big, false);
+        try h.conn.send("short", false);
+        try h.conn.ping("p");
+        try h.conn.send(&noise, true);
+        try h.conn.send(&big, true);
+        try h.flush();
+        // Every byte queued has been written.
+        try testing.expectEqual(@as(usize, 0), h.conn.queued);
+
+        const inf = try deflate.Inflater.create(&h.pool);
+        defer inf.destroy(&h.pool);
+        const want = [_]struct { op: u8, compressed: bool, payload: []const u8 }{
+            .{ .op = 1, .compressed = true, .payload = &big },
+            .{ .op = 1, .compressed = false, .payload = "short" },
+            .{ .op = 9, .compressed = false, .payload = "p" },
+            .{ .op = 2, .compressed = false, .payload = &noise },
+            .{ .op = 2, .compressed = true, .payload = &big },
+        };
+        var rest = h.out.items;
+        for (want) |w| {
+            try testing.expectEqual(w.op, rest[0] & 0x0f);
+            try testing.expectEqual(w.compressed, rest[0] & 0x40 != 0);
+            const b1 = rest[1];
+            const hl: usize = if (b1 == 126) 4 else 2;
+            const n: usize = if (b1 == 126) std.mem.readInt(u16, rest[2..4], .big) else b1;
+            const payload = rest[hl..][0..n];
+            rest = rest[hl + n ..];
+            if (!w.compressed) {
+                try testing.expectEqualSlices(u8, w.payload, payload);
+                continue;
+            }
+            try testing.expect(n < w.payload.len / 2);
+            // Each stands alone (server_no_context_takeover).
+            inf.reset();
+            const with_trailer = try std.mem.concat(testing.allocator, u8, &.{ payload, &deflate.trailer });
+            defer testing.allocator.free(with_trailer);
+            var got: std.ArrayList(u8) = .empty;
+            defer got.deinit(testing.allocator);
+            const Sink = struct {
+                list: *std.ArrayList(u8),
+                pub fn append(sk: @This(), bytes: []const u8) deflate.InflateError!void {
+                    try sk.list.appendSlice(testing.allocator, bytes);
+                }
+            };
+            try inf.inflate(with_trailer, Sink{ .list = &got });
+            try testing.expectEqualSlices(u8, w.payload, got.items);
+        }
+        try testing.expectEqual(@as(usize, 0), rest.len);
+    }
 }
 
 test "partial writes resume where they stopped" {

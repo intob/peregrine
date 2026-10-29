@@ -11,6 +11,7 @@ const File = @import("../response.zig").File;
 const Status = @import("../status.zig").Status;
 const Header = @import("../header.zig").Header;
 const exchange = @import("./exchange.zig");
+const ws_deflate = @import("../ws/deflate.zig");
 const iovec_const = std.posix.iovec_const;
 
 /// Fixed-size read buffers shared by a worker's connections. A connection
@@ -36,6 +37,8 @@ pub const BufferPool = struct {
     large: [large_cache_count][]u8 = undefined,
     large_len: usize = 0,
     large_bytes: usize = 0,
+    /// The worker's WebSocket compressor, made on first use.
+    ws_deflater: ?*ws_deflate.Deflater = null,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, buffer_size: usize, count: usize) !Self {
@@ -55,6 +58,17 @@ pub const BufferPool = struct {
         for (self.free[0..self.free_len]) |b| self.allocator.free(b);
         self.allocator.free(self.free);
         for (self.large[0..self.large_len]) |b| self.allocator.free(b);
+        if (self.ws_deflater) |d| self.allocator.destroy(d);
+    }
+
+    /// The worker's WebSocket compressor (permessage-deflate).
+    pub fn wsDeflater(self: *Self, level: std.compress.flate.Compress.Options) !*ws_deflate.Deflater {
+        if (self.ws_deflater) |d| return d;
+        const d = try self.allocator.create(ws_deflate.Deflater);
+        d.level = level;
+        d.ready = false;
+        self.ws_deflater = d;
+        return d;
     }
 
     pub fn acquire(self: *Self) ![]u8 {
@@ -233,6 +247,8 @@ pub const Session = struct {
     body_left: u64 = 0,
     body_paused: bool = false,
     body_ex: exchange.Exchange = undefined,
+    /// For `.upgrade`: the permessage-deflate agreement of the WebSocket.
+    ws_deflate: ws_deflate.Agreement = .{},
 
     pub const Body = enum(u8) {
         none,
@@ -474,6 +490,7 @@ fn finishRequest(comptime Handler: type, s: *Session, ctx: *const Context(Handle
     if (ctx.resp.is_ws_upgrade) {
         // Anything after the request is the first WebSocket frames; the
         // event loop hands the buffer to the WebSocket side.
+        s.ws_deflate = ctx.resp.ws_deflate;
         return .upgrade;
     }
     if (!keep_alive) {

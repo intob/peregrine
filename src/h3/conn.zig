@@ -892,6 +892,7 @@ pub const Conn = struct {
             ctx.exchanges.release(ex.slot);
             return self.streamError(ctx, slot, .internal_error);
         };
+        s.ws.?.enableDeflate(resp.ws_deflate);
         s.exchange = ex.slot;
         self.exchanges += 1;
         self.writeHead(ctx, slot, resp.status, resp.headerBytes(), null) catch return self.fail(.internal_error, "", ctx.now_us);

@@ -9,6 +9,7 @@
 //! code the server should fail the connection with.
 const std = @import("std");
 const BufferPool = @import("../http/session.zig").BufferPool;
+const deflate = @import("./deflate.zig");
 
 pub const Opcode = enum(u4) {
     continuation = 0x0,
@@ -68,6 +69,8 @@ pub const Error = error{
     ProtocolError,
     /// Fail with 1007.
     InvalidUtf8,
+    /// Fail with 1007: a compressed message that doesn't inflate.
+    InvalidCompressedData,
     /// Fail with 1009.
     MessageTooBig,
     /// Fail with 1011.
@@ -77,7 +80,7 @@ pub const Error = error{
 pub fn closeCodeFor(err: Error) u16 {
     return switch (err) {
         error.ProtocolError => close_code.protocol_error,
-        error.InvalidUtf8 => close_code.invalid_payload,
+        error.InvalidUtf8, error.InvalidCompressedData => close_code.invalid_payload,
         error.MessageTooBig => close_code.message_too_big,
         error.OutOfMemory => close_code.internal_error,
     };
@@ -167,6 +170,8 @@ pub fn applyMask(data: []u8, key: [4]u8, offset: usize) void {
 
 const Header = struct {
     fin: bool,
+    /// RSV1: the message is compressed (permessage-deflate).
+    compressed: bool,
     opcode: Opcode,
     key: [4]u8,
     len: usize,
@@ -174,12 +179,13 @@ const Header = struct {
 };
 
 /// Parses a client frame header. Returns null if more bytes are needed.
-fn parseHeader(data: []const u8) Error!?Header {
+/// RSV1 is allowed when permessage-deflate was negotiated (`rsv1`).
+fn parseHeader(data: []const u8, rsv1: bool) Error!?Header {
     if (data.len < 2) return null;
     const b0 = data[0];
     const b1 = data[1];
-    // No extensions are negotiated, so RSV1-3 must be zero (§5.2).
-    if (b0 & 0x70 != 0) return error.ProtocolError;
+    // RSV bits must be zero unless an extension defines them (§5.2).
+    if (b0 & (if (rsv1) @as(u8, 0x30) else 0x70) != 0) return error.ProtocolError;
     const opcode = Opcode.fromByte(b0 & 0x0F) orelse return error.ProtocolError;
     const fin = b0 & 0x80 != 0;
     // Client frames must be masked (§5.1).
@@ -211,7 +217,7 @@ fn parseHeader(data: []const u8) Error!?Header {
     }
     if (data.len < hdr_len + 4) return null;
     const key = data[hdr_len..][0..4].*;
-    return .{ .fin = fin, .opcode = opcode, .key = key, .len = len, .hdr_len = hdr_len + 4 };
+    return .{ .fin = fin, .compressed = b0 & 0x40 != 0, .opcode = opcode, .key = key, .len = len, .hdr_len = hdr_len + 4 };
 }
 
 /// The payload of a close frame is empty, or a valid status code followed
@@ -327,6 +333,17 @@ pub const Decoder = struct {
     /// unmasked so far, and the prefix of them validated.
     part_masked: usize = 0,
     part_valid: usize = 0,
+    /// permessage-deflate was negotiated: messages may be compressed.
+    deflate: bool = false,
+    /// The client compresses each message on its own, so the inflate
+    /// stream is dropped after each.
+    deflate_no_takeover: bool = false,
+    inflater: ?*deflate.Inflater = null,
+    /// The message being reassembled is compressed.
+    msg_compressed: bool = false,
+    /// The last compressed message, inflated: `inf_buf[0..inf_len]`.
+    inf_buf: []u8 = &.{},
+    inf_len: usize = 0,
 
     pub fn init(pool: *BufferPool, max_message_size: usize) Self {
         return .{ .pool = pool, .max_message_size = max_message_size };
@@ -335,6 +352,8 @@ pub const Decoder = struct {
     pub fn deinit(self: *Self) void {
         if (self.buf.len > 0) self.pool.release(self.buf);
         if (self.msg_buf.len > 0) self.pool.releaseLarge(self.msg_buf);
+        if (self.inf_buf.len > 0) self.pool.releaseLarge(self.inf_buf);
+        if (self.inflater) |i| i.destroy(self.pool);
         self.* = .{ .pool = self.pool, .max_message_size = self.max_message_size };
     }
 
@@ -407,19 +426,66 @@ pub const Decoder = struct {
             self.start = 0;
             self.end = 0;
         }
-        if (self.msg_buf.len > 0 and (self.msg_delivered or self.msg_opcode == null)) {
+        if (self.msg_delivered or self.msg_opcode == null) {
             self.resetMessage();
-            self.pool.releaseLarge(self.msg_buf);
+            if (self.msg_buf.len > 0) self.pool.releaseLarge(self.msg_buf);
+            if (self.inf_buf.len > 0) self.pool.releaseLarge(self.inf_buf);
             self.msg_buf = &.{};
+            self.inf_buf = &.{};
         }
     }
 
     fn resetMessage(self: *Self) void {
         self.msg_delivered = false;
         self.msg_opcode = null;
+        self.msg_compressed = false;
         self.msg_valid = 0;
         self.msg_len = 0;
+        self.inf_len = 0;
     }
+
+    /// Inflates a compressed message whose payload is followed by 4
+    /// writable bytes (`with_room` holds both), into `inf_buf`. Returns the
+    /// message.
+    fn inflateMessage(self: *Self, with_room: []u8, opcode: Opcode) Error!Frame {
+        const n = with_room.len - deflate.trailer.len;
+        @memcpy(with_room[n..], &deflate.trailer);
+        const inf = self.inflater orelse blk: {
+            self.inflater = try deflate.Inflater.create(self.pool);
+            break :blk self.inflater.?;
+        };
+        inf.inflate(with_room, InflateSink{ .dec = self }) catch |err| return switch (err) {
+            error.InvalidData => error.InvalidCompressedData,
+            else => |e| e,
+        };
+        if (self.deflate_no_takeover) {
+            inf.destroy(self.pool);
+            self.inflater = null;
+        }
+        const payload = self.inf_buf[0..self.inf_len];
+        if (opcode == .text and !std.unicode.utf8ValidateSlice(payload)) return error.InvalidUtf8;
+        self.msg_delivered = true;
+        return .{ .opcode = opcode, .payload = payload };
+    }
+
+    const InflateSink = struct {
+        dec: *Self,
+
+        pub fn append(sink: InflateSink, bytes: []const u8) deflate.InflateError!void {
+            const d = sink.dec;
+            const need = d.inf_len + bytes.len;
+            if (need > d.max_message_size) return error.MessageTooBig;
+            if (need > d.inf_buf.len) {
+                const grown = @max(need, @min(2 * d.inf_buf.len, d.max_message_size), 16 * 1024);
+                const new = try d.pool.acquireLarge(grown);
+                @memcpy(new[0..d.inf_len], d.inf_buf[0..d.inf_len]);
+                if (d.inf_buf.len > 0) d.pool.releaseLarge(d.inf_buf);
+                d.inf_buf = new;
+            }
+            @memcpy(d.inf_buf[d.inf_len..][0..bytes.len], bytes);
+            d.inf_len = need;
+        }
+    };
 
     /// Room in `msg_buf` for `need` bytes, keeping what it holds. Fragments
     /// grow it geometrically (up to the message size limit).
@@ -442,9 +508,14 @@ pub const Decoder = struct {
             switch (self.state) {
                 .header => {
                     const data = self.buf[self.start..self.end];
-                    const hdr = (try parseHeader(data)) orelse return null;
+                    const hdr = (try parseHeader(data, self.deflate)) orelse return null;
                     const total = hdr.hdr_len + hdr.len;
                     const in_progress = self.msg_opcode != null;
+                    // Only a message's first frame says it is compressed
+                    // (RFC 7692 §6.1).
+                    if (hdr.compressed and (hdr.opcode.isControl() or hdr.opcode == .continuation)) {
+                        return error.ProtocolError;
+                    }
                     if (hdr.opcode.isControl()) {
                         // At most 139 bytes: wait for all of it, handle in place.
                         if (data.len < total) return null;
@@ -467,7 +538,7 @@ pub const Decoder = struct {
                         // Text is unmasked and checked as it arrives.
                         const payload = data[hdr.hdr_len..@min(data.len, total)];
                         if (data.len < total) {
-                            if (hdr.opcode == .text) {
+                            if (hdr.opcode == .text and !hdr.compressed) {
                                 applyMask(payload[self.part_masked..], hdr.key, self.part_masked);
                                 self.part_masked = payload.len;
                                 try validateUtf8Partial(payload, &self.part_valid);
@@ -475,6 +546,22 @@ pub const Decoder = struct {
                             return null;
                         }
                         applyMask(payload[self.part_masked..], hdr.key, self.part_masked);
+                        if (hdr.compressed) {
+                            // Inflate where it lies: the 4 bytes after it
+                            // (the next frame's, if any) are lent for the
+                            // trailer. Otherwise copy it into msg.
+                            const at = self.start + hdr.hdr_len;
+                            self.part_masked = 0;
+                            self.start += total;
+                            if (at + hdr.len + 4 <= self.buf.len) {
+                                const lent = self.buf[at + hdr.len ..][0..4].*;
+                                defer self.buf[at + hdr.len ..][0..4].* = lent;
+                                return try self.inflateMessage(self.buf[at..][0 .. hdr.len + 4], hdr.opcode);
+                            }
+                            try self.reserve(hdr.len + 4);
+                            @memcpy(self.msg_buf[0..hdr.len], payload);
+                            return try self.inflateMessage(self.msg_buf[0 .. hdr.len + 4], hdr.opcode);
+                        }
                         if (hdr.opcode == .text and !std.unicode.utf8ValidateSlice(payload[self.part_valid..])) {
                             return error.InvalidUtf8;
                         }
@@ -483,8 +570,10 @@ pub const Decoder = struct {
                         self.start += total;
                         return .{ .opcode = hdr.opcode, .payload = payload };
                     }
-                    // Fragmented or larger than the buffer: stream into msg.
-                    try self.reserve(msg_len);
+                    // Fragmented or larger than the buffer: stream into msg
+                    // (with room for the trailer a compressed one needs).
+                    if (!in_progress) self.msg_compressed = hdr.compressed;
+                    try self.reserve(msg_len + if (self.msg_compressed) deflate.trailer.len else 0);
                     if (!in_progress) self.msg_opcode = hdr.opcode;
                     self.fin = hdr.fin;
                     self.key = hdr.key;
@@ -501,7 +590,7 @@ pub const Decoder = struct {
                         self.msg_len += self.direct;
                         self.consumed += self.direct;
                         self.direct = 0;
-                        if (self.msg_opcode == .text) try self.validateUtf8Progress();
+                        if (self.msg_opcode == .text and !self.msg_compressed) try self.validateUtf8Progress();
                     }
                     const take = @min(self.end - self.start, self.len - self.consumed);
                     if (take > 0) {
@@ -511,11 +600,14 @@ pub const Decoder = struct {
                         self.msg_len += take;
                         self.start += take;
                         self.consumed += take;
-                        if (self.msg_opcode == .text) try self.validateUtf8Progress();
+                        if (self.msg_opcode == .text and !self.msg_compressed) try self.validateUtf8Progress();
                     }
                     if (self.consumed < self.len) return null;
                     self.state = .header;
                     if (!self.fin) continue;
+                    if (self.msg_compressed) {
+                        return try self.inflateMessage(self.msg_buf[0 .. self.msg_len + deflate.trailer.len], self.msg_opcode.?);
+                    }
                     if (self.msg_opcode == .text and self.msg_valid != self.msg_len) {
                         // Ends in the middle of a sequence.
                         return error.InvalidUtf8;
@@ -917,6 +1009,117 @@ test "the rest of a large frame is read straight into the message" {
     try testing.expect(t.pool.large[0].ptr == cached);
 }
 
+/// A compressed client frame (RSV1 on a first frame).
+fn compressedFrame(out: []u8, fin: bool, op: Opcode, deflated: []const u8) []u8 {
+    const f = frame(out, fin, op, deflated);
+    f[0] |= 0x40;
+    return f;
+}
+
+test "permessage-deflate: compressed messages in place, streamed and fragmented, with context takeover" {
+    var client: deflate.TestClient = undefined;
+    try client.init();
+    defer client.out.deinit();
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(testing.allocator);
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(testing.allocator);
+    var scratch: [16384]u8 = undefined;
+    var big: [6000]u8 = undefined;
+    for (&big, 0..) |*b, i| b.* = "the quick brown fox "[i % 20];
+    const texts = [_][]const u8{ "Hello, hello, hello, compressed world!", "Hello, hello, hello, compressed world!", &big, "\xe2\x82\xac uro" };
+    for (texts, 0..) |t, i| {
+        const m = try client.message(t);
+        defer testing.allocator.free(m);
+        const deflated = m[0 .. m.len - 4];
+        if (i == 2) {
+            // Fragmented: RSV1 on the first frame only, a ping between.
+            const half = deflated.len / 2;
+            try input.appendSlice(testing.allocator, compressedFrame(&scratch, false, .text, deflated[0..half]));
+            try input.appendSlice(testing.allocator, frame(&scratch, true, .ping, "p"));
+            try input.appendSlice(testing.allocator, frame(&scratch, true, .continuation, deflated[half..]));
+            try fuzzLog(&expected, .ping, "p");
+        } else {
+            try input.appendSlice(testing.allocator, compressedFrame(&scratch, true, .text, deflated));
+        }
+        try fuzzLog(&expected, .text, t);
+    }
+    // An uncompressed message in between is fine.
+    try input.appendSlice(testing.allocator, frame(&scratch, true, .binary, "plain"));
+    try fuzzLog(&expected, .binary, "plain");
+    // In one go (in place), and byte by byte through a small buffer
+    // (streamed, read in place).
+    for ([_]usize{ 8192, 256 }) |buf_size| {
+        const t = try TestDecoder.init(buf_size, 1 << 20);
+        defer t.deinit();
+        t.dec.deflate = true;
+        if (buf_size == 8192) {
+            try t.feed(input.items);
+        } else {
+            for (input.items, 0..) |_, i| try t.feed(input.items[i..][0..1]);
+        }
+        try testing.expectEqual(@as(?Error, null), t.err);
+        try testing.expectEqualSlices(u8, expected.items, t.log.items);
+    }
+}
+
+test "permessage-deflate: RSV1 rules, corrupt data, invalid text and the size limit" {
+    var out: [256]u8 = undefined;
+    const Case = struct { bytes: []const u8, deflate: bool, err: Error };
+    var client: deflate.TestClient = undefined;
+    try client.init();
+    defer client.out.deinit();
+    const bad_text = try client.message("ok \xff not UTF-8");
+    defer testing.allocator.free(bad_text);
+    var b1: [256]u8 = undefined;
+    var b2: [256]u8 = undefined;
+    var b3: [256]u8 = undefined;
+    var b4: [256]u8 = undefined;
+    var two: [256]u8 = undefined;
+    const first = frame(&two, false, .binary, "a");
+    const cont = compressedFrame(two[first.len..], true, .continuation, "b");
+    const cases = [_]Case{
+        // Not negotiated.
+        .{ .bytes = compressedFrame(&b1, true, .text, "x"), .deflate = false, .err = error.ProtocolError },
+        // Control frames and continuations never carry it.
+        .{ .bytes = compressedFrame(&b2, true, .ping, ""), .deflate = true, .err = error.ProtocolError },
+        .{ .bytes = two[0 .. first.len + cont.len], .deflate = true, .err = error.ProtocolError },
+        // RSV2 is still reserved.
+        .{ .bytes = blk: {
+            const f = frame(&b3, true, .text, "x");
+            f[0] |= 0x20;
+            break :blk f;
+        }, .deflate = true, .err = error.ProtocolError },
+        // A block type of 3.
+        .{ .bytes = compressedFrame(&b4, true, .binary, &.{0x07}), .deflate = true, .err = error.InvalidCompressedData },
+        .{ .bytes = compressedFrame(&out, true, .text, bad_text[0 .. bad_text.len - 4]), .deflate = true, .err = error.InvalidUtf8 },
+    };
+    for (cases) |c| {
+        const t = try TestDecoder.init(4096, 1 << 20);
+        defer t.deinit();
+        t.dec.deflate = c.deflate;
+        try t.feed(c.bytes);
+        try testing.expectEqual(@as(?Error, c.err), t.err);
+    }
+    // Inflated past the message limit: fails, though the compressed
+    // message is small.
+    var zclient: deflate.TestClient = undefined;
+    try zclient.init();
+    defer zclient.out.deinit();
+    const zeros = try testing.allocator.alloc(u8, 100_000);
+    defer testing.allocator.free(zeros);
+    @memset(zeros, 0);
+    const z = try zclient.message(zeros);
+    defer testing.allocator.free(z);
+    const zf = try testing.allocator.alloc(u8, z.len + max_header_len);
+    defer testing.allocator.free(zf);
+    const t = try TestDecoder.init(4096, 50_000);
+    defer t.deinit();
+    t.dec.deflate = true;
+    try t.feed(compressedFrame(zf, true, .binary, z[0 .. z.len - 4]));
+    try testing.expectEqual(@as(?Error, error.MessageTooBig), t.err);
+}
+
 // The property from the HTTP state machine, for WebSockets: any split of
 // the input, including byte by byte, produces the same messages.
 test "random splits produce identical messages" {
@@ -979,6 +1182,9 @@ test "random splits produce identical messages" {
 // the same messages and fail the same way. Most inputs are valid streams,
 // whose messages are also checked against what was encoded; the rest mix in
 // mangled frames (bad bits, opcodes, lengths, missing masks, truncation).
+// Half the streams have permessage-deflate on: their data messages are
+// compressed by one client stream (context takeover), and mangled frames
+// with RSV1 feed the inflater garbage.
 fn fuzzDecoder(_: void, smith: *std.testing.Smith) anyerror!void {
     const a = testing.allocator;
     var input: std.ArrayList(u8) = .empty;
@@ -986,10 +1192,17 @@ fn fuzzDecoder(_: void, smith: *std.testing.Smith) anyerror!void {
     var expected: std.ArrayList(u8) = .empty;
     defer expected.deinit(a);
     const valid = smith.value(u8) & 3 != 0;
+    const compressed = smith.value(u8) & 1 != 0;
+    const client: ?*deflate.TestClient = if (compressed) try a.create(deflate.TestClient) else null;
+    defer if (client) |c| {
+        c.out.deinit();
+        a.destroy(c);
+    };
+    if (client) |c| try c.init();
     var count: usize = 0;
     while (count < 8 and !smith.eos()) : (count += 1) {
         if (valid or smith.value(u8) & 1 == 0) {
-            try fuzzMessage(smith, &input, &expected);
+            try fuzzMessage(smith, &input, &expected, client);
         } else {
             try fuzzMangledFrame(smith, &input);
         }
@@ -998,6 +1211,7 @@ fn fuzzDecoder(_: void, smith: *std.testing.Smith) anyerror!void {
 
     const whole = try TestDecoder.init(8192, max_message);
     defer whole.deinit();
+    whole.dec.deflate = compressed;
     try whole.feed(input.items);
     if (valid) {
         try testing.expectEqual(@as(?Error, null), whole.err);
@@ -1007,6 +1221,7 @@ fn fuzzDecoder(_: void, smith: *std.testing.Smith) anyerror!void {
     const sizes = [_]usize{ 256, 512, 1024 };
     const split = try TestDecoder.init(sizes[smith.value(u8) % sizes.len], max_message);
     defer split.deinit();
+    split.dec.deflate = compressed;
     var rest: []const u8 = input.items;
     while (rest.len > 0 and split.err == null) {
         const n = @min(rest.len, 1 + @as(usize, smith.value(u8)) * 8);
@@ -1023,11 +1238,11 @@ fn fuzzDecoder(_: void, smith: *std.testing.Smith) anyerror!void {
 
 /// Appends one valid message: a ping or pong, or text or binary in up to
 /// three fragments with control frames between them, and logs it as
-/// `TestDecoder` does.
-fn fuzzMessage(smith: *std.testing.Smith, input: *std.ArrayList(u8), expected: *std.ArrayList(u8)) !void {
+/// `TestDecoder` does. With a `client`, data messages are compressed.
+fn fuzzMessage(smith: *std.testing.Smith, input: *std.ArrayList(u8), expected: *std.ArrayList(u8), client: ?*deflate.TestClient) !void {
     const a = testing.allocator;
     var payload: [2048]u8 = undefined;
-    var scratch: [2048 + max_header_len]u8 = undefined;
+    var scratch: [4096 + max_header_len]u8 = undefined;
     var key: [4]u8 = undefined;
     smith.bytes(&key);
     if (smith.value(u8) % 4 == 0) {
@@ -1052,14 +1267,22 @@ fn fuzzMessage(smith: *std.testing.Smith, input: *std.ArrayList(u8), expected: *
         len = smith.slice(&payload);
     }
     const message = payload[0..len];
+    var deflated: ?[]u8 = null;
+    defer if (deflated) |d| a.free(d);
+    if (client) |c| deflated = try c.message(message);
+    // What goes in the frames: the message, or what it compressed to.
+    const body = if (deflated) |d| d[0 .. d.len - deflate.trailer.len] else message;
+    const body_len = body.len;
     // Fragment boundaries anywhere, splitting UTF-8 sequences too.
     const fragments = 1 + smith.value(u8) % 3;
     var at: usize = 0;
     for (0..fragments) |i| {
         const last = i + 1 == fragments;
-        const end = if (last) len else at + (if (len - at == 0) 0 else smith.value(u16) % (len - at + 1));
+        const end = if (last) body_len else at + (if (body_len - at == 0) 0 else smith.value(u16) % (body_len - at + 1));
         const op: Opcode = if (i > 0) .continuation else if (text) .text else .binary;
-        try input.appendSlice(a, encodeFrame(&scratch, last, op, message[at..end], key));
+        const f = encodeFrame(&scratch, last, op, body[at..end], key);
+        if (i == 0 and deflated != null) f[0] |= 0x40;
+        try input.appendSlice(a, f);
         at = end;
         if (!last and smith.value(u8) % 4 == 0) {
             var ping: [16]u8 = undefined;

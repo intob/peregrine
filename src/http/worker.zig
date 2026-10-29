@@ -232,6 +232,7 @@ pub fn Worker(comptime Handler: type) type {
             errdefer req.deinit();
             const resp = try Response.init(allocator, opts.response_body_buffer_size, opts.response_header_buffer_size);
             errdefer resp.deinit();
+            resp.ws_deflate_options = opts.websocket.deflate;
             if (opts.out_buffer_size < session.headRoom(resp)) return error.OutBufferTooSmall;
             const out_buf = try allocator.alloc(u8, opts.out_buffer_size);
             errdefer allocator.free(out_buf);
@@ -629,6 +630,7 @@ pub fn Worker(comptime Handler: type) type {
                 return self.closeConn(c);
             };
             c.ws = w;
+            w.enableDeflate(c.session.ws_deflate);
             // Bytes after the upgrade request are the first frames.
             w.decoder.adopt(c.session.buf, c.session.start, c.session.end);
             c.session = .{};

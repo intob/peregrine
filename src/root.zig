@@ -51,6 +51,7 @@ test {
     _ = @import("./poller.zig");
     _ = @import("./sys.zig");
     _ = @import("./ws/protocol.zig");
+    _ = @import("./ws/deflate.zig");
     _ = @import("./ws/conn.zig");
     _ = @import("./ws/upgrader.zig");
     _ = @import("./tls/key_schedule.zig");

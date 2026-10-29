@@ -1216,6 +1216,7 @@ pub const Conn = struct {
             ctx.exchanges.release(ex.slot);
             return self.resetStream(ctx, s, .internal_error);
         };
+        s.ws.?.enableDeflate(resp.ws_deflate);
         s.exchange = ex.slot;
         self.output_streams += 1;
         self.writeHead(ctx, s, resp.status, resp.headerBytes(), null, false);

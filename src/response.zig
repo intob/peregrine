@@ -1,4 +1,5 @@
 const std = @import("std");
+const ws_deflate = @import("./ws/deflate.zig");
 const Header = @import("./header.zig").Header;
 const Status = @import("./status.zig").Status;
 const exchange = @import("./http/exchange.zig");
@@ -41,6 +42,11 @@ pub const Response = struct {
     /// Close the connection after this response is sent.
     close: bool = false,
     is_ws_upgrade: bool = false,
+    /// The server's permessage-deflate settings (`Config.websocket_deflate`),
+    /// for `upgrader.handleUpgrade`; kept across resets.
+    ws_deflate_options: ?ws_deflate.Options = null,
+    /// What `handleUpgrade` negotiated for the WebSocket being accepted.
+    ws_deflate: ws_deflate.Agreement = .{},
     /// Serialised "key: value\r\n" lines.
     header_buf: []u8,
     header_len: usize = 0,
@@ -199,6 +205,7 @@ pub const Response = struct {
         self.status = .ok;
         self.close = false;
         self.is_ws_upgrade = false;
+        self.ws_deflate = .{};
         self.header_len = self.preset_len;
         self.body = "";
         // A file nothing took (an exchange answered instead).

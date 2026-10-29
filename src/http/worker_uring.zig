@@ -428,6 +428,7 @@ pub fn Worker(comptime Handler: type) type {
             errdefer req.deinit();
             const resp = try Response.init(allocator, opts.response_body_buffer_size, opts.response_header_buffer_size);
             errdefer resp.deinit();
+            resp.ws_deflate_options = opts.websocket.deflate;
             const out_size = @max(session.headRoom(resp), 16 * 1024);
             const waker = try sys.Waker.init();
             errdefer waker.deinit();
@@ -1074,6 +1075,7 @@ pub fn Worker(comptime Handler: type) type {
                 return self.closeConn(c);
             };
             c.ws = w;
+            w.enableDeflate(c.session.ws_deflate);
             if (c.out.buf.len > 0) {
                 self.out_pool.release(c.out.buf);
                 c.out = .{ .buf = &.{} };

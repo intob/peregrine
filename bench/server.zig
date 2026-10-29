@@ -4,7 +4,7 @@
 //! plaintext HTTP/1.1), and `/ws`, a WebSocket echo (HTTP/1.1 Upgrade, or
 //! extended CONNECT on HTTP/2 and HTTP/3); request bodies are read and
 //! discarded.
-//! Usage: bench-server [workers] [auto|epoll|io_uring] [port] [tls|h3|plain] [stream] [rsa] [noktls] [0rtt] [sni]
+//! Usage: bench-server [workers] [auto|epoll|io_uring] [port] [tls|h3|plain] [stream] [rsa] [noktls] [0rtt] [sni] [deflate]
 //! With `tls`, serves TLS 1.3 with the self-signed P-256 certificate in
 //! this directory (`rsa`: the RSA-2048 one), with ALPN "h2" and
 //! "http/1.1"; `h3` adds HTTP/3 on the
@@ -15,7 +15,9 @@
 //! send up to 16 KiB of early data when resuming; responses to requests
 //! handled in it carry `x-early-data: 1`. With `sni`, two more
 //! certificates are chosen by SNI: for a.example, and for *.b.example and
-//! b.example.
+//! b.example. With `deflate`, WebSockets offered permessage-deflate are
+//! compressed (`deflate-nct`: and clients are asked not to use context
+//! takeover).
 const std = @import("std");
 const per = @import("peregrine");
 
@@ -117,7 +119,10 @@ fn serve(comptime H: type, args: []const [:0]const u8) !void {
     var ktls = true;
     var max_early: u32 = 0;
     var sni = false;
+    var ws_deflate: ?per.ws.deflate.Options = null;
     for (args[@min(args.len, 5)..]) |arg| {
+        if (std.mem.eql(u8, arg, "deflate")) ws_deflate = .{};
+        if (std.mem.eql(u8, arg, "deflate-nct")) ws_deflate = .{ .client_no_context_takeover = true };
         sni = sni or std.mem.eql(u8, arg, "sni");
         use_rsa = use_rsa or std.mem.eql(u8, arg, "rsa");
         if (std.mem.eql(u8, arg, "noktls")) ktls = false;
@@ -139,6 +144,7 @@ fn serve(comptime H: type, args: []const [:0]const u8) !void {
             } else &.{},
         } else null,
         .http3 = if (use_h3) .{} else null,
+        .websocket_deflate = ws_deflate,
     });
     std.debug.print("listening on :{d} ({s}, {d} workers{s}{s})\n", .{ srv.getPort(), @tagName(srv.getBackend()), srv.workers.len, if (use_h3) ", tls, h3" else if (use_tls) ", tls" else "", if (H == StreamHandler) ", streamed bodies" else "" });
     try srv.start();

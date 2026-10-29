@@ -1,6 +1,7 @@
 const std = @import("std");
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
+const deflate = @import("./deflate.zig");
 
 const MAGIC_KEY = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -30,10 +31,12 @@ pub fn isUpgrade(req: *Request) bool {
 /// Sec-WebSocket-Accept, HTTP/2 and HTTP/3 get 200 (no key exchange, RFC
 /// 8441 §5). The connection, or the stream, then carries the WebSocket and
 /// the handler's `handleWSConn` is called. Add Sec-WebSocket-Protocol to
-/// `resp` yourself if you negotiate a subprotocol.
+/// `resp` yourself if you negotiate a subprotocol. permessage-deflate is
+/// negotiated here when the server enables it (`Config.websocket_deflate`).
 pub fn handleUpgrade(allocator: std.mem.Allocator, req: *Request, resp: *Response) !void {
     _ = allocator;
     if (isExtendedConnect(req)) {
+        try negotiateDeflate(req, resp);
         resp.is_ws_upgrade = true;
         resp.status = .ok;
         return;
@@ -57,8 +60,17 @@ pub fn handleUpgrade(allocator: std.mem.Allocator, req: *Request, resp: *Respons
     // Headers are copied when added, so a stack buffer is fine.
     try resp.addNewHeader("sec-websocket-accept", encoded);
     try resp.addNewHeader("upgrade", "websocket");
+    try negotiateDeflate(req, resp);
     resp.is_ws_upgrade = true; // the server sets "connection: upgrade"
     resp.status = .switching_protocols;
+}
+
+fn negotiateDeflate(req: *const Request, resp: *Response) !void {
+    const opts = resp.ws_deflate_options orelse return;
+    var buf: [deflate.max_response_len]u8 = undefined;
+    const n = deflate.negotiate(req, opts, &buf) orelse return;
+    try resp.addNewHeader("sec-websocket-extensions", n.response);
+    resp.ws_deflate = n.agreement;
 }
 
 test "extended CONNECT gets 200 without the HTTP/1.1 handshake headers" {

@@ -1,6 +1,6 @@
 //! WebSocket load generator (Linux): echo round trips against a server's
 //! WebSocket endpoint, with several messages in flight per connection.
-//! Usage: ws-load [ip] [port] [threads] [connections] [depth] [size] [seconds] [binary|text] [path]
+//! Usage: ws-load [ip] [port] [threads] [connections] [depth] [size] [seconds] [binary|text] [path] [deflate]
 //! Defaults: 127.0.0.1 8080 6 256 1 20 8 binary /ws.
 //! `connections` is the total, spread over the threads, each with its own
 //! epoll. Every connection upgrades with HTTP/1.1, then keeps `depth`
@@ -10,6 +10,11 @@
 //! FIN and length, and the first one on each connection byte by byte.
 //! Prints the number of messages echoed and the rate; the caller reads
 //! the server's CPU time around the run.
+//!
+//! With `deflate`, connections offer permessage-deflate and the message is
+//! `size` bytes of JSON-like text sent compressed (compressed once, on its
+//! own, so it is valid with or without context takeover). Echoes, which
+//! may come back compressed, are checked for opcode and FIN only.
 const std = @import("std");
 const per = @import("peregrine");
 const sys = per.internal.sys;
@@ -26,6 +31,7 @@ const Options = struct {
     seconds: u64 = 8,
     text: bool = false,
     path: []const u8 = "/ws",
+    deflate: bool = false,
 };
 
 const mask_key = [4]u8{ 0x12, 0x34, 0x56, 0x78 };
@@ -36,14 +42,39 @@ fn serverHeaderLen(n: usize) usize {
     return if (n < 126) 2 else if (n <= 0xffff) 4 else 10;
 }
 
+/// What each message's frame carries: `size` bytes of 'x', or with
+/// `deflate`, `size` bytes of JSON-like text compressed (ending as RFC 7692
+/// says: an empty stored block, its last four bytes left off).
+fn buildBody(allocator: std.mem.Allocator, o: Options) ![]u8 {
+    const plain = try allocator.alloc(u8, o.size);
+    if (!o.deflate) {
+        @memset(plain, payload_byte);
+        return plain;
+    }
+    defer allocator.free(plain);
+    const json = "{\"userId\":12345,\"action\":\"purchase\",\"items\":[{\"id\":\"A1B2C3\",\"name\":\"Wireless Mouse\",\"price\":25.99,\"quantity\":1}],\"status\":\"approved\"} ";
+    for (plain, 0..) |*b, i| b.* = json[i % json.len];
+    var out: std.Io.Writer.Allocating = try .initCapacity(allocator, o.size + 64);
+    defer out.deinit();
+    const window = try allocator.alloc(u8, std.compress.flate.max_window_len);
+    defer allocator.free(window);
+    const c = try allocator.create(std.compress.flate.Compress);
+    defer allocator.destroy(c);
+    c.* = try .init(&out.writer, window, .raw, .default);
+    try c.writer.writeAll(plain);
+    try c.writer.flush();
+    try out.writer.writeByte(0);
+    return out.toOwnedSlice();
+}
+
 /// `count` copies of one masked client frame, back to back.
-fn buildFrames(allocator: std.mem.Allocator, o: Options, count: usize) ![]u8 {
-    const n = o.size;
+fn buildFrames(allocator: std.mem.Allocator, o: Options, body: []const u8, count: usize) ![]u8 {
+    const n = body.len;
     const head_len = serverHeaderLen(n) + 4;
     const frame_len = head_len + n;
     const buf = try allocator.alloc(u8, frame_len * count);
     const f = buf[0..frame_len];
-    f[0] = 0x80 | @as(u8, if (o.text) 0x1 else 0x2);
+    f[0] = 0x80 | @as(u8, if (o.text) 0x1 else 0x2) | @as(u8, if (o.deflate) 0x40 else 0);
     if (n < 126) {
         f[1] = 0x80 | @as(u8, @intCast(n));
     } else if (n <= 0xffff) {
@@ -54,7 +85,7 @@ fn buildFrames(allocator: std.mem.Allocator, o: Options, count: usize) ![]u8 {
         std.mem.writeInt(u64, f[2..10], n, .big);
     }
     @memcpy(f[head_len - 4 .. head_len], &mask_key);
-    for (f[head_len..], 0..) |*b, i| b.* = payload_byte ^ mask_key[i % 4];
+    for (f[head_len..], body, 0..) |*b, x, i| b.* = x ^ mask_key[i % 4];
     var i: usize = 1;
     while (i < count) : (i += 1) @memcpy(buf[i * frame_len ..][0..frame_len], f);
     return buf;
@@ -148,7 +179,10 @@ const Worker = struct {
         try sys.setsockoptInt(fd, linux.IPPROTO.TCP, sys.TCP_NODELAY, 1);
         var req_buf: [512]u8 = undefined;
         const req = try std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.1\r\nHost: bench\r\nUpgrade: websocket\r\n" ++
-            "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", .{self.o.path});
+            "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{s}\r\n", .{
+            self.o.path,
+            if (self.o.deflate) "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n" else "",
+        });
         var rest: []const u8 = req;
         while (rest.len > 0) rest = rest[try sys.write(fd, rest)..];
         // Nothing follows the 101 until we send, so the head ends the read.
@@ -165,6 +199,10 @@ const Worker = struct {
             return error.UpgradeRefused;
         }
         if (std.mem.indexOf(u8, resp[0..len], "\r\n\r\n").? + 4 != len) return error.UnexpectedData;
+        if (self.o.deflate and std.ascii.findIgnoreCase(resp[0..len], "permessage-deflate") == null) {
+            self.fail("permessage-deflate not accepted", .{});
+            return error.NoDeflate;
+        }
         try sys.setNonBlocking(fd);
         return fd;
     }
@@ -216,16 +254,21 @@ const Worker = struct {
             c.hdr_len += 1;
             in = in[1..];
             if (c.hdr_len < 2) continue;
-            const want = serverHeaderLen(self.o.size);
+            const want: usize = switch (c.hdr[1]) {
+                126 => 4,
+                127 => 10,
+                else => 2,
+            };
             const expected_op: u8 = if (self.o.text) 0x81 else 0x82;
-            if (c.hdr[0] != expected_op) return error.BadOpcode;
+            if (c.hdr[0] & ~@as(u8, if (self.o.deflate) 0x40 else 0) != expected_op) return error.BadOpcode;
             if (c.hdr_len < want) continue;
             const len: u64 = switch (c.hdr[1]) {
                 126 => std.mem.readInt(u16, c.hdr[2..4], .big),
                 127 => std.mem.readInt(u64, c.hdr[2..10], .big),
                 else => |l| l,
             };
-            if (len != self.o.size) return error.BadLength;
+            if (!self.o.deflate and len != self.o.size) return error.BadLength;
+            if (self.o.deflate) c.verified = true;
             c.hdr_len = 0;
             c.payload_left = len;
             c.in_payload = true;
@@ -263,13 +306,16 @@ pub fn main(init: std.process.Init) !void {
     if (args.len > 7) o.seconds = try std.fmt.parseInt(u64, args[7], 10);
     if (args.len > 8) o.text = std.mem.eql(u8, args[8], "text");
     if (args.len > 9) o.path = args[9];
+    if (args.len > 10) o.deflate = std.mem.eql(u8, args[10], "deflate");
     if (o.threads == 0 or o.connections < o.threads or o.depth == 0) return error.BadArguments;
 
     const allocator = std.heap.smp_allocator;
-    const frame_len = serverHeaderLen(o.size) + 4 + o.size;
+    const body = try buildBody(allocator, o);
+    defer allocator.free(body);
+    const frame_len = serverHeaderLen(body.len) + 4 + body.len;
     // Enough copies of the frame to write a whole batch of echoes at once.
     const copies = @max(1, @min(o.depth, (256 * 1024) / frame_len));
-    const frames = try buildFrames(allocator, o, copies);
+    const frames = try buildFrames(allocator, o, body, copies);
     defer allocator.free(frames);
 
     const workers = try allocator.alloc(Worker, o.threads);
