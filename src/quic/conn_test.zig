@@ -703,3 +703,204 @@ test "QUIC pacing: a hold is timed after the datagram's last packet, and counted
     for (0..5) |_| try testing.expectEqual(@as(usize, 0), s.send(&buf, h.now));
     try testing.expectEqual(waits + 1, s.paced_waits);
 }
+
+// -- Adversarial pacing checks (verifier) ------------------------------------
+
+test "verify pacing: an amplification budget under 64 bytes leaves no deadline in the past" {
+    const h = try Harness.init(.{}, noTweak);
+    defer h.deinit();
+    var buf: [1500]u8 = undefined;
+    try h.toServer(buf[0..try h.client.send(&buf)]);
+    const s = h.server.?;
+    // The first flight goes out (within the amplification limit).
+    while (s.send(&buf, h.now) > 0) {}
+    try testing.expect(!s.address_validated);
+    // Data waiting in 1-RTT, a dry pacer, and 30 bytes of budget left.
+    s.max_data_pending = true;
+    s.pacer.tokens = 0;
+    s.pacer.last = h.now;
+    s.bytes_sent = 3 * s.bytes_received - 30;
+    try testing.expectEqual(@as(usize, 0), s.send(&buf, h.now));
+    // The endpoint's loop: wake at the deadline, onTimeout, send, re-arm.
+    var wakeups: usize = 0;
+    const start = h.now;
+    while (h.now < start + 500_000) {
+        const d = s.deadline() orelse break;
+        if (d >= start + 500_000) break;
+        if (d <= h.now) wakeups += 1;
+        h.now = @max(h.now + 1, d);
+        s.onTimeout(h.now);
+        _ = s.send(&buf, h.now);
+    }
+    // A deadline that stays due while send can do nothing is a busy loop
+    // (the endpoint polls with a 0 ms timeout).
+    if (wakeups >= 5) std.debug.print("amplification: {d} wakeups with the deadline already due (deadline {d} us, now {d} us)\n", .{ wakeups, s.deadline().?, h.now });
+    try testing.expect(wakeups < 5);
+}
+
+/// runDelayed with server-to-client loss.
+fn runLossy(h: *Harness, delay: u64, loss: u8, id: u64) !void {
+    var queue: std.ArrayList(Flight) = .empty;
+    defer queue.deinit(h.a);
+    var head: usize = 0;
+    const limit = h.now + 120 * std.time.us_per_s;
+    var buf: [1500]u8 = undefined;
+    while (!h.client.finished(id)) {
+        if (h.now > limit) return error.Timeout;
+        while (true) {
+            const n = try h.client.send(&buf);
+            if (n == 0) break;
+            try queue.append(h.a, .{ .at = h.now + delay, .to_server = true, .len = n, .buf = buf });
+        }
+        const s = h.server.?;
+        if (s.isClosed()) return error.Closed;
+        while (true) {
+            const n = s.send(&buf, h.now);
+            if (n == 0) break;
+            if (h.prng.random().uintLessThan(u8, 100) < loss) continue;
+            try queue.append(h.a, .{ .at = h.now + delay, .to_server = false, .len = n, .buf = buf });
+        }
+        var next: ?u64 = if (head < queue.items.len) queue.items[head].at else null;
+        var timer: ?u64 = null;
+        if (s.deadline()) |d| if (d < h.now + 10 * std.time.us_per_s) {
+            timer = @max(d, h.now);
+            next = if (next) |x| @min(x, timer.?) else timer;
+        };
+        h.now = next orelse return error.Stalled;
+        while (head < queue.items.len and queue.items[head].at <= h.now) : (head += 1) {
+            const f = &queue.items[head];
+            if (f.to_server) try h.toServer(f.buf[0..f.len]) else try h.client.recv(f.buf[0..f.len]);
+        }
+        if (timer) |t| if (t <= h.now) {
+            s.onTimeout(h.now);
+            try EchoApp.run(s);
+        };
+    }
+}
+
+test "verify pacing: downloads complete with loss over delayed paths, paced not much slower" {
+    const Case = struct { delay: u64, loss: u8, size: usize };
+    const cases = [_]Case{
+        .{ .delay = 10_000, .loss = 5, .size = 1_000_000 },
+        .{ .delay = 25_000, .loss = 15, .size = 400_000 },
+        .{ .delay = 1, .loss = 10, .size = 1_000_000 },
+        .{ .delay = 250_000, .loss = 3, .size = 300_000 },
+        .{ .delay = 2_000, .loss = 1, .size = 2_000_000 },
+        .{ .delay = 250_000, .loss = 0, .size = 300_000 },
+        .{ .delay = 100_000, .loss = 0, .size = 2_000_000 },
+    };
+    for (cases) |cs| {
+        for (0..3) |seed| {
+            var durations: [2]u64 = undefined;
+            inline for (.{ true, false }, 0..) |pacing, pi| {
+                const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20 }, if (pacing) noTweak else noPacing);
+                defer h.deinit();
+                h.prng = .init(seed * 7 + 3);
+                var bursts: std.ArrayList(Burst) = .empty;
+                defer bursts.deinit(testing.allocator);
+                try h.runDelayed(cs.delay, {}, established, &bursts);
+                const id = try h.client.openBidi();
+                var req: [32]u8 = undefined;
+                try h.client.write(id, try std.fmt.bufPrint(&req, "big {d}", .{cs.size}), true);
+                const began = h.now;
+                runLossy(h, cs.delay, cs.loss, id) catch |e| {
+                    std.debug.print("case delay={d} loss={d} seed={d} pacing={}: {s}\n", .{ cs.delay, cs.loss, seed, pacing, @errorName(e) });
+                    return e;
+                };
+                durations[pi] = h.now - began;
+                try testing.expectEqual(cs.size, h.client.readAll(id).len);
+            }
+            std.debug.print("delay={d} loss={d} seed={d}: paced {d} ms, unpaced {d} ms\n", .{ cs.delay, cs.loss, seed, durations[0] / 1000, durations[1] / 1000 });
+        }
+    }
+}
+
+test "verify pacing: a stream blocked by flow control doesn't keep the timer busy" {
+    const h = try Harness.init(.{ .max_stream_data = 100_000, .max_data = 16 << 20 }, noTweak);
+    defer h.deinit();
+    var bursts: std.ArrayList(Burst) = .empty;
+    defer bursts.deinit(testing.allocator);
+    try h.runDelayed(20_000, {}, established, &bursts);
+    const id = try h.client.openBidi();
+    try h.client.write(id, "big 1000000", true);
+    // Run 3 s of the delayed path; count server timer wakeups.
+    var queue: std.ArrayList(Flight) = .empty;
+    defer queue.deinit(h.a);
+    var head: usize = 0;
+    var buf: [1500]u8 = undefined;
+    const s = h.server.?;
+    const start = h.now;
+    var wakeups: usize = 0;
+    while (h.now < start + 3 * std.time.us_per_s) {
+        while (true) {
+            const n = try h.client.send(&buf);
+            if (n == 0) break;
+            try queue.append(h.a, .{ .at = h.now + 20_000, .to_server = true, .len = n, .buf = buf });
+        }
+        while (true) {
+            const n = s.send(&buf, h.now);
+            if (n == 0) break;
+            try queue.append(h.a, .{ .at = h.now + 20_000, .to_server = false, .len = n, .buf = buf });
+        }
+        var next: ?u64 = if (head < queue.items.len) queue.items[head].at else null;
+        var timer: ?u64 = null;
+        if (s.deadline()) |d| if (d < start + 3 * std.time.us_per_s) {
+            timer = @max(d, h.now);
+            next = if (next) |x| @min(x, timer.?) else timer;
+        };
+        h.now = next orelse break;
+        while (head < queue.items.len and queue.items[head].at <= h.now) : (head += 1) {
+            const f = &queue.items[head];
+            if (f.to_server) try h.toServer(f.buf[0..f.len]) else try h.client.recv(f.buf[0..f.len]);
+        }
+        if (timer) |t| if (t <= h.now) {
+            wakeups += 1;
+            s.onTimeout(h.now);
+            try EchoApp.run(s);
+        };
+    }
+    std.debug.print("flow-blocked: {d} bytes read, {d} timer wakeups in 3 s, paced_waits {d}\n", .{ h.client.readAll(id).len, wakeups, s.paced_waits });
+    try testing.expect(wakeups < 50);
+}
+
+test "verify pacing: pacer arithmetic at extremes" {
+    const recovery = @import("./recovery.zig");
+    var cc = recovery.Congestion.init(1200, .cubic);
+    var rtt: recovery.Rtt = .{};
+    var p = recovery.Pacer.init(1200, recovery.Pacer.default_burst_us);
+    // Before any RTT sample.
+    p.refill(0, &cc, &rtt);
+    try testing.expectEqual(@as(u64, 12000), p.tokens);
+    // A zero RTT, a huge window, a clock at its end.
+    rtt.update(0, 0);
+    cc.window = 1 << 40;
+    p.refill(std.math.maxInt(u64), &cc, &rtt);
+    try testing.expect(p.tokens >= 12000);
+    p.onSent(std.math.maxInt(u64));
+    try testing.expectEqual(@as(u64, 0), p.tokens);
+    const n = p.nextSend(1200, &cc, &rtt).?;
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), n);
+    // Clock going backwards: no refill, no underflow.
+    p.refill(5, &cc, &rtt);
+    try testing.expectEqual(@as(u64, 0), p.tokens);
+    // A huge RTT (an hour), the minimum window.
+    rtt = .{};
+    rtt.update(3600 * std.time.us_per_s, 0);
+    cc.window = cc.minWindow();
+    p = recovery.Pacer.init(1200, recovery.Pacer.default_burst_us);
+    p.refill(1000, &cc, &rtt);
+    p.onSent(12000);
+    const due = p.nextSend(1200, &cc, &rtt).?;
+    // 6000 bytes at 1.25 · 2400 B / hour.
+    try testing.expect(due > 1000 + 3600 * std.time.us_per_s);
+    // Long idle gap after.
+    try testing.expectEqual(@as(u64, 12000), p.available(1000 + 1_000_000 * std.time.us_per_s, &cc, &rtt));
+    // Burst setting of 0.
+    var p0 = recovery.Pacer.init(1200, 0);
+    rtt = .{};
+    rtt.update(50_000, 0);
+    try testing.expectEqual(@as(u64, 12000), p0.capacity(&cc, &rtt));
+    p0.refill(0, &cc, &rtt);
+    p0.onSent(12000);
+    try testing.expect(p0.nextSend(1200, &cc, &rtt).? > 0);
+}
