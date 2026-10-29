@@ -122,8 +122,11 @@ benchmark next to fuzzing or test containers: the numbers would be noise.
 - **Mac (M2 Pro, 12 cores, Docker)**: tests, protocol suites, competitor
   images (`comp-uws*`, `comp-facil`, `comp-may`, `comp-h2o`, nginx in
   `peregrine-test`; uWS Dockerfiles in bench/competitors/uws). Benchmarks
-  take `mac-bench` (ws-bench.sh does, after waiting for other peregrine
-  containers); test, Autobahn and local fuzz jobs wait while it is held.
+  take `mac-bench` exclusively (`acquire`; ws-bench.sh does, after waiting
+  for other peregrine containers); test, Autobahn, interop and local fuzz
+  jobs hold it shared (`share`/`unshare`, builds included). The queue is
+  fair: a benchmark that releases and re-acquires goes behind waiting
+  jobs, so new scripts must use `share`, not `wait`.
   Other heavy work on this Mac (check `uptime`) skews numbers too.
 - **Raspberry Pis 1 and 5** (`pi1-wg`, `pi5-wg`; Pi 5 Model B, 4 A76 cores,
   8 GB, gigabit LAN between them, 0.35 ms): the user's machines, lent when
