@@ -13,6 +13,7 @@ const Header = @import("../header.zig").Header;
 const exchange = @import("./exchange.zig");
 const ws_deflate = @import("../ws/deflate.zig");
 const ws_inflate = @import("../ws/inflate.zig");
+const H2Stream = @import("../h2/conn.zig").Stream;
 const iovec_const = std.posix.iovec_const;
 
 /// A bounded stack of things waiting for reuse: BufferPool's buffers, and
@@ -49,70 +50,99 @@ pub fn FreeList(comptime T: type) type {
 /// within two ticks. Releasing never frees (a send in flight may still be
 /// reading a buffer until the worker has drained its ring) and never
 /// allocates (acquiring made room for it).
-pub const Recycler = struct {
-    /// Bytes per buffer; 0 until the first user sets it.
-    size: usize = 0,
-    free: FreeList([]u8) = .{ .items = &.{} },
-    in_use: usize = 0,
-    /// The most in use at once since the last trim.
-    peak: usize = 0,
+pub const Recycler = Recycling([]u8);
 
-    pub fn acquire(self: *Recycler, allocator: std.mem.Allocator) ![]u8 {
-        if (self.free.pop()) |b| {
+/// Recycler's policy for `[]u8` buffers of `size` bytes, or for objects
+/// (`*T`, made as `.{}`, freed with `T.deinit(allocator)` first if it has
+/// one: what they own goes with them).
+pub fn Recycling(comptime Item: type) type {
+    return struct {
+        const Self = @This();
+
+        /// Bytes per buffer; 0 until the first user sets it. Unused for
+        /// objects.
+        size: usize = 0,
+        free: FreeList(Item) = .{ .items = &.{} },
+        in_use: usize = 0,
+        /// The most in use at once since the last trim.
+        peak: usize = 0,
+
+        pub fn acquire(self: *Self, allocator: std.mem.Allocator) !Item {
+            if (self.free.pop()) |b| {
+                self.take();
+                return b;
+            }
+            // Room for every one to come back.
+            if (self.free.items.len < self.in_use + 1) {
+                const items = try allocator.alloc(Item, @max(8, 2 * (self.in_use + 1)));
+                @memcpy(items[0..self.free.len], self.free.slice());
+                allocator.free(self.free.items);
+                self.free.items = items;
+            }
+            const b = try self.make(allocator);
             self.take();
             return b;
         }
-        // Room for every buffer to come back.
-        if (self.free.items.len < self.in_use + 1) {
-            const items = try allocator.alloc([]u8, @max(8, 2 * (self.in_use + 1)));
-            @memcpy(items[0..self.free.len], self.free.slice());
-            allocator.free(self.free.items);
-            self.free.items = items;
+
+        fn make(self: *const Self, allocator: std.mem.Allocator) !Item {
+            if (Item == []u8) {
+                return allocator.alloc(u8, self.size);
+            } else {
+                const x = try allocator.create(@typeInfo(Item).pointer.child);
+                x.* = .{};
+                return x;
+            }
         }
-        const b = try allocator.alloc(u8, self.size);
-        self.take();
-        return b;
-    }
 
-    fn take(self: *Recycler) void {
-        self.in_use += 1;
-        self.peak = @max(self.peak, self.in_use);
-    }
-
-    pub fn release(self: *Recycler, buf: []u8) void {
-        self.in_use -= 1;
-        const kept = self.free.push(buf);
-        std.debug.assert(kept);
-    }
-
-    pub fn trim(self: *Recycler, allocator: std.mem.Allocator) void {
-        while (self.free.len > self.peak -| self.in_use) allocator.free(self.free.pop().?);
-        self.peak = self.in_use;
-        // The list shrinks with them: room for twice what is out now.
-        const count = self.in_use + self.free.len;
-        if (count == 0) {
-            allocator.free(self.free.items);
-            self.free.items = &.{};
-        } else if (self.free.items.len > 8 and self.free.items.len > 4 * count) {
-            const items = allocator.alloc([]u8, @max(8, 2 * count)) catch return;
-            @memcpy(items[0..self.free.len], self.free.slice());
-            allocator.free(self.free.items);
-            self.free.items = items;
+        fn destroy(allocator: std.mem.Allocator, x: Item) void {
+            if (Item == []u8) {
+                allocator.free(x);
+            } else {
+                if (@hasDecl(@typeInfo(Item).pointer.child, "deinit")) x.deinit(allocator);
+                allocator.destroy(x);
+            }
         }
-    }
 
-    /// Buffers in use or waiting for reuse: the worker keeps ticking (to
-    /// trim) while there are any, connections or not.
-    pub inline fn holds(self: *const Recycler) bool {
-        return self.in_use + self.free.len > 0;
-    }
+        fn take(self: *Self) void {
+            self.in_use += 1;
+            self.peak = @max(self.peak, self.in_use);
+        }
 
-    pub fn deinit(self: *Recycler, allocator: std.mem.Allocator) void {
-        for (self.free.slice()) |b| allocator.free(b);
-        allocator.free(self.free.items);
-        self.* = .{};
-    }
-};
+        pub fn release(self: *Self, x: Item) void {
+            self.in_use -= 1;
+            const kept = self.free.push(x);
+            std.debug.assert(kept);
+        }
+
+        pub fn trim(self: *Self, allocator: std.mem.Allocator) void {
+            while (self.free.len > self.peak -| self.in_use) destroy(allocator, self.free.pop().?);
+            self.peak = self.in_use;
+            // The list shrinks with them: room for twice what is out now.
+            const count = self.in_use + self.free.len;
+            if (count == 0) {
+                allocator.free(self.free.items);
+                self.free.items = &.{};
+            } else if (self.free.items.len > 8 and self.free.items.len > 4 * count) {
+                const items = allocator.alloc(Item, @max(8, 2 * count)) catch return;
+                @memcpy(items[0..self.free.len], self.free.slice());
+                allocator.free(self.free.items);
+                self.free.items = items;
+            }
+        }
+
+        /// In use or waiting for reuse: the worker keeps ticking (to
+        /// trim) while there are any, connections or not.
+        pub inline fn holds(self: *const Self) bool {
+            return self.in_use + self.free.len > 0;
+        }
+
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            for (self.free.slice()) |x| destroy(allocator, x);
+            allocator.free(self.free.items);
+            self.* = .{};
+        }
+    };
+}
 
 /// Fixed-size read buffers shared by a worker's connections. A connection
 /// only holds one while it has unprocessed bytes, so idle keep-alive
@@ -141,8 +171,16 @@ pub const BufferPool = struct {
     /// queue. Sizes are set by the first connection.
     out_small: Recycler = .{},
     out_large: Recycler = .{},
-    /// Output buffers held or kept, as of the last trim, for other
-    /// threads (tests) to read.
+    /// HTTP/2 stream states: taken when a stream opens and given back
+    /// when it closes, so a connection holds only its open streams'.
+    h2_streams: Recycling(*H2Stream) = .{},
+    /// Scratch for HTTP/2 field blocks, used only inside one call: the
+    /// response block being encoded, the field being decoded. Made by
+    /// the first connection (`h2.Conn.init`).
+    h2_enc: std.ArrayList(u8) = .empty,
+    h2_dec: []u8 = &.{},
+    /// Output buffers and stream states held or kept, as of the last
+    /// trim, for other threads (tests) to read.
     output_held: std.atomic.Value(usize) = .init(0),
     /// The worker's WebSocket compressor and inflate tables, made on
     /// first use.
@@ -167,6 +205,9 @@ pub const BufferPool = struct {
         for (self.large[0..self.large_len]) |b| self.allocator.free(b);
         self.out_small.deinit(self.allocator);
         self.out_large.deinit(self.allocator);
+        self.h2_streams.deinit(self.allocator);
+        self.h2_enc.deinit(self.allocator);
+        self.allocator.free(self.h2_dec);
         if (self.ws_deflater) |d| self.allocator.destroy(d);
         if (self.ws_inflate_tables) |t| self.allocator.destroy(t);
     }
@@ -199,18 +240,21 @@ pub const BufferPool = struct {
         if (buf.len != self.buffer_size or !self.free.push(buf)) self.allocator.free(buf);
     }
 
-    /// Once a second, from the worker's tick: output buffers beyond what
-    /// was in use recently are freed.
+    /// Once a second, from the worker's tick: output buffers and stream
+    /// states beyond what was in use recently are freed.
     pub fn trim(self: *Self) void {
         self.out_small.trim(self.allocator);
         self.out_large.trim(self.allocator);
-        const held = self.out_small.in_use + self.out_small.free.len + self.out_large.in_use + self.out_large.free.len;
+        self.h2_streams.trim(self.allocator);
+        const held = self.out_small.in_use + self.out_small.free.len + self.out_large.in_use + self.out_large.free.len +
+            self.h2_streams.in_use + self.h2_streams.free.len;
         self.output_held.store(held, .release);
     }
 
-    /// Output buffers are held or kept: the worker must keep ticking.
+    /// Output buffers or stream states are held or kept: the worker must
+    /// keep ticking.
     pub inline fn holdsOutput(self: *const Self) bool {
-        return self.out_small.holds() or self.out_large.holds();
+        return self.out_small.holds() or self.out_large.holds() or self.h2_streams.holds();
     }
 
     /// A buffer of at least `min` bytes: the smallest cached one that
@@ -1227,6 +1271,38 @@ test "recycler: keeps as many as were in use at once recently, frees the rest on
     // Nothing is left, the list included.
     try testing.expectEqual(counting.allocations, counting.deallocations);
     try testing.expect(!r.holds());
+}
+
+test "recycling objects: kept with what they own, freed with it" {
+    const Obj = struct {
+        buf: std.ArrayList(u8) = .empty,
+        pub fn deinit(o: *@This(), allocator: std.mem.Allocator) void {
+            o.buf.deinit(allocator);
+        }
+    };
+    var counting = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const a = counting.allocator();
+    var r: Recycling(*Obj) = .{};
+    defer r.deinit(a);
+    var held: [10]*Obj = undefined;
+    for (&held) |*o| {
+        o.* = try r.acquire(a);
+        try testing.expectEqual(@as(usize, 0), o.*.buf.items.len);
+        try o.*.buf.appendSlice(a, "kept");
+    }
+    for (held) |o| r.release(o);
+    // Reused as given back, the newest first.
+    const x = try r.acquire(a);
+    try testing.expect(x == held[held.len - 1]);
+    try testing.expectEqualStrings("kept", x.buf.items);
+    r.release(x);
+    r.trim(a);
+    try testing.expectEqual(@as(usize, 10), r.free.len);
+    // Two quiet trims: every object and its buffer freed, the list too.
+    r.trim(a);
+    r.trim(a);
+    try testing.expect(!r.holds());
+    try testing.expectEqual(counting.allocations, counting.deallocations);
 }
 
 test "body larger than the pool buffer grows the buffer" {

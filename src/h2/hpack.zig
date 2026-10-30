@@ -531,20 +531,43 @@ pub const Decoder = struct {
 
     table: DynamicTable,
     limits: Limits,
-    /// Decoded name then value of the field being read.
+    /// Decoded name then value of the field being read (`scratchLen`
+    /// bytes): the decoder's own, or lent for one call (`decodeWith`).
     scratch: []u8,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits) !Self {
-        var table = try DynamicTable.init(allocator, limits.max_table_size);
-        errdefer table.deinit();
-        const scratch = try allocator.alloc(u8, 2 * @as(usize, limits.max_field_len));
-        return .{ .table = table, .limits = limits, .scratch = scratch, .allocator = allocator };
+        var self = try initShared(allocator, limits);
+        errdefer self.deinit();
+        self.scratch = try allocator.alloc(u8, scratchLen(limits));
+        return self;
+    }
+
+    /// A decoder without scratch space of its own, for `decodeWith`: a
+    /// worker's connections share one (it is only used inside a call).
+    pub fn initShared(allocator: std.mem.Allocator, limits: Limits) !Self {
+        const table = try DynamicTable.init(allocator, limits.max_table_size);
+        return .{ .table = table, .limits = limits, .scratch = &.{}, .allocator = allocator };
+    }
+
+    /// Scratch space a decoder with these limits needs.
+    pub fn scratchLen(limits: Limits) usize {
+        return 2 * @as(usize, limits.max_field_len);
     }
 
     pub fn deinit(self: *Self) void {
         self.table.deinit();
         self.allocator.free(self.scratch);
+    }
+
+    /// `decode` with `scratch` (at least `scratchLen` bytes) lent for the
+    /// call.
+    pub fn decodeWith(self: *Self, scratch: []u8, block: []const u8, sink: anytype) !void {
+        std.debug.assert(scratch.len >= scratchLen(self.limits));
+        const own = self.scratch;
+        self.scratch = scratch;
+        defer self.scratch = own;
+        return self.decode(block, sink);
     }
 
     /// Decodes one complete header block. For every field, calls
@@ -1156,6 +1179,41 @@ test "RFC 7541 C.6: response examples with Huffman coding" {
     try runExamples(&examples, .always, 256);
     // The default policy differs here: "307" is 3 bytes either way, and the
     // RFC's encoder still used Huffman where ours sends it raw.
+}
+
+test "decoders sharing one scratch (a worker's connections) keep their own tables" {
+    // C.3 on one decoder and C.5 on another, block by block in turn: the
+    // scratch holds a field only during a call.
+    const scratch = try testing.allocator.alloc(u8, Decoder.scratchLen(.{}));
+    defer testing.allocator.free(scratch);
+    var requests = try Decoder.initShared(testing.allocator, .{});
+    defer requests.deinit();
+    var responses = try Decoder.initShared(testing.allocator, .{});
+    defer responses.deinit();
+    responses.table.setMaxSize(256);
+    const q = request_examples;
+    const r = response_examples;
+    const blocks = [_][2][]const u8{
+        .{ hex("8286 8441 0f77 7777 2e65 7861 6d70 6c65 2e63 6f6d"), hex("4803 3330 3258 0770 7269 7661 7465 611d 4d6f 6e2c 2032 3120 4f63 7420 3230 3133 2032 303a 3133 3a32 3120 474d 546e 1768 7474 7073 3a2f 2f77 7777 2e65 7861 6d70 6c65 2e63 6f6d") },
+        .{ hex("8286 84be 5808 6e6f 2d63 6163 6865"), hex("4803 3330 37c1 c0bf") },
+        .{ hex("8287 85bf 400a 6375 7374 6f6d 2d6b 6579 0c63 7573 746f 6d2d 7661 6c75 65"), hex("88c1 611d 4d6f 6e2c 2032 3120 4f63 7420 3230 3133 2032 303a 3133 3a32 3220 474d 54c0 5a04 677a 6970 7738 666f 6f3d 4153 444a 4b48 514b 425a 584f 5157 454f 5049 5541 5851 5745 4f49 553b 206d 6178 2d61 6765 3d33 3630 303b 2076 6572 7369 6f6e 3d31") },
+    };
+    const fields = [_][2][]const Field{ .{ &q.first, &r.first }, .{ &q.second, &r.second }, .{ &q.third, &r.third } };
+    for (blocks, fields) |b, f| {
+        for ([_]*Decoder{ &requests, &responses }, 0..) |dec, i| {
+            var sink: ListSink = .{};
+            defer sink.deinit();
+            try dec.decodeWith(scratch, b[i], &sink);
+            var expected: std.ArrayList(u8) = .empty;
+            defer expected.deinit(testing.allocator);
+            for (f[i]) |x| try expected.print(testing.allocator, "{s}: {s}\n", .{ x.name, x.value });
+            try testing.expectEqualStrings(expected.items, sink.out.items);
+            // Nothing of the decoder's own is left pointing at it.
+            try testing.expectEqual(@as(usize, 0), dec.scratch.len);
+        }
+    }
+    try expectTable(&requests.table, &q.table3, 164);
+    try expectTable(&responses.table, &r.table3, 215);
 }
 
 test "decoder rejects malformed blocks" {
