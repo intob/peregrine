@@ -276,6 +276,19 @@ const TestHandler = struct {
             _ = resp.later() catch unreachable;
             return;
         }
+        if (std.mem.startsWith(u8, path, "/kf/") or std.mem.startsWith(u8, path, "/km/")) {
+            // /kf/OFF/LEN: big_body[OFF..][0..LEN] from the file;
+            // /km/LEN: big_body[0..LEN] from memory.
+            var it = std.mem.tokenizeScalar(u8, path[4..], '/');
+            const a = std.fmt.parseInt(usize, it.next() orelse "0", 10) catch 0;
+            if (path[2] == 'm') {
+                resp.setBodyBorrowed(big_body[0..a]);
+            } else {
+                const len = std.fmt.parseInt(usize, it.next() orelse "0", 10) catch 0;
+                resp.sendFile(.{ .fd = test_file_fd, .offset = a, .len = len });
+            }
+            return;
+        }
         if (std.mem.startsWith(u8, path, "/file")) {
             // big_body from a file: whole, a range, an owned duplicate, or
             // a length past the end (the file "shrank").
@@ -2531,6 +2544,458 @@ fn testKernelTls(backend: Backend) !void {
         try testing.expect(err != error.KeyUpdateMissed);
         try testing.expect(ktls and !kernelRekeySupported());
     }
+}
+
+// -- Record limits per key, through the kernel (kTLS) or not ------------------
+
+/// Reads a TLS stream with std's client a record at a time, keeping the
+/// plaintext, and fails as soon as more than `limit` records come under one
+/// key (std counts them in read_seq, which a KeyUpdate resets; one more is
+/// allowed for close_notify, as for a KeyUpdate).
+const KeyChecker = struct {
+    c: *TlsClient,
+    limit: u64,
+    buf: []u8,
+    len: usize = 0,
+    seq: u64 = 0,
+    key_updates: usize = 0,
+    closed: bool = false,
+    /// Sleep now and then: the server's socket fills and its writes stop
+    /// short.
+    slow: bool = false,
+    fills: usize = 0,
+
+    fn init(c: *TlsClient, limit: u64, buf: []u8) KeyChecker {
+        return .{ .c = c, .limit = limit, .buf = buf, .seq = c.client.read_seq };
+    }
+
+    /// One record (or what is buffered). error.EndOfStream after
+    /// close_notify.
+    fn step(self: *KeyChecker) !void {
+        if (self.closed) return error.EndOfStream;
+        const r = &self.c.client.reader;
+        if (r.bufferedLen() == 0) {
+            if (self.slow) {
+                self.fills += 1;
+                if (self.fills % 4 == 0) sleepMs(1);
+            }
+            try r.fillMore();
+        }
+        const seq = self.c.client.read_seq;
+        if (seq < self.seq) self.key_updates += 1;
+        self.seq = seq;
+        self.closed = self.c.client.eof();
+        if (seq > self.limit + @intFromBool(self.closed)) return error.KeyUpdateMissed;
+        const k = r.bufferedLen();
+        if (self.len + k > self.buf.len) return error.TooMuchData;
+        @memcpy(self.buf[self.len..][0..k], r.buffered());
+        r.toss(k);
+        self.len += k;
+    }
+
+    fn untilLen(self: *KeyChecker, n: usize) !void {
+        while (self.len < n) try self.step();
+    }
+
+    fn untilClose(self: *KeyChecker) !void {
+        while (!self.closed) try self.step();
+    }
+
+    /// Reads one response at `pos.*` and checks its body is `body`.
+    fn expectResponse(self: *KeyChecker, pos: *usize, body: []const u8) !void {
+        const head_end = while (true) {
+            if (std.mem.indexOf(u8, self.buf[pos.*..self.len], "\r\n\r\n")) |i| break pos.* + i + 4;
+            try self.step();
+        };
+        const head = self.buf[pos.*..head_end];
+        try testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 200 "));
+        const cl = (std.mem.indexOf(u8, head, "content-length: ") orelse return error.NoContentLength) + 16;
+        const cl_end = std.mem.indexOfScalarPos(u8, head, cl, '\r').?;
+        try testing.expectEqual(body.len, try std.fmt.parseInt(usize, head[cl..cl_end], 10));
+        try self.untilLen(head_end + body.len);
+        if (!std.mem.eql(u8, body, self.buf[head_end..][0..body.len])) return error.BodyMismatch;
+        pos.* = head_end + body.len;
+    }
+
+    /// Reads one server WebSocket frame at `pos.*`.
+    fn expectWsFrame(self: *KeyChecker, pos: *usize, opcode: ws.Opcode, payload: []const u8) !void {
+        try self.untilLen(pos.* + 2);
+        const b0 = self.buf[pos.*];
+        var len: usize = self.buf[pos.* + 1] & 0x7f;
+        var hl: usize = 2;
+        if (len == 126) {
+            try self.untilLen(pos.* + 4);
+            len = std.mem.readInt(u16, self.buf[pos.* + 2 ..][0..2], .big);
+            hl = 4;
+        } else if (len == 127) {
+            try self.untilLen(pos.* + 10);
+            len = @intCast(std.mem.readInt(u64, self.buf[pos.* + 2 ..][0..8], .big));
+            hl = 10;
+        }
+        try testing.expectEqual(@backingInt(opcode), b0 & 0x0f);
+        try self.untilLen(pos.* + hl + len);
+        if (!std.mem.eql(u8, payload, self.buf[pos.* + hl ..][0..len])) return error.PayloadMismatch;
+        pos.* += hl + len;
+    }
+};
+
+/// Sends KeyUpdate(update_requested) as std's client's next record, then
+/// switches its sending key (RFC 8446 §4.6.3); std's client answers the
+/// server's KeyUpdate itself.
+fn sendKeyUpdateRequest(c: *TlsClient) !void {
+    try c.client.writer.flush();
+    try c.file_writer.interface.flush();
+    var rec: [5 + 6 + 16]u8 = undefined;
+    switch (c.client.application_cipher) {
+        inline else => |*p| {
+            const pv = &p.tls_1_3;
+            const P = @TypeOf(p.*);
+            comptime std.debug.assert(P.AEAD.tag_length == 16);
+            // KeyUpdate(update_requested), then the inner content type.
+            const clear = [_]u8{ 24, 0, 0, 1, 1, 22 };
+            rec[0..5].* = .{ 23, 3, 3, 0, clear.len + 16 };
+            const V = @Vector(P.AEAD.nonce_length, u8);
+            const pad: [P.AEAD.nonce_length - 8]u8 = @splat(0);
+            var seq: [8]u8 = undefined;
+            std.mem.writeInt(u64, &seq, c.client.write_seq, .big);
+            const nonce: [P.AEAD.nonce_length]u8 = @as(V, pv.client_iv) ^ @as(V, pad ++ seq);
+            P.AEAD.encrypt(rec[5..][0..clear.len], rec[5 + clear.len ..][0..16], &clear, rec[0..5], nonce, pv.client_key);
+            const secret = std.crypto.tls.hkdfExpandLabel(P.Hkdf, pv.client_secret, "traffic upd", "", P.Hash.digest_length);
+            pv.client_secret = secret;
+            pv.client_key = std.crypto.tls.hkdfExpandLabel(P.Hkdf, secret, "key", "", P.AEAD.key_length);
+            pv.client_iv = std.crypto.tls.hkdfExpandLabel(P.Hkdf, secret, "iv", "", P.AEAD.nonce_length);
+        },
+    }
+    c.client.write_seq = 0;
+    var rest: []const u8 = &rec;
+    while (rest.len > 0) rest = rest[try sys.write(c.fd, rest)..];
+}
+
+/// The outcome of a stream checked with KeyChecker: complete, or (kTLS
+/// without rekey) cut short when the first KeyUpdate came due, never with
+/// more records under a key than allowed.
+fn expectKeyLimitOutcome(result: anyerror!void, ktls: bool) !void {
+    if (result) |_| {
+        // Complete: every KeyUpdate due went out (or none came due).
+    } else |err| {
+        if (err == error.KeyUpdateMissed or err == error.BodyMismatch or err == error.PayloadMismatch or
+            err == error.TooMuchData or err == error.TestUnexpectedResult or err == error.TestExpectedEqual)
+        {
+            std.debug.print("key limit check failed: {s}\n", .{@errorName(err)});
+            return err;
+        }
+        if (!(ktls and !rekeyOk())) {
+            std.debug.print("unexpected error: {s}\n", .{@errorName(err)});
+            return err;
+        }
+    }
+}
+
+fn ktlsOk() bool {
+    if (comptime !sys.is_linux) return false;
+    return kernelTlsAvailable();
+}
+
+fn rekeyOk() bool {
+    if (comptime !sys.is_linux) return false;
+    return kernelRekeySupported();
+}
+
+const KfReq = struct { kind: u8, off: usize, len: usize };
+
+fn kfPath(buf: []u8, q: KfReq) ![]const u8 {
+    return if (q.kind == 'f')
+        std.fmt.bufPrint(buf, "/kf/{d}/{d}", .{ q.off, q.len })
+    else
+        std.fmt.bufPrint(buf, "/km/{d}", .{q.len});
+}
+
+fn kfBody(q: KfReq) []const u8 {
+    return if (q.kind == 'f') big_body[q.off..][0..q.len] else big_body[0..q.len];
+}
+
+fn setupKfFile(tmp: *std.testing.TmpDir) !std.Io.File {
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    const io = testing.io;
+    const file = try tmp.dir.createFile(io, "big", .{ .read = true });
+    try file.writeStreamingAll(io, &big_body);
+    test_file_fd = file.handle;
+    return file;
+}
+
+/// Files and in-memory bodies of sizes around record multiples and the
+/// per-write cap, on one connection: pipelined all at once, or one at a
+/// time.
+fn kfRequests(limit: u64, list: *std.ArrayList(KfReq)) !void {
+    const R = 16384;
+    const cap = limit * R;
+    const a = testing.allocator;
+    try list.append(a, .{ .kind = 'm', .off = 0, .len = 2 }); // user space
+    try list.append(a, .{ .kind = 'f', .off = 0, .len = 1 }); // kTLS from here
+    try list.append(a, .{ .kind = 'm', .off = 0, .len = R - 1 });
+    try list.append(a, .{ .kind = 'f', .off = 0, .len = R });
+    try list.append(a, .{ .kind = 'f', .off = 1, .len = R + 1 });
+    try list.append(a, .{ .kind = 'm', .off = 0, .len = R });
+    try list.append(a, .{ .kind = 'm', .off = 0, .len = R + 1 });
+    try list.append(a, .{ .kind = 'f', .off = 7, .len = R - 1 });
+    for ([_]usize{ 2 * R - 1, 2 * R, 2 * R + 1, 3 * R - 1, 3 * R, 3 * R + 1 }) |n| {
+        try list.append(a, .{ .kind = 'f', .off = 0, .len = n });
+        try list.append(a, .{ .kind = 'm', .off = 0, .len = n });
+    }
+    for ([_]usize{ cap - 1, cap, cap + 1, 2 * cap - 1, 2 * cap + 1 }) |n| {
+        if (n > 4 << 20) continue;
+        try list.append(a, .{ .kind = 'f', .off = 4095, .len = n });
+        try list.append(a, .{ .kind = 'm', .off = 0, .len = n });
+    }
+    try list.append(a, .{ .kind = 'm', .off = 0, .len = 300000 });
+    try list.append(a, .{ .kind = 'f', .off = 123, .len = 1000000 });
+    try list.append(a, .{ .kind = 'f', .off = 0, .len = 1 });
+}
+
+test "tls: key record limits (1, 2, 3, 4, 5, 37, 256), kernel TLS or not: pipelined and sequential files and bodies around record multiples" {
+    try forEachBackend(testKeyLimitsMixed);
+}
+
+fn testKeyLimitsMixed(backend: Backend) !void {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try setupKfFile(&tmp);
+    defer file.close(testing.io);
+    defer test_file_fd = -1;
+    const r = try Running.start(backend, tlsConfig());
+    defer r.stop();
+    const ktls = ktlsOk();
+    const buf = try testing.allocator.alloc(u8, 32 << 20);
+    defer testing.allocator.free(buf);
+    defer tls_conn.test_key_update_limit = null;
+    for ([_]u64{ 1, 2, 3, 4, 5, 37, 256 }) |limit| {
+        for ([_]bool{ false, true }) |no_sendfile| {
+            for ([_]bool{ true, false }) |pipelined| {
+                sys.sendfile_disabled = no_sendfile;
+                defer sys.sendfile_disabled = false;
+                tls_conn.test_key_update_limit = limit;
+                var list: std.ArrayList(KfReq) = .empty;
+                defer list.deinit(testing.allocator);
+                try kfRequests(limit, &list);
+                const c = try TlsClient.connect(r.port);
+                defer c.close();
+                var k = KeyChecker.init(c, limit, buf);
+                const res = runKf(c, &k, list.items, pipelined);
+                expectKeyLimitOutcome(res, ktls) catch |err| {
+                    std.debug.print("backend {s} limit {d} no_sendfile {} pipelined {}: {d} bytes, {d} key updates\n", .{ @tagName(backend), limit, no_sendfile, pipelined, k.len, k.key_updates });
+                    return err;
+                };
+            }
+        }
+    }
+}
+
+fn runKf(c: *TlsClient, k: *KeyChecker, list: []const KfReq, pipelined: bool) !void {
+    var req_buf: [64 << 10]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&req_buf);
+    var path_buf: [64]u8 = undefined;
+    var pos: usize = 0;
+    for (list, 0..) |q, i| {
+        const last = i == list.len - 1;
+        try w.print("GET {s} HTTP/1.1\r\nHost: x\r\n{s}\r\n", .{ try kfPath(&path_buf, q), if (last) "Connection: close\r\n" else "" });
+        if (!pipelined) {
+            try c.send(w.buffered());
+            _ = w.consumeAll();
+            try k.expectResponse(&pos, kfBody(q));
+        }
+    }
+    if (pipelined) {
+        try c.send(w.buffered());
+        for (list) |q| try k.expectResponse(&pos, kfBody(q));
+    }
+    try k.untilClose();
+    try testing.expectEqual(pos, k.len);
+}
+
+test "tls: key record limits with a slow reader (the server's writes stop short)" {
+    try forEachBackend(testKeyLimitsSlow);
+}
+
+fn testKeyLimitsSlow(backend: Backend) !void {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try setupKfFile(&tmp);
+    defer file.close(testing.io);
+    defer test_file_fd = -1;
+    const r = try Running.start(backend, tlsConfig());
+    defer r.stop();
+    const ktls = ktlsOk();
+    const buf = try testing.allocator.alloc(u8, 16 << 20);
+    defer testing.allocator.free(buf);
+    defer tls_conn.test_key_update_limit = null;
+    for ([_]u64{ 1, 3, 37 }) |limit| {
+        for ([_]bool{ false, true }) |no_sendfile| {
+            sys.sendfile_disabled = no_sendfile;
+            defer sys.sendfile_disabled = false;
+            tls_conn.test_key_update_limit = limit;
+            const c = try TlsClient.connect(r.port);
+            defer c.close();
+            sys.setsockoptInt(c.fd, posix.SOL.SOCKET, posix.SO.RCVBUF, 4096) catch {};
+            var k = KeyChecker.init(c, limit, buf);
+            k.slow = true;
+            const list = [_]KfReq{
+                .{ .kind = 'm', .off = 0, .len = 2 },
+                .{ .kind = 'f', .off = 3, .len = 2 << 20 },
+                .{ .kind = 'm', .off = 0, .len = 200000 },
+                .{ .kind = 'f', .off = 0, .len = 3 * 16384 - 1 },
+                .{ .kind = 'f', .off = 0, .len = 1 << 20 },
+            };
+            // Requests first, then nothing read for a while: every write
+            // the server tries runs into a full socket.
+            const res = runKfSlow(c, &k, &list);
+            expectKeyLimitOutcome(res, ktls) catch |err| {
+                std.debug.print("backend {s} limit {d} no_sendfile {}: {d} bytes, {d} key updates\n", .{ @tagName(backend), limit, no_sendfile, k.len, k.key_updates });
+                return err;
+            };
+        }
+    }
+}
+
+fn runKfSlow(c: *TlsClient, k: *KeyChecker, list: []const KfReq) !void {
+    var req_buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&req_buf);
+    var path_buf: [64]u8 = undefined;
+    for (list, 0..) |q, i| {
+        try w.print("GET {s} HTTP/1.1\r\nHost: x\r\n{s}\r\n", .{ try kfPath(&path_buf, q), if (i == list.len - 1) "Connection: close\r\n" else "" });
+    }
+    try c.send(w.buffered());
+    sleepMs(100);
+    var pos: usize = 0;
+    for (list) |q| try k.expectResponse(&pos, kfBody(q));
+    try k.untilClose();
+}
+
+test "tls: key record limits: the client's KeyUpdate (update_requested) mid-file and while idle" {
+    try forEachBackend(testKeyUpdateRequested);
+}
+
+fn testKeyUpdateRequested(backend: Backend) !void {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try setupKfFile(&tmp);
+    defer file.close(testing.io);
+    defer test_file_fd = -1;
+    const r = try Running.start(backend, tlsConfig());
+    defer r.stop();
+    const ktls = ktlsOk();
+    const buf = try testing.allocator.alloc(u8, 16 << 20);
+    defer testing.allocator.free(buf);
+    defer tls_conn.test_key_update_limit = null;
+    for ([_]u64{ 2, 5, 1000000 }) |limit| {
+        for ([_]bool{ false, true }) |no_sendfile| {
+            sys.sendfile_disabled = no_sendfile;
+            defer sys.sendfile_disabled = false;
+            tls_conn.test_key_update_limit = limit;
+            const c = try TlsClient.connect(r.port);
+            defer c.close();
+            var k = KeyChecker.init(c, limit, buf);
+            const res = runKeyUpdateRequested(c, &k);
+            // A large limit: no KeyUpdate of our own, only answers, which
+            // kernels without rekey can't give either.
+            expectKeyLimitOutcome(res, ktls) catch |err| {
+                std.debug.print("backend {s} limit {d} no_sendfile {}: {d} bytes, {d} key updates\n", .{ @tagName(backend), limit, no_sendfile, k.len, k.key_updates });
+                return err;
+            };
+            if (res) |_| {
+                try testing.expect(k.key_updates >= 3);
+            } else |_| {}
+        }
+    }
+}
+
+fn runKeyUpdateRequested(c: *TlsClient, k: *KeyChecker) !void {
+    var pos: usize = 0;
+    try c.send("GET /km/2 HTTP/1.1\r\nHost: x\r\n\r\nGET /kf/0/4000000 HTTP/1.1\r\nHost: x\r\n\r\n");
+    try k.expectResponse(&pos, big_body[0..2]);
+    // Part of the file, then our KeyUpdate: the answer comes before more
+    // data, under the old key.
+    try k.untilLen(pos + 300000);
+    try sendKeyUpdateRequest(c);
+    try k.untilLen(pos + 1000000);
+    // Three in a row.
+    try sendKeyUpdateRequest(c);
+    try sendKeyUpdateRequest(c);
+    try sendKeyUpdateRequest(c);
+    try k.expectResponse(&pos, big_body[0..4000000]);
+    // Idle (kTLS on): answered at once; then requests under our new key.
+    const before = k.key_updates;
+    try sendKeyUpdateRequest(c);
+    while (k.key_updates == before) try k.step();
+    try c.send("GET /km/70000 HTTP/1.1\r\nHost: x\r\n\r\n");
+    try k.expectResponse(&pos, big_body[0..70000]);
+    try sendKeyUpdateRequest(c);
+    try c.send("GET /kf/9/100000 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    try k.expectResponse(&pos, big_body[9..][0..100000]);
+    try k.untilClose();
+}
+
+test "tls: key record limits: a WebSocket after a file on one connection (kernel TLS from the file on)" {
+    try forEachBackend(testKeyLimitsWebSocket);
+}
+
+fn testKeyLimitsWebSocket(backend: Backend) !void {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try setupKfFile(&tmp);
+    defer file.close(testing.io);
+    defer test_file_fd = -1;
+    const r = try Running.start(backend, tlsConfig());
+    defer r.stop();
+    const ktls = ktlsOk();
+    const buf = try testing.allocator.alloc(u8, 16 << 20);
+    defer testing.allocator.free(buf);
+    defer tls_conn.test_key_update_limit = null;
+    for ([_]u64{ 1, 2, 3, 37 }) |limit| {
+        for ([_]bool{ true, false }) |pipelined| {
+            tls_conn.test_key_update_limit = limit;
+            const c = try TlsClient.connect(r.port);
+            defer c.close();
+            var k = KeyChecker.init(c, limit, buf);
+            const res = runKfWebSocket(c, &k, pipelined);
+            expectKeyLimitOutcome(res, ktls) catch |err| {
+                std.debug.print("backend {s} limit {d} pipelined {}: {d} bytes, {d} key updates\n", .{ @tagName(backend), limit, pipelined, k.len, k.key_updates });
+                return err;
+            };
+        }
+    }
+}
+
+fn runKfWebSocket(c: *TlsClient, k: *KeyChecker, pipelined: bool) !void {
+    var pos: usize = 0;
+    try c.send("GET /kf/0/100000 HTTP/1.1\r\nHost: x\r\n\r\n");
+    if (!pipelined) try k.expectResponse(&pos, big_body[0..100000]);
+    try c.send(Client.upgrade_request);
+    if (pipelined) try k.expectResponse(&pos, big_body[0..100000]);
+    while (true) {
+        if (std.mem.indexOf(u8, k.buf[pos..k.len], "\r\n\r\n")) |i| {
+            try testing.expect(std.mem.startsWith(u8, k.buf[pos..], "HTTP/1.1 101 "));
+            pos += i + 4;
+            break;
+        }
+        try k.step();
+    }
+    const frame = try testing.allocator.alloc(u8, 70000);
+    defer testing.allocator.free(frame);
+    const sizes = [_]usize{ 1, 16383, 16384, 16385, 16384 * 3 - 4, 60000, 125, 126, 65535 };
+    if (pipelined) {
+        for (sizes) |n| try c.send(Client.wsFrame(frame, true, .binary, big_body[n..][0..n]));
+        for (sizes) |n| try k.expectWsFrame(&pos, .binary, big_body[n..][0..n]);
+    } else {
+        for (sizes) |n| {
+            try c.send(Client.wsFrame(frame, true, .binary, big_body[n..][0..n]));
+            try k.expectWsFrame(&pos, .binary, big_body[n..][0..n]);
+        }
+    }
+    try c.send(Client.wsFrame(frame, true, .text, "close-me"));
+    try k.untilLen(pos + 2);
+    try testing.expectEqual(@backingInt(ws.Opcode.close), k.buf[pos] & 0x0f);
+    try c.send(Client.wsFrame(frame, true, .close, &.{ 0x03, 0xe8 }));
+    try k.untilClose();
 }
 
 /// Whether the kernel can switch TLS 1.3 sending keys (kTLS rekey).
