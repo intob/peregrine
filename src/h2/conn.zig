@@ -104,13 +104,17 @@ pub fn Context(comptime Handler: type) type {
 /// and two frames allow: header blocks, trailers, control frames.
 const out_slack = 16 * 1024;
 
+/// The worker's buffers for header blocks split over CONTINUATIONs start
+/// this small (see `Conn.growBlock`).
+const block_small = 1024;
+
 /// Sizes the worker's output buffers (see `Conn.out`) for connections
 /// with these options: one frame plus `out_slack`, and everything
 /// `out_limit` allows.
 pub fn preparePool(pool: *BufferPool, opts: Options) void {
     pool.out_small.size = std.mem.alignForward(usize, frame.header_len + opts.max_frame_size + out_slack, 4096);
     pool.out_large.size = std.mem.alignForward(usize, opts.out_limit + 2 * opts.max_frame_size + out_slack, 4096);
-    pool.h2_blocks.size = opts.limits.max_header_bytes;
+    pool.h2_blocks.size = @min(opts.limits.max_header_bytes, block_small);
 }
 
 const StreamState = enum(u8) {
@@ -294,6 +298,20 @@ const State = enum(u8) {
 /// how it closed: frames after END_STREAM are a connection error, after
 /// the peer's RST_STREAM a stream error, after our RST_STREAM ignored.
 const Closed = struct { id: u31 = 0, how: How = .ended };
+
+/// Why a field block is only decoded, and what follows it.
+const Discard = enum {
+    /// Over SETTINGS_MAX_CONCURRENT_STREAMS, after GOAWAY, or no memory
+    /// for the stream: RST_STREAM(REFUSED_STREAM).
+    refused,
+    /// For a stream that is closed, or no longer receiving:
+    /// RST_STREAM(STREAM_CLOSED).
+    closed,
+    /// Its stream closed while the block was arriving (the response ended
+    /// it, or a timeout reset it): the block is still taken whole (§6.10),
+    /// and nothing more is sent.
+    ended,
+};
 const IdlePriority = struct { id: u31, prio: Priority };
 
 /// DATA bytes an incremental stream sends before the next one of its
@@ -354,16 +372,10 @@ pub const Conn = struct {
     hb_target: ?*Stream = null,
     hb_end_stream: bool = false,
     hb_trailers: bool = false,
-    /// The block is decoded only to keep HPACK in sync; its stream is
-    /// refused or closed with this code (stream error) afterwards.
-    hb_discard: ?ErrorCode = null,
-    /// The stream closed while its block was arriving (the response ended
-    /// it, or a timeout reset it): the block is still taken whole and
-    /// decoded (§4.3, §6.10), and nothing more is sent for it.
-    hb_closed: bool = false,
-    /// A block split over CONTINUATIONs, gathered in a buffer from the
-    /// worker's pool (`h2_blocks`, `max_header_bytes` each), given back once
-    /// decoded. A block in one frame is decoded where it lies.
+    /// Set: the block is decoded only to keep HPACK in sync (§4.3).
+    hb_discard: ?Discard = null,
+    /// A block split over CONTINUATIONs, gathered (see `growBlock`), given
+    /// back once decoded. A block in one frame is decoded where it lies.
     hb_buf: std.ArrayList(u8) = .empty,
     hb_since: u32 = 0,
     /// Flood budgets, per second.
@@ -423,7 +435,7 @@ pub const Conn = struct {
             .idle_prio = idle_prio,
             .pool = pool,
         };
-        std.debug.assert(pool.out_small.size > 0 and pool.h2_blocks.size >= opts.limits.max_header_bytes); // preparePool
+        std.debug.assert(pool.out_small.size > 0 and pool.h2_blocks.size > 0); // preparePool
         errdefer self.giveBack(&self.out);
         // Our preface: SETTINGS, then a larger connection window.
         var buf: [64]u8 = undefined;
@@ -726,8 +738,7 @@ pub const Conn = struct {
         }
         if (self.hb_target == s) {
             self.hb_target = null;
-            self.hb_discard = .stream_closed;
-            self.hb_closed = true;
+            self.hb_discard = .ended;
         }
         self.setBlocked(s, false);
         self.closed_ring[self.closed_pos] = .{ .id = s.id, .how = how };
@@ -1106,14 +1117,13 @@ pub const Conn = struct {
         if (h.fragment.len == 0 and !h.end_headers) self.countControl();
         if (h.stream_id % 2 == 0) return self.fail(.protocol_error);
         self.hb_discard = null;
-        self.hb_closed = false;
         self.hb_trailers = false;
         if (h.stream_id > self.last_stream_id) {
             self.last_stream_id = h.stream_id;
             const prio = if (self.idle_prio_len > 0) self.takeIdlePriority(h.stream_id) else null;
             if (self.goaway_sent or self.goaway_received) {
                 // Not accepted after GOAWAY: decode to stay in sync, then refuse.
-                self.hb_discard = .refused_stream;
+                self.hb_discard = .refused;
                 self.hb_target = null;
             } else if (self.openStream(h.stream_id)) |s| {
                 if (prio) |p| {
@@ -1123,12 +1133,12 @@ pub const Conn = struct {
                 self.hb_target = s;
             } else {
                 // §5.1.2: over SETTINGS_MAX_CONCURRENT_STREAMS.
-                self.hb_discard = .refused_stream;
+                self.hb_discard = .refused;
                 self.hb_target = null;
             }
         } else if (self.findStream(h.stream_id)) |s| {
             if (s.state != .open) {
-                self.hb_discard = .stream_closed;
+                self.hb_discard = .closed;
                 self.hb_target = null;
             } else {
                 // Trailers (§8.1): must end the stream.
@@ -1141,7 +1151,7 @@ pub const Conn = struct {
             // closed: a connection error (§5.1). After a reset, a stream
             // error (the block is still decoded, to keep HPACK in sync).
             if (c.how == .ended) return self.fail(.stream_closed);
-            self.hb_discard = .stream_closed;
+            self.hb_discard = .closed;
             self.hb_target = null;
         } else {
             return self.fail(.protocol_error);
@@ -1159,25 +1169,44 @@ pub const Conn = struct {
     }
 
     fn appendFragment(self: *Self, comptime Handler: type, ctx: *const Context(Handler), fragment: []const u8, end: bool) void {
+        const len = self.hb_buf.items.len + fragment.len;
         // A CONTINUATION flood: the block is bounded like an HTTP/1.1 head.
-        if (self.hb_buf.items.len + fragment.len > self.opts.limits.max_header_bytes) return self.fail(.enhance_your_calm);
-        // In one frame: decoded where it lies.
-        if (end and self.hb_buf.items.len == 0) return self.onBlock(Handler, ctx, fragment);
-        if (self.hb_buf.capacity == 0) {
-            const buf = self.pool.h2_blocks.acquire(self.pool.allocator) catch return self.fail(.internal_error);
-            self.hb_buf = .initBuffer(buf);
+        if (len > self.opts.limits.max_header_bytes) return self.fail(.enhance_your_calm);
+        if (self.hb_buf.items.len == 0) {
+            // In one frame (empty fragments before it aside): decoded
+            // where it lies.
+            if (end) return self.onBlock(Handler, ctx, fragment);
+            if (fragment.len == 0) return;
         }
-        // Fits: the check above bounds it by the buffer's size.
+        if (len > self.hb_buf.capacity) self.growBlock(len) catch return self.fail(.internal_error);
         self.hb_buf.appendSliceAssumeCapacity(fragment);
         if (!end) return;
         self.onBlock(Handler, ctx, self.hb_buf.items);
         self.dropBlock();
     }
 
+    /// Room for `len` bytes of a block being gathered, in step with what
+    /// has arrived: a small buffer from the worker's pool (`h2_blocks`),
+    /// then from its large-buffer cache, doubling, up to
+    /// `max_header_bytes`. A block that never completes holds it until the
+    /// request timeout fails the connection.
+    fn growBlock(self: *Self, len: usize) !void {
+        const pool = self.pool;
+        const buf = if (len <= pool.h2_blocks.size)
+            try pool.h2_blocks.acquire(pool.allocator)
+        else
+            try pool.acquireLarge(@max(len, @min(2 * self.hb_buf.capacity, self.opts.limits.max_header_bytes)));
+        var grown: std.ArrayList(u8) = .initBuffer(buf);
+        grown.appendSliceAssumeCapacity(self.hb_buf.items);
+        self.dropBlock();
+        self.hb_buf = grown;
+    }
+
     /// The gathered block's buffer goes back to the worker.
     fn dropBlock(self: *Self) void {
         if (self.hb_buf.capacity == 0) return;
-        self.pool.h2_blocks.release(self.hb_buf.allocatedSlice());
+        const buf = self.hb_buf.allocatedSlice();
+        if (buf.len == self.pool.h2_blocks.size) self.pool.h2_blocks.release(buf) else self.pool.releaseLarge(buf);
         self.hb_buf = .empty;
     }
 
@@ -1191,18 +1220,24 @@ pub const Conn = struct {
         const discard = self.hb_discard;
         self.hb_stream = 0;
         self.hb_target = null;
-        if (discard) |code| {
+        if (discard) |why| {
             var sink: DiscardSink = .{};
             self.decoder.decodeWith(self.pool.h2_dec, block, &sink) catch |err| switch (err) {
                 error.HeaderListTooLarge => {},
                 else => return self.fail(.compression_error),
             };
-            if (self.hb_closed) return;
-            if (code == .refused_stream and self.recentlyClosed(stream_id) == null and self.findStream(stream_id) == null) {
-                self.closed_ring[self.closed_pos] = .{ .id = stream_id, .how = .we_reset };
-                self.closed_pos = (self.closed_pos + 1) % self.closed_ring.len;
+            switch (why) {
+                .ended => {},
+                .closed => self.writeRst(stream_id, .stream_closed),
+                .refused => {
+                    if (self.recentlyClosed(stream_id) == null and self.findStream(stream_id) == null) {
+                        self.closed_ring[self.closed_pos] = .{ .id = stream_id, .how = .we_reset };
+                        self.closed_pos = (self.closed_pos + 1) % self.closed_ring.len;
+                    }
+                    self.writeRst(stream_id, .refused_stream);
+                },
             }
-            return self.writeRst(stream_id, code);
+            return;
         }
         const s = target.?;
         if (trailers) {
@@ -1502,6 +1537,7 @@ pub const Conn = struct {
         }
         const date_line: []const u8 = ctx.date;
         self.encodeField("date", date_line[6 .. date_line.len - 2]) catch return self.fail(.internal_error);
+        self.pool.noteEncoded();
         // Frame it.
         var block: []const u8 = self.pool.h2_enc.items;
         // All of it or nothing: a HEADERS without its CONTINUATIONs, then
@@ -1933,6 +1969,7 @@ pub const Conn = struct {
             const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
             self.encodeField(name, value) catch return self.fail(.internal_error);
         }
+        self.pool.noteEncoded();
         var block: []const u8 = self.pool.h2_enc.items;
         // All of it or nothing: a HEADERS without its CONTINUATIONs, then
         // anything else, is a connection error for the client (§6.10).
@@ -2113,8 +2150,10 @@ const TrailerSink = struct {
     inner: fields_mod.TrailerStore,
 
     pub fn header(self: *TrailerSink, name: []const u8, value: []const u8) !void {
+        // A trailer that is dropped or faults takes no room.
+        if (!self.inner.accepts(name, value)) return;
         try self.conn.ensureRoom(self.inner.buf, name.len + value.len);
-        return self.inner.header(name, value);
+        self.inner.storeAssumeCapacity(name, value);
     }
 };
 
@@ -3645,7 +3684,45 @@ test "output buffers: an exchange or HEAD with nothing to send holds none; small
     try testing.expectEqual(@as(usize, 0), h.conn.out.capacity + h.conn.wire.capacity);
 }
 
-test "field block scratch: a large response head grows the worker's encoding buffer, the tick takes it back" {
+test "CONTINUATION blocks: gathered in step with what arrived, given back once decoded" {
+    const h = try Harness.init(.{ .limits = .{ .max_header_bytes = 64 * 1024 }, .hpack = .{ .max_header_list_size = 64 * 1024, .max_field_len = 48 * 1024 } });
+    defer h.deinit();
+    try h.preface();
+    h.events.clearRetainingCapacity();
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(testing.allocator);
+    const long: [40000]u8 = @splat('L');
+    for ([_]hpack.Field{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "x-long", .value = &long },
+    }) |f| {
+        try block.ensureUnusedCapacity(testing.allocator, f.value.len + 64);
+        block.items.len += try h.enc.encode(block.unusedCapacitySlice(), f.name, f.value, .{ .indexing = .never, .huffman = .never });
+    }
+    const b = block.items;
+    var buf: [frame.header_len + 16384]u8 = undefined;
+    // One byte holds a small buffer, not one of max_header_bytes.
+    try h.feed(buf[0..try frame.writeHeaders(&buf, 1, frame.flag.end_stream, b[0..1])]);
+    try testing.expect(h.conn.hb_buf.capacity > 0 and h.conn.hb_buf.capacity <= block_small);
+    // Then it grows with the block, at most doubling.
+    var pos: usize = 1;
+    while (b.len - pos > 16384) : (pos += 16384) {
+        frame.writeHeader(buf[0..frame.header_len], 16384, .continuation, 0, 1);
+        @memcpy(buf[frame.header_len..][0..16384], b[pos..][0..16384]);
+        try h.feed(&buf);
+        try testing.expect(h.conn.hb_buf.capacity >= pos + 16384 and h.conn.hb_buf.capacity <= 2 * (pos + 16384) + 4096);
+    }
+    frame.writeHeader(buf[0..frame.header_len], @intCast(b.len - pos), .continuation, frame.flag.end_headers, 1);
+    @memcpy(buf[frame.header_len..][0 .. b.len - pos], b[pos..]);
+    try h.feed(buf[0 .. frame.header_len + b.len - pos]);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, h.events.items, "end=true"));
+    try testing.expectEqual(@as(usize, 0), h.conn.hb_buf.capacity);
+    try testing.expectEqual(@as(usize, 0), h.pool.h2_blocks.in_use);
+}
+
+test "field block scratch: large response heads grow the worker's encoding buffer, a quiet tick takes it back" {
     const h = try Harness.init(.{});
     defer h.deinit();
     try h.preface();
@@ -3654,13 +3731,21 @@ test "field block scratch: a large response head grows the worker's encoding buf
     try lines.appendSlice(testing.allocator, "x-big: ");
     try lines.appendNTimes(testing.allocator, '~', 20000);
     try lines.appendSlice(testing.allocator, "\r\n");
-    const s = h.conn.openStream(1).?;
     const c = h.ctx();
-    h.conn.writeHead(&c, s, .ok, lines.items, null, false);
-    try testing.expect(!h.conn.failed);
-    // Written (the harness's client takes small heads only).
-    h.conn.advance(h.conn.wireBytes().len);
-    try testing.expect(h.pool.h2_enc.capacity > 20000);
+    var grown: ?[*]u8 = null;
+    // A large head every second: grown once, kept.
+    for (0..4) |i| {
+        const s = h.conn.openStream(@intCast(1 + 2 * i)).?;
+        h.conn.writeHead(&c, s, .ok, lines.items, null, false);
+        try testing.expect(!h.conn.failed);
+        // Written (the harness's client takes small heads only).
+        h.conn.advance(h.conn.wireBytes().len);
+        try testing.expect(h.pool.h2_enc.capacity > 20000);
+        if (grown) |p| try testing.expect(h.pool.h2_enc.items.ptr == p);
+        grown = h.pool.h2_enc.items.ptr;
+        h.pool.trim();
+    }
+    // A second without one: back to what is kept.
     h.pool.trim();
     try testing.expectEqual(@as(usize, BufferPool.h2_enc_kept), h.pool.h2_enc.capacity);
 }
@@ -3934,6 +4019,45 @@ fn requestMix(h: *Harness, first: u31, gets: u31, bigs: u31) !Mix {
         try frames.appendSlice(a, block[half..]);
         id += 2;
     }
+    {
+        // HEADERS with an empty fragment, the whole block in the
+        // CONTINUATION.
+        const block = try h.encodeFields(&.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":path", .value = "/" },
+        });
+        defer a.free(block);
+        try frames.appendSlice(a, buf[0..try frame.writeHeaders(&buf, id, frame.flag.end_stream, "")]);
+        frame.writeHeader(buf[0..frame.header_len], @intCast(block.len), .continuation, frame.flag.end_headers, id);
+        try frames.appendSlice(a, buf[0..frame.header_len]);
+        try frames.appendSlice(a, block);
+        id += 2;
+    }
+    {
+        // Past the small gathering buffer, in three fragments (never
+        // indexed, so as large every round).
+        var block: std.ArrayList(u8) = .empty;
+        defer block.deinit(a);
+        const long: [3000]u8 = @splat('L');
+        for ([_]hpack.Field{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":path", .value = "/" },
+            .{ .name = "x-long", .value = &long },
+        }) |f| {
+            try block.ensureUnusedCapacity(a, f.value.len + 64);
+            block.items.len += try h.enc.encode(block.unusedCapacitySlice(), f.name, f.value, .{ .indexing = .never, .huffman = .never });
+        }
+        const third = block.items.len / 3;
+        try frames.appendSlice(a, buf[0..try frame.writeHeaders(&buf, id, frame.flag.end_stream, block.items[0..third])]);
+        for ([_][]const u8{ block.items[third .. 2 * third], block.items[2 * third ..] }, 0..) |part, k| {
+            frame.writeHeader(buf[0..frame.header_len], @intCast(part.len), .continuation, if (k == 1) frame.flag.end_headers else 0, id);
+            try frames.appendSlice(a, buf[0..frame.header_len]);
+            try frames.appendSlice(a, part);
+        }
+        id += 2;
+    }
     try h.feed(frames.items);
     return .{ .first = first, .count = (id - first) / 2, .bigs = bigs };
 }
@@ -3984,7 +4108,7 @@ test "stream states: from the worker's pool while open; an idle connection holds
         h.conn.releaseIfIdle(&h.pool);
         try testing.expectEqual(@as(u32, 0), h.conn.activeStreams());
         try testing.expectEqual(@as(usize, mix.count), std.mem.count(u8, h.events.items, "end=true"));
-        try testing.expectEqual(@as(usize, 20 * big.len + 100 * 13 + 3000 + 13), h.data_out.items.len);
+        try testing.expectEqual(@as(usize, 20 * big.len + 100 * 13 + 3000 + 3 * 13), h.data_out.items.len);
         h.events.clearRetainingCapacity();
         h.data_out.clearRetainingCapacity();
         h.out.clearRetainingCapacity();
@@ -3992,6 +4116,9 @@ test "stream states: from the worker's pool while open; an idle connection holds
         // the worker's pool (the tick keeps as many as were in use).
         try testing.expectEqual(held_new, heldBy(&conn_counting));
         try testing.expectEqual(@as(usize, 0), h.pool.h2_streams.in_use);
+        // No gathered block either (an empty first fragment took none).
+        try testing.expectEqual(@as(usize, 0), h.conn.hb_buf.capacity);
+        try testing.expectEqual(@as(usize, 0), h.pool.h2_blocks.in_use);
         h.pool.trim();
         try testing.expect(h.pool.h2_streams.free.len >= 20);
         // A state keeps small buffers only: the large ones went back to
@@ -4006,6 +4133,7 @@ test "stream states: from the worker's pool while open; an idle connection holds
     h.pool.trim();
     h.pool.trim();
     try testing.expect(!h.pool.h2_streams.holds());
+    try testing.expect(!h.pool.h2_blocks.holds());
     try testing.expectEqual(@as(usize, 0), h.pool.output_held.load(.monotonic));
 }
 
@@ -4963,25 +5091,74 @@ fn expectSameRun(a: *Harness, b: *Harness) !void {
 /// Both runs ended in a connection error. Output still queued for a
 /// stream then (behind other streams, or an exchange's answer not yet
 /// pumped) went out or not depending on where the input was split, as
-/// nothing follows the GOAWAY: the requests must be the same, and each
-/// stream's DATA in one run a prefix of the other's.
+/// nothing follows the GOAWAY: the requests and the GOAWAY must be the
+/// same, the streams of one run among the other's, and each stream's
+/// frames (DATA as runs) and bytes in one run the start of the other's.
 fn expectSameUntilFailure(a: *Harness, b: *Harness) !void {
     try testing.expect(a.conn.failed and b.conn.failed);
     try testing.expectEqualStrings(a.handler.log.items, b.handler.log.items);
     try testing.expectEqualStrings(a.handler.bodies.items, b.handler.bodies.items);
     try testing.expectEqualStrings(a.handler.ws_log.items, b.handler.ws_log.items);
+    try testing.expectEqualStrings(lastGoaway(a.events.items), lastGoaway(b.events.items));
+    const fewer, const more = if (a.per_stream.count() <= b.per_stream.count()) .{ a, b } else .{ b, a };
+    var ps = fewer.per_stream.iterator();
+    while (ps.next()) |entry| {
+        const other = more.per_stream.get(entry.key_ptr.*) orelse return error.MissingStream;
+        const x = try mergeData(entry.value_ptr.items);
+        defer testing.allocator.free(x);
+        const y = try mergeData(other.items);
+        defer testing.allocator.free(y);
+        try expectLinesAgree(x, y);
+    }
     var da = try dataByStream(a);
     defer freeDataMap(&da);
     var db = try dataByStream(b);
     defer freeDataMap(&db);
-    for ([_]*std.AutoHashMap(u32, std.ArrayList(u8)){ &da, &db }, [_]*std.AutoHashMap(u32, std.ArrayList(u8)){ &db, &da }) |x, y| {
-        var it = x.iterator();
-        while (it.next()) |e| {
-            const other = (y.get(e.key_ptr.*) orelse continue).items;
-            const mine = e.value_ptr.items;
-            const n = @min(mine.len, other.len);
-            try testing.expectEqualSlices(u8, mine[0..n], other[0..n]);
-        }
+    const df, const dm = if (da.count() <= db.count()) .{ &da, &db } else .{ &db, &da };
+    var it = df.iterator();
+    while (it.next()) |e| {
+        const other = (dm.get(e.key_ptr.*) orelse return error.MissingStream).items;
+        const mine = e.value_ptr.items;
+        const n = @min(mine.len, other.len);
+        try testing.expectEqualSlices(u8, mine[0..n], other[0..n]);
+    }
+}
+
+fn lastGoaway(events: []const u8) []const u8 {
+    var found: []const u8 = "";
+    var it = std.mem.splitScalar(u8, events, '\n');
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "goaway ")) found = line;
+    }
+    return found;
+}
+
+/// One stream's lines in two runs, one cut short: the same up to where the
+/// shorter ends, where its last DATA run may be shorter and not ended.
+fn expectLinesAgree(x: []const u8, y: []const u8) !void {
+    var xs = std.mem.splitScalar(u8, x, '\n');
+    var ys = std.mem.splitScalar(u8, y, '\n');
+    while (true) {
+        const lx = xs.next() orelse return;
+        const ly = ys.next() orelse return;
+        if (lx.len == 0 or ly.len == 0) return;
+        if (std.mem.eql(u8, lx, ly)) continue;
+        // Differing: only a cut DATA run, the last line of its run.
+        const short, const rest = if (xs.peek() == null or xs.peek().?.len == 0) .{ lx, ly } else .{ ly, lx };
+        const tail = if (short.ptr == lx.ptr) &xs else &ys;
+        if (tail.peek()) |n| try testing.expectEqual(@as(usize, 0), n.len);
+        try testing.expect(std.mem.startsWith(u8, short, "data ") and std.mem.startsWith(u8, rest, "data "));
+        try testing.expect(std.mem.endsWith(u8, short, "end=false"));
+        const len = struct {
+            fn of(line: []const u8) !usize {
+                const at = std.mem.indexOf(u8, line, "len=").? + 4;
+                const stop = std.mem.indexOfScalarPos(u8, line, at, ' ').?;
+                return std.fmt.parseInt(usize, line[at..stop], 10);
+            }
+        }.of;
+        try testing.expectEqualStrings(short[0..std.mem.indexOf(u8, short, " len=").?], rest[0..std.mem.indexOf(u8, rest, " len=").?]);
+        try testing.expect(try len(short) < try len(rest));
+        return;
     }
 }
 
@@ -5378,11 +5555,13 @@ fn sharedConversation(pick: Pick) !void {
     var refs: [3]*Harness = undefined;
     var nrefs: usize = 0;
     defer for (refs[0..nrefs]) |r| r.deinit();
-    while (nrefs < refs.len) : (nrefs += 1) {
-        refs[nrefs] = try Harness.init(opts);
-        refs[nrefs].handler.big = big;
-        try refs[nrefs].feed(scripts[nrefs]);
-        try answerExchanges(refs[nrefs]);
+    while (nrefs < refs.len) {
+        const r = try Harness.init(opts);
+        refs[nrefs] = r;
+        nrefs += 1;
+        r.handler.big = big;
+        try r.feed(scripts[nrefs - 1]);
+        try answerExchanges(r);
     }
     // Interleaved on one pool, split where the fuzzer says, with ticks.
     const owner = try Harness.init(opts);
@@ -5390,9 +5569,10 @@ fn sharedConversation(pick: Pick) !void {
     var conns: [3]*Harness = undefined;
     var nconns: usize = 0;
     defer for (conns[0..nconns]) |c| c.deinit();
-    while (nconns < conns.len) : (nconns += 1) {
+    while (nconns < conns.len) {
         conns[nconns] = try Harness.share(owner, opts);
-        conns[nconns].handler.big = big;
+        nconns += 1;
+        conns[nconns - 1].handler.big = big;
     }
     var rests: [3][]const u8 = .{ scripts[0], scripts[1], scripts[2] };
     var rounds: usize = 0;

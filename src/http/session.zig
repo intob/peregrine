@@ -176,14 +176,17 @@ pub const BufferPool = struct {
     /// HTTP/2 stream states: taken when a stream opens and given back
     /// when it closes, so a connection holds only its open streams'.
     h2_streams: Recycling(*H2Stream) = .{},
-    /// HTTP/2 header blocks split over CONTINUATIONs, gathered (sized by
-    /// the first connection).
+    /// The start of HTTP/2 header blocks split over CONTINUATIONs (small;
+    /// larger blocks move to the large-buffer cache; sized by the first
+    /// connection).
     h2_blocks: Recycler = .{},
     /// Scratch for HTTP/2 field blocks, used only inside one call: the
     /// response block being encoded, the field being decoded. Made by
     /// the first connection (`h2.Conn.init`); the trim takes `h2_enc` back
-    /// to `h2_enc_kept` after a larger block.
+    /// to `h2_enc_kept` after a second without a larger block.
     h2_enc: std.ArrayList(u8) = .empty,
+    /// The largest block encoded since the last trim.
+    h2_enc_peak: usize = 0,
     h2_dec: []u8 = &.{},
     /// Output buffers and stream states held or kept, as of the last
     /// trim, for other threads (tests) to read.
@@ -254,14 +257,20 @@ pub const BufferPool = struct {
         self.out_large.trim(self.allocator);
         self.h2_streams.trim(self.allocator);
         self.h2_blocks.trim(self.allocator);
-        if (self.h2_enc.capacity > h2_enc_kept) {
+        if (self.h2_enc.capacity > h2_enc_kept and self.h2_enc_peak <= h2_enc_kept) {
             // Empty outside a call. Failing, encoding grows it again.
             self.h2_enc.clearAndFree(self.allocator);
             self.h2_enc.ensureTotalCapacityPrecise(self.allocator, h2_enc_kept) catch {};
         }
+        self.h2_enc_peak = 0;
         const held = self.out_small.in_use + self.out_small.free.len + self.out_large.in_use + self.out_large.free.len +
             self.h2_streams.in_use + self.h2_streams.free.len + self.h2_blocks.in_use + self.h2_blocks.free.len;
         self.output_held.store(held, .release);
+    }
+
+    /// An HTTP/2 field block was encoded in `h2_enc` (for the trim).
+    pub inline fn noteEncoded(self: *Self) void {
+        self.h2_enc_peak = @max(self.h2_enc_peak, self.h2_enc.items.len);
     }
 
     /// Output buffers or stream states are held or kept: the worker must

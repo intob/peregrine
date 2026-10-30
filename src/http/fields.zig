@@ -316,6 +316,13 @@ pub const TrailerStore = struct {
     fault: bool = false,
 
     pub fn header(self: *TrailerStore, name: []const u8, val: []const u8) !void {
+        if (!self.accepts(name, val)) return;
+        try self.buf.ensureUnusedCapacity(self.allocator, name.len + val.len);
+        self.storeAssumeCapacity(name, val);
+    }
+
+    /// Checks a trailer (setting `fault`): whether it is to be stored.
+    pub fn accepts(self: *TrailerStore, name: []const u8, val: []const u8) bool {
         if (name.len == 0 or name[0] == ':') self.fault = true;
         for (name) |c| {
             if (c >= 'A' and c <= 'Z' or !isTokenChar(c)) self.fault = true;
@@ -324,9 +331,12 @@ pub const TrailerStore = struct {
             if (c == 0 or c == '\r' or c == '\n') self.fault = true;
         }
         if (val.len > 0 and (val[0] == ' ' or val[0] == '\t' or val[val.len - 1] == ' ' or val[val.len - 1] == '\t')) self.fault = true;
-        if (self.fault or self.count.* >= self.refs.len) return;
+        return !self.fault and self.count.* < self.refs.len;
+    }
+
+    /// Stores an accepted trailer; `buf` has room for it.
+    pub fn storeAssumeCapacity(self: *TrailerStore, name: []const u8, val: []const u8) void {
         const off = self.buf.items.len;
-        try self.buf.ensureUnusedCapacity(self.allocator, name.len + val.len);
         self.buf.appendSliceAssumeCapacity(name);
         self.buf.appendSliceAssumeCapacity(val);
         self.refs[self.count.*] = .{ .name_off = @intCast(off), .name_len = @intCast(name.len), .value_len = @intCast(val.len) };

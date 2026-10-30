@@ -374,9 +374,14 @@ class Client:
             self.conn.send_headers(sid, head, end_stream=kind != 'e' or (length == 0 and not trailers))
             await self.flush()
         if kind == 'e' and (length > 0 or trailers):
-            if not await self.upload(sid, s, pattern[off:off + length], [('x-off', str(off))] if trailers else None):
+            why = await self.upload(sid, s, pattern[off:off + length], [('x-off', str(off))] if trailers else None)
+            if why is not None:
                 del self.streams[sid]
-                return
+                # The server answers /e only after the whole body: a stream
+                # that ends first is its bug, unless the connection went.
+                if self.aborting or self.goaway or self.closed.done():
+                    return
+                return fail(f'POST {path}: ended during the upload: {why} (slow={self.slow} window={self.window})')
         res = await s.done
         del self.streams[sid]
         if res in ('reset', 'closed') or self.aborting or self.goaway:
@@ -407,12 +412,14 @@ class Client:
 
     async def upload(self, sid, s, body, trailers):
         """Sends a request body as the windows allow, then trailers or
-        END_STREAM. False if the stream or connection ended first."""
+        END_STREAM. None once sent, else why it stopped."""
         pos = 0
         while True:
             async with self.lock:
-                if s.done.done() or self.closed.done() or self.goaway:
-                    return False
+                if self.closed.done() or self.goaway:
+                    return 'connection ended'
+                if s.done.done():
+                    return f'stream {s.done.result()} at {pos} of {len(body)}'
                 try:
                     room = min(self.conn.local_flow_control_window(sid), self.conn.max_outbound_frame_size)
                     if room > 0 and pos < len(body):
@@ -425,10 +432,10 @@ class Client:
                         elif body:
                             self.conn.end_stream(sid)
                 except h2.exceptions.StreamClosedError:
-                    return False
+                    return f'stream closed at {pos} of {len(body)}' + (f' ({s.done.result()})' if s.done.done() else '')
                 await self.flush()
                 if pos == len(body):
-                    return True
+                    return None
             await asyncio.sleep(0.002 if room <= 0 else 0)
 
     async def websocket(self):
