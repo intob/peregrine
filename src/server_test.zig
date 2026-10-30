@@ -5210,6 +5210,51 @@ fn testHttp3PmtuInterface(backend: Backend) !void {
     try testing.expect(cl.c.largest_datagrams > 16);
 }
 
+test "verify PMTU: the server takes datagrams up to the max_udp_payload_size it advertises (2048), drops larger ones" {
+    try forEachBackend(testHttp3RecvSize);
+}
+
+fn testHttp3RecvSize(backend: Backend) !void {
+    var cfg = tlsConfig();
+    cfg.http3 = .{};
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    var cl = try H3Client.connect(r.srv.getQuicPort());
+    defer cl.close();
+    try cl.start();
+    const advertised = cl.c.serverParam(0x03) orelse return error.NoMaxUdpPayloadSize;
+    var rd: quic_packet.Reader = .{ .data = advertised };
+    try testing.expectEqual(@as(u64, 2048), try rd.varint());
+    // At the limit, every 1-RTT datagram of ours (requests, ACKs).
+    for ([_]usize{ 1500, 2000, 2048 }) |size| {
+        cl.c.pad_to = size;
+        const id = try cl.request("GET", "/", "");
+        try cl.waitFinished(&.{id});
+        var a = try cl.response(id);
+        defer a.body.deinit(testing.allocator);
+        try testing.expectEqualStrings("200", &a.status);
+    }
+    // Larger: cut short by the receive buffer, so dropped (their packets
+    // don't authenticate); nothing breaks, and the connection carries on
+    // once our datagrams fit again.
+    const max: usize = if (sys.is_linux) 65507 else 9216;
+    for ([_]usize{ 2049, 2100, 4096, max }) |size| {
+        cl.c.pad_to = size;
+        const id = try cl.request("GET", "/", "");
+        try testing.expectError(error.Timeout, cl.runUntil(300, id, struct {
+            fn f(i: u64, h: *H3Client) bool {
+                return h.c.finished(i);
+            }
+        }.f));
+        cl.c.pad_to = 0;
+        try cl.c.retransmit();
+        try cl.waitFinished(&.{id});
+        var a = try cl.response(id);
+        defer a.body.deinit(testing.allocator);
+        try testing.expectEqualStrings("200", &a.status);
+    }
+}
+
 test "verify ECN: HTTP/3 on an IPv6 address: IPv6 clients, and IPv4 ones through a dual-stack socket" {
     try forEachBackend(testHttp3EcnIpv6);
 }

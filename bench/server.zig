@@ -4,7 +4,7 @@
 //! plaintext HTTP/1.1), and `/ws`, a WebSocket echo (HTTP/1.1 Upgrade, or
 //! extended CONNECT on HTTP/2 and HTTP/3); request bodies are read and
 //! discarded.
-//! Usage: bench-server [workers] [auto|epoll|io_uring] [port] [tls|h3|plain] [stream] [rsa] [noktls] [0rtt] [sni] [deflate] [nopace] [noecn] [mtu=N]
+//! Usage: bench-server [workers] [auto|epoll|io_uring] [port] [tls|h3|plain] [stream] [rsa] [noktls] [0rtt] [sni] [deflate] [nopace] [noecn] [mtu=N] [ip=ADDR]
 //! With `tls`, serves TLS 1.3 with the self-signed P-256 certificate in
 //! this directory (`rsa`: the RSA-2048 one), with ALPN "h2" and
 //! "http/1.1"; `h3` adds HTTP/3 on the
@@ -19,7 +19,9 @@
 //! compressed (`deflate-nct`: and clients are asked not to use context
 //! takeover). With `nopace`, HTTP/3 sends without pacing; with `noecn`,
 //! without ECN (no codepoints read or marked); `mtu=N` sets HTTP/3's PMTU
-//! discovery ceiling (`Http3Options.max_mtu`, 1500 by default; 0: off).
+//! discovery ceiling (`Http3Options.max_mtu`, 1500 by default; 0: off);
+//! `ip=ADDR` the address to listen on (0.0.0.0 by default; `ip=::` for
+//! IPv6 and, on Linux, IPv4-mapped clients on the same sockets).
 const std = @import("std");
 const per = @import("peregrine");
 
@@ -125,6 +127,7 @@ fn serve(comptime H: type, args: []const [:0]const u8) !void {
     var pacing = true;
     var ecn = true;
     var max_mtu: u16 = 1500;
+    var ip: []const u8 = "0.0.0.0";
     for (args[@min(args.len, 5)..]) |arg| {
         if (std.mem.eql(u8, arg, "deflate")) ws_deflate = .{};
         if (std.mem.eql(u8, arg, "deflate-nct")) ws_deflate = .{ .client_no_context_takeover = true };
@@ -135,8 +138,10 @@ fn serve(comptime H: type, args: []const [:0]const u8) !void {
         if (std.mem.eql(u8, arg, "nopace")) pacing = false;
         if (std.mem.eql(u8, arg, "noecn")) ecn = false;
         if (std.mem.startsWith(u8, arg, "mtu=")) max_mtu = try std.fmt.parseInt(u16, arg[4..], 10);
+        if (std.mem.startsWith(u8, arg, "ip=")) ip = arg[3..];
     }
     const srv = try per.Server(H).init(std.heap.smp_allocator, port, .{
+        .ip = ip,
         .worker_thread_count = workers,
         .backend = backend,
         .h2c = true,

@@ -119,6 +119,9 @@ pub const Client = struct {
     /// The largest datagram received, and how many of that size.
     largest_datagram: usize = 0,
     largest_datagrams: u64 = 0,
+    /// 1-RTT datagrams are padded (PADDING frames) to this many bytes;
+    /// 0: not padded.
+    pad_to: usize = 0,
 
     pub fn init(a: Allocator, opts: Options) !*Self {
         const self = try a.create(Self);
@@ -548,7 +551,8 @@ pub const Client = struct {
             const sp = &self.spaces[idx];
             if (sp.tx == null) continue;
             if (idx == 2 and !self.handshake_complete) continue;
-            const n = try self.buildPacket(idx, out[pos..@min(out.len, 1350)]);
+            const cap = if (idx == 2 and self.pad_to > 0) out.len else @min(out.len, 1350);
+            const n = try self.buildPacket(idx, out[pos..cap]);
             if (n > 0 and idx == 0) has_initial = true;
             pos += n;
         }
@@ -642,6 +646,10 @@ pub const Client = struct {
         const pn_offset = o.pos;
         o.int(u16, @truncate(pn));
         o.bytes(w.written());
+        if (idx == 2 and self.pad_to > o.pos + 16 and self.pad_to <= out.len) {
+            @memset(out[o.pos .. self.pad_to - 16], 0);
+            o.pos = self.pad_to - 16;
+        }
         const end = o.pos + 16;
         sp.tx.?.protect(out[0..end], pn_offset, pn_len, pn);
         return end;

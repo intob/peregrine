@@ -2614,6 +2614,78 @@ test "verify PMTU: random paths, limits, losses and changes: every download comp
     }
 }
 
+/// A download whose path changes at fixed points: each step at a quarter
+/// more of the body, the limit changes (and, with `ku`, the client
+/// initiates a key update, as soon as the last one is complete: RFC 9001
+/// §6.5, which the test client doesn't track itself; with `rebind`, the
+/// client's address changes).
+const Flapping = struct {
+    id: u64,
+    total: usize,
+    limits: []const usize,
+    step: usize = 0,
+    ku: bool = false,
+    ku_pending: u32 = 0,
+    key_updates: u32 = 0,
+    rebind: bool = false,
+
+    fn done(c: *Flapping, h: *Harness) bool {
+        const got = h.client.readAll(c.id).len;
+        while (c.step < c.limits.len and got >= c.total * (c.step + 1) / (c.limits.len + 1)) : (c.step += 1) {
+            h.path_max = c.limits[c.step];
+            if (c.ku) c.ku_pending += 1;
+            if (c.rebind) h.server.?.onPathChange(h.now, h.ipv6, true);
+        }
+        const s = h.server.?;
+        if (c.ku_pending > 0 and s.tx_phase == h.client.key_phase and s.tx_phase_acked) {
+            c.ku_pending -= 1;
+            c.key_updates += 1;
+            h.client.initiateKeyUpdate();
+            h.client.followKeyUpdate();
+        }
+        return finishedAndSearched(c.id, h);
+    }
+};
+
+test "verify PMTU: a path flapping between sizes mid-download, with key updates and rebinding: completes, sizes within the path" {
+    const seqs = [_][]const usize{
+        &.{ 1300, 1500, 1252, 9000, 1350, 1500, 1232 },
+        &.{ 1232, 1500, 1232, 1500, 1232 },
+        &.{ 1472, 1471, 1300, 1299, 1500 },
+    };
+    for (seqs) |limits| {
+        for ([_]bool{ false, true }) |ku| {
+            for ([_]bool{ false, true }) |rebind| {
+                for ([_]Path{ .{ .delay = 10_000 }, .{ .delay = 15_000, .jitter = 3_000, .loss = 2 } }) |path| {
+                    const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20 }, pmtuOn);
+                    defer h.deinit();
+                    try runPath(h, path, {}, established);
+                    const id = try h.client.openBidi();
+                    try h.client.write(id, "big 3000000", true);
+                    var f: Flapping = .{ .id = id, .total = 3_000_000, .limits = limits, .ku = ku, .rebind = rebind };
+                    const start = h.now;
+                    runPath(h, path, &f, Flapping.done) catch |err| {
+                        const sv = h.server.?;
+                        std.debug.print("limits {any} ku {} rebind {} path {any}: {s} at step {d}, got {d}; server tx {d} rx {d} acked {} max {d} bh {d} pto {d}; client tx {d} rx {d}\n", .{ limits, ku, rebind, path, @errorName(err), f.step, h.client.readAll(id).len, sv.tx_phase, sv.rx_phase, sv.tx_phase_acked, sv.max_datagram, sv.pmtu.black_holes, sv.pto_count, h.client.key_phase, h.client.rx_phase });
+                        return err;
+                    };
+                    try expectBody(h, id, 3_000_000);
+                    if (ku) try testing.expect(f.key_updates >= 2);
+                    const s = h.server.?;
+                    const last = limits[limits.len - 1];
+                    try testing.expect(s.max_datagram <= @min(last, 1472));
+                    try testing.expectEqual(@as(u64, s.max_datagram), s.cc.mss);
+                    try testing.expectEqual(liveInFlight(s), s.cc.in_flight);
+                    if (h.now - start > 60 * std.time.us_per_s) {
+                        std.debug.print("limits {any} ku {} rebind {} path {any}: {d} ms\n", .{ limits, ku, rebind, path, (h.now - start) / 1000 });
+                        return error.TooSlow;
+                    }
+                }
+            }
+        }
+    }
+}
+
 test "verify PMTU: a stale probe acknowledged with the current one doesn't hide the current one's acknowledgment" {
     // NAT rebinding while a probe is in flight: the search restarts and
     // sends a new probe; the client gets both and acknowledges them in
