@@ -168,6 +168,17 @@ const TestHandler = struct {
             }
         } else if (std.mem.eql(u8, data, "close-me")) {
             conn.close(1000, "bye") catch unreachable;
+        } else if (std.mem.eql(u8, data, "async-big")) {
+            // A large message from another thread, sent while the
+            // connection's receive is armed (input may be answered while
+            // it is written).
+            const t = std.Thread.spawn(.{}, struct {
+                fn run(c: *ws.Conn) void {
+                    sleepMs(20);
+                    c.send(&big_body, true) catch unreachable;
+                }
+            }.run, .{conn}) catch unreachable;
+            t.detach();
         } else if (std.mem.eql(u8, data, "async")) {
             // Sends from another thread must wake the owning worker.
             const t = std.Thread.spawn(.{}, struct {
@@ -225,6 +236,23 @@ const TestHandler = struct {
                 ex.write("part3") catch unreachable;
                 ex.finish(&.{.{ .key = "x-trailer", .value = "end" }}) catch unreachable;
             },
+            'b' => {
+                // All of big_body, streamed from this thread.
+                ex.startStream(.{}) catch unreachable;
+                var off: usize = 0;
+                while (off < big_body_len) {
+                    const n = @min(big_body_len - off, 256 * 1024);
+                    ex.writeBorrowed(big_body[off..][0..n], null) catch |err| switch (err) {
+                        error.WouldBlock => {
+                            sleepMs(2);
+                            continue;
+                        },
+                        else => return,
+                    };
+                    off += n;
+                }
+                ex.finish(&.{}) catch {};
+            },
             else => unreachable,
         }
     }
@@ -250,6 +278,12 @@ const TestHandler = struct {
                 else
                     .none,
             }) catch unreachable;
+            return;
+        }
+        if (std.mem.eql(u8, path, "/later-big")) {
+            const ex = resp.later() catch unreachable;
+            const t = std.Thread.spawn(.{}, laterThread, .{ self, ex, @as(u8, 'b') }) catch unreachable;
+            t.detach();
             return;
         }
         if (std.mem.eql(u8, path, "/later") or std.mem.eql(u8, path, "/later-stream")) {
@@ -2447,6 +2481,11 @@ const TlsAlpnClient = struct {
     in_end: usize = 0,
     /// Application data opened and not yet read.
     plain: []const u8 = &.{},
+    /// Application traffic secrets, for KeyUpdates.
+    tx_secret: ks.Secret = undefined,
+    rx_secret: ks.Secret = undefined,
+    /// KeyUpdates received from the server.
+    key_updates: usize = 0,
 
     const Keys = struct {
         key: [Aes.key_length]u8,
@@ -2581,8 +2620,10 @@ const TlsAlpnClient = struct {
                         const fin = [4]u8{ 20, 0, 0, 32 } ++ ks.finishedVerifyData(c_hs, &th);
                         var hs_tx: Keys = .init(c_hs);
                         self.finished_len = hs_tx.seal(&self.finished, 22, &fin).len;
-                        self.tx = .init(ks.deriveSecret(master, "c ap traffic", &th));
-                        self.rx = .init(ks.deriveSecret(master, "s ap traffic", &th));
+                        self.tx_secret = ks.deriveSecret(master, "c ap traffic", &th);
+                        self.rx_secret = ks.deriveSecret(master, "s ap traffic", &th);
+                        self.tx = .init(self.tx_secret);
+                        self.rx = .init(self.rx_secret);
                         return self;
                     }
                     std.mem.copyForwards(u8, msgs[0 .. msgs_len - used], msgs[used..msgs_len]);
@@ -2657,13 +2698,44 @@ const TlsAlpnClient = struct {
         try self.tcp.send(out[0..n]);
     }
 
+    /// Our KeyUpdate (asking for the server's if `requested`), then our
+    /// next key.
+    fn keyUpdate(self: *TlsAlpnClient, requested: bool) !void {
+        var out: [128]u8 = undefined;
+        var n = self.finished_len;
+        @memcpy(out[0..n], self.finished[0..n]);
+        self.finished_len = 0;
+        n += self.tx.seal(out[n..], 22, &.{ 24, 0, 0, 1, @intFromBool(requested) }).len;
+        try self.tcp.send(out[0..n]);
+        self.tx_secret = ks.nextTrafficSecret(self.tx_secret);
+        self.tx = .init(self.tx_secret);
+    }
+
+    /// Exactly `out.len` bytes of application data.
+    fn readExact(self: *TlsAlpnClient, out: []u8) !void {
+        var got: usize = 0;
+        while (got < out.len) {
+            const n = try self.read(out[got..]);
+            if (n == 0) return error.EndOfStream;
+            got += n;
+        }
+    }
+
     /// Application data into `buf`; 0 at the server's close_notify.
     fn read(self: *TlsAlpnClient, buf: []u8) !usize {
         while (self.plain.len == 0) {
             const r = try self.rx.open(try self.nextRecord());
             switch (r.ty) {
                 23 => self.plain = r.data,
-                22 => {}, // NewSessionTicket
+                22 => {
+                    // NewSessionTicket, or the server's KeyUpdate (which
+                    // ends its record): the next record has the next key.
+                    if (r.data.len == 5 and r.data[0] == 24) {
+                        self.rx_secret = ks.nextTrafficSecret(self.rx_secret);
+                        self.rx = .init(self.rx_secret);
+                        self.key_updates += 1;
+                    }
+                },
                 21 => return 0,
                 else => return error.UnexpectedRecord,
             }
@@ -3594,6 +3666,287 @@ test "io_uring: receives fall back to pooled buffers while the ring is empty" {
         worker_uring.test_ring_buffers = 2;
         inline for (.{ testPipelinedBurst, testKeepAlive, testUploads, testUploadHold }) |f| try f(.io_uring);
     } else return error.SkipZigTest;
+}
+
+test "io_uring: the rest of the suite with the ring at 0, 1 and 2 buffers" {
+    if (sys.is_linux) {
+        const worker_uring = @import("./http/worker_uring.zig");
+        if (!worker_uring.available()) return error.SkipZigTest;
+        defer worker_uring.test_ring_buffers = null;
+        inline for (.{ 0, 1, 2 }) |count| {
+            worker_uring.test_ring_buffers = count;
+            inline for (.{
+                testLargeResponses,           testFiles,                  testMalformed,     testHttp10,
+                testStream,                   testStreamBackpressure,     testUploadHold,    testWebSocketErrors,
+                testWebSocketSlowReader,      testH2FirstWrite,           testH2LargeBodies, testH2Goaway,
+                testH2ClientGoaway,           testH2ShutdownStuck,        testH2OutputFreed, testTlsSni,
+                testTlsFinishedWithData,      testTlsPlaintextRejected,   testShutdown,      testTlsKeyUpdateDuringSend,
+                testH2TlsKeyUpdateDuringSend, testTlsBadRecordDuringSend, testTlsLingering,  testH2FirstWriteVariants,
+                testIdleAcrossTicks,
+            }) |f| try f(.io_uring);
+            if (count != 0) {
+                inline for (.{
+                    testKeepAlive,    testPipelinedBurst, testLater,        testUploads,   testLingering,
+                    testWebSocket,    testH2Streams,      testH2Exchanges,  testH2Uploads, testH2WebSocket,
+                    testTlsKeepAlive, testTlsUpload,      testTlsWebSocket,
+                }) |f| try f(.io_uring);
+            }
+        }
+    } else return error.SkipZigTest;
+}
+
+/// A connected TLS client (no ALPN) that has upgraded to a WebSocket.
+fn tlsWsClient(port: u16) !*TlsAlpnClient {
+    const t = try TlsAlpnClient.connect(port, null);
+    errdefer t.close();
+    try t.send(Client.upgrade_request);
+    var buf: [4096]u8 = undefined;
+    const got = try t.readUntil(&buf, "\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 101 "));
+    try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\n"));
+    return t;
+}
+
+test "tls: a KeyUpdate asked for while a large WebSocket send is in flight" {
+    try forEachBackend(testTlsKeyUpdateDuringSend);
+}
+
+fn testTlsKeyUpdateDuringSend(backend: Backend) !void {
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    const r = try Running.start(backend, tlsConfig());
+    defer r.stop();
+    const len = big_body_len;
+    const payload = try testing.allocator.alloc(u8, len);
+    defer testing.allocator.free(payload);
+    for (0..4) |round| {
+        const t = try tlsWsClient(r.port);
+        defer t.close();
+        var frame: [64]u8 = undefined;
+        // The message (8 MiB) goes out from another thread (the receive is
+        // armed meanwhile) and fills the socket buffers: its write is in
+        // flight when the KeyUpdate request comes. The answer is sealed after the bytes
+        // being written, under the old key; what follows under the new.
+        try t.send(Client.wsFrame(&frame, true, .text, "async-big"));
+        sleepMs(60 + 30 * @as(u64, round));
+        try t.keyUpdate(true);
+        // Twice in some rounds: the second answer while the first is
+        // still queued behind the write.
+        if (round % 2 == 1) {
+            sleepMs(10);
+            try t.keyUpdate(true);
+        }
+        var hdr: [10]u8 = undefined;
+        try t.readExact(&hdr);
+        try testing.expectEqual(@as(u8, 0x82), hdr[0]);
+        try testing.expectEqual(@as(u8, 127), hdr[1]);
+        try testing.expectEqual(@as(u64, len), std.mem.readInt(u64, hdr[2..10], .big));
+        try t.readExact(payload);
+        try testing.expect(std.mem.eql(u8, big_body[0..len], payload));
+        // In step both ways under the new keys.
+        try t.send(Client.wsFrame(&frame, true, .text, "hello"));
+        var echo: [7]u8 = undefined;
+        try t.readExact(&echo);
+        try testing.expectEqualSlices(u8, "\x81\x05hello", &echo);
+        try testing.expectEqual(@as(usize, if (round % 2 == 1) 2 else 1), t.key_updates);
+    }
+}
+
+test "tls: h2, a KeyUpdate asked for while a large response from another thread is written" {
+    try forEachBackend(testH2TlsKeyUpdateDuringSend);
+}
+
+fn testH2TlsKeyUpdateDuringSend(backend: Backend) !void {
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    var cfg = tlsConfig();
+    cfg.tls.?.alpn = &.{ "h2", "http/1.1" };
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    for (0..2) |round| {
+        const c = try H2Client.open(r.port, true);
+        defer c.close();
+        // Windows wide open: flow control doesn't stop the server, the
+        // socket does.
+        var buf: [256]u8 = undefined;
+        var n = h2frame.preface.len;
+        @memcpy(buf[0..n], h2frame.preface);
+        n += try h2frame.writeSettings(buf[n..], &.{ .{ .id = .max_concurrent_streams, .value = 100 }, .{ .id = .initial_window_size, .value = 0x7fffffff } });
+        n += try h2frame.writeWindowUpdate(buf[n..], 0, 0x7fffffff - 65535);
+        try c.send(buf[0..n]);
+        try c.request(1, "GET", "/later-big", null);
+        sleepMs(80 + 40 * @as(u64, round));
+        try c.tls.?.keyUpdate(true);
+        var reply: H2Client.Reply = .{};
+        defer reply.deinit();
+        var map = std.AutoHashMap(u31, *H2Client.Reply).init(testing.allocator);
+        defer map.deinit();
+        try map.put(1, &reply);
+        try testing.expectEqual(@as(?h2frame.ErrorCode, null), try c.collect(&map));
+        try testing.expectEqual(@as(u16, 200), reply.status);
+        try testing.expectEqual(@as(usize, big_body_len), reply.body.items.len);
+        try testing.expect(std.mem.eql(u8, &big_body, reply.body.items));
+        // Answered by now (epoll reads it once the response is written).
+        var again: H2Client.Reply = .{};
+        defer again.deinit();
+        try c.fetch(3, "GET", "/h2", null, &again);
+        try testing.expectEqualStrings("ok", again.body.items);
+        try testing.expectEqual(@as(usize, 1), c.tls.?.key_updates);
+    }
+}
+
+test "tls: a bad record while a large send is in flight closes that connection only" {
+    try forEachBackend(testTlsBadRecordDuringSend);
+}
+
+fn testTlsBadRecordDuringSend(backend: Backend) !void {
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    const r = try Running.start(backend, tlsConfig());
+    defer r.stop();
+    for (0..3) |round| {
+        const t = try tlsWsClient(r.port);
+        defer t.close();
+        var frame: [64]u8 = undefined;
+        try t.send(Client.wsFrame(&frame, true, .text, "async-big"));
+        sleepMs(60 + 30 * @as(u64, round));
+        // A record that doesn't decrypt (bad_record_mac).
+        var bad: [5 + 40]u8 = @splat(0x5a);
+        bad[0..5].* = .{ 23, 3, 3, 0, 40 };
+        try t.tcp.send(&bad);
+        // Whatever arrives ends: an alert, EOF or a reset.
+        var sink: [64 * 1024]u8 = undefined;
+        while (true) {
+            const got = t.read(&sink) catch break;
+            if (got == 0) break;
+        }
+    }
+    // The worker goes on.
+    const t = try tlsWsClient(r.port);
+    defer t.close();
+    var frame: [64]u8 = undefined;
+    try t.send(Client.wsFrame(&frame, true, .text, "hello"));
+    var echo: [7]u8 = undefined;
+    try t.readExact(&echo);
+    try testing.expectEqualSlices(u8, "\x81\x05hello", &echo);
+}
+
+test "tls: error response survives an ongoing upload (lingering close)" {
+    try forEachBackend(testTlsLingering);
+}
+
+fn testTlsLingering(backend: Backend) !void {
+    var cfg = tlsConfig();
+    cfg.limits = .{ .max_body_size = 1024 };
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    const body = try testing.allocator.alloc(u8, 256 * 1024);
+    defer testing.allocator.free(body);
+    @memset(body, 'u');
+    for (0..3) |_| {
+        const t = try TlsAlpnClient.connect(r.port, null);
+        defer t.close();
+        try t.send("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 4194304\r\n\r\n");
+        try t.send(body);
+        sleepMs(20);
+        var buf: [4096]u8 = undefined;
+        const got = try t.readUntil(&buf, "\r\n\r\n");
+        try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 413 "));
+        // The rest of the response, then close_notify.
+        while (try t.read(&buf) != 0) {}
+        // Then a clean EOF (FIN), not ECONNRESET.
+        try testing.expectEqual(@as(usize, 0), try sys.read(t.tcp.fd, &buf));
+    }
+}
+
+test "h2: frames in the preface's write: a body, GOAWAY, a bad frame, more than a read buffer" {
+    try forEachBackend(testH2FirstWriteVariants);
+}
+
+fn testH2FirstWriteVariants(backend: Backend) !void {
+    var cfg = tlsConfig();
+    cfg.tls.?.alpn = &.{ "h2", "http/1.1" };
+    const rt = try Running.start(backend, cfg);
+    defer rt.stop();
+    const rp = try Running.start(backend, h2Config());
+    defer rp.stop();
+    const a = testing.allocator;
+    const body = try a.alloc(u8, 60 * 1024);
+    defer a.free(body);
+    for (body, 0..) |*b, i| b.* = @truncate(i *% 13);
+    for ([_]bool{ false, true }) |tls| {
+        const port = if (tls) rt.port else rp.port;
+        for (0..4) |variant| {
+            const c = try H2Client.open(port, tls);
+            defer c.close();
+            c.quiet = true;
+            const out = try a.alloc(u8, 256 * 1024);
+            defer a.free(out);
+            var n = h2frame.preface.len;
+            @memcpy(out[0..n], h2frame.preface);
+            n += (try H2Client.settings(out[n..])).len;
+            var streams: u31 = 1;
+            switch (variant) {
+                // A request with a body larger than a read buffer.
+                0 => {
+                    n += (try c.headers(out[n..], 1, "POST", "/echo", false)).len;
+                    var rest: []const u8 = body;
+                    while (rest.len > 0) {
+                        const k = @min(rest.len, 16384);
+                        n += try h2frame.writeData(out[n..], 1, k == rest.len, rest[0..k]);
+                        rest = rest[k..];
+                    }
+                },
+                // A request, then GOAWAY: answered, then closed.
+                1 => {
+                    n += (try c.headers(out[n..], 1, "GET", "/first", true)).len;
+                    n += try h2frame.writeGoaway(out[n..], 0, .no_error, "");
+                },
+                // Many requests, more than a read buffer's worth.
+                2 => {
+                    streams = 99;
+                    var id: u31 = 1;
+                    while (id <= streams) : (id += 2) n += (try c.headers(out[n..], id, "GET", "/x", true)).len;
+                    var pad: [8000]u8 = undefined;
+                    @memset(&pad, 0);
+                    // Unknown frames (type 0x20) are ignored: padding.
+                    for (0..3) |_| {
+                        out[n..][0..9].* = .{ 0, 0x1f, 0x40, 0x20, 0, 0, 0, 0, 0 };
+                        n += 9;
+                        @memcpy(out[n..][0..8000], &pad);
+                        n += 8000;
+                    }
+                },
+                // A request, then a frame that is a connection error.
+                3 => {
+                    n += (try c.headers(out[n..], 1, "GET", "/first", true)).len;
+                    n += try h2frame.writeData(out[n..], 0, false, "x");
+                },
+                else => unreachable,
+            }
+            try c.send(out[0..n]);
+            var replies: [50]H2Client.Reply = @splat(.{});
+            defer for (&replies) |*rep| rep.deinit();
+            var map = std.AutoHashMap(u31, *H2Client.Reply).init(a);
+            defer map.deinit();
+            var id: u31 = 1;
+            while (id <= streams) : (id += 2) try map.put(id, &replies[id / 2]);
+            const code = c.collect(&map) catch |err| switch (err) {
+                error.EndOfStream => if (variant == 1 or variant == 3) null else return err,
+                else => return err,
+            };
+            switch (variant) {
+                0 => {
+                    try testing.expectEqual(@as(?h2frame.ErrorCode, null), code);
+                    try testing.expectEqualSlices(u8, body, replies[0].body.items);
+                },
+                1 => try testing.expectEqualStrings("ok", replies[0].body.items),
+                2 => {
+                    try testing.expectEqual(@as(?h2frame.ErrorCode, null), code);
+                    for (replies) |rep| try testing.expectEqualStrings("ok", rep.body.items);
+                },
+                3 => try testing.expectEqual(@as(?h2frame.ErrorCode, .protocol_error), code),
+                else => unreachable,
+            }
+        }
+    }
 }
 
 /// HTTP/1.1, HTTP/2 and WebSocket connections used, left idle across two
