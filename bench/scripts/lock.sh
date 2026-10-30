@@ -47,6 +47,19 @@ next_ticket() {
     echo $n
 }
 
+# The share NAME held by this caller or a process it runs under, if any. A
+# script holding a share that runs another script which shares too (gates.sh
+# → linux-test.sh) must not queue again: behind a waiting benchmark, which
+# waits for the outer share to go, the two would wait for each other forever.
+held_share() {
+    local p=$PPID
+    while [ -n "$p" ] && [ "$p" -gt 1 ]; do
+        [ -f "$LOCKS/$1.s/$p" ] && return 0
+        p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+    done
+    return 1
+}
+
 # Waits for this caller's turn. A ticket (pid, mode, what) is named by its
 # number, so the directory listing is the queue. Exclusive (x) goes once nothing
 # is held and no ticket is older; shared (s) once no exclusive lock is held
@@ -80,14 +93,18 @@ queue() {
 
 case $1 in
 acquire)
+    if held_share "$2"; then
+        echo "lock.sh: can't acquire $2 exclusively while a process this runs under shares it" >&2
+        exit 1
+    fi
     queue "$2" x "${3:-$PWD}"
     echo "${3:-$PWD} since $(date '+%F %T') (ticket $(basename "$me"))" > "$LOCKS/$2/owner" ;;
 release) rm -rf "${LOCKS:?}/$2" ;;
 share)
-    queue "$2" s "${3:-$PWD}"
+    held_share "$2" || queue "$2" s "${3:-$PWD}"
     printf '%s\n%s since %s\n' $PPID "${3:-$PWD}" "$(date '+%F %T')" > "$LOCKS/$2.s/$PPID" ;;
 unshare) rm -f "$LOCKS/$2.s/$PPID" ;;
-wait) queue "$2" s "wait ${3:-$PWD}" ;;
+wait) held_share "$2" || queue "$2" s "wait ${3:-$PWD}" ;;
 list)
     for l in "$LOCKS"/*; do
         [ -d "$l" ] || continue
