@@ -38,7 +38,8 @@
 //! not in a GSO run) when one is due and the window has room for it. An
 //! acknowledged probe raises `max_datagram`, and the congestion
 //! controller's datagram size and the pacer's floor with it; a lost one
-//! is neither congestion nor a loss for persistent congestion. Full-sized
+//! (by the time threshold only: reordering isn't loss enough) is neither
+//! congestion nor a loss for persistent congestion. Full-sized
 //! packets that stop arriving while smaller ones get through (a black
 //! hole) bring it back to 1200 bytes.
 //!
@@ -1426,7 +1427,12 @@ pub const Conn = struct {
         while (it.next()) |e| {
             if (e.pn > largest_acked) break;
             const p = e.packet;
-            if (p.time_sent <= lost_send_time or largest_acked >= e.pn + recovery.packet_threshold) {
+            // A PMTU probe is lost by the time threshold only: packets
+            // sent after it that overtake it (reordering) aren't evidence
+            // enough when MAX_PROBES losses fail its size for 600 s, and
+            // waiting costs nothing (it carries only PING and PADDING).
+            const by_count = largest_acked >= e.pn + recovery.packet_threshold and !p.pmtu_probe;
+            if (p.time_sent <= lost_send_time or by_count) {
                 for (sp.sent.recordsOf(p)) |rec| self.onRecordLost(space, rec);
                 if (p.pmtu_probe) {
                     // §14.4: a failed probe, not congestion; and not a

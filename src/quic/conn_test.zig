@@ -2697,9 +2697,8 @@ test "verify PMTU: a path flapping between sizes mid-download, with key updates 
 test "verify PMTU: random loss on a path that carries every size is no black hole" {
     // Up to 10% loss in order. (Known, 2026-10-30: at 20% loss about half
     // the runs see a black hole, from two probe timeouts in a row whose
-    // 1200-byte packets arrive; with 2 ms of jitter on 10 ms, reordered
-    // probes declared lost fail sizes that arrive, and 10% loss finds black
-    // holes too. Each costs a few bytes of datagram until the raise timer.)
+    // 1200-byte packets arrive. Each costs a few bytes of datagram until
+    // the raise timer. Reordering: see "reordering doesn't fail probes".)
     var false_positives: u32 = 0;
     var runs: u32 = 0;
     for ([_]u8{ 2, 5, 10 }) |loss| {
@@ -2794,6 +2793,33 @@ test "verify PMTU: odd client max_udp_payload_size values, IPv4 and IPv6: no dat
                 try testing.expectEqual(@as(u64, s.max_datagram), s.cc.mss);
                 if (limit <= 1350 and path_max > 1350) try testing.expectEqual(@as(u32, 0), s.pmtu.probes_sent);
                 try testing.expectEqual(liveInFlight(s), s.cc.in_flight);
+            }
+        }
+    }
+}
+
+test "QUIC PMTU: reordering doesn't fail probes: jitter of up to half the round trip, with loss, still finds 1472" {
+    // Probes are declared lost by the time threshold only: with the packet
+    // threshold, datagrams sent after a probe overtook it, three such
+    // reorderings failed a size the path carries (6 of 48 of these runs
+    // ended below 1472 until the raise timer).
+    for ([_]u64{ 1_000, 2_000, 5_000 }) |jitter| {
+        for ([_]u8{ 0, 2, 10 }) |loss| {
+            for (0..4) |seed| {
+                const h = try Harness.init(.{ .seed = @intCast(seed + 1), .max_stream_data = 8 << 20, .max_data = 16 << 20 }, pmtuOn);
+                defer h.deinit();
+                h.prng = .init(seed * 13 + jitter + loss);
+                const path: Path = .{ .delay = 10_000, .jitter = jitter, .loss = loss };
+                try runPath(h, path, {}, established);
+                const id = try h.client.openBidi();
+                try h.client.write(id, "big 1500000", true);
+                try runPath(h, path, id, finishedAndSearched);
+                try expectBody(h, id, 1_500_000);
+                const s = h.server.?;
+                if (s.pmtu.black_holes > 0 or s.max_datagram != 1472) {
+                    std.debug.print("jitter {d} loss {d}% seed {d}: {d} black holes, max {d}, {d} probes lost\n", .{ jitter, loss, seed, s.pmtu.black_holes, s.max_datagram, s.pmtu.probes_lost });
+                    return error.SizeFailed;
+                }
             }
         }
     }
