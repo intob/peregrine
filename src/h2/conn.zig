@@ -2276,6 +2276,9 @@ const Harness = struct {
     /// each stream got.
     check_body: ?[]const u8 = null,
     body_pos: std.AutoHashMapUnmanaged(u32, usize) = .empty,
+    /// Another harness's pool, when connections share a worker's (see
+    /// `share`); `pool` is then unused.
+    shared: ?*BufferPool = null,
 
     fn init(opts: Options) !*Harness {
         return initWith(opts, testing.allocator, 1024);
@@ -2315,10 +2318,32 @@ const Harness = struct {
         return h;
     }
 
+    /// A harness whose connection uses `owner`'s pool, as connections on
+    /// one worker do (deinit it before `owner`).
+    fn share(owner: *Harness, opts: Options) !*Harness {
+        const h = try Harness.init(opts);
+        errdefer h.deinit();
+        h.conn.abortAll(&h.ctx());
+        h.conn.deinit(&h.pool);
+        h.shared = &owner.pool;
+        h.conn = try Conn.init(testing.allocator, opts, &owner.pool);
+        h.events.clearRetainingCapacity();
+        var it = h.per_stream.valueIterator();
+        while (it.next()) |l| l.deinit(testing.allocator);
+        h.per_stream.clearRetainingCapacity();
+        h.out.clearRetainingCapacity();
+        try h.collect();
+        return h;
+    }
+
+    fn bp(h: *Harness) *BufferPool {
+        return h.shared orelse &h.pool;
+    }
+
     fn deinit(h: *Harness) void {
         const a = testing.allocator;
         h.conn.abortAll(&h.ctx());
-        h.conn.deinit(&h.pool);
+        h.conn.deinit(h.bp());
         h.slab.deinit();
         h.mailbox.waker.deinit();
         h.mailbox.deinit();
@@ -2353,7 +2378,7 @@ const Harness = struct {
             .exchanges = &h.slab,
             .conn_slot = 3,
             .conn_gen = 7,
-            .pool = &h.pool,
+            .pool = h.bp(),
             .early_data = h.early_data,
         };
     }
@@ -2456,7 +2481,7 @@ const Harness = struct {
     fn feed(h: *Harness, bytes: []const u8) !void {
         var rest = bytes;
         while (rest.len > 0) {
-            const space = try h.conn.readSpace(&h.pool);
+            const space = try h.conn.readSpace(h.bp());
             const n = @min(space.len, rest.len);
             @memcpy(space[0..n], rest[0..n]);
             h.conn.commitRead(n);
@@ -2475,7 +2500,7 @@ const Harness = struct {
             try h.collect();
             if (h.last != .flush) break;
         }
-        h.conn.releaseIfIdle(&h.pool);
+        h.conn.releaseIfIdle(h.bp());
         // Everything written: no output buffer is held.
         if (!h.conn.hasWire()) try testing.expectEqual(@as(usize, 0), h.conn.out.capacity + h.conn.wire.capacity);
     }
@@ -4614,4 +4639,369 @@ test "fuzz: h2 connection" {
             @embedFile("testdata/fuzz/split-1.bin"),
         },
     });
+}
+
+// -- Stream states shared by a worker's connections (verification) ---------
+
+/// A conversation that makes stream states hold large buffers and the HPACK
+/// table move: bodies past `state_kept` (buffered with and without
+/// trailers, and streamed), responses that wait for small windows (their
+/// rest in `pending`, past `state_kept` too), field blocks split over
+/// CONTINUATIONs that add to the dynamic table, a reset mid-response,
+/// PRIORITY_UPDATE for open, idle and closed streams, then the client's
+/// GOAWAY and streams after it (refused, their blocks still decoded).
+fn bigScript() ![]u8 {
+    const a = testing.allocator;
+    var enc = try hpack.Encoder.init(a, 4096);
+    defer enc.deinit();
+    var s: std.ArrayList(u8) = .empty;
+    errdefer s.deinit(a);
+    try s.appendSlice(a, frame.preface);
+    var buf: [frame.header_len + 16384]u8 = undefined;
+    var n = try frame.writeSettings(&buf, &.{.{ .id = .initial_window_size, .value = 20000 }});
+    try s.appendSlice(a, buf[0..n]);
+    const body = try testBody(48 * 1024);
+    defer a.free(body);
+    var block: [4096]u8 = undefined;
+    var stream: u31 = 1;
+    for (0..12) |i| {
+        const kind = i % 3; // 0 /echo, 1 /big, 2 /up
+        var bn: usize = 0;
+        bn += try enc.encode(block[bn..], ":method", if (kind == 1) "GET" else "POST", .{});
+        bn += try enc.encode(block[bn..], ":scheme", "https", .{});
+        bn += try enc.encode(block[bn..], ":path", switch (kind) {
+            0 => "/echo",
+            1 => "/big",
+            else => "/up",
+        }, .{});
+        bn += try enc.encode(block[bn..], ":authority", "example.com", .{});
+        var name_buf: [16]u8 = undefined;
+        var value_buf: [600]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "x-f{d}", .{i % 5});
+        @memset(&value_buf, 'a' + @as(u8, @intCast(i)));
+        bn += try enc.encode(block[bn..], name, value_buf[0 .. 40 + 50 * i], .{});
+        bn += try enc.encode(block[bn..], "x-same", "repeated", .{});
+        const flags: u8 = if (kind == 1) frame.flag.end_stream else 0;
+        if (i % 2 == 1) {
+            // HEADERS, then two CONTINUATIONs (the last one empty when i % 4 == 3).
+            const cut1 = bn / 3;
+            const cut2 = if (i % 4 == 3) bn else 2 * bn / 3;
+            n = try frame.writeHeaders(&buf, stream, flags, block[0..cut1]);
+            try s.appendSlice(a, buf[0..n]);
+            frame.writeHeader(buf[0..frame.header_len], @intCast(cut2 - cut1), .continuation, 0, stream);
+            try s.appendSlice(a, buf[0..frame.header_len]);
+            try s.appendSlice(a, block[cut1..cut2]);
+            frame.writeHeader(buf[0..frame.header_len], @intCast(bn - cut2), .continuation, frame.flag.end_headers, stream);
+            try s.appendSlice(a, buf[0..frame.header_len]);
+            try s.appendSlice(a, block[cut2..bn]);
+        } else {
+            n = try frame.writeHeaders(&buf, stream, flags | frame.flag.end_headers, block[0..bn]);
+            try s.appendSlice(a, buf[0..n]);
+        }
+        if (kind != 1) {
+            const len = 17000 + 2500 * i;
+            const trailers = i % 2 == 1;
+            var pos: usize = 0;
+            while (pos < len) {
+                const k = @min(len - pos, 9000 + 1000 * (i % 4));
+                const last = pos + k == len;
+                n = try frame.writeData(&buf, stream, last and !trailers, body[pos..][0..k]);
+                try s.appendSlice(a, buf[0..n]);
+                pos += k;
+            }
+            if (trailers) {
+                bn = try enc.encode(&block, "x-trailer", name, .{});
+                n = try frame.writeHeaders(&buf, stream, frame.flag.end_headers | frame.flag.end_stream, block[0..bn]);
+                try s.appendSlice(a, buf[0..n]);
+            }
+        }
+        n = try frame.writePriorityUpdate(&buf, stream, if (i % 2 == 0) "u=1" else "u=5, i");
+        try s.appendSlice(a, buf[0..n]);
+        n = try frame.writePriorityUpdate(&buf, stream + 4, "u=0"); // idle
+        try s.appendSlice(a, buf[0..n]);
+        if (stream > 4) {
+            n = try frame.writePriorityUpdate(&buf, stream - 4, "u=7, i"); // closed or waiting
+            try s.appendSlice(a, buf[0..n]);
+        }
+        if (i == 5) {
+            // A /big waiting for its window: reset mid-response.
+            n = try frame.writeRstStream(&buf, 3, .cancel);
+            try s.appendSlice(a, buf[0..n]);
+        }
+        if (i == 8) {
+            n = try frame.writeWindowUpdate(&buf, 0, 300000);
+            try s.appendSlice(a, buf[0..n]);
+        }
+        stream += 2;
+    }
+    // The client goes away while responses wait for the windows: streams
+    // after that are refused, their blocks decoded all the same (the
+    // first adds to the table, the second refers to it).
+    n = try frame.writeGoaway(&buf, 0, .no_error, "");
+    try s.appendSlice(a, buf[0..n]);
+    for (0..2) |k| {
+        var bn: usize = 0;
+        bn += try enc.encode(block[bn..], ":method", "GET", .{});
+        bn += try enc.encode(block[bn..], ":scheme", "https", .{});
+        bn += try enc.encode(block[bn..], ":path", "/", .{});
+        bn += try enc.encode(block[bn..], "x-after-goaway", "added to the table", .{});
+        n = try frame.writeHeaders(&buf, stream + 2 * @as(u31, @intCast(k)), frame.flag.end_headers | frame.flag.end_stream, block[0..bn]);
+        try s.appendSlice(a, buf[0..n]);
+    }
+    // Room for everything left.
+    n = try frame.writeWindowUpdate(&buf, 0, 2000000);
+    try s.appendSlice(a, buf[0..n]);
+    var id: u31 = 1;
+    while (id < stream) : (id += 2) {
+        if (id == 3) continue;
+        n = try frame.writeWindowUpdate(&buf, id, 200000);
+        try s.appendSlice(a, buf[0..n]);
+    }
+    return s.toOwnedSlice(a);
+}
+
+/// DATA per stream, from everything the server wrote.
+fn dataByStream(h: *Harness) !std.AutoHashMap(u32, std.ArrayList(u8)) {
+    const a = testing.allocator;
+    var map = std.AutoHashMap(u32, std.ArrayList(u8)).init(a);
+    errdefer freeDataMap(&map);
+    var pool = try BufferPool.init(a, 1024, 2);
+    defer pool.deinit();
+    var reader: frame.Reader = .{};
+    defer reader.deinit(&pool);
+    var rest: []const u8 = h.out.items;
+    while (rest.len > 0) {
+        const space = try reader.readSpace(&pool, .{ .max_frame_size = frame.max_max_frame_size });
+        const n = @min(space.len, rest.len);
+        @memcpy(space[0..n], rest[0..n]);
+        reader.commitRead(n);
+        rest = rest[n..];
+        while (true) {
+            switch (reader.next(.{ .max_frame_size = frame.max_max_frame_size })) {
+                .need_more => break,
+                .failure => return error.BadServerFrame,
+                .frame => |fr| switch (fr) {
+                    .data => |d| {
+                        const gop = try map.getOrPut(d.stream_id);
+                        if (!gop.found_existing) gop.value_ptr.* = .empty;
+                        try gop.value_ptr.appendSlice(a, d.data);
+                    },
+                    else => {},
+                },
+            }
+        }
+    }
+    return map;
+}
+
+fn freeDataMap(map: *std.AutoHashMap(u32, std.ArrayList(u8))) void {
+    var it = map.valueIterator();
+    while (it.next()) |l| l.deinit(testing.allocator);
+    map.deinit();
+}
+
+/// Same frames per stream, same handler logs and the same DATA bytes.
+fn expectSameRun(a: *Harness, b: *Harness) !void {
+    try expectSameStreams(a, b);
+    var da = try dataByStream(a);
+    defer freeDataMap(&da);
+    var db = try dataByStream(b);
+    defer freeDataMap(&db);
+    try testing.expectEqual(da.count(), db.count());
+    var it = da.iterator();
+    while (it.next()) |e| {
+        const other = db.get(e.key_ptr.*) orelse return error.MissingStream;
+        try testing.expectEqualSlices(u8, e.value_ptr.items, other.items);
+    }
+}
+
+/// The reference run of bigScript, checked against what the requests were.
+fn bigReference(opts: Options, big: []const u8) !*Harness {
+    const script = try bigScript();
+    defer testing.allocator.free(script);
+    const h = try Harness.init(opts);
+    errdefer h.deinit();
+    h.handler.big = big;
+    try h.feed(script);
+    const body = try testBody(48 * 1024);
+    defer testing.allocator.free(body);
+    var data = try dataByStream(h);
+    defer freeDataMap(&data);
+    var id: u31 = 1;
+    for (0..12) |i| {
+        const got = data.get(id);
+        switch (i % 3) {
+            0 => try testing.expectEqualSlices(u8, body[0 .. 17000 + 2500 * i], got.?.items),
+            1 => if (id != 3) try testing.expectEqualSlices(u8, big, got.?.items),
+            else => {
+                var buf: [32]u8 = undefined;
+                try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "got {d}", .{17000 + 2500 * i}), got.?.items);
+            },
+        }
+        id += 2;
+    }
+    // Every head decoded right, trailers included; the streams after GOAWAY refused.
+    try testing.expectEqual(@as(usize, 12), std.mem.count(u8, h.handler.log.items, "[x-same=repeated]"));
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, h.handler.log.items, "trailer[x-trailer=x-f"));
+    try testing.expect(std.mem.indexOf(u8, h.events.items, "rst 25 refused_stream") != null);
+    try testing.expect(std.mem.indexOf(u8, h.events.items, "rst 27 refused_stream") != null);
+    try testing.expectEqual(@as(u32, 0), h.conn.activeStreams());
+    return h;
+}
+
+test "stream states: large bodies, pending responses and moving tables are split-invariant" {
+    const big = try testBody(70 * 1024);
+    defer testing.allocator.free(big);
+    const ref = try bigReference(.{}, big);
+    defer ref.deinit();
+    const script = try bigScript();
+    defer testing.allocator.free(script);
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+    for (0..12) |iteration| {
+        const h = try Harness.init(.{});
+        defer h.deinit();
+        h.handler.big = big;
+        var rest: []const u8 = script;
+        while (rest.len > 0 and h.last != .close) {
+            const max_chunk: usize = switch (iteration) {
+                0 => 1,
+                1 => 9,
+                else => 1 + random.uintLessThan(usize, 20000),
+            };
+            const k = @min(rest.len, max_chunk);
+            try h.feed(rest[0..k]);
+            rest = rest[k..];
+            // The worker's tick, now and then, while streams are open.
+            if (random.uintLessThan(u8, 50) == 0) h.pool.trim();
+        }
+        try expectSameRun(ref, h);
+        // Nothing held: every state is back, none keeps a large buffer.
+        try testing.expectEqual(@as(usize, 0), h.pool.h2_streams.in_use);
+        for (h.pool.h2_streams.free.slice()) |st| {
+            try testing.expect(st.req.capacity <= state_kept and st.pending.capacity <= state_kept);
+            try testing.expect(!st.active and st.exchange == NIL and st.id == 0 and st.req.items.len == 0);
+        }
+    }
+}
+
+test "stream states: connections on one worker interleaved, sharing its pool and scratch" {
+    const big = try testBody(70 * 1024);
+    defer testing.allocator.free(big);
+    const opts: Options = .{ .enable_connect_protocol = true };
+    const big_ref = try bigReference(opts, big);
+    defer big_ref.deinit();
+    const small_script = try buildScript();
+    defer testing.allocator.free(small_script);
+    const small_ref = try Harness.init(opts);
+    defer small_ref.deinit();
+    try small_ref.feed(small_script);
+    const big_script = try bigScript();
+    defer testing.allocator.free(big_script);
+
+    var prng = std.Random.DefaultPrng.init(0xb0b);
+    const random = prng.random();
+    for (0..10) |_| {
+        const owner = try Harness.init(opts);
+        defer owner.deinit();
+        var conns: [4]*Harness = undefined;
+        var made: usize = 0;
+        defer for (conns[0..made]) |c| c.deinit();
+        while (made < conns.len) : (made += 1) conns[made] = try Harness.share(owner, opts);
+        const scripts = [_][]const u8{ big_script, small_script, big_script, small_script };
+        var rests: [4][]const u8 = scripts;
+        // The small script's /big is empty, as in its reference.
+        for (conns, 0..) |c, i| c.handler.big = if (i % 2 == 0) big else "";
+        while (true) {
+            var live: usize = 0;
+            for (conns, rests) |c, r| {
+                if (r.len > 0 and c.last != .close) live += 1;
+            }
+            if (live == 0) break;
+            const i = random.uintLessThan(usize, conns.len);
+            const c = conns[i];
+            if (rests[i].len == 0 or c.last == .close) continue;
+            const k = @min(rests[i].len, 1 + random.uintLessThan(usize, if (random.boolean()) 40 else 12000));
+            try c.feed(rests[i][0..k]);
+            rests[i] = rests[i][k..];
+            if (random.uintLessThan(u8, 30) == 0) owner.pool.trim();
+            // In use: what the connections hold open.
+            var open: usize = 0;
+            for (conns) |x| open += x.conn.activeStreams();
+            try testing.expectEqual(open, owner.pool.h2_streams.in_use);
+        }
+        for (conns, 0..) |c, i| try expectSameRun(if (i % 2 == 0) big_ref else small_ref, c);
+    }
+}
+
+test "stream states: a stream refused for want of memory still moves the HPACK table" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const h = try Harness.initPools(.{}, testing.allocator, failing.allocator(), 1024);
+    defer h.deinit();
+    try h.preface();
+    h.events.clearRetainingCapacity();
+    // The pool has no state to give and can't make one: refused. The
+    // block adds x-new to both tables (the client's encoder indexes it).
+    failing.fail_index = failing.alloc_index;
+    try h.headers(.{ .stream = 1, .fields = &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "x-new", .value = "first value, now in the table" },
+    } });
+    try h.expectEvents("rst 1 refused_stream\n");
+    failing.fail_index = std.math.maxInt(usize);
+    // The same fields again, as indexed references.
+    try h.headers(.{ .stream = 3, .fields = &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "x-new", .value = "first value, now in the table" },
+    } });
+    try h.expectLog("GET / [x-new=first value, now in the table]\n");
+    try testing.expectEqual(@as(u32, 0), h.conn.activeStreams());
+}
+
+test "stream states: exchanges completed after their stream's state went to another connection" {
+    const owner = try Harness.init(.{});
+    defer owner.deinit();
+    const other = try Harness.share(owner, .{});
+    defer other.deinit();
+    try owner.preface();
+    try other.preface();
+    owner.events.clearRetainingCapacity();
+    other.events.clearRetainingCapacity();
+    // Deferred responses on the owner, then the client resets them: their
+    // states go back to the pool.
+    var id: u31 = 1;
+    while (id <= 15) : (id += 2) try owner.get(id, if (id % 4 == 1) "/later" else "/stream");
+    try testing.expectEqual(@as(usize, 8), owner.pool.h2_streams.in_use);
+    owner.events.clearRetainingCapacity();
+    id = 1;
+    while (id <= 15) : (id += 2) try owner.rst(id, .cancel);
+    try testing.expectEqual(@as(usize, 0), owner.pool.h2_streams.in_use);
+    try testing.expectEqual(@as(usize, 8), owner.handler.aborts);
+    // The other connection takes those states for its own deferred ones.
+    id = 1;
+    while (id <= 15) : (id += 2) try other.get(id, "/later");
+    try testing.expectEqual(@as(usize, 8), owner.pool.h2_streams.in_use);
+    // The owner's handler answers its (aborted) exchanges from another
+    // thread while the other's are answered here.
+    const T = struct {
+        fn run(list: []const exchange.Exchange) void {
+            for (list) |ex| ex.respond(.{}, "late answer") catch {};
+        }
+    };
+    const t = try std.Thread.spawn(.{}, T.run, .{owner.handler.exchanges.items});
+    for (other.handler.exchanges.items) |ex| try ex.respond(.{}, "for the other connection");
+    t.join();
+    try owner.drainMailbox();
+    try owner.collect();
+    try other.drainMailbox();
+    try other.collect();
+    try owner.expectEvents("");
+    try testing.expectEqual(@as(usize, 8), std.mem.count(u8, other.events.items, "data"));
+    try testing.expectEqual(@as(usize, 8), std.mem.count(u8, other.events.items, "end=true"));
+    try testing.expectEqual(@as(usize, 0), std.mem.count(u8, other.events.items, "rst"));
+    try testing.expectEqual(@as(usize, 0), owner.pool.h2_streams.in_use);
 }
