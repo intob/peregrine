@@ -1387,7 +1387,7 @@ test "QUIC ECN: a path that drops marked datagrams: marking stops when the testi
     try h.run(10);
     try download(h, 300_000);
     const s = h.server.?;
-    try testing.expectEqual(conn_mod.EcnState.failed, s.ecn);
+    try testing.expectEqual(conn_mod.EcnState.lost, s.ecn);
     try testing.expectEqual(@as(u64, conn_mod.ecn_testing_packets), s.ecn_marked);
     try testing.expectEqual(s.ecn_marked, s.ecn_marked_lost);
 }
@@ -1747,7 +1747,7 @@ test "QUIC ECN: testing packets declared lost that arrive after all: the path is
     defer held.deinit(testing.allocator);
     var id: ?u64 = null;
     var rounds: usize = 0;
-    while (h.server == null or h.server.?.ecn != .failed) : (rounds += 1) {
+    while (h.server == null or h.server.?.ecn != .lost) : (rounds += 1) {
         if (rounds == 200) return error.TestUnexpectedResult;
         // (A request that went before the server had its keys.)
         if (rounds % 20 == 19) try h.client.retransmit();
@@ -1840,4 +1840,116 @@ test "QUIC ECN: a CE event takes the window before the ACK carrying it grew it" 
     try testing.expectEqual(@as(u64, @intFromFloat(@as(f64, @floatFromInt(before)) * 0.7)), s.cc.window);
     try h.run(100);
     try testing.expect(h.client.finished(id));
+}
+
+/// Starts a download and returns what the server sends at once (a window
+/// of marked datagrams), undelivered.
+fn heldWindow(h: *Harness, req: []const u8, out: []Flight) !usize {
+    const s = h.server.?;
+    const id = try h.client.openBidi();
+    try h.client.write(id, req, true);
+    var buf: [1500]u8 = undefined;
+    while (true) {
+        const n = try h.client.send(&buf);
+        if (n == 0) break;
+        try h.toServer(buf[0..n]);
+    }
+    var count: usize = 0;
+    while (count < out.len) : (count += 1) {
+        const ecn = s.sendEcn();
+        const n = s.send(&out[count].buf, h.now);
+        if (n == 0) break;
+        out[count].len = n;
+        out[count].ecn = ecn;
+    }
+    return count;
+}
+
+test "QUIC ECN: a new path isn't judged by the old one's packets: their loss doesn't fail it" {
+    const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 32 << 20 }, noPacing);
+    defer h.deinit();
+    try h.run(10);
+    try download(h, 300_000);
+    const s = h.server.?;
+    try testing.expectEqual(conn_mod.EcnState.capable, s.ecn);
+    // Marked packets in flight on the old path, then the peer's address
+    // changes: the new path's ten testing packets follow.
+    var old: [32]Flight = undefined;
+    const n = try heldWindow(h, "big 300000", &old);
+    try testing.expectEqual(old.len, n);
+    s.spaces[2].ecn_ce_pending = true;
+    s.onPathChange();
+    try testing.expect(!s.spaces[2].ecn_ce_pending);
+    var fresh: [32]Flight = undefined;
+    var m: usize = 0;
+    while (m < fresh.len) : (m += 1) {
+        const ecn = s.sendEcn();
+        const k = s.send(&fresh[m].buf, h.now);
+        if (k == 0) break;
+        fresh[m].len = k;
+        fresh[m].ecn = ecn;
+    }
+    try testing.expect(m > conn_mod.ecn_testing_packets);
+    try testing.expectEqual(conn_mod.EcnState.unknown, s.ecn);
+    // The old path's last packet arrives, the rest of them is lost: not
+    // this path's testing packets.
+    const last = &old[n - 1];
+    try h.toClient(last.buf[0..last.len], last.ecn);
+    var buf: [1500]u8 = undefined;
+    try h.toServer(buf[0..try h.client.send(&buf)]);
+    try testing.expect(s.lost_packets >= n - 4);
+    try testing.expectEqual(conn_mod.EcnState.unknown, s.ecn);
+    try testing.expectEqual(@as(u64, 0), s.ecn_marked_lost);
+    // The new path's arrive: validated.
+    for (fresh[0..m]) |*f| try h.toClient(f.buf[0..f.len], f.ecn);
+    try h.run(3000);
+    try download(h, 100_000);
+    try testing.expectEqual(conn_mod.EcnState.capable, s.ecn);
+    try testing.expectEqual(@as(u8, 0), s.ecn_retests);
+}
+
+test "QUIC ECN: a new path isn't validated by the old one's packets: one dropping marks is found" {
+    const h = try ecnCapable();
+    defer h.deinit();
+    const s = h.server.?;
+    var flights: [64]Flight = undefined;
+    const n = try heldWindow(h, "big 300000", &flights);
+    try testing.expect(n > conn_mod.ecn_testing_packets);
+    s.onPathChange();
+    // The old mapping still delivers what it carried; the new path drops
+    // every marked datagram.
+    for (flights[0..n]) |*f| try h.toClient(f.buf[0..f.len], f.ecn);
+    h.drop_marked = true;
+    try h.run(3000);
+    try download(h, 100_000);
+    try testing.expectEqual(conn_mod.EcnState.lost, s.ecn);
+    try testing.expectEqual(@as(u64, conn_mod.ecn_testing_packets), s.ecn_marked);
+    try testing.expectEqual(s.ecn_marked, s.ecn_marked_lost);
+}
+
+test "QUIC: only the newest non-probing packet may move the peer's address (RFC 9000 §9.3)" {
+    const h = try Harness.init(.{}, noTweak);
+    defer h.deinit();
+    try h.run(10);
+    const s = h.server.?;
+    const id = try h.client.openBidi();
+    var older: [1500]u8 = undefined;
+    var newer: [1500]u8 = undefined;
+    try h.client.write(id, "a", false);
+    const n1 = try h.client.send(&older);
+    try h.client.write(id, "b", false);
+    const n2 = try h.client.send(&newer);
+    // The newer first: it may; the older one after it (reordered, from
+    // where the peer was) may not.
+    try testing.expect(s.recv(newer[0..n2], .not_ect, h.now));
+    try testing.expect(!s.recv(older[0..n1], .not_ect, h.now));
+    // A duplicate may not either.
+    try testing.expect(!s.recv(newer[0..n2], .not_ect, h.now));
+    // Nor a probing packet (PATH_CHALLENGE and PADDING only).
+    try h.client.injectFrames(&.{ 0x1a, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0 });
+    const n3 = try h.client.send(&older);
+    try testing.expect(!s.recv(older[0..n3], .not_ect, h.now));
+    try h.client.write(id, "c", true);
+    const n4 = try h.client.send(&older);
+    try testing.expect(s.recv(older[0..n4], .not_ect, h.now));
 }

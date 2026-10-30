@@ -36,6 +36,29 @@ pub const Addr = extern struct {
         return std.mem.bigToNative(u16, a.storage.port);
     }
 
+    pub fn fromIp(address: std.Io.net.IpAddress) Addr {
+        var a: Addr = .{};
+        switch (address) {
+            .ip4 => |v| {
+                const in: *posix.sockaddr.in = @ptrCast(&a.storage);
+                in.* = std.mem.zeroes(posix.sockaddr.in);
+                in.family = posix.AF.INET;
+                in.port = std.mem.nativeToBig(u16, v.port);
+                in.addr = @bitCast(v.bytes);
+                a.len = @sizeOf(posix.sockaddr.in);
+            },
+            .ip6 => |v| {
+                a.storage.family = posix.AF.INET6;
+                a.storage.port = std.mem.nativeToBig(u16, v.port);
+                a.storage.addr = v.bytes;
+                a.len = @sizeOf(posix.sockaddr.in6);
+            },
+        }
+        // BSD sockaddrs start with their length.
+        if (!sys.is_linux) std.mem.asBytes(&a.storage)[0] = @intCast(a.len);
+        return a;
+    }
+
     /// Address bytes and port, for tokens and logs.
     pub fn bytes(a: *const Addr) []const u8 {
         return std.mem.asBytes(&a.storage)[0..a.len];
@@ -61,23 +84,7 @@ pub fn bind(address: std.Io.net.IpAddress, reuse_port: bool) !fd_t {
     // Bursts of datagrams between event loop turns: big kernel buffers.
     sys.setsockoptInt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, 4 << 20) catch {};
     sys.setsockoptInt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, 4 << 20) catch {};
-    var storage: Addr = .{};
-    switch (address) {
-        .ip4 => |a| {
-            const in: *posix.sockaddr.in = @ptrCast(&storage.storage);
-            in.* = std.mem.zeroes(posix.sockaddr.in);
-            in.family = posix.AF.INET;
-            in.port = std.mem.nativeToBig(u16, a.port);
-            in.addr = @bitCast(a.bytes);
-            storage.len = @sizeOf(posix.sockaddr.in);
-        },
-        .ip6 => |a| {
-            storage.storage.family = posix.AF.INET6;
-            storage.storage.port = std.mem.nativeToBig(u16, a.port);
-            storage.storage.addr = a.bytes;
-            storage.len = @sizeOf(posix.sockaddr.in6);
-        },
-    }
+    const storage: Addr = .fromIp(address);
     if (posix.errno(system.bind(fd, storage.sockaddr(), storage.len)) != .SUCCESS) return error.AddressInUse;
     return fd;
 }
@@ -240,20 +247,21 @@ const UDP_SEGMENT = 103;
 pub const SendError = error{
     WouldBlock,
     Unexpected,
-    /// Sent, but unmarked: the kernel refused the TOS control message
-    /// (EINVAL with it, success without). The caller sends unmarked from
-    /// then on (per socket: ECN validation then ends each connection's
-    /// marking).
+    /// Sent (all of it, or up to a datagram that would block or failed:
+    /// lost, to QUIC), but unmarked: the kernel refused the TOS control
+    /// message (EINVAL with it, success without). The caller sends
+    /// unmarked from then on, per `tosKind` (ECN validation then ends each
+    /// connection's marking).
     TosRefused,
 };
 
-/// The control message that sets a send's codepoint: IP_TOS for IPv4
+/// The control message that sets a send's codepoint: IP_TOS (0) for IPv4
 /// (on Linux, IPv4-mapped addresses on an IPv6 socket too), else
-/// IPV6_TCLASS.
-fn tosLevelType(to: *const Addr) struct { i32, i32 } {
+/// IPV6_TCLASS (1). A kernel may refuse one and not the other.
+pub fn tosKind(to: *const Addr) u1 {
     const v4 = to.storage.family == posix.AF.INET or
         (sys.is_linux and std.mem.eql(u8, to.storage.addr[0..12], &[12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff }));
-    return if (v4) .{ posix.IPPROTO.IP, posix.IP.TOS } else .{ posix.IPPROTO.IPV6, posix.IPV6.TCLASS };
+    return if (v4) 0 else 1;
 }
 
 /// One sendmsg of `data` to `to` with `control`, retried on EINTR.
@@ -289,9 +297,11 @@ pub fn send(fd: fd_t, to: *const Addr, data: []const u8, segment: ?u16, ecn: Ecn
     // The TOS message last, so it can be dropped.
     const plain = len;
     if (ecn != .not_ect) {
-        const lt = tosLevelType(to);
         const v: c_int = @backingInt(ecn);
-        len = sys.putCmsg(&control, len, lt[0], lt[1], std.mem.asBytes(&v));
+        len = switch (tosKind(to)) {
+            0 => sys.putCmsg(&control, len, posix.IPPROTO.IP, posix.IP.TOS, std.mem.asBytes(&v)),
+            1 => sys.putCmsg(&control, len, posix.IPPROTO.IPV6, posix.IPV6.TCLASS, std.mem.asBytes(&v)),
+        };
     }
     var refused = false;
     var rest = data;
@@ -312,10 +322,11 @@ pub fn send(fd: fd_t, to: *const Addr, data: []const u8, segment: ?u16, ecn: Ecn
         }
         switch (e) {
             .SUCCESS => {},
-            .AGAIN => return error.WouldBlock,
+            // (The refusal is news the caller keeps.)
+            .AGAIN => return if (refused) error.TosRefused else error.WouldBlock,
             // EIO: GSO unsupported by the device; ECONNREFUSED and
             // friends: ICMP errors from earlier sends. Drop.
-            else => return error.Unexpected,
+            else => return if (refused) error.TosRefused else error.Unexpected,
         }
         rest = rest[n..];
     }
@@ -366,13 +377,7 @@ test "ECN codepoints set per send come back on loopback (GSO sends too)" {
     defer sys.close(fd);
     enableEcn(fd, false);
     addr.setPort(try localPort(fd));
-    var to: Addr = .{};
-    const in: *posix.sockaddr.in = @ptrCast(&to.storage);
-    in.* = std.mem.zeroes(posix.sockaddr.in);
-    in.family = posix.AF.INET;
-    in.port = std.mem.nativeToBig(u16, addr.ip4.port);
-    in.addr = @bitCast(addr.ip4.bytes);
-    to.len = @sizeOf(posix.sockaddr.in);
+    const to: Addr = .fromIp(addr);
     const batch = try testing.allocator.create(RecvBatch(8, 2048));
     defer testing.allocator.destroy(batch);
     const data: [3000]u8 = @splat(0x5a);
@@ -395,31 +400,6 @@ test "ECN codepoints set per send come back on loopback (GSO sends too)" {
 }
 
 // -- verify ECN: adversarial cases --------------------------------------------
-
-fn addrOf(ip: std.Io.net.IpAddress) Addr {
-    var a: Addr = .{};
-    switch (ip) {
-        .ip4 => |v| {
-            const in: *posix.sockaddr.in = @ptrCast(&a.storage);
-            in.* = std.mem.zeroes(posix.sockaddr.in);
-            in.family = posix.AF.INET;
-            in.port = std.mem.nativeToBig(u16, v.port);
-            in.addr = @bitCast(v.bytes);
-            a.len = @sizeOf(posix.sockaddr.in);
-        },
-        .ip6 => |v| {
-            a.storage.family = posix.AF.INET6;
-            a.storage.port = std.mem.nativeToBig(u16, v.port);
-            a.storage.addr = v.bytes;
-            a.len = @sizeOf(posix.sockaddr.in6);
-        },
-    }
-    if (!sys.is_linux) {
-        // BSD sockaddrs start with their length.
-        std.mem.asBytes(&a.storage)[0] = @intCast(a.len);
-    }
-    return a;
-}
 
 /// Sends `data` from `from_fd` to `to` with each codepoint and checks
 /// what arrives on `to_fd`.
@@ -453,7 +433,7 @@ test "verify ECN: IPv6 loopback, and IPv4-mapped peers on a dual-stack socket" {
         defer sys.close(c);
         enableEcn(c, true);
         a6.setPort(try localPort(s));
-        const to = addrOf(a6);
+        const to = Addr.fromIp(a6);
         try expectCodepoints(c, s, &to, null);
         try expectCodepoints(c, s, &to, 1000);
     }
@@ -472,12 +452,12 @@ test "verify ECN: IPv6 loopback, and IPv4-mapped peers on a dual-stack socket" {
         enableEcn(c, false);
         a4.setPort(any6.ip6.port);
         // Client to server: an IPv4 datagram arrives on the IPv6 socket.
-        const to_server = addrOf(a4);
+        const to_server = Addr.fromIp(a4);
         try expectCodepoints(c, s, &to_server, null);
         // Server to client, at the client's mapped address (the sockaddr
         // the server's recvmsg reported).
         const mapped: std.Io.net.IpAddress = .{ .ip6 = .{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 }, .port = try localPort(c) } };
-        const to_client = addrOf(mapped);
+        const to_client = Addr.fromIp(mapped);
         try expectCodepoints(s, c, &to_client, null);
         try expectCodepoints(s, c, &to_client, 1000);
     }
@@ -491,10 +471,10 @@ test "verify ECN: a send failing EINVAL for another reason doesn't stop marking"
     enableEcn(fd, false);
     // A peer at port 0 (a client can send from it, through a raw socket):
     // Linux's udp_sendmsg refuses the destination with EINVAL, TOS or not.
-    var port0 = addrOf(addr);
+    var port0 = Addr.fromIp(addr);
     try testing.expectError(error.Unexpected, send(fd, &port0, "x", null, .ect0));
     // Every other peer's datagrams still carry their marks.
     addr.setPort(try localPort(fd));
-    const to = addrOf(addr);
+    const to = Addr.fromIp(addr);
     try expectCodepoints(fd, fd, &to, null);
 }

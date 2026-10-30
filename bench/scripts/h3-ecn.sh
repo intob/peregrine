@@ -44,16 +44,14 @@ capture() { # name, command
     out=$(docker exec "$N" sh -c "$2" 2>&1 | tail -1)
     sleep 0.5; docker exec "$N" pkill tcpdump; sleep 0.5
     # tcpdump -v: "IP (tos 0x2,ECT(0), ttl ...)", then "    A.port > B.port: UDP ...".
-    read -r s0 s1 s2 s3 c0 c1 c2 c3 < <(docker exec "$N" cat /tmp/cap.txt | awk '
+    # Also `last`: of the server's last ten packets, how many were marked
+    # (ten if it sent fewer than 15); all empty if nothing was captured.
+    s0= s1= s2= s3= c0= c1= c2= c3= last=
+    read -r s0 s1 s2 s3 c0 c1 c2 c3 last < <(docker exec "$N" cat /tmp/cap.txt | awk '
         /^[0-9:.]+ IP \(tos/ { match($0, /tos 0x[0-9a-f]+/); t = (index("0123456789abcdef", substr($0, RSTART + RLENGTH - 1, 1)) - 1) % 4; next }
-        / > / && t != "" { n[(($1 ~ /\.8443$/) ? 0 : 4) + t]++; t = "" }
-        END { for (i = 0; i < 8; i++) printf "%d ", n[i]; print "" }')
-    # Of the server's last ten packets, how many were marked (ten if it
-    # sent fewer than 15).
-    last=$(docker exec "$N" cat /tmp/cap.txt | awk '
-        /^[0-9:.]+ IP \(tos/ { match($0, /tos 0x[0-9a-f]+/); t = (index("0123456789abcdef", substr($0, RSTART + RLENGTH - 1, 1)) - 1) % 4; next }
-        / > / && t != "" { if ($1 ~ /\.8443$/) l[k++ % 10] = t; t = "" }
-        END { m = 0; for (i = 0; i < 10; i++) if (l[i] >= 2) m++; print (k < 15 ? 10 : m) }')
+        / > / && t != "" { n[(($1 ~ /\.8443$/) ? 0 : 4) + t]++; if ($1 ~ /\.8443$/) l[k++ % 10] = t; t = ""; seen = 1 }
+        END { if (!seen) exit; m = 0; for (i = 0; i < 10; i++) if (l[i] >= 2) m++
+              for (i = 0; i < 8; i++) printf "%d ", n[i]; print (k < 15 ? 10 : m) }')
     [ -n "$1" ] && printf "     %-28s server not-ECT/ECT(0)/CE %s/%s/%s, client %s/%s/%s (%s)\n" "$1" "$s0" "$s2" "$s3" "$c0" "$c2" "$c3" "$out"
 }
 ossl="/opt/n/bin/osslclient -q --exit-on-all-streams-close 127.0.0.1 8443 $U/1m $U/1m $U/1m $U/1m >/dev/null; echo exit=\$?"
@@ -66,9 +64,9 @@ for pass in clean ce; do
     fi
     capture "ngtcp2 osslclient 4 x 1 MiB" "$ossl"
     check "$pass: ngtcp2 finished" "$([ "$out" = exit=0 ] && echo 1)"
-    check "$pass: ngtcp2 kept marking (our ACK_ECN counts validated)" "$([ "$c0" -le 2 ] && [ $((c2 + c3)) -gt 20 ] && echo 1)"
-    check "$pass: we kept marking (ngtcp2's counts validated)" "$([ "$s2" -gt 20 ] && echo 1)"
-    [ $pass = ce ] && check "$pass: CE marks on the path" "$([ $((s3 + c3)) -gt 0 ] && echo 1)"
+    check "$pass: ngtcp2 kept marking (our ACK_ECN counts validated)" "$([ -n "$last" ] && [ "$c0" -le 2 ] && [ $((c2 + c3)) -gt 20 ] && echo 1)"
+    check "$pass: we kept marking (ngtcp2's counts validated)" "$([ -n "$last" ] && [ "$s2" -gt 20 ] && echo 1)"
+    [ $pass = ce ] && check "$pass: CE marks on the path" "$([ -n "$last" ] && [ $((s3 + c3)) -gt 0 ] && echo 1)"
     capture "curl 1 MiB" "curl -sk --http3-only -o /dev/null -w '%{http_code} %{size_download}' $U/1m"
     capture "h2load 300 x 64 KiB" "h2load --alpn-list=h3 -t1 -c1 -m10 -n300 $U/64k | grep '^status codes:'"
     capture "aioquic 5 x 1 MiB" "python3 /h3/aioquic_client.py 127.0.0.1 8443 /1m -n 5 | grep -c ' 200 1048576'"
@@ -80,8 +78,12 @@ for r in $(seq "$RUNS"); do
     capture "" "timeout 60 $ossl"
     verdict=
     [ "$out" != exit=0 ] && verdict="$verdict client-failed($out)"
-    [ "$last" -lt 7 ] && verdict="$verdict we-stopped-marking"
-    [ "$c0" -gt 2 ] && verdict="$verdict ngtcp2-stopped-marking"
+    if [ -z "$last" ]; then
+        verdict="$verdict nothing-captured"
+    else
+        [ "$last" -lt 7 ] && verdict="$verdict we-stopped-marking"
+        [ "$c0" -gt 2 ] && verdict="$verdict ngtcp2-stopped-marking"
+    fi
     if [ -n "$verdict" ]; then
         bad=$((bad + 1))
         printf "     %3d: server not-ECT/ECT(0)/CE %s/%s/%s, client %s/%s/%s, last ten marked %s:%s\n" "$r" "$s0" "$s2" "$s3" "$c0" "$c2" "$c3" "$last" "$verdict"

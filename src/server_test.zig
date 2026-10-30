@@ -3212,15 +3212,18 @@ const H3Client = struct {
     const Delayed = struct { due: u64, len: usize, buf: [1500]u8 };
 
     fn connect(port: u16) !H3Client {
+        return connectTo(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } });
+    }
+
+    fn connectTo(address: std.Io.net.IpAddress) !H3Client {
         const nonblock: u32 = if (sys.is_linux) std.os.linux.SOCK.NONBLOCK else 0;
-        const rc = system.socket(posix.AF.INET, posix.SOCK.DGRAM | nonblock, posix.IPPROTO.UDP);
+        const family: u32 = if (address == .ip6) posix.AF.INET6 else posix.AF.INET;
+        const rc = system.socket(family, posix.SOCK.DGRAM | nonblock, posix.IPPROTO.UDP);
         if (posix.errno(rc) != .SUCCESS) return error.SocketFailed;
         const fd: sys.fd_t = @intCast(rc);
-        var addr = std.mem.zeroes(posix.sockaddr.in);
-        addr.family = posix.AF.INET;
-        addr.port = std.mem.nativeToBig(u16, port);
-        addr.addr = @bitCast([4]u8{ 127, 0, 0, 1 });
-        if (posix.errno(system.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in))) != .SUCCESS) return error.ConnectFailed;
+        errdefer sys.close(fd);
+        const addr: quic_udp.Addr = .fromIp(address);
+        if (posix.errno(system.connect(fd, addr.sockaddr(), addr.len)) != .SUCCESS) return error.ConnectFailed;
         if (!sys.is_linux) try sys.setNonBlocking(fd);
         sys.setsockoptInt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, 8 << 20) catch {};
         var dcid: [8]u8 = undefined;
@@ -3629,22 +3632,9 @@ test "verify ECN: HTTP/3 on an IPv6 address: IPv6 clients, and IPv4 ones through
 /// IPv4 (127.0.0.1).
 fn h3ClientAt(port: u16, v6: bool) !H3Client {
     if (!v6) return H3Client.connect(port);
-    const nonblock: u32 = if (sys.is_linux) std.os.linux.SOCK.NONBLOCK else 0;
-    const rc = system.socket(posix.AF.INET6, posix.SOCK.DGRAM | nonblock, posix.IPPROTO.UDP);
-    if (posix.errno(rc) != .SUCCESS) return error.SocketFailed;
-    const fd: sys.fd_t = @intCast(rc);
-    var addr = std.mem.zeroes(posix.sockaddr.in6);
-    addr.family = posix.AF.INET6;
-    addr.port = std.mem.nativeToBig(u16, port);
-    addr.addr[15] = 1;
-    if (posix.errno(system.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in6))) != .SUCCESS) return error.ConnectFailed;
-    if (!sys.is_linux) try sys.setNonBlocking(fd);
-    sys.setsockoptInt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, 8 << 20) catch {};
-    var dcid: [8]u8 = undefined;
-    sys.randomBytes(&dcid);
-    const c = try quic_test_client.Client.init(testing.allocator, .{ .dcid = dcid, .max_stream_data = 16 << 20, .max_data = 64 << 20 });
-    errdefer c.deinit();
-    return .{ .fd = fd, .c = c, .batch = try testing.allocator.create(quic_udp.RecvBatch(8, 2048)) };
+    var a: std.Io.net.IpAddress = .{ .ip6 = .{ .bytes = std.mem.zeroes([16]u8), .port = port } };
+    a.ip6.bytes[15] = 1;
+    return H3Client.connectTo(a);
 }
 
 fn testHttp3EcnIpv6(backend: Backend) !void {

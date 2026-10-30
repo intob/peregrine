@@ -104,9 +104,12 @@ pub const EcnState = enum(u8) {
     unknown,
     /// Validated: marking every packet, still validating each ACK.
     capable,
-    /// Validation failed, the marked packets were all lost, or ECN is
-    /// off: not marking.
+    /// Validation failed, or ECN is off: not marking.
     failed,
+    /// The testing packets were all declared lost: not marking, but
+    /// tested again if the counts show they arrived after all
+    /// (reordered), at most `ecn_max_retests` times.
+    lost,
 };
 
 /// Packets marked ECT(0) before waiting for their validation.
@@ -399,13 +402,15 @@ pub const Conn = struct {
     pacing_hold: ?u64 = null,
 
     ecn: EcnState,
-    /// Packets we sent ECT(0) since the path's testing began, and those
-    /// of them declared lost.
+    /// The application space's first packet number on this path (since
+    /// its testing began): only packets from it on count towards its
+    /// validation.
+    ecn_path_start: u64 = 0,
+    /// Packets we sent ECT(0) on this path, and those of them declared
+    /// lost.
     ecn_marked: u64 = 0,
     ecn_marked_lost: u64 = 0,
-    /// The testing packets were all declared lost: the counts rising
-    /// proves they arrived, and the path is tested again.
-    ecn_retest: bool = false,
+    /// Tests after the testing packets were all declared lost.
     ecn_retests: u8 = 0,
     /// CE count increases that started a congestion event.
     ecn_ce_events: u64 = 0,
@@ -562,8 +567,11 @@ pub const Conn = struct {
     // -- Receiving ------------------------------------------------------------
 
     /// Processes one datagram (its packets are decrypted in place) that
-    /// arrived with the ECN codepoint `ecn`. Returns whether any packet in
-    /// it was authenticated, for the worker to trust its source address.
+    /// arrived with the ECN codepoint `ecn`. Returns whether the peer may
+    /// have moved to its source address (RFC 9000 §9.3): it held an
+    /// authenticated non-probing packet with the largest packet number yet
+    /// in its space (so a reordered datagram from an old address doesn't
+    /// move it back).
     pub fn recv(self: *Self, datagram: []u8, ecn: packet.Ecn, now: u64) bool {
         if (self.state == .closed or self.state == .draining) return false;
         const codepoint: packet.Ecn = if (self.cfg.ecn) ecn else .not_ect;
@@ -576,7 +584,7 @@ pub const Conn = struct {
             }
             return false;
         }
-        const before = self.packets_received;
+        var moves = false;
         var rest = datagram;
         var first_dcid: ?[]const u8 = null;
         while (rest.len > 0) {
@@ -587,25 +595,27 @@ pub const Conn = struct {
             if (first_dcid) |d| {
                 if (!std.mem.eql(u8, d, h.dcid)) continue;
             } else first_dcid = h.dcid;
-            self.recvPacket(h, pkt, codepoint, now);
+            if (self.recvPacket(h, pkt, codepoint, now)) moves = true;
             if (self.state == .closing or self.state == .draining or self.state == .closed) break;
         }
-        return self.packets_received != before;
+        return moves;
     }
 
-    fn recvPacket(self: *Self, h: packet.Header, pkt: []u8, ecn: packet.Ecn, now: u64) void {
+    /// Whether the packet was processed, non-probing and the newest yet in
+    /// its space.
+    fn recvPacket(self: *Self, h: packet.Header, pkt: []u8, ecn: packet.Ecn, now: u64) bool {
         const space: Space = switch (h.type) {
             .initial => .initial,
             .handshake => .handshake,
             // 0-RTT and 1-RTT share the application space.
             .one_rtt, .zero_rtt => .application,
-            else => return,
+            else => return false,
         };
         const sp = &self.spaces[@backingInt(space)];
-        if (sp.discarded) return;
+        if (sp.discarded) return false;
         // 0-RTT: only with the early key (accepted, and not yet dropped).
-        const keys = if (h.type == .zero_rtt) self.zero_rtt_rx orelse return else sp.rx orelse return;
-        const pn_info = keys.header.unprotect(pkt, h.pn_offset) catch return;
+        const keys = if (h.type == .zero_rtt) self.zero_rtt_rx orelse return false else sp.rx orelse return false;
+        const pn_info = keys.header.unprotect(pkt, h.pn_offset) catch return false;
         const pn = packet.decodePn(sp.largest_rx, pn_info.truncated, pn_info.len);
         const header_len = h.pn_offset + pn_info.len;
 
@@ -615,18 +625,21 @@ pub const Conn = struct {
             const phase: u1 = @intCast((pkt[0] >> 2) & 1);
             if (phase != self.rx_phase) {
                 if (pn < self.rx_phase_start) {
-                    key = if (self.rx_prev) |*p| p else return;
+                    key = if (self.rx_prev) |*p| p else return false;
                 } else {
-                    key = if (self.rx_next) |*n| n else return;
+                    key = if (self.rx_next) |*n| n else return false;
                     phase_change = true;
                 }
             }
         }
-        const payload = key.open(pkt, header_len, pn) catch return;
+        const payload = key.open(pkt, header_len, pn) catch return false;
         // Reserved bits must be zero once protection is removed (§17.2).
         const reserved: u8 = if (h.type == .one_rtt) 0x18 else 0x0c;
-        if (pkt[0] & reserved != 0) return self.fail(.protocol_violation, 0, now);
-        if (pn < sp.rx_floor or sp.rx_ranges.contains(pn)) return; // duplicate
+        if (pkt[0] & reserved != 0) {
+            self.fail(.protocol_violation, 0, now);
+            return false;
+        }
+        if (pn < sp.rx_floor or sp.rx_ranges.contains(pn)) return false; // duplicate
         self.packets_received += 1;
         if (phase_change) self.commitKeyUpdate(pn, now);
         if (h.type == .one_rtt) {
@@ -648,15 +661,30 @@ pub const Conn = struct {
 
         var r: packet.Reader = .{ .data = payload };
         var ack_eliciting = false;
-        if (payload.len == 0) return self.fail(.protocol_violation, 0, now);
+        var probing = true;
+        if (payload.len == 0) {
+            self.fail(.protocol_violation, 0, now);
+            return false;
+        }
         while (r.left() > 0) {
             switch (frame.parse(&r)) {
-                .failure => |f| return self.fail(f.code, f.frame_type, now),
+                .failure => |f| {
+                    self.fail(f.code, f.frame_type, now);
+                    return false;
+                },
                 .frame => |f| {
-                    if (!frame.allowed(f, h.type)) return self.fail(.protocol_violation, frameTypeOf(f), now);
+                    if (!frame.allowed(f, h.type)) {
+                        self.fail(.protocol_violation, frameTypeOf(f), now);
+                        return false;
+                    }
                     if (frame.ackEliciting(f)) ack_eliciting = true;
+                    // §9.1: probing frames.
+                    switch (f) {
+                        .padding, .path_challenge, .path_response, .new_connection_id => {},
+                        else => probing = false,
+                    }
                     self.onFrame(space, f, now);
-                    if (self.state == .closing or self.state == .draining or self.state == .closed) return;
+                    if (self.state == .closing or self.state == .draining or self.state == .closed) return false;
                 },
             }
         }
@@ -670,10 +698,14 @@ pub const Conn = struct {
                 sp.rx_ranges.dropFirst();
                 sp.rx_ranges.insert(self.allocator, pn, pn + 1, max_ack_ranges) catch {};
             },
-            error.OutOfMemory => return self.fail(.internal_error, 0, now),
+            error.OutOfMemory => {
+                self.fail(.internal_error, 0, now);
+                return false;
+            },
         };
         const out_of_order = if (sp.largest_rx) |l| pn < l or pn > l + 1 else false;
-        if (sp.largest_rx == null or pn > sp.largest_rx.?) {
+        const newest = sp.largest_rx == null or pn > sp.largest_rx.?;
+        if (newest) {
             sp.largest_rx = pn;
             sp.largest_rx_time = now;
         }
@@ -693,6 +725,7 @@ pub const Conn = struct {
         }
         self.last_activity = now;
         self.sent_since_rx = false;
+        return newest and !probing;
     }
 
     fn frameTypeOf(f: frame.Frame) u64 {
@@ -921,7 +954,15 @@ pub const Conn = struct {
         if (raised) sp.largest_acked = ack.largest;
 
         const in_flight_before = self.cc.in_flight;
-        const window_before = self.cc.window;
+        // RFC 9002 §A.7: ECN before the acknowledged packets grow the
+        // window. Only a CE increase makes the order matter (a congestion
+        // event), so only then is the ACK walked twice.
+        const ecn_first = self.cfg.ecn and raised and
+            (sp.ecn_ce_pending or if (ack.ecn) |c| c[2] > sp.ecn_peer[2] else false);
+        if (ecn_first) {
+            const pre = self.newlyAcked(space, ack);
+            self.onAckEcn(space, ack.ecn, raised, pre.marked, pre.largest_time, now);
+        }
         var largest_newly: ?u64 = null;
         var largest_time: u64 = 0;
         var any_eliciting = false;
@@ -940,7 +981,7 @@ pub const Conn = struct {
                             largest_time = p.time_sent;
                         }
                         if (p.ack_eliciting) any_eliciting = true;
-                        if (p.ecn) newly_marked += 1;
+                        if (p.ecn and self.onPath(space, pn)) newly_marked += 1;
                         if (space == .application and pn >= self.tx_phase_start) self.tx_phase_acked = true;
                         for (sp.sent.recordsOf(p)) |rec| self.onRecordAcked(space, rec);
                         if (p.in_flight) self.cc.onAcked(p.size, p.time_sent, now, &self.rtt, in_flight_before);
@@ -950,7 +991,7 @@ pub const Conn = struct {
                 }
             }
         }
-        if (self.cfg.ecn) self.onAckEcn(space, ack.ecn, raised, newly_marked, if (largest_newly != null) largest_time else null, window_before, now);
+        if (self.cfg.ecn and !ecn_first) self.onAckEcn(space, ack.ecn, raised, newly_marked, if (largest_newly != null) largest_time else null, now);
         if (largest_newly == null) return;
         if (largest_newly.? == ack.largest and any_eliciting) {
             var ack_delay: u64 = 0;
@@ -976,17 +1017,17 @@ pub const Conn = struct {
     /// ranges it shed, declared lost by then). Then a CE increase is a
     /// congestion event (RFC 9002 §7.1, §B.7), once per round trip like a
     /// loss, placed by the newest packet the ACK newly acknowledged (or
-    /// the next ACK's), and taken before this ACK grows the window
-    /// (§A.7): the window goes back to `window_before`.
-    fn onAckEcn(self: *Self, space: Space, counts: ?[3]u64, raised: bool, newly_marked: u64, largest_sent: ?u64, window_before: u64, now: u64) void {
+    /// the next ACK's). Only this path's marked packets count (an old
+    /// path's can still be in flight when the peer's address changes).
+    fn onAckEcn(self: *Self, space: Space, counts: ?[3]u64, raised: bool, newly_marked: u64, largest_sent: ?u64, now: u64) void {
         const sp = &self.spaces[@backingInt(space)];
-        if (self.ecn == .failed) {
+        if (self.ecn == .failed or self.ecn == .lost) {
             const c = counts orelse return;
             if (!raised) return;
             // Testing packets all declared lost, then counted by the
             // peer: they were reordered, not dropped.
-            if (self.ecn_retest and space == .application and c[0] +| c[2] > sp.ecn_peer[0] +| sp.ecn_peer[2]) {
-                self.ecn_retest = false;
+            if (self.ecn == .lost and space == .application and c[0] +| c[2] > sp.ecn_peer[0] +| sp.ecn_peer[2]) {
+                self.ecn_retests += 1;
                 self.restartEcn();
             }
             for (&sp.ecn_peer, c) |*mine, theirs| mine.* = @max(mine.*, theirs);
@@ -1020,17 +1061,50 @@ pub const Conn = struct {
         const t = largest_sent orelse return;
         sp.ecn_ce_pending = false;
         if (self.cc.inRecovery(t)) return;
-        self.cc.window = @min(self.cc.window, window_before);
         self.cc.onCongestionEvent(t, now);
         self.ecn_ce_events += 1;
     }
 
-    /// Tests ECN on the path from the start (Appendix A.4).
+    /// Tests ECN on the path from the start (Appendix A.4), from the next
+    /// packet number on.
     fn restartEcn(self: *Self) void {
         self.ecn = .testing;
+        self.ecn_path_start = self.spaces[@backingInt(Space.application)].sent.nextPn();
         self.ecn_marked = 0;
         self.ecn_marked_lost = 0;
-        for (&self.spaces) |*sp| sp.ecn_owed = 0;
+        for (&self.spaces) |*sp| {
+            sp.ecn_owed = 0;
+            sp.ecn_ce_pending = false;
+        }
+    }
+
+    /// Whether a packet was sent on the current path (as far as ECN goes:
+    /// only 1-RTT packets are marked).
+    fn onPath(self: *const Self, space: Space, pn: u64) bool {
+        return space != .application or pn >= self.ecn_path_start;
+    }
+
+    const NewlyAcked = struct { marked: u64 = 0, largest_time: ?u64 = null };
+
+    /// What `onAck` will acknowledge, ahead of it (for ECN first).
+    fn newlyAcked(self: *Self, space: Space, ack: frame.Ack) NewlyAcked {
+        const sp = &self.spaces[@backingInt(space)];
+        var out: NewlyAcked = .{};
+        const floor = sp.sent.oldest() orelse return out;
+        var it = ack.iterator();
+        while (it.next()) |rg| {
+            if (rg.largest < floor) break;
+            var pn = @min(rg.largest, sp.sent.nextPn() - 1);
+            const low = @max(rg.smallest, floor);
+            while (true) : (pn -= 1) {
+                if (sp.sent.get(pn)) |p| {
+                    if (out.largest_time == null) out.largest_time = p.time_sent;
+                    if (p.ecn and self.onPath(space, pn)) out.marked += 1;
+                }
+                if (pn == low) break;
+            }
+        }
+        return out;
     }
 
     /// The peer's address changed (NAT rebinding): ECN is validated per
@@ -1040,7 +1114,6 @@ pub const Conn = struct {
     /// without path validation).
     pub fn onPathChange(self: *Self) void {
         if (!self.cfg.ecn) return;
-        self.ecn_retest = false;
         self.ecn_retests = 0;
         self.restartEcn();
     }
@@ -1129,7 +1202,7 @@ pub const Conn = struct {
                     newest_lost_time = @max(newest_lost_time, p.time_sent);
                     if (p.ack_eliciting) oldest_lost_time = @min(oldest_lost_time, p.time_sent);
                 }
-                if (p.ecn) self.ecn_marked_lost += 1;
+                if (p.ecn and self.onPath(space, e.pn)) self.ecn_marked_lost += 1;
                 sp.sent.remove(p);
                 self.lost_packets += 1;
             } else {
@@ -1139,11 +1212,8 @@ pub const Conn = struct {
         }
         // Appendix A.4: every packet of the testing period lost may be
         // the marks' doing (unless they turn out to have arrived).
-        if (self.ecn == .unknown and self.ecn_marked_lost >= self.ecn_marked) {
-            self.ecn = .failed;
-            self.ecn_retest = self.ecn_retests < ecn_max_retests;
-            self.ecn_retests += 1;
-        }
+        if (self.ecn == .unknown and self.ecn_marked_lost >= self.ecn_marked)
+            self.ecn = if (self.ecn_retests < ecn_max_retests) .lost else .failed;
         if (lost_any) {
             self.cc.onCongestionEvent(newest_lost_time, now);
             // Persistent congestion (§7.6), approximated by the span of the
@@ -1825,7 +1895,7 @@ pub const Conn = struct {
         if (self.state != .established) return .not_ect;
         return switch (self.ecn) {
             .testing, .capable => .ect0,
-            .unknown, .failed => .not_ect,
+            .unknown, .failed, .lost => .not_ect,
         };
     }
 
