@@ -16,6 +16,8 @@ pub fn SentPackets(comptime Record: type) type {
             ack_eliciting: bool,
             /// Counts towards bytes in flight (ACK-only packets don't).
             in_flight: bool,
+            /// Sent with the ECT(0) codepoint.
+            ecn: bool = false,
             live: bool = true,
             rec_start: u32,
             rec_count: u32,
@@ -61,7 +63,7 @@ pub fn SentPackets(comptime Record: type) type {
         }
 
         /// Records the next packet, with the records added since `mark`.
-        pub fn add(self: *Self, a: Allocator, mark: u64, time_sent: u64, size: u32, ack_eliciting: bool, in_flight: bool) Allocator.Error!void {
+        pub fn add(self: *Self, a: Allocator, mark: u64, time_sent: u64, size: u32, ack_eliciting: bool, in_flight: bool, ecn: bool) Allocator.Error!void {
             if (self.live_count == 0) {
                 // Nothing outstanding: start both arrays afresh.
                 const pn = self.nextPn();
@@ -79,6 +81,7 @@ pub fn SentPackets(comptime Record: type) type {
                 .size = size,
                 .ack_eliciting = ack_eliciting,
                 .in_flight = in_flight,
+                .ecn = ecn,
                 .rec_start = @intCast(mark - self.rec_base),
                 .rec_count = @intCast(self.rec_next - mark),
             });
@@ -174,7 +177,7 @@ test "packets, records, removal and compaction" {
             try s.addRecord(a, 999);
             s.discardRecordsSince(m2);
         }
-        try s.add(a, mark, i, 1200, n > 0, true);
+        try s.add(a, mark, i, 1200, n > 0, true, i % 3 == 0);
     }
     try testing.expectEqual(@as(u64, 100), s.nextPn());
     // Resolve in a scattered order, checking records each time.
@@ -185,6 +188,7 @@ test "packets, records, removal and compaction" {
     for (order, 0..) |pn, k| {
         const p = s.get(pn).?;
         try testing.expectEqualSlices(u32, expected_records[pn], s.recordsOf(p));
+        try testing.expectEqual(pn % 3 == 0, p.ecn);
         s.remove(p);
         try testing.expectEqual(@as(?*SentPackets(u32).Packet, null), s.get(pn));
         if (k % 10 == 0) s.compact();
@@ -196,7 +200,7 @@ test "packets, records, removal and compaction" {
     // After everything resolved, a new packet restarts the arrays.
     const mark = s.recordMark();
     try s.addRecord(a, 7);
-    try s.add(a, mark, 0, 100, true, true);
+    try s.add(a, mark, 0, 100, true, true, false);
     try testing.expectEqual(@as(u64, 100), s.oldest().?);
     try testing.expectEqualSlices(u32, &.{7}, s.recordsOf(s.get(100).?));
     try testing.expectEqual(@as(usize, 1), s.packets.items.len);

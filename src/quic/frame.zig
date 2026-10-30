@@ -288,9 +288,11 @@ pub fn ackEliciting(f: Frame) bool {
 // Each writes into a Writer known to have room; the *Len functions give the
 // room needed.
 
-pub fn writeAckFrame(w: *Writer, ranges: []const Range, delay: u64) void {
+/// An ACK frame, or ACK_ECN with `ecn` (the ECT(0), ECT(1) and ECN-CE
+/// counts, §19.3.2).
+pub fn writeAckFrame(w: *Writer, ranges: []const Range, delay: u64, ecn: ?[3]u64) void {
     // `ranges` are disjoint, largest first, with gaps of at least one.
-    w.varint(0x02);
+    w.varint(if (ecn == null) 0x02 else 0x03);
     w.varint(ranges[0].largest);
     w.varint(delay);
     w.varint(ranges.len - 1);
@@ -301,9 +303,10 @@ pub fn writeAckFrame(w: *Writer, ranges: []const Range, delay: u64) void {
         w.varint(rg.largest - rg.smallest);
         prev_smallest = rg.smallest;
     }
+    if (ecn) |counts| for (counts) |c| w.varint(c);
 }
 
-pub fn ackFrameLen(ranges: []const Range, delay: u64) usize {
+pub fn ackFrameLen(ranges: []const Range, delay: u64, ecn: ?[3]u64) usize {
     var n = 1 + varintLen(ranges[0].largest) + varintLen(delay) + varintLen(ranges.len - 1) +
         varintLen(ranges[0].largest - ranges[0].smallest);
     var prev_smallest = ranges[0].smallest;
@@ -311,6 +314,9 @@ pub fn ackFrameLen(ranges: []const Range, delay: u64) usize {
         n += varintLen(prev_smallest - rg.largest - 2) + varintLen(rg.largest - rg.smallest);
         prev_smallest = rg.smallest;
     }
+    if (ecn) |counts| for (counts) |c| {
+        n += varintLen(c);
+    };
     return n;
 }
 
@@ -433,8 +439,8 @@ test "ACK ranges round trip; malformed ranges fail" {
     };
     var buf: [64]u8 = undefined;
     var w: Writer = .{ .buf = &buf };
-    writeAckFrame(&w, &ranges, 25);
-    try testing.expectEqual(ackFrameLen(&ranges, 25), w.pos);
+    writeAckFrame(&w, &ranges, 25, null);
+    try testing.expectEqual(ackFrameLen(&ranges, 25, null), w.pos);
     const f = try parseOne(w.written());
     try testing.expectEqual(@as(u64, 25), f.ack.delay);
     var it = f.ack.iterator();
@@ -455,6 +461,16 @@ test "ACK ranges round trip; malformed ranges fail" {
     // ECN counts
     const ecn = try parseOne(&.{ 0x03, 3, 0, 0, 0, 1, 2, 3 });
     try testing.expectEqual([3]u64{ 1, 2, 3 }, ecn.ack.ecn.?);
+    // ACK_ECN round trip, counts of every size; truncated counts fail.
+    const counts = [3]u64{ 63, 1 << 20, packet.max_varint };
+    w = .{ .buf = &buf };
+    writeAckFrame(&w, &ranges, 25, counts);
+    try testing.expectEqual(ackFrameLen(&ranges, 25, counts), w.pos);
+    const g = try parseOne(w.written());
+    try testing.expectEqual(counts, g.ack.ecn.?);
+    try testing.expectEqual(@as(u64, 100), g.ack.largest);
+    try expectFailure(.frame_encoding_error, w.written()[0 .. w.pos - 1]);
+    try expectFailure(.frame_encoding_error, &.{ 0x03, 3, 0, 0, 0, 1, 2 });
 }
 
 test "STREAM and CRYPTO frames" {

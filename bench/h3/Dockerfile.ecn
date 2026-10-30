@@ -1,0 +1,16 @@
+# peregrine-h3-ecn: peregrine-h3load-netem plus tcpdump and ngtcp2's
+# example client (osslclient), which marks its packets ECT(0), reports the
+# codepoints it receives and validates ours (RFC 9000 §13.4). curl and
+# h2load use ngtcp2 too but never mark what they send. For
+# bench/scripts/h3-ecn.sh (needs NET_ADMIN for netem's CE marks).
+#   docker build -t peregrine-h3-ecn -f bench/h3/Dockerfile.ecn bench/h3
+FROM alpine:edge AS build
+RUN apk add --no-cache build-base pkgconf openssl-dev nghttp3-dev libev-dev curl linux-headers
+WORKDIR /src
+RUN curl -fsSL https://github.com/ngtcp2/ngtcp2/releases/download/v1.25.0/ngtcp2-1.25.0.tar.xz | tar xJ && \
+    cd ngtcp2-1.25.0 && ./configure --prefix=/opt/n --with-openssl --with-libev && make -j8 && make install && \
+    mkdir -p /opt/n/bin && cp examples/osslclient /opt/n/bin/
+
+FROM peregrine-h3load-netem:latest
+RUN apk add --no-cache tcpdump libev nghttp3 openssl
+COPY --from=build /opt/n /opt/n

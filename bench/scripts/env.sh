@@ -8,7 +8,7 @@ mkdir -p "$OUT"
 TAG=${TAG:-$$}
 LOCK=$ROOT/bench/scripts/lock.sh
 # Containers these scripts start are named with one of these prefixes
-# (linux-test, autobahn, fuzz, ws-bench, h2-bench, h3-interop, h3-netem).
+# (linux-test, autobahn, fuzz, ws-bench, h2-bench, h3-interop and h3-ecn, h3-netem).
 JOB_CONTAINERS='^(lt-|ab-|fuzz-|wsb-|h2b-|h3i-|h3n-)'
 
 # For benchmarks, after taking mac-bench: wait for other jobs' containers

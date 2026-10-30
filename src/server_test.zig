@@ -3196,11 +3196,14 @@ const quic_conn = @import("./quic/conn.zig");
 const h3frame = @import("./h3/frame.zig");
 const qpack = @import("./h3/qpack.zig");
 const quic_packet = @import("./quic/packet.zig");
+const quic_udp = @import("./quic/udp.zig");
 
-/// The QUIC test client on a connected UDP socket.
+/// The QUIC test client on a connected UDP socket, reading each datagram's
+/// ECN codepoint as the server does.
 const H3Client = struct {
     fd: sys.fd_t,
     c: *quic_test_client.Client,
+    batch: *quic_udp.RecvBatch(8, 2048),
     /// Datagrams to the server wait this long (a path with a round trip
     /// of at least this), in `queue`.
     delay_ns: u64 = 0,
@@ -3223,13 +3226,25 @@ const H3Client = struct {
         var dcid: [8]u8 = undefined;
         sys.randomBytes(&dcid);
         const c = try quic_test_client.Client.init(testing.allocator, .{ .dcid = dcid, .max_stream_data = 16 << 20, .max_data = 64 << 20 });
-        return .{ .fd = fd, .c = c };
+        errdefer c.deinit();
+        return .{ .fd = fd, .c = c, .batch = try testing.allocator.create(quic_udp.RecvBatch(8, 2048)) };
     }
 
     fn close(self: *H3Client) void {
         self.queue.deinit(testing.allocator);
         self.c.deinit();
+        testing.allocator.destroy(self.batch);
         sys.close(self.fd);
+    }
+
+    /// Reads the codepoint of what arrives, and sends with `ecn`.
+    fn enableEcn(self: *H3Client, ecn: quic_packet.Ecn) !void {
+        quic_udp.enableEcn(self.fd, false);
+        try self.setEcn(ecn);
+    }
+
+    fn setEcn(self: *H3Client, ecn: quic_packet.Ecn) !void {
+        try sys.setsockoptInt(self.fd, posix.IPPROTO.IP, posix.IP.TOS, @backingInt(ecn));
     }
 
     /// Exchanges datagrams until `done` holds or `ms` pass.
@@ -3256,8 +3271,12 @@ const H3Client = struct {
             self.queue.replaceRangeAssumeCapacity(0, due, &.{});
             var got = false;
             while (true) {
-                const n = sys.read(self.fd, &buf) catch break;
-                try self.c.recv(buf[0..n]);
+                const n = self.batch.recv(self.fd);
+                for (0..n) |i| {
+                    const d = self.batch.get(i);
+                    try self.c.recvEcn(d.data, d.ecn);
+                }
+                if (n == 0) break;
                 got = true;
             }
             if (!got) {
@@ -3418,6 +3437,42 @@ fn testHttp3Pacing(backend: Backend) !void {
     try testing.expectEqualStrings("200", &a.status);
     try testing.expect(std.mem.eql(u8, &big_body, a.body.items));
     try testing.expect(quic_conn.test_paced_waits.load(.monotonic) > waits);
+}
+
+test "http3: ECN marks go out and come back over UDP" {
+    try forEachBackend(testHttp3Ecn);
+}
+
+fn testHttp3Ecn(backend: Backend) !void {
+    var cfg = tlsConfig();
+    cfg.http3 = .{};
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    var cl = try H3Client.connect(r.srv.getQuicPort());
+    defer cl.close();
+    try cl.enableEcn(.ect0);
+    try cl.start();
+    const id = try cl.request("GET", "/big", "");
+    try cl.waitFinished(&.{id});
+    var a = try cl.response(id);
+    defer a.body.deinit(testing.allocator);
+    try testing.expect(std.mem.eql(u8, &big_body, a.body.items));
+    // The server marked its 1-RTT datagrams ECT(0) (GSO sends on Linux
+    // included), the marks arrived, and our counts of them validated the
+    // path: past its ten testing packets, it kept marking.
+    const got = cl.c.datagrams_ecn;
+    try testing.expect(got[@backingInt(quic_packet.Ecn.ect0)] > big_body.len / 1350 / 2);
+    try testing.expectEqual(@as(u64, 0), got[@backingInt(quic_packet.Ecn.ect1)] + got[@backingInt(quic_packet.Ecn.ce)]);
+    // Ours arrived marked too: the server counted them in its ACKs.
+    const counts = cl.c.spaces[2].peer_ecn.?;
+    try testing.expect(counts[0] > 0 and counts[1] == 0 and counts[2] == 0);
+    // A request marked CE is counted as such.
+    try cl.setEcn(.ce);
+    const hello = try cl.request("GET", "/hello", "");
+    try cl.waitFinished(&.{hello});
+    try cl.setEcn(.ect0);
+    try testing.expect(cl.c.spaces[2].peer_ecn.?[2] > 0);
 }
 
 test "http3: streamed uploads, a held body resumed from another thread" {

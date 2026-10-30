@@ -206,14 +206,14 @@ pub fn Endpoint(comptime Handler: type) type {
                 const n = self.batch.recv(self.fd);
                 for (0..n) |i| {
                     const d = self.batch.get(i);
-                    self.onDatagram(d.data, &d.from, now_us);
+                    self.onDatagram(d.data, &d.from, d.ecn, now_us);
                 }
                 if (n < batch_len) break;
             }
             self.flushDirty(now_us);
         }
 
-        fn onDatagram(self: *Self, data: []u8, from: *const udp.Addr, now_us: u64) void {
+        fn onDatagram(self: *Self, data: []u8, from: *const udp.Addr, ecn: packet.Ecn, now_us: u64) void {
             if (data.len == 0) return;
             const cid_len = self.opts.quic.cid_len;
             var slot: ?u32 = null;
@@ -228,7 +228,7 @@ pub fn Endpoint(comptime Handler: type) type {
                     if (data.len < packet.min_initial_datagram) return;
                     var out: [7 + 2 * 255 + 8]u8 = undefined;
                     const n = packet.writeVersionNegotiation(&out, h, self.rng.random().int(u8));
-                    udp.send(self.fd, from, out[0..n], null) catch {};
+                    udp.send(self.fd, from, out[0..n], null, .not_ect) catch {};
                     return;
                 }
                 if (h.dcid.len == cid_len and cid_len == 8) slot = self.by_cid.get(std.mem.readInt(u64, h.dcid[0..8], .little));
@@ -238,13 +238,13 @@ pub fn Endpoint(comptime Handler: type) type {
                     // §14.1: a client's Initial comes in a full-size datagram;
                     // §7.2: its first DCID has at least 8 bytes.
                     if (data.len < packet.min_initial_datagram or h.dcid.len < 8) return;
-                    slot = self.accept(h, data, from, now_us) orelse return;
+                    slot = self.accept(h, data, from, ecn, now_us) orelse return;
                     return;
                 }
             }
             const s = slot.?;
             const st = &self.slots[s];
-            if (st.q.?.recv(data, now_us) and !st.peer.eql(from)) {
+            if (st.q.?.recv(data, ecn, now_us) and !st.peer.eql(from)) {
                 // An authenticated packet from a new address (NAT rebinding;
                 // we ask clients not to migrate): answer there.
                 st.peer = from.*;
@@ -260,7 +260,7 @@ pub fn Endpoint(comptime Handler: type) type {
         }
 
         /// A new connection from a client's first Initial.
-        fn accept(self: *Self, h: packet.Header, data: []u8, from: *const udp.Addr, now_us: u64) ?u32 {
+        fn accept(self: *Self, h: packet.Header, data: []u8, from: *const udp.Addr, ecn: packet.Ecn, now_us: u64) ?u32 {
             var retry_scid: ?[]const u8 = null;
             var odcid = h.dcid;
             var odcid_buf: [packet.max_cid_len]u8 = undefined;
@@ -310,7 +310,7 @@ pub fn Endpoint(comptime Handler: type) type {
             st.odcid = CidKey.init(h.dcid);
             self.by_odcid.putAssumeCapacity(st.odcid, slot);
             self.count += 1;
-            _ = q.recv(data, now_us);
+            _ = q.recv(data, ecn, now_us);
             self.markDirty(slot);
             return slot;
         }
@@ -349,7 +349,7 @@ pub fn Endpoint(comptime Handler: type) type {
             self.rng.fill(out[0 .. len - 16]);
             out[0] = 0x40 | (out[0] & 0x3f);
             out[len - 16 ..][0..16].* = self.resetToken(data[1 .. 1 + cid_len]);
-            udp.send(self.fd, from, out[0..len], null) catch {};
+            udp.send(self.fd, from, out[0..len], null, .not_ect) catch {};
         }
 
         // -- Retry (address validation) -------------------------------------
@@ -370,7 +370,7 @@ pub fn Endpoint(comptime Handler: type) type {
             self.newCid(&scid);
             var out: [7 + 2 * packet.max_cid_len + token.len + 16]u8 = undefined;
             const n = protection.writeRetry(&out, h.dcid, h.scid, &scid, token[0 .. 12 + plen + 16], self.rng.random().int(u8));
-            udp.send(self.fd, from, out[0..n], null) catch {};
+            udp.send(self.fd, from, out[0..n], null, .not_ect) catch {};
         }
 
         /// The original DCID from a valid token, or null.
@@ -426,16 +426,20 @@ pub fn Endpoint(comptime Handler: type) type {
             const seg: usize = q.max_datagram;
             var pos: usize = 0;
             var segments: usize = 0;
+            // One GSO send has one ECN codepoint: a change ends the batch.
+            var ecn: packet.Ecn = .not_ect;
             while (true) {
-                if (pos + seg > self.send_buf.len) {
-                    self.sendOut(st, pos, seg, segments);
+                const next_ecn = q.sendEcn();
+                if (pos + seg > self.send_buf.len or (pos > 0 and next_ecn != ecn)) {
+                    self.sendOut(st, pos, seg, segments, ecn);
                     pos = 0;
                     segments = 0;
                 }
+                ecn = next_ecn;
                 const n = q.send(self.send_buf[pos..][0..seg], now_us);
                 if (n == 0) break;
                 if (!self.gso) {
-                    udp.send(self.fd, &st.peer, self.send_buf[0..n], null) catch {};
+                    udp.send(self.fd, &st.peer, self.send_buf[0..n], null, ecn) catch {};
                     continue;
                 }
                 pos += n;
@@ -443,18 +447,18 @@ pub fn Endpoint(comptime Handler: type) type {
                 // GSO sends equal segments with a shorter last one: a short
                 // datagram ends the batch.
                 if (n < seg or segments == 64) {
-                    self.sendOut(st, pos, seg, segments);
+                    self.sendOut(st, pos, seg, segments, ecn);
                     pos = 0;
                     segments = 0;
                 }
             }
-            if (pos > 0) self.sendOut(st, pos, seg, segments);
+            if (pos > 0) self.sendOut(st, pos, seg, segments, ecn);
         }
 
-        fn sendOut(self: *Self, st: *Slot, len: usize, seg: usize, segments: usize) void {
+        fn sendOut(self: *Self, st: *Slot, len: usize, seg: usize, segments: usize, ecn: packet.Ecn) void {
             if (len == 0) return;
             // A send that fails is a lost packet to QUIC; recovery resends.
-            udp.send(self.fd, &st.peer, self.send_buf[0..len], if (segments > 1) @intCast(seg) else null) catch {};
+            udp.send(self.fd, &st.peer, self.send_buf[0..len], if (segments > 1) @intCast(seg) else null, ecn) catch {};
         }
 
         fn destroy(self: *Self, slot: u32, now_us: u64) void {

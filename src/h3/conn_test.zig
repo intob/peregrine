@@ -196,6 +196,10 @@ const Harness = struct {
     pool: BufferPool,
     /// The client's control stream (after `startClient`).
     control: u64 = 0,
+    /// The ECN codepoint the client's datagrams arrive with, and whether
+    /// the path clears the server's marks.
+    client_ecn: packet.Ecn = .not_ect,
+    bleach: bool = false,
 
     fn init() !*Harness {
         const a = testing.allocator;
@@ -277,7 +281,7 @@ const Harness = struct {
             });
             h.h3c = try h3.Conn.init(h.a, h.h3_opts, h.server.?);
         }
-        _ = h.server.?.recv(dgram, h.now_us);
+        _ = h.server.?.recv(dgram, h.client_ecn, h.now_us);
         h.serverProcess();
     }
 
@@ -312,10 +316,11 @@ const Harness = struct {
                 h.drainMailbox();
                 h.serverProcess();
                 while (true) {
+                    const ecn = s.sendEcn();
                     const n = s.send(&buf, h.now_us);
                     if (n == 0) break;
                     progress = true;
-                    try h.client.recv(buf[0..n]);
+                    try h.client.recvEcn(buf[0..n], if (h.bleach) .not_ect else ecn);
                 }
                 if (s.isClosed()) return;
             }
@@ -1189,8 +1194,11 @@ test "HTTP/3: GOAWAY finishes requests in flight, then closes" {
 // -- Fuzzing ----------------------------------------------------------------------
 
 /// A completed handshake with the client's control stream open, then a
-/// fuzzer-chosen mix of raw QUIC frames in 1-RTT packets, bytes on request
-/// and unidirectional streams (with or without FIN), and lost datagrams.
+/// fuzzer-chosen mix of raw QUIC frames in 1-RTT packets (ACK_ECN with any
+/// counts among them), bytes on request and unidirectional streams (with
+/// or without FIN), and ECN: the codepoint of the client's datagrams, a
+/// path that clears the server's, and the client's counts reported,
+/// withheld, frozen or inflated.
 /// Checked: no crash, leak or out-of-bounds access; a connection that
 /// closes does so with a transport or HTTP/3 error code; every response
 /// the client sees parses as HTTP/3 frames.
@@ -1209,7 +1217,7 @@ fn fuzzH3(_: void, smith: *std.testing.Smith) anyerror!void {
         const op = smith.value(u8);
         const n = smith.slice(data[0..@min(data.len, 1 + @as(usize, smith.value(u8)) * 2)]);
         const bytes = data[0..n];
-        switch (op % 7) {
+        switch (op % 8) {
             0 => try h.client.injectFrames(bytes),
             1 => {
                 if (nids < ids.len) {
@@ -1251,6 +1259,21 @@ fn fuzzH3(_: void, smith: *std.testing.Smith) anyerror!void {
                 var buf: [600]u8 = undefined;
                 try h.client.write(h.control, priorityUpdate(&buf, if (op & 0x40 != 0) .priority_update_push else .priority_update_request, id, bytes), false);
             },
+            7 => {
+                h.client_ecn = @fromBackingInt(@as(u2, @truncate(op >> 3)));
+                h.bleach = op & 0x80 != 0;
+                const sel: u8 = if (n > 0) bytes[0] else 0;
+                h.client.ecn_mode = switch (sel % 4) {
+                    0 => .honest,
+                    1 => .none,
+                    2 => .frozen,
+                    else => blk: {
+                        // Counts beyond what was received.
+                        h.client.spaces[2].ecn[(sel >> 2) % 3] += n;
+                        break :blk h.client.ecn_mode;
+                    },
+                };
+            },
             else => {},
         }
         try h.run(3);
@@ -1279,6 +1302,8 @@ test "fuzz: h3 connection" {
             &[_]u8{ 0x01, 0x10, 0x01, 0x0b, 0x00, 0x00, 0xd1, 0xd7, 0x51, 0x01, '/', 0xc4, 0x00, 0x01, 'x', 0x81, 0x00 },
             // A control stream with a GOAWAY, an encoder stream.
             &[_]u8{ 0x03, 0x04, 0x00, 0x07, 0x01, 0x00, 0x03, 0x01, 0x02 },
+            // ECT(0) from the client; an ACK_ECN frame.
+            &[_]u8{ 0x17, 0x00, 0x00, 0x00, 0x03, 0x02, 0x00, 0x00, 0x02, 0x05, 0x00, 0x01 },
         },
     });
 }

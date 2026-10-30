@@ -88,6 +88,18 @@ const Harness = struct {
     datagrams_to_client: usize = 0,
     bytes_to_client: usize = 0,
     first_datagram_len: usize = 0,
+    /// ECN on the path: the codepoint the client's datagrams arrive
+    /// with; the server's marks cleared (`bleach`), its marked datagrams
+    /// dropped (`drop_marked`), or `ce_marks` of them marked CE, one in
+    /// every `ce_every` (the first and last at `ce_first`, `ce_last`).
+    client_ecn: packet.Ecn = .not_ect,
+    bleach: bool = false,
+    drop_marked: bool = false,
+    ce_marks: u32 = 0,
+    ce_every: u32 = 1,
+    ce_skipped: u32 = 0,
+    ce_first: u64 = 0,
+    ce_last: u64 = 0,
 
     fn init(client_opts: test_client.Options, tweak: anytype) !*Harness {
         const a = testing.allocator;
@@ -135,8 +147,28 @@ const Harness = struct {
             });
             h.first_datagram_len = dgram.len;
         }
-        _ = h.server.?.recv(dgram, h.now);
+        _ = h.server.?.recv(dgram, h.client_ecn, h.now);
         try EchoApp.run(h.server.?);
+    }
+
+    /// A datagram from the server, sent with `ecn`, over the path.
+    fn toClient(h: *Harness, dgram: []const u8, ecn: packet.Ecn) !void {
+        var arrived = ecn;
+        if (ecn != .not_ect) {
+            if (h.drop_marked) return;
+            if (h.bleach) arrived = .not_ect;
+            if (h.ce_marks > 0) {
+                h.ce_skipped += 1;
+                if (h.ce_skipped >= h.ce_every) {
+                    h.ce_skipped = 0;
+                    h.ce_marks -= 1;
+                    arrived = .ce;
+                    if (h.ce_first == 0) h.ce_first = h.now;
+                    h.ce_last = h.now;
+                }
+            }
+        }
+        try h.client.recvEcn(dgram, arrived);
     }
 
     /// Exchanges datagrams until neither side has anything to send, then
@@ -155,12 +187,13 @@ const Harness = struct {
             // Server to client.
             if (h.server) |s| {
                 while (true) {
+                    const ecn = s.sendEcn();
                     const n = s.send(&buf, h.now);
                     if (n == 0) break;
                     progress = true;
                     h.datagrams_to_client += 1;
                     h.bytes_to_client += n;
-                    if (!h.dropped()) try h.client.recv(buf[0..n]);
+                    if (!h.dropped()) try h.toClient(buf[0..n], ecn);
                 }
                 if (s.isClosed()) return;
             }
@@ -206,10 +239,11 @@ const Harness = struct {
                 var bytes: u64 = 0;
                 while (true) {
                     const in_flight = s.cc.in_flight;
+                    const ecn = s.sendEcn();
                     const n = s.send(&buf, h.now);
                     if (n == 0) break;
                     bytes += s.cc.in_flight - in_flight;
-                    try queue.append(h.a, .{ .at = h.now + delay, .to_server = false, .len = n, .buf = buf });
+                    try queue.append(h.a, .{ .at = h.now + delay, .to_server = false, .len = n, .buf = buf, .ecn = ecn });
                 }
                 if (bytes > 0) try bursts.append(h.a, .{ .at = h.now, .bytes = bytes, .tokens = tokens, .window = s.cc.window });
             }
@@ -224,7 +258,7 @@ const Harness = struct {
             h.now = next orelse return error.Stalled;
             while (head < queue.items.len and queue.items[head].at <= h.now) : (head += 1) {
                 const f = &queue.items[head];
-                if (f.to_server) try h.toServer(f.buf[0..f.len]) else try h.client.recv(f.buf[0..f.len]);
+                if (f.to_server) try h.toServer(f.buf[0..f.len]) else try h.toClient(f.buf[0..f.len], f.ecn);
             }
             if (timer) |t| if (t <= h.now) {
                 h.server.?.onTimeout(h.now);
@@ -235,7 +269,7 @@ const Harness = struct {
 };
 
 /// A datagram on its way over a delayed path.
-const Flight = struct { at: u64, to_server: bool, len: usize, buf: [1500]u8 };
+const Flight = struct { at: u64, to_server: bool, len: usize, buf: [1500]u8, ecn: packet.Ecn = .not_ect };
 
 /// In-flight bytes the server sent at one instant, what its pacer had
 /// then, and its congestion window.
@@ -767,11 +801,12 @@ fn runLossy(h: *Harness, delay: u64, loss: u8, id: u64) !void {
         if (s.isClosed()) return error.Closed;
         var sent_now: usize = 0;
         while (true) {
+            const ecn = s.sendEcn();
             const n = s.send(&buf, h.now);
             if (n == 0) break;
             sent_now += 1;
             if (h.prng.random().uintLessThan(u8, 100) < loss) continue;
-            try queue.append(h.a, .{ .at = h.now + delay, .to_server = false, .len = n, .buf = buf });
+            try queue.append(h.a, .{ .at = h.now + delay, .to_server = false, .len = n, .buf = buf, .ecn = ecn });
         }
         // A hold is always ahead of the send that set it.
         if (s.pacing_hold) |d| try testing.expect(d > h.now);
@@ -786,7 +821,7 @@ fn runLossy(h: *Harness, delay: u64, loss: u8, id: u64) !void {
         h.now = next orelse return error.Stalled;
         while (head < queue.items.len and queue.items[head].at <= h.now) : (head += 1) {
             const f = &queue.items[head];
-            if (f.to_server) try h.toServer(f.buf[0..f.len]) else try h.client.recv(f.buf[0..f.len]);
+            if (f.to_server) try h.toServer(f.buf[0..f.len]) else try h.toClient(f.buf[0..f.len], f.ecn);
         }
         if (timer) |t| if (t <= h.now) {
             if (s.pacing_hold) |ph| if (ph == t) {
@@ -868,9 +903,10 @@ test "verify pacing: a stream blocked by flow control doesn't keep the timer bus
             try queue.append(h.a, .{ .at = h.now + 20_000, .to_server = true, .len = n, .buf = buf });
         }
         while (true) {
+            const ecn = s.sendEcn();
             const n = s.send(&buf, h.now);
             if (n == 0) break;
-            try queue.append(h.a, .{ .at = h.now + 20_000, .to_server = false, .len = n, .buf = buf });
+            try queue.append(h.a, .{ .at = h.now + 20_000, .to_server = false, .len = n, .buf = buf, .ecn = ecn });
         }
         var next: ?u64 = if (head < queue.items.len) queue.items[head].at else null;
         var timer: ?u64 = null;
@@ -881,7 +917,7 @@ test "verify pacing: a stream blocked by flow control doesn't keep the timer bus
         h.now = next orelse break;
         while (head < queue.items.len and queue.items[head].at <= h.now) : (head += 1) {
             const f = &queue.items[head];
-            if (f.to_server) try h.toServer(f.buf[0..f.len]) else try h.client.recv(f.buf[0..f.len]);
+            if (f.to_server) try h.toServer(f.buf[0..f.len]) else try h.toClient(f.buf[0..f.len], f.ecn);
         }
         if (timer) |t| if (t <= h.now) {
             wakeups += 1;
@@ -1003,19 +1039,21 @@ fn runLossyMulti(h: *Harness, delay: u64, loss: u8, ids: []const u64) !void {
         const s = h.server.?;
         if (s.isClosed()) return error.Closed;
         while (true) {
+            const ecn = s.sendEcn();
             const n = s.send(&buf, h.now);
             if (n == 0) break;
             if (h.prng.random().uintLessThan(u8, 100) < loss) continue;
-            try queue.append(h.a, .{ .at = h.now + delay, .to_server = false, .len = n, .buf = buf });
+            try queue.append(h.a, .{ .at = h.now + delay, .to_server = false, .len = n, .buf = buf, .ecn = ecn });
         }
         if (s.pacing_hold) |d| try testing.expect(d > h.now);
         if (s.deadline()) |d| if (d <= h.now) {
             // Due already: the worker would come straight back. Only fine
             // if that next send does something.
             s.onTimeout(h.now);
+            const ecn = s.sendEcn();
             const n = s.send(&buf, h.now);
             if (n == 0 and !s.isClosed()) if (s.deadline()) |d2| if (d2 <= h.now) return error.BusyLoop;
-            if (n > 0) try queue.append(h.a, .{ .at = h.now + delay, .to_server = false, .len = n, .buf = buf });
+            if (n > 0) try queue.append(h.a, .{ .at = h.now + delay, .to_server = false, .len = n, .buf = buf, .ecn = ecn });
         };
         var next: ?u64 = if (head < queue.items.len) queue.items[head].at else null;
         var timer: ?u64 = null;
@@ -1026,7 +1064,7 @@ fn runLossyMulti(h: *Harness, delay: u64, loss: u8, ids: []const u64) !void {
         h.now = next orelse return error.Stalled;
         while (head < queue.items.len and queue.items[head].at <= h.now) : (head += 1) {
             const f = &queue.items[head];
-            if (f.to_server) try h.toServer(f.buf[0..f.len]) else try h.client.recv(f.buf[0..f.len]);
+            if (f.to_server) try h.toServer(f.buf[0..f.len]) else try h.toClient(f.buf[0..f.len], f.ecn);
         }
         if (timer) |t| if (t <= h.now) {
             s.onTimeout(h.now);
@@ -1091,4 +1129,327 @@ test "verify pacing: random paths, losses and stream mixes all complete without 
         for (0..n) |i| try testing.expectEqual(sizes[i], h.client.readAll(ids[i]).len);
     };
     try testing.expectEqual(@as(usize, 0), fails);
+}
+
+// -- ECN --------------------------------------------------------------------------
+
+fn noEcn(c: *conn_mod.Config) void {
+    c.ecn = false;
+}
+
+/// Downloads `n` bytes over the harness's instant path.
+fn download(h: *Harness, n: usize) !void {
+    const id = try h.client.openBidi();
+    var req: [32]u8 = undefined;
+    try h.client.write(id, try std.fmt.bufPrint(&req, "big {d}", .{n}), true);
+    try h.run(3000);
+    try testing.expectEqual(n, h.client.readAll(id).len);
+    try testing.expect(h.client.finished(id));
+}
+
+/// Established, with ECN validated by the client's counts.
+fn ecnCapable() !*Harness {
+    const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 32 << 20 }, noTweak);
+    errdefer h.deinit();
+    try h.run(10);
+    try download(h, 100_000);
+    try testing.expectEqual(conn_mod.EcnState.capable, h.server.?.ecn);
+    return h;
+}
+
+test "QUIC ECN: our ACKs count the codepoints received, per packet number space" {
+    {
+        // Not-ECT only: plain ACK frames.
+        const h = try Harness.init(.{}, noTweak);
+        defer h.deinit();
+        try h.run(10);
+        try download(h, 20_000);
+        // (Handshake packets are acknowledged in 1-RTT ones, the space
+        // gone.)
+        for ([_]usize{ 0, 2 }) |i| {
+            try testing.expect(h.client.spaces[i].acks_seen > 0);
+            try testing.expectEqual(@as(?[3]u64, null), h.client.spaces[i].peer_ecn);
+        }
+    }
+    const h = try Harness.init(.{}, noTweak);
+    defer h.deinit();
+    h.client_ecn = .ect0;
+    try h.run(10);
+    const s = h.server.?;
+    try testing.expect(s.isEstablished());
+    // The handshake's packets counted ECT(0) in their own spaces, and our
+    // Initial ACKs said so (the client's last Initial and its Handshake
+    // packets are never acknowledged: the spaces are gone by then).
+    for (0..2) |i| {
+        try testing.expect(s.spaces[i].ecn_rx[0] > 0);
+        try testing.expectEqual(@as(u64, 0), s.spaces[i].ecn_rx[1] + s.spaces[i].ecn_rx[2]);
+    }
+    const initial = h.client.spaces[0].peer_ecn.?;
+    try testing.expect(initial[0] > 0 and initial[0] <= s.spaces[0].ecn_rx[0] and initial[1] + initial[2] == 0);
+    // In the application space, ECT(1) and CE count apart, a packet each.
+    const base = s.spaces[2].ecn_rx;
+    var pn = h.client.spaces[2].next_pn;
+    var counts = base;
+    for ([_]packet.Ecn{ .ect1, .ce, .ect0 }, [_]usize{ 1, 2, 0 }) |ecn, k| {
+        h.client_ecn = ecn;
+        const id = try h.client.openBidi();
+        try h.client.write(id, "hello", true);
+        try h.run(5);
+        try testing.expectEqualStrings("echo:hello", h.client.readAll(id));
+        counts[k] += h.client.spaces[2].next_pn - pn;
+        pn = h.client.spaces[2].next_pn;
+    }
+    try testing.expectEqual(counts, s.spaces[2].ecn_rx);
+    try testing.expect(counts[1] > base[1] and counts[2] > base[2]);
+    const reported = h.client.spaces[2].peer_ecn.?;
+    try testing.expect(reported[1] == counts[1] and reported[2] == counts[2]);
+
+    // An ack-eliciting packet waits for the ACK delay; one marked CE is
+    // acknowledged at once (§13.2.1); its duplicate counts nothing.
+    try h.run(20);
+    try testing.expectEqual(@as(?u64, null), s.spaces[2].ack_deadline);
+    var buf: [1500]u8 = undefined;
+    const id = try h.client.openBidi();
+    try h.client.write(id, "x", false);
+    h.client_ecn = .ect0;
+    try h.toServer(buf[0..try h.client.send(&buf)]);
+    try testing.expectEqual(h.now + 25_000, s.spaces[2].ack_deadline.?);
+    h.now += 25_000;
+    try testing.expect(s.send(&buf, h.now) > 0);
+    try testing.expectEqual(@as(?u64, null), s.spaces[2].ack_deadline);
+    try h.client.write(id, "y", false);
+    const n = try h.client.send(&buf);
+    const copy = buf;
+    h.client_ecn = .ce;
+    const ce = s.spaces[2].ecn_rx[2];
+    try h.toServer(buf[0..n]);
+    try testing.expectEqual(h.now, s.spaces[2].ack_deadline.?);
+    try testing.expectEqual(ce + 1, s.spaces[2].ecn_rx[2]);
+    buf = copy;
+    try h.toServer(buf[0..n]);
+    try testing.expectEqual(ce + 1, s.spaces[2].ecn_rx[2]);
+}
+
+test "QUIC ECN: a client that reports its counts validates the path; 1-RTT datagrams go out ECT(0)" {
+    const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 32 << 20 }, noTweak);
+    defer h.deinit();
+    try h.run(10);
+    const s = h.server.?;
+    // Handshake packets go unmarked.
+    try testing.expectEqual(@as(u64, 0), s.spaces[0].ecn_sent + s.spaces[1].ecn_sent);
+    try download(h, 500_000);
+    try testing.expectEqual(conn_mod.EcnState.capable, s.ecn);
+    try testing.expect(s.ecn_marked > 300);
+    // Each marked datagram (one 1-RTT packet) counted ECT(0) at the
+    // client, which reported it.
+    try testing.expectEqual(s.ecn_marked, h.client.datagrams_ecn[@backingInt(packet.Ecn.ect0)]);
+    try testing.expectEqual(s.ecn_marked, h.client.spaces[2].ecn[0]);
+    try testing.expect(s.spaces[2].ecn_peer[0] > 300);
+    try testing.expectEqual(@as(u64, 0), s.ecn_ce_events);
+    try testing.expectEqual(@as(u64, 0), s.ecn_marked_lost);
+}
+
+/// Drives a download over a delayed path through CE marks (one
+/// `runDelayed`: datagrams in flight survive between the steps).
+const CeScript = struct {
+    id: u64,
+    rtt: u64,
+    step: u8 = 0,
+    // What each step saw.
+    capable: bool = false,
+    slow_start: bool = false,
+    first_window: u64 = 0,
+    first_ssthresh: u64 = 0,
+    events_a_round_later: u64 = 0,
+    marks_left: u32 = 0,
+    second_window: u64 = 0,
+    until: u64 = 0,
+
+    fn done(c: *CeScript, h: *Harness) bool {
+        const s = h.server.?;
+        switch (c.step) {
+            0 => if (s.cc.window > 120_000) {
+                c.capable = s.ecn == .capable;
+                c.slow_start = s.cc.ssthresh == std.math.maxInt(u64);
+                // Five marks spread over a window, reported in several
+                // ACKs.
+                h.ce_marks = 5;
+                h.ce_every = 8;
+                c.step = 1;
+            },
+            1 => if (s.ecn_ce_events >= 1) {
+                c.first_window = s.cc.window;
+                c.first_ssthresh = s.cc.ssthresh;
+                c.until = h.now + 3 * c.rtt;
+                c.step = 2;
+            },
+            2 => if (h.now >= c.until) {
+                c.events_a_round_later = s.ecn_ce_events;
+                c.marks_left = h.ce_marks;
+                // A mark more than a round trip later.
+                h.ce_marks = 1;
+                h.ce_every = 1;
+                c.step = 3;
+            },
+            3 => if (s.ecn_ce_events >= 2) {
+                c.second_window = s.cc.window;
+                c.step = 4;
+            },
+            else => return h.client.finished(c.id),
+        }
+        return false;
+    }
+};
+
+test "QUIC ECN: CE marks are a congestion event once per round trip, with nothing lost" {
+    inline for (.{ .cubic, .new_reno }) |alg| {
+        const h = try Harness.init(.{ .max_stream_data = 16 << 20, .max_data = 32 << 20 }, struct {
+            fn f(c: *conn_mod.Config) void {
+                c.congestion = alg;
+            }
+        }.f);
+        defer h.deinit();
+        var bursts: std.ArrayList(Burst) = .empty;
+        defer bursts.deinit(testing.allocator);
+        const delay = 10_000;
+        try h.runDelayed(delay, {}, established, &bursts);
+        const s = h.server.?;
+        var script: CeScript = .{ .id = try h.client.openBidi(), .rtt = 2 * delay };
+        try h.client.write(script.id, "big 6000000", true);
+        try h.runDelayed(delay, &script, CeScript.done, &bursts);
+        try testing.expectEqual(@as(usize, 6_000_000), h.client.readAll(script.id).len);
+        try testing.expect(script.capable and script.slow_start);
+        // The first mark ended slow start: the window is the new threshold.
+        try testing.expectEqual(script.first_ssthresh, script.first_window);
+        // The five marks came back over more than one ACK (bursts at least
+        // 2 ms apart), all in one round trip: one event.
+        try testing.expectEqual(@as(u32, 0), script.marks_left);
+        try testing.expect(h.ce_last - h.ce_first > 2000);
+        try testing.expectEqual(@as(u64, 1), script.events_a_round_later);
+        // The next round trip's mark: a second event, a smaller window.
+        try testing.expect(script.second_window < script.first_window);
+        try testing.expectEqual(@as(u64, 2), s.ecn_ce_events);
+        try testing.expectEqual([3]u64{ s.spaces[2].ecn_peer[0], 0, 6 }, s.spaces[2].ecn_peer);
+        // Nothing was lost or sent again: CE only shrinks the window.
+        try testing.expectEqual(@as(u64, 0), s.lost_packets);
+        try testing.expectEqual(conn_mod.EcnState.capable, s.ecn);
+    }
+}
+
+test "QUIC ECN: validation fails on missing, bogus or decreasing counts, and marking stops" {
+    const Case = enum { not_reported, bleached, bleached_later, frozen, ect0_beyond_sent, ect1, ce_beyond_sent, ect0_becomes_ce };
+    inline for (comptime std.enums.values(Case)) |case| {
+        const h = switch (case) {
+            .not_reported, .bleached => try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 32 << 20 }, noTweak),
+            else => try ecnCapable(),
+        };
+        defer h.deinit();
+        const sp = &h.client.spaces[2];
+        switch (case) {
+            .not_reported => h.client.ecn_mode = .none,
+            .bleached, .bleached_later => h.bleach = true,
+            .frozen => h.client.ecn_mode = .frozen,
+            .ect0_beyond_sent => sp.ecn[0] += 1_000_000,
+            .ect1 => sp.ecn[1] += 1,
+            .ce_beyond_sent => sp.ecn[2] += 1_000_000,
+            // ECT(0) can still exceed what it was, CE too: only the fall
+            // of the ECT(0) count is wrong.
+            .ect0_becomes_ce => {
+                sp.ecn[2] += sp.ecn[0];
+                sp.ecn[0] = 0;
+            },
+        }
+        try h.run(10);
+        const s = h.server.?;
+        try download(h, 200_000);
+        try testing.expectEqual(conn_mod.EcnState.failed, s.ecn);
+        // Not marking any more.
+        const marked = s.ecn_marked;
+        const unmarked = h.client.datagrams_ecn[@backingInt(packet.Ecn.not_ect)];
+        try download(h, 100_000);
+        try testing.expectEqual(marked, s.ecn_marked);
+        try testing.expect(h.client.datagrams_ecn[@backingInt(packet.Ecn.not_ect)] > unmarked + 80);
+        switch (case) {
+            // Found by the first ACK of the testing packets.
+            .not_reported, .bleached => try testing.expect(s.ecn_marked <= conn_mod.ecn_testing_packets),
+            else => {},
+        }
+        // Bogus CE counts don't touch the window.
+        try testing.expectEqual(@as(u64, 0), s.ecn_ce_events);
+        try testing.expectEqual(@as(u64, std.math.maxInt(u64)), s.cc.ssthresh);
+    }
+}
+
+test "QUIC ECN: a path that drops marked datagrams: marking stops when the testing packets are all lost" {
+    const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 32 << 20 }, noTweak);
+    defer h.deinit();
+    h.drop_marked = true;
+    try h.run(10);
+    try download(h, 300_000);
+    const s = h.server.?;
+    try testing.expectEqual(conn_mod.EcnState.failed, s.ecn);
+    try testing.expectEqual(@as(u64, conn_mod.ecn_testing_packets), s.ecn_marked);
+    try testing.expectEqual(s.ecn_marked, s.ecn_marked_lost);
+}
+
+test "QUIC ECN: an ACK that doesn't raise the largest acknowledged isn't validated" {
+    const h = try ecnCapable();
+    defer h.deinit();
+    const s = h.server.?;
+    const id = try h.client.openBidi();
+    try h.client.write(id, "big 30000", true);
+    var buf: [1500]u8 = undefined;
+    while (true) {
+        const n = try h.client.send(&buf);
+        if (n == 0) break;
+        try h.toServer(buf[0..n]);
+    }
+    var flights: [64]Flight = undefined;
+    var count: usize = 0;
+    while (count < flights.len) : (count += 1) {
+        const ecn = s.sendEcn();
+        const n = s.send(&flights[count].buf, h.now);
+        if (n == 0) break;
+        flights[count].len = n;
+        flights[count].ecn = ecn;
+    }
+    try testing.expect(count > 10);
+    // ACK one half, then both halves but the last datagram (so a packet
+    // is still in flight); the second ACK arrives first.
+    var acks: [2][1500]u8 = undefined;
+    var lens: [2]usize = undefined;
+    var counts: [2][3]u64 = undefined;
+    for (0..2) |k| {
+        const part = flights[k * count / 2 .. if (k == 0) count / 2 else count - 1];
+        for (part) |*f| try h.toClient(f.buf[0..f.len], f.ecn);
+        lens[k] = try h.client.send(&acks[k]);
+        counts[k] = h.client.spaces[2].ecn;
+    }
+    try testing.expect(counts[0][0] < counts[1][0]);
+    try h.toServer(acks[1][0..lens[1]]);
+    try testing.expectEqual(counts[1], s.spaces[2].ecn_peer);
+    try testing.expect(s.spaces[2].sent.live_count > 0);
+    // The first ACK's counts are lower: validated, they would fail.
+    try h.toServer(acks[0][0..lens[0]]);
+    try testing.expectEqual(conn_mod.EcnState.capable, s.ecn);
+    try testing.expectEqual(counts[1], s.spaces[2].ecn_peer);
+    const last = &flights[count - 1];
+    try h.toClient(last.buf[0..last.len], last.ecn);
+    try h.run(50);
+    try testing.expect(h.client.finished(id));
+    try testing.expectEqual(conn_mod.EcnState.capable, s.ecn);
+}
+
+test "QUIC ECN: off, nothing is marked and no counts are reported" {
+    const h = try Harness.init(.{ .max_stream_data = 8 << 20 }, noEcn);
+    defer h.deinit();
+    h.client_ecn = .ect0;
+    try h.run(10);
+    try download(h, 100_000);
+    const s = h.server.?;
+    try testing.expectEqual(conn_mod.EcnState.failed, s.ecn);
+    try testing.expectEqual(@as(u64, 0), s.ecn_marked);
+    try testing.expectEqual(@as(u64, 0), h.client.datagrams_ecn[@backingInt(packet.Ecn.ect0)]);
+    try testing.expectEqual([3]u64{ 0, 0, 0 }, s.spaces[2].ecn_rx);
+    try testing.expectEqual(@as(?[3]u64, null), h.client.spaces[2].peer_ecn);
 }

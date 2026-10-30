@@ -21,8 +21,18 @@
 //! it may go for `deadline()`, so the worker's timer brings the connection
 //! back to `send`. ACKs, probes and PATH_RESPONSE don't wait.
 //!
+//! ECN (RFC 9000 §13.4): the worker passes each datagram's codepoint to
+//! `recv`, and the counts of each go back in our ACK_ECN frames, per
+//! packet number space. Our own 1-RTT datagrams go out ECT(0) (`sendEcn`
+//! says which codepoint the next one takes) through a testing period of
+//! ten packets; the peer's counts are then validated on every ACK that
+//! raises the largest acknowledged (§13.4.2.1), and a failure, or losing
+//! every packet of the testing period, stops the marking for good
+//! (Appendix A.4). A CE count increase is a congestion event, like a loss
+//! (RFC 9002 §7.1).
+//!
 //! Not yet: connection migration and NEW_CONNECTION_ID, Retry tokens
-//! (the worker's job), ECN, PMTU discovery, DATAGRAM frames.
+//! (the worker's job), PMTU discovery, DATAGRAM frames.
 const std = @import("std");
 const builtin = @import("builtin");
 const packet = @import("./packet.zig");
@@ -78,7 +88,28 @@ pub const Config = struct {
     cid_len: u8 = 8,
     /// Out-of-order CRYPTO data held per encryption level.
     max_crypto_buffer: u64 = 64 * 1024,
+    /// ECN (RFC 9000 §13.4): report the codepoints datagrams arrive with,
+    /// and mark ours ECT(0) while the path and the peer pass validation.
+    /// Off: everything is Not-ECT both ways.
+    ecn: bool = true,
 };
+
+/// Where ECN stands on the path (RFC 9000 Appendix A.4).
+pub const EcnState = enum(u8) {
+    /// Marking the first `ecn_testing_packets` packets.
+    testing,
+    /// Testing is over; not marking until an ACK validates the marked
+    /// packets' counts, or every one of them is lost.
+    unknown,
+    /// Validated: marking every packet, still validating each ACK.
+    capable,
+    /// Validation failed, the marked packets were all lost, or ECN is
+    /// off: not marking.
+    failed,
+};
+
+/// Packets marked ECT(0) before waiting for their validation.
+pub const ecn_testing_packets = 10;
 
 pub const Space = enum(u2) {
     initial,
@@ -158,6 +189,12 @@ const PnSpace = struct {
     last_ack_eliciting_time: u64 = 0,
     /// Probe packets owed after a PTO.
     probes: u8 = 0,
+    /// ECN (§13.4): packets received with ECT(0), ECT(1) and CE, which
+    /// our ACKs report; our packets sent ECT(0), and the peer's counts in
+    /// the last ACK that passed validation.
+    ecn_rx: [3]u64 = @splat(0),
+    ecn_sent: u64 = 0,
+    ecn_peer: [3]u64 = @splat(0),
     crypto_rx: RecvStream = .{},
     crypto_tx: SendStream = .{},
 
@@ -350,6 +387,15 @@ pub const Conn = struct {
     /// When the data the last `send` held back for the pacer may go.
     pacing_hold: ?u64 = null,
 
+    ecn: EcnState,
+    /// Packets we sent ECT(0), and those of them declared lost.
+    ecn_marked: u64 = 0,
+    ecn_marked_lost: u64 = 0,
+    /// The codepoint of the datagram `recv` is processing.
+    rx_ecn: packet.Ecn = .not_ect,
+    /// CE count increases that started a congestion event.
+    ecn_ce_events: u64 = 0,
+
     pub const InitOptions = struct {
         /// The client's Initial: its DCID, SCID.
         odcid: []const u8,
@@ -389,6 +435,7 @@ pub const Conn = struct {
             .rx_max_data = cfg.max_data,
             // A Retry already proved the address.
             .address_validated = opts.retry_scid != null,
+            .ecn = if (cfg.ecn) .testing else .failed,
         };
         errdefer self.freeAll();
         try self.free_slots.ensureTotalCapacity(allocator, total);
@@ -500,11 +547,12 @@ pub const Conn = struct {
 
     // -- Receiving ------------------------------------------------------------
 
-    /// Processes one datagram (its packets are decrypted in place).
-    /// Returns whether any packet in it was authenticated, for the worker
-    /// to trust its source address.
-    pub fn recv(self: *Self, datagram: []u8, now: u64) bool {
+    /// Processes one datagram (its packets are decrypted in place) that
+    /// arrived with the ECN codepoint `ecn`. Returns whether any packet in
+    /// it was authenticated, for the worker to trust its source address.
+    pub fn recv(self: *Self, datagram: []u8, ecn: packet.Ecn, now: u64) bool {
         if (self.state == .closed or self.state == .draining) return false;
+        self.rx_ecn = if (self.cfg.ecn) ecn else .not_ect;
         self.bytes_received += datagram.len;
         if (self.state == .closing) {
             // Answer with our CONNECTION_CLOSE again, at a bounded rate.
@@ -616,9 +664,19 @@ pub const Conn = struct {
             sp.largest_rx_time = now;
         }
         sp.ack_wanted = true;
+        // §13.4.1: each packet counts its datagram's codepoint (coalesced
+        // packets each count once); duplicates returned above.
+        switch (self.rx_ecn) {
+            .not_ect => {},
+            .ect1 => sp.ecn_rx[1] += 1,
+            .ect0 => sp.ecn_rx[0] += 1,
+            .ce => sp.ecn_rx[2] += 1,
+        }
         if (ack_eliciting) {
             sp.ack_eliciting_unacked += 1;
-            if (space != .application or out_of_order or sp.ack_eliciting_unacked >= ack_eliciting_threshold) {
+            // §13.2.1: CE marks are acknowledged at once, so the peer
+            // reacts to the congestion sooner.
+            if (space != .application or out_of_order or self.rx_ecn == .ce or sp.ack_eliciting_unacked >= ack_eliciting_threshold) {
                 sp.ack_deadline = now;
             } else if (sp.ack_deadline == null) {
                 sp.ack_deadline = now + self.cfg.max_ack_delay_ms * 1000;
@@ -850,12 +908,14 @@ pub const Conn = struct {
     fn onAck(self: *Self, space: Space, ack: frame.Ack, now: u64) void {
         const sp = &self.spaces[@backingInt(space)];
         if (ack.largest >= sp.sent.nextPn()) return self.fail(.protocol_violation, 0x02, now);
-        if (sp.largest_acked == null or ack.largest > sp.largest_acked.?) sp.largest_acked = ack.largest;
+        const raised = sp.largest_acked == null or ack.largest > sp.largest_acked.?;
+        if (raised) sp.largest_acked = ack.largest;
 
         const in_flight_before = self.cc.in_flight;
         var largest_newly: ?u64 = null;
         var largest_time: u64 = 0;
         var any_eliciting = false;
+        var newly_marked: u64 = 0;
         // Packets below the oldest live one were all resolved already.
         const floor = sp.sent.oldest() orelse return;
         var it = ack.iterator();
@@ -870,6 +930,7 @@ pub const Conn = struct {
                         largest_time = p.time_sent;
                     }
                     if (p.ack_eliciting) any_eliciting = true;
+                    if (p.ecn) newly_marked += 1;
                     if (space == .application and pn >= self.tx_phase_start) self.tx_phase_acked = true;
                     for (sp.sent.recordsOf(p)) |rec| self.onRecordAcked(space, rec);
                     if (p.in_flight) self.cc.onAcked(p.size, p.time_sent, now, &self.rtt, in_flight_before);
@@ -878,6 +939,9 @@ pub const Conn = struct {
                 if (pn == low) break;
             }
         }
+        // §13.4.2.1: an ACK that doesn't raise the largest acknowledged
+        // may be a reordered one, with older counts.
+        if (raised and self.ecn != .failed) self.onAckEcn(space, ack.ecn, newly_marked, if (largest_newly != null) largest_time else null, now);
         if (largest_newly == null) return;
         if (largest_newly.? == ack.largest and any_eliciting) {
             var ack_delay: u64 = 0;
@@ -891,6 +955,39 @@ pub const Conn = struct {
         self.pto_count = 0;
         sp.sent.compact();
         self.setLossTimer(now);
+    }
+
+    /// Validates the ECN counts of an ACK that raised the largest
+    /// acknowledged (RFC 9000 §13.4.2.1), `newly_marked` being the packets
+    /// sent ECT(0) that it newly acknowledged; then a CE increase is a
+    /// congestion event (RFC 9002 §7.1, §B.7), once per round trip like a
+    /// loss, timed by the largest packet it newly acknowledged.
+    fn onAckEcn(self: *Self, space: Space, counts: ?[3]u64, newly_marked: u64, largest_sent: ?u64, now: u64) void {
+        const sp = &self.spaces[@backingInt(space)];
+        const c = counts orelse {
+            // Marks cleared on the way, or a peer that doesn't report them.
+            if (newly_marked > 0) self.ecn = .failed;
+            return;
+        };
+        const prev = sp.ecn_peer;
+        const valid = c[0] >= prev[0] and c[2] >= prev[2] and
+            // ECT(1) we never send; ECT(0) and CE only come from the
+            // packets we marked, all of which the network may have
+            // marked CE; each newly acknowledged one was counted.
+            c[1] == 0 and c[0] +| c[2] <= sp.ecn_sent and
+            (c[0] - prev[0]) + (c[2] - prev[2]) >= newly_marked;
+        if (!valid) {
+            self.ecn = .failed;
+            return;
+        }
+        sp.ecn_peer = c;
+        if (newly_marked > 0 and self.ecn != .capable) self.ecn = .capable;
+        if (c[2] > prev[2]) {
+            const t = largest_sent orelse return;
+            const before = self.cc.recovery_start;
+            self.cc.onCongestionEvent(t, now);
+            if (self.cc.recovery_start != before) self.ecn_ce_events += 1;
+        }
     }
 
     fn onRecordAcked(self: *Self, space: Space, rec: Rec) void {
@@ -977,6 +1074,7 @@ pub const Conn = struct {
                     newest_lost_time = @max(newest_lost_time, p.time_sent);
                     if (p.ack_eliciting) oldest_lost_time = @min(oldest_lost_time, p.time_sent);
                 }
+                if (p.ecn) self.ecn_marked_lost += 1;
                 sp.sent.remove(p);
                 self.lost_packets += 1;
             } else {
@@ -984,6 +1082,9 @@ pub const Conn = struct {
                 sp.loss_time = if (sp.loss_time) |l| @min(l, t) else t;
             }
         }
+        // Appendix A.4: every packet of the testing period lost may be
+        // the marks' doing.
+        if (self.ecn == .unknown and self.ecn_marked_lost == self.ecn_marked) self.ecn = .failed;
         if (lost_any) {
             self.cc.onCongestionEvent(newest_lost_time, now);
             // Persistent congestion (§7.6), approximated by the span of the
@@ -1528,7 +1629,7 @@ pub const Conn = struct {
             if (budget < max) max = @intCast(budget);
         }
         if (max < 64) return 0;
-        var b: Builder = .{ .out = out[0..max] };
+        var b: Builder = .{ .out = out[0..max], .ecn = self.sendEcn() == .ect0 };
         if (self.cfg.pacing) {
             // A datagram's worth of room, or only ACKs, probes and
             // PATH_RESPONSE go.
@@ -1595,6 +1696,8 @@ pub const Conn = struct {
         paced: bool = true,
         /// Data that could have gone was held back for the pacer.
         held: bool = false,
+        /// The datagram goes out ECT(0).
+        ecn: bool = false,
 
         fn room(b: *const Builder) usize {
             return b.out.len - b.pos;
@@ -1631,10 +1734,15 @@ pub const Conn = struct {
         sp.tx.?.protect(pkt, b.pn_offset - b.start, b.pn_len, b.pn);
         b.pos = end;
         const size: u32 = @intCast(end - b.start);
-        sp.sent.add(self.allocator, b.rec_mark, now, size, b.last_eliciting, b.last_in_flight or b.last_eliciting) catch {
+        sp.sent.add(self.allocator, b.rec_mark, now, size, b.last_eliciting, b.last_in_flight or b.last_eliciting, b.ecn) catch {
             self.fail(.internal_error, 0, now);
             return;
         };
+        if (b.ecn) {
+            sp.ecn_sent += 1;
+            self.ecn_marked += 1;
+            if (self.ecn == .testing and self.ecn_marked >= ecn_testing_packets) self.ecn = .unknown;
+        }
         if (b.last_eliciting or b.last_in_flight) {
             self.cc.onSent(size);
             self.pacer.onSent(size);
@@ -1649,6 +1757,17 @@ pub const Conn = struct {
         }
         if (b.space == .application) self.tx_phase_packets += 1;
         self.setLossTimer(now);
+    }
+
+    /// The ECN codepoint for the datagram `send` fills next (one for a
+    /// whole GSO send): ECT(0) once the handshake is complete (only 1-RTT
+    /// packets are marked), while ECN is tested or validated.
+    pub fn sendEcn(self: *const Self) packet.Ecn {
+        if (self.state != .established) return .not_ect;
+        return switch (self.ecn) {
+            .testing, .capable => .ect0,
+            .unknown, .failed => .not_ect,
+        };
     }
 
     fn ackDue(sp: *const PnSpace, now: u64) bool {
@@ -1781,10 +1900,12 @@ pub const Conn = struct {
         }
         const exponent = 3; // the default ack_delay_exponent, which we advertise
         const delay = (now -| sp.largest_rx_time) >> exponent;
+        // ACK_ECN once any packet arrived marked (§13.4.1).
+        const ecn: ?[3]u64 = if (sp.ecn_rx[0] | sp.ecn_rx[1] | sp.ecn_rx[2] != 0) sp.ecn_rx else null;
         // Shed the oldest ranges if the frame doesn't fit.
-        while (n > 0 and frame.ackFrameLen(list[0..n], delay) > w.left()) n -= 1;
+        while (n > 0 and frame.ackFrameLen(list[0..n], delay, ecn) > w.left()) n -= 1;
         if (n == 0) return;
-        frame.writeAckFrame(w, list[0..n], delay);
+        frame.writeAckFrame(w, list[0..n], delay, ecn);
         try sp.sent.addRecord(self.allocator, .{ .ack = list[0].largest });
         sp.ack_wanted = false;
         sp.ack_eliciting_unacked = 0;
@@ -1958,7 +2079,7 @@ pub const Conn = struct {
         if (long) _ = packet.writeVarintLen(out[pn_offset - 2 ..], end - pn_offset, 2);
         sp.tx.?.protect(out[0..end], pn_offset, pn_len, pn);
         // Consume the packet number (nothing is tracked for it).
-        sp.sent.add(self.allocator, sp.sent.recordMark(), 0, @intCast(end), false, false) catch {};
+        sp.sent.add(self.allocator, sp.sent.recordMark(), 0, @intCast(end), false, false, false) catch {};
         if (sp.sent.get(pn)) |p| sp.sent.remove(p);
         return end;
     }

@@ -48,6 +48,12 @@ pub const Http3Options = struct {
     /// Spread each congestion window over the round trip (RFC 9002 §7.7)
     /// instead of sending it in bursts as acknowledgements open it.
     pacing: bool = true,
+    /// Explicit Congestion Notification (RFC 9000 §13.4): read the ECN
+    /// codepoint of every datagram and report the counts to the client;
+    /// mark our datagrams ECT(0) while the path and the client prove they
+    /// carry and count the marks, and back off on Congestion Experienced
+    /// as on a loss.
+    ecn: bool = true,
     /// Connection receive window, and per request stream.
     max_data: u64 = 16 * 1024 * 1024,
     max_stream_data: u64 = 1024 * 1024,
@@ -459,6 +465,7 @@ pub fn Server(comptime Handler: type) type {
                         var ua = address;
                         ua.setPort(srv.quic_port);
                         udp_fds[i] = try udp.bind(ua, sys.is_linux);
+                        if (o.ecn) udp.enableEcn(udp_fds[i], ua == .ip6);
                         if (i == 0 and srv.quic_port == 0) srv.quic_port = try udp.localPort(udp_fds[0]);
                     }
                     if (o.alt_svc) {
@@ -544,6 +551,7 @@ pub fn Server(comptime Handler: type) type {
                     .max_datagram_size = o.max_datagram_size,
                     .congestion = o.congestion,
                     .pacing = o.pacing,
+                    .ecn = o.ecn,
                 },
                 .h3 = h3_opts,
                 .max_connections = o.max_connections_per_worker,

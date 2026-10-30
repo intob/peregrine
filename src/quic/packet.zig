@@ -12,6 +12,16 @@ pub const max_cid_len = 20;
 pub const min_initial_datagram = 1200;
 pub const max_varint: u64 = (1 << 62) - 1;
 
+/// The ECN field of the IP header a datagram arrived in or leaves with
+/// (RFC 3168 §5): the two low bits of the IPv4 TOS byte or IPv6 Traffic
+/// Class.
+pub const Ecn = enum(u2) {
+    not_ect = 0,
+    ect1 = 1,
+    ect0 = 2,
+    ce = 3,
+};
+
 pub const Error = error{
     /// Not a decodable QUIC packet: dropped (§12.2, §17).
     Malformed,

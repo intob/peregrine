@@ -1,8 +1,9 @@
 //! A minimal QUIC client for tests: TLS 1.3 with X25519 and AES-128-GCM,
 //! certificate not verified (the server's Finished is), CRYPTO and STREAM
 //! data with crude retransmission (everything unacknowledged is resent on
-//! `retransmit`), and ACKs for everything received. Enough to drive
-//! conn.zig through handshakes, streams, flow control, loss and errors.
+//! `retransmit`), and ACKs for everything received, with ECN counts of the
+//! codepoints it was given (`recvEcn`). Enough to drive conn.zig through
+//! handshakes, streams, flow control, loss, ECN and errors.
 const std = @import("std");
 const packet = @import("./packet.zig");
 const protection = @import("./protection.zig");
@@ -38,6 +39,21 @@ const Space = struct {
     crypto_tx: stream_mod.SendStream = .{},
     /// Crypto frames per packet number, for acks: (pn, offset, len).
     sent: std.ArrayList(SentFrame) = .empty,
+    /// Packets received with ECT(0), ECT(1) and CE, as our ACKs report
+    /// them; the server's counts in its last ACK_ECN (null: plain ACKs).
+    ecn: [3]u64 = @splat(0),
+    peer_ecn: ?[3]u64 = null,
+    acks_seen: u32 = 0,
+};
+
+/// How the client reports ECN counts in its ACKs.
+pub const EcnMode = enum {
+    /// What it received.
+    honest,
+    /// Never: plain ACK frames.
+    none,
+    /// ACK_ECN with the counts as they are now, never raised again.
+    frozen,
 };
 
 const SentFrame = struct { pn: u64, kind: enum { crypto, stream }, id: u64 = 0, offset: u64, len: u64, fin: bool = false };
@@ -91,6 +107,9 @@ pub const Client = struct {
     path_responses: u32 = 0,
     new_cids: u32 = 0,
     stateless_reset_tokens: u32 = 0,
+    ecn_mode: EcnMode = .honest,
+    /// Datagrams received with each codepoint (by its value).
+    datagrams_ecn: [4]u64 = @splat(0),
 
     pub fn init(a: Allocator, opts: Options) !*Self {
         const self = try a.create(Self);
@@ -216,6 +235,12 @@ pub const Client = struct {
     // -- Receiving -----------------------------------------------------------
 
     pub fn recv(self: *Self, datagram: []const u8) !void {
+        return self.recvEcn(datagram, .not_ect);
+    }
+
+    /// A datagram that arrived with the ECN codepoint `ecn`.
+    pub fn recvEcn(self: *Self, datagram: []const u8, ecn: packet.Ecn) !void {
+        self.datagrams_ecn[@backingInt(ecn)] += 1;
         var copy = try self.a.dupe(u8, datagram);
         defer self.a.free(copy);
         var rest: []u8 = copy[0..];
@@ -237,6 +262,12 @@ pub const Client = struct {
             const pk = if (idx == 2 and ((pkt[0] >> 2) & 1) != self.rx_phase and self.prev_rx_packet != null) self.prev_rx_packet.? else keys.packet;
             const payload = pk.open(pkt, h.pn_offset + pn_info.len, pn) catch return error.Undecryptable;
             if (sp.largest_rx == null or pn > sp.largest_rx.?) sp.largest_rx = pn;
+            if (!sp.rx_pns.contains(pn) and self.ecn_mode != .frozen) switch (ecn) {
+                .not_ect => {},
+                .ect0 => sp.ecn[0] += 1,
+                .ect1 => sp.ecn[1] += 1,
+                .ce => sp.ecn[2] += 1,
+            };
             sp.rx_pns.insert(self.a, pn, pn + 1, 1 << 20) catch unreachable;
             var r: packet.Reader = .{ .data = payload };
             while (r.left() > 0) {
@@ -256,6 +287,8 @@ pub const Client = struct {
         switch (f) {
             .padding, .ping => {},
             .ack => |ack| {
+                sp.peer_ecn = ack.ecn;
+                sp.acks_seen += 1;
                 var it = ack.iterator();
                 while (it.next()) |rg| {
                     var i: usize = 0;
@@ -536,7 +569,8 @@ pub const Client = struct {
                 list[n] = .{ .smallest = r.start, .largest = r.end - 1 };
                 n += 1;
             }
-            frame.writeAckFrame(&w, list[0..n], 0);
+            const report = self.ecn_mode != .none and (sp.ecn[0] | sp.ecn[1] | sp.ecn[2]) != 0;
+            frame.writeAckFrame(&w, list[0..n], 0, if (report) sp.ecn else null);
             sp.ack_needed = false;
         }
         while (sp.crypto_tx.next(w.left() -| 16, std.math.maxInt(u64))) |c| {
