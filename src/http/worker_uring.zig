@@ -45,9 +45,14 @@ const NIL16: u16 = std.math.maxInt(u16);
 const is_test = @import("builtin").is_test;
 
 /// Tests give every provided-buffer ring this many buffers (0: none
-/// posted), so that receives find none (ENOBUFS) and fall back to pooled
-/// ones (`armRecvPlain`), as under a burst of connections.
+/// posted; else a power of two), so that receives find none (ENOBUFS) and
+/// fall back to pooled ones (`armRecvPlain`), as under a burst of
+/// connections. Read when a worker is created (set it before the server
+/// starts, reset it after it stops).
 pub var test_ring_buffers: ?u16 = null;
+/// Tests: while set, nothing is posted to the rings (every receive gets
+/// ENOBUFS); once cleared they fill again.
+pub var test_ring_closed: std.atomic.Value(bool) = .init(false);
 
 /// The ALPN protocol is HTTP/2.
 fn isH2(alpn: ?[]const u8) bool {
@@ -59,6 +64,9 @@ const BUFFER_GROUP_ID: u16 = 1;
 const Op = enum(u8) {
     recv,
     recv_plain,
+    /// The socket is readable, for a receive that found no kernel buffer
+    /// (`armRecvWait`).
+    recv_ready,
     write,
     cancel,
     accept,
@@ -87,7 +95,7 @@ pub fn available() bool {
     if (!(probe.is_supported(.ACCEPT) and probe.is_supported(.RECV) and
         probe.is_supported(.SEND) and probe.is_supported(.SENDMSG) and probe.is_supported(.ASYNC_CANCEL) and
         probe.is_supported(.TIMEOUT))) return false;
-    var buffers = RecvBuffers.init(ring.fd, std.heap.page_allocator, 64, 1) catch return false;
+    var buffers = RecvBuffers.init(ring.fd, std.heap.page_allocator, 64, 1, false) catch return false;
     buffers.deinit(ring.fd, std.heap.page_allocator);
     return true;
 }
@@ -131,7 +139,8 @@ const Parked = struct {
 /// all of them, each receive landing in cold memory. Only as many as
 /// recent batches used (`target`) are posted; the rest wait on the stack,
 /// most recently used on top. A receive that finds the ring empty gets
-/// ENOBUFS (and a pooled buffer instead), and doubles the target.
+/// ENOBUFS (and waits for readability instead, `armRecvWait`), and doubles
+/// the target.
 const RecvBuffers = struct {
     br: *align(std.heap.page_size_min) linux.io_uring_buf_ring,
     memory: []u8,
@@ -155,10 +164,12 @@ const RecvBuffers = struct {
     taken: u16 = 0,
     taken_max: u16 = 0,
     starved: bool = false,
+    /// Tests: post nothing (`test_ring_buffers` = 0).
+    keep_empty: bool = false,
 
     const min_target = 8;
 
-    fn init(ring_fd: linux.fd_t, allocator: std.mem.Allocator, size: u32, count: u16) !RecvBuffers {
+    fn init(ring_fd: linux.fd_t, allocator: std.mem.Allocator, size: u32, count: u16, keep_empty: bool) !RecvBuffers {
         const memory = try allocator.alloc(u8, @as(usize, size) * count);
         errdefer allocator.free(memory);
         const free = try allocator.alloc(u16, count);
@@ -188,6 +199,7 @@ const RecvBuffers = struct {
             .lo = lo,
             .hi = hi,
             .target = @min(count, 2 * min_target),
+            .keep_empty = keep_empty,
         };
         self.topUp();
         return self;
@@ -274,7 +286,7 @@ const RecvBuffers = struct {
     fn topUp(self: *RecvBuffers) void {
         self.taken_max = @max(self.taken_max, self.taken);
         self.taken = 0;
-        if (is_test and test_ring_buffers == 0) return;
+        if (is_test and (self.keep_empty or test_ring_closed.load(.monotonic))) return;
         const mask = IoUring.buf_ring_mask(self.count);
         var added: u16 = 0;
         while (self.posted + added < self.target and self.free_len > 0) : (added += 1) {
@@ -511,11 +523,14 @@ pub fn Worker(comptime Handler: type) type {
             self.ring = try IoUring.init(cfg.ring_entries, linux.IORING_SETUP_SINGLE_ISSUER |
                 linux.IORING_SETUP_DEFER_TASKRUN | linux.IORING_SETUP_R_DISABLED);
             errdefer self.ring.deinit();
+            const test_count: ?u16 = if (is_test) test_ring_buffers else null;
+            if (test_count) |n| std.debug.assert(n == 0 or std.math.isPowerOfTwo(n));
             self.buffers = try .init(
                 self.ring.fd,
                 allocator,
                 @intCast(opts.read_buffer_size),
-                if (is_test) @max(1, test_ring_buffers orelse cfg.recv_buffer_count) else cfg.recv_buffer_count,
+                if (test_count) |n| @max(1, n) else cfg.recv_buffer_count,
+                test_count == 0,
             );
             self.buffers_live = true;
             self.exchanges = try exchange.Slab.init(allocator, opts.max_exchanges, &self.mailbox, opts.exchange);
@@ -633,7 +648,7 @@ pub fn Worker(comptime Handler: type) type {
             if (self.quic) |*ep| ep.shutdown(nowUs());
             // Shutting down: one GOAWAY per HTTP/2 connection, best effort.
             for (self.conns) |*c| {
-                if (!c.open or c.h2 == null or c.closing or c.write_inflight) continue;
+                if (!c.open or c.h2 == null or c.closing or c.write_inflight or c.lingering) continue;
                 const conn = c.h2.?;
                 conn.shutdown();
                 if (userTls(c)) |t| {
@@ -732,11 +747,13 @@ pub fn Worker(comptime Handler: type) type {
             switch (op) {
                 .recv => self.onRecv(c, cqe),
                 .recv_plain => self.onRecvPlain(c, cqe),
+                .recv_ready => self.onRecvReady(c, cqe),
                 .write => if (c.ws != null) self.onWsWrite(c, cqe) else if (c.h2 != null) self.onH2Write(c, cqe) else self.onWrite(c, cqe),
                 .write_ready => {
                     c.write_inflight = false;
                     if (c.closing) return;
                     if (cqe.res < 0) return self.closeConn(c);
+                    if (self.alertAfterWrite(c, 0)) return;
                     // Room again: carry on with what was waiting.
                     if (c.ws != null) {
                         self.wsDrive(c);
@@ -882,17 +899,22 @@ pub fn Worker(comptime Handler: type) type {
         }
 
         /// A receive armed by `armRecvPlain` is writing into the
-        /// connection's own input buffer (TLS's, else the protocol's). The
-        /// kernel owns that buffer until the completion: nothing may
-        /// release, compact or replace it meanwhile, or the pool would
-        /// hand it to another connection. Idle connections are driven
-        /// meanwhile (ticks, posts from other threads, write completions).
+        /// connection's own input buffer (TLS's, else the protocol's; the
+        /// session's while lingering). The kernel owns that buffer until
+        /// the completion: nothing may release, compact or replace it
+        /// meanwhile, or the pool would hand it to another connection.
+        /// Idle connections are driven meanwhile (ticks, posts from other
+        /// threads, write completions).
         fn plainRecvArmed(c: *const Conn) bool {
             return c.recv_armed and c.recv_op == .recv_plain;
         }
 
         /// Returns the buffers that hold nothing to their pools, except
-        /// the one a plain receive is writing into.
+        /// the one a plain receive is writing into, which stays until the
+        /// completion. That one holds input already (the rest of a request,
+        /// record or frame goes in after it), as on epoll; a receive that
+        /// found no kernel buffer and holds nothing waits for readability
+        /// instead (`armRecvWait`), so an idle connection holds no buffer.
         fn releaseIdle(self: *Self, c: *Conn) void {
             const armed = plainRecvArmed(c);
             if (c.tls) |t| {
@@ -911,21 +933,51 @@ pub fn Worker(comptime Handler: type) type {
             }
         }
 
-        /// Receives into a pooled buffer: the one holding partial input, or
-        /// a fresh one when the provided-buffer ring is exhausted.
+        /// Receives into the buffer holding partial input: the rest of the
+        /// request, record or frame goes straight in after it.
         fn armRecvPlain(self: *Self, c: *Conn) void {
-            const space = if (c.tls) |t|
-                t.readSpace() catch return self.closeConn(c)
-            else if (c.ws) |w|
-                w.decoder.readSpace() catch return self.closeConn(c)
-            else if (c.h2) |conn|
-                conn.readSpace(&self.pool) catch return self.closeConn(c)
-            else
-                c.session.readSpace(&self.pool, self.opts.session) catch return self.closeConn(c);
+            const space = self.plainSpace(c) orelse return;
             const sqe = self.getSqe();
             sqe.prep_recv(c.fd, space, 0);
             sqe.user_data = userData(c.gen, self.slotOf(c), .recv_plain);
             c.recv_op = .recv_plain;
+            c.recv_armed = true;
+            c.inflight += 1;
+        }
+
+        /// Where input goes without a kernel buffer: TLS's buffer, else the
+        /// protocol's. Lingering input is discarded (plainInput): whatever
+        /// the protocol, it goes into the session's buffer. Null if the
+        /// connection was closed.
+        fn plainSpace(self: *Self, c: *Conn) ?[]u8 {
+            const space = if (c.lingering)
+                c.session.readSpace(&self.pool, self.opts.session)
+            else if (c.tls) |t|
+                t.readSpace()
+            else if (c.ws) |w|
+                w.decoder.readSpace()
+            else if (c.h2) |conn|
+                conn.readSpace(&self.pool)
+            else
+                c.session.readSpace(&self.pool, self.opts.session);
+            return space catch {
+                self.closeConn(c);
+                return null;
+            };
+        }
+
+        /// A receive found no kernel buffer (ENOBUFS) and the connection
+        /// holds no input: wait until the socket is readable, then receive
+        /// at once into a pooled buffer, held only while the input lasts.
+        /// A receive armed into such a buffer would hold it for as long as
+        /// the connection idles (a burst leaves many so, and WebSockets
+        /// have no idle timeout).
+        fn armRecvWait(self: *Self, c: *Conn) void {
+            if (c.recv_armed or c.closing or c.peer_closed) return;
+            const sqe = self.getSqe();
+            sqe.prep_poll_add(c.fd, linux.POLL.IN);
+            sqe.user_data = userData(c.gen, self.slotOf(c), .recv_ready);
+            c.recv_op = .recv_ready;
             c.recv_armed = true;
             c.inflight += 1;
         }
@@ -983,7 +1035,7 @@ pub fn Worker(comptime Handler: type) type {
         fn tickH2(self: *Self) void {
             if (self.h2_count == 0) return;
             for (self.conns) |*c| {
-                if (!c.open or c.h2 == null or c.closing) continue;
+                if (!c.open or c.h2 == null or c.closing or c.lingering) continue;
                 const ctx = self.h2Context(c);
                 c.h2.?.tick(Handler, &ctx);
                 self.h2Drive(c);
@@ -1261,7 +1313,8 @@ pub fn Worker(comptime Handler: type) type {
                     // Parked input goes in first (drive takes it, then
                     // receives); after it would come out of order.
                     if (c.parked.head != NIL16) return self.carryOn(c);
-                    return self.armRecvPlain(c);
+                    if (!c.lingering and holdsPartialInput(c)) return self.armRecvPlain(c);
+                    return self.armRecvWait(c);
                 }
                 // Cancelled for backpressure: receive again once ready.
                 if (cqe.err() == .CANCELED) return self.carryOn(c);
@@ -1317,46 +1370,71 @@ pub fn Worker(comptime Handler: type) type {
             c.recv_cancelling = false;
             if (c.closing) return;
             if (cqe.res < 0) return self.closeConn(c);
+            self.plainInput(c, @intCast(cqe.res));
+        }
+
+        /// The socket is readable (armRecvWait): receive what is there.
+        fn onRecvReady(self: *Self, c: *Conn, cqe: linux.io_uring_cqe) void {
+            c.recv_armed = false;
+            c.recv_cancelling = false;
+            if (c.closing) return;
+            if (cqe.res < 0) return self.closeConn(c);
+            const space = self.plainSpace(c) orelse return;
+            // TLS with decrypted input not yet taken: it goes first.
+            if (space.len == 0) return self.carryOn(c);
+            const n = sys.read(c.fd, space) catch |err| switch (err) {
+                error.WouldBlock => {
+                    // Not after all: the buffer goes back, and the wait on.
+                    self.releaseIdle(c);
+                    return self.armRecv(c);
+                },
+                else => return self.closeConn(c),
+            };
+            self.plainInput(c, n);
+        }
+
+        /// `n` bytes received into `plainSpace` (0: the peer closed).
+        fn plainInput(self: *Self, c: *Conn, n: usize) void {
             if (c.lingering) {
-                // Drained input (armed for want of a kernel buffer, or
+                // Drained input (after a wait for readability, or
                 // before the final response went out: see finish) is
-                // discarded like the rest.
+                // discarded like the rest, with the buffer it went into.
                 c.session.deinit(&self.pool);
-                c.lingered +|= @intCast(cqe.res);
-                if (cqe.res == 0 or c.lingered > sys.max_linger_bytes) return self.closeConn(c);
+                c.lingered +|= @intCast(@min(n, std.math.maxInt(u32)));
+                if (n == 0 or c.lingered > sys.max_linger_bytes) return self.closeConn(c);
                 return self.armRecv(c);
             }
             if (c.tls) |t| {
-                if (cqe.res == 0) {
+                if (n == 0) {
                     c.peer_closed = true;
                 } else {
-                    t.commitRead(@intCast(cqe.res));
+                    t.commitRead(n);
                     if (!self.tlsDecrypt(c, t)) return;
                 }
                 return if (c.ws != null) self.wsDrive(c) else self.drive(c);
             }
             if (c.ws) |w| {
-                if (cqe.res == 0) {
+                if (n == 0) {
                     c.peer_closed = true;
                 } else {
-                    w.decoder.commitRead(@intCast(cqe.res));
+                    w.decoder.commitRead(n);
                     _ = w.process(Handler, self.handler);
                 }
                 return self.wsDrive(c);
             }
             if (c.h2) |conn| {
-                if (cqe.res == 0) {
+                if (n == 0) {
                     c.peer_closed = true;
                 } else {
-                    conn.commitRead(@intCast(cqe.res));
+                    conn.commitRead(n);
                     if (!self.h2Process(c)) return;
                 }
                 return self.h2Drive(c);
             }
-            if (cqe.res == 0) {
+            if (n == 0) {
                 c.peer_closed = true;
             } else {
-                c.session.commitRead(@intCast(cqe.res));
+                c.session.commitRead(n);
             }
             self.drive(c);
         }
@@ -1413,6 +1491,7 @@ pub fn Worker(comptime Handler: type) type {
             c.write_inflight = false;
             if (c.closing) return;
             if (cqe.res < 0) return self.closeConn(c);
+            if (self.alertAfterWrite(c, @intCast(cqe.res))) return;
             if (cqe.res > 0) self.arm(c, .active);
             if (userTls(c)) |t| {
                 t.advance(@intCast(cqe.res));
@@ -1814,7 +1893,7 @@ pub fn Worker(comptime Handler: type) type {
         /// there is nothing to write. One write at a time; no recv while
         /// a write is in flight (backpressure).
         fn h2Drive(self: *Self, c: *Conn) void {
-            if (c.closing or c.write_inflight) return;
+            if (c.closing or c.write_inflight or c.lingering) return;
             const conn = c.h2 orelse return;
             if (userTls(c)) |t| {
                 switch (self.tlsSubmit(c, t)) {
@@ -1846,7 +1925,16 @@ pub fn Worker(comptime Handler: type) type {
                 if (c.list != .active) self.arm(c, .active);
                 return;
             }
-            if (conn.wantsClose() or c.peer_closed) return self.closeConn(c);
+            if (conn.wantsClose()) return self.h2Linger(c);
+            if (c.peer_closed) {
+                // Half-closed: what was asked is still answered, within the
+                // request timeout (progress writing extends it), unless
+                // that needs more from the client.
+                if (conn.activeStreams() == 0 or !conn.answerableAlone()) return self.closeConn(c);
+                self.releaseIdle(c);
+                if (c.list != .active) self.arm(c, .active);
+                return;
+            }
             self.releaseIdle(c);
             if (conn.activeStreams() == 0 and !conn.inFrame()) {
                 self.arm(c, .idle);
@@ -1856,10 +1944,32 @@ pub fn Worker(comptime Handler: type) type {
             self.armRecv(c);
         }
 
+        /// Our GOAWAY is written: half-close, and drain what the client
+        /// still sends (a PING, frames on their way) for a while before
+        /// closing, as after an HTTP/1.1 error response. Closing with
+        /// input unread makes the kernel reset the connection, which can
+        /// destroy the GOAWAY before the client reads it.
+        fn h2Linger(self: *Self, c: *Conn) void {
+            if (c.peer_closed) return self.closeConn(c);
+            if (c.tls) |t| {
+                // No write is in flight: close_notify goes out directly.
+                if (t.isEstablished() and !t.hasWire()) {
+                    t.close();
+                    tlsWriteOnce(c, t);
+                }
+            }
+            sys.shutdownWrite(c.fd);
+            c.lingering = true;
+            self.releaseIdle(c);
+            self.arm(c, .active);
+            self.armRecv(c);
+        }
+
         fn onH2Write(self: *Self, c: *Conn, cqe: linux.io_uring_cqe) void {
             c.write_inflight = false;
             if (c.closing) return;
             if (cqe.res < 0) return self.closeConn(c);
+            if (self.alertAfterWrite(c, @intCast(cqe.res))) return;
             const conn = c.h2.?;
             if (userTls(c)) |t| {
                 t.advance(@intCast(cqe.res));
@@ -2037,8 +2147,8 @@ pub fn Worker(comptime Handler: type) type {
 
         /// Decrypts every complete record into the session (or the
         /// WebSocket decoder, processing frames as they land). On a TLS
-        /// failure sends the alert and closes. Returns false if the
-        /// connection was closed.
+        /// failure sends the alert and closes (after a write in flight).
+        /// Returns false if the connection was closed or is to close.
         fn tlsDecrypt(self: *Self, c: *Conn, t: *TlsConn) bool {
             while (true) {
                 // ALPN decides, once the handshake is done or 0-RTT data
@@ -2081,10 +2191,15 @@ pub fn Worker(comptime Handler: type) type {
                 }
             }
             if (t.failed) {
-                // The alert, unless a write is in flight (HTTP/2 and
-                // WebSockets receive while writing): a direct write would
-                // overtake it.
-                if (!c.write_inflight) tlsWriteOnce(c, t);
+                // With a write in flight (HTTP/2 and WebSockets receive
+                // while writing) the alert is sealed behind its bytes: the
+                // completion sends it and closes (alertAfterWrite). Input
+                // borrowed from a kernel buffer is dropped.
+                if (c.write_inflight) {
+                    if (t.borrowed) t.endBorrow() catch {};
+                    return false;
+                }
+                tlsWriteOnce(c, t);
                 self.closeConn(c);
                 return false;
             }
@@ -2165,6 +2280,18 @@ pub fn Worker(comptime Handler: type) type {
             c.write_inflight = true;
             c.inflight += 1;
             return .writing;
+        }
+
+        /// TLS failed while a write was in flight (tlsDecrypt), which has
+        /// now completed: the rest of the wire, the alert last, then close.
+        /// The caller returns at once.
+        fn alertAfterWrite(self: *Self, c: *Conn, n: usize) bool {
+            const t = c.tls orelse return false;
+            if (!t.failed) return false;
+            if (!t.kernel_tx) t.advance(n);
+            tlsWriteOnce(c, t);
+            self.closeConn(c);
+            return true;
         }
 
         /// Best effort before closing (alerts, close_notify): one direct
@@ -2249,6 +2376,7 @@ pub fn Worker(comptime Handler: type) type {
             c.write_inflight = false;
             if (c.closing) return;
             if (cqe.res < 0) return self.closeConn(c);
+            if (self.alertAfterWrite(c, @intCast(cqe.res))) return;
             // With TLS the WebSocket bytes were consumed when encrypted.
             if (userTls(c)) |t| {
                 t.advance(@intCast(cqe.res));

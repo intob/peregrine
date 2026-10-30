@@ -1600,8 +1600,8 @@ const H2Client = struct {
     connect_protocol: bool = false,
     /// Over TLS (ALPN h2) instead of `tcp` alone.
     tls: ?*TlsAlpnClient = null,
-    /// SETTINGS and PING go unanswered: nothing is sent that would make
-    /// the server read again.
+    /// SETTINGS, PING and our windows go unanswered: nothing is sent that
+    /// would make the server read again (or after our FIN).
     quiet: bool = false,
 
     const Reply = struct {
@@ -1779,11 +1779,11 @@ const H2Client = struct {
                             if (d.end_stream) r.done = true;
                             self.conn_consumed += d.flow_len;
                             r.consumed += d.flow_len;
-                            if (self.conn_consumed >= 32 * 1024) {
+                            if (!self.quiet and self.conn_consumed >= 32 * 1024) {
                                 try self.sendWindow(0, @intCast(self.conn_consumed));
                                 self.conn_consumed = 0;
                             }
-                            if (!r.done and r.consumed >= 32 * 1024) {
+                            if (!self.quiet and !r.done and r.consumed >= 32 * 1024) {
                                 try self.sendWindow(d.stream_id, @intCast(r.consumed));
                                 r.consumed = 0;
                             }
@@ -2300,6 +2300,76 @@ fn testH2ShutdownStuck(backend: Backend) !void {
 
 test "h2c: the client's GOAWAY closes the connection, and the worker goes on" {
     try forEachBackend(testH2ClientGoaway);
+}
+
+test "h2c: a connection ending with input unread closes with a FIN, not a reset" {
+    try forEachBackend(testH2CloseUnread);
+}
+
+/// GOAWAY, then more frames than one read takes: once the connection
+/// wants to close, the rest is unread. Closing then would make the kernel
+/// reset it (h2spec saw "connection reset by peer" reading our GOAWAY);
+/// the server half-closes and drains instead.
+fn testH2CloseUnread(backend: Backend) !void {
+    const r = try Running.start(backend, h2Config());
+    defer r.stop();
+    for (0..3) |round| {
+        const c = try H2Client.connect(r.port);
+        defer c.close();
+        var first: H2Client.Reply = .{};
+        defer first.deinit();
+        try c.fetch(1, "GET", "/", null, &first);
+        const pings = 4000;
+        const out = try testing.allocator.alloc(u8, 64 + pings * (h2frame.header_len + 8));
+        defer testing.allocator.free(out);
+        // The client's GOAWAY, or a connection error of ours (a GOAWAY
+        // on a stream).
+        var n = try h2frame.writeGoaway(out, 1, .no_error, "");
+        if (round == 1) std.mem.writeInt(u32, out[5..9], 1, .big);
+        for (0..pings) |_| n += try h2frame.writePing(out[n..], false, "unread..");
+        try c.send(out[0..n]);
+        // Whatever comes (PING ACKs, our GOAWAY), then the end: a FIN.
+        var buf: [16 * 1024]u8 = undefined;
+        while (try sys.read(c.tcp.fd, &buf) > 0) {}
+    }
+}
+
+test "h2c: a client that half-closes still gets its answers" {
+    try forEachBackend(testH2HalfClose);
+}
+
+/// Requests, then FIN: the responses still come (one answered later from
+/// another thread, one large enough to wait for room), then the server
+/// closes.
+fn testH2HalfClose(backend: Backend) !void {
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    const r = try Running.start(backend, h2Config());
+    defer r.stop();
+    const c = try H2Client.connect(r.port);
+    defer c.close();
+    var later: H2Client.Reply = .{};
+    defer later.deinit();
+    var big: H2Client.Reply = .{};
+    defer big.deinit();
+    var map = std.AutoHashMap(u31, *H2Client.Reply).init(testing.allocator);
+    defer map.deinit();
+    try map.put(1, &later);
+    try map.put(3, &big);
+    // Our window covers the whole body: nothing more need be sent.
+    var buf: [64]u8 = undefined;
+    try c.send(buf[0..try h2frame.writeWindowUpdate(&buf, 0, big_body_len)]);
+    var settings: [64]u8 = undefined;
+    try c.send(settings[0..try h2frame.writeSettings(&settings, &.{.{ .id = .initial_window_size, .value = big_body_len }})]);
+    try c.request(1, "GET", "/later", null);
+    try c.request(3, "GET", "/big", null);
+    sys.shutdownWrite(c.tcp.fd);
+    c.quiet = true;
+    try testing.expectEqual(@as(?h2frame.ErrorCode, null), try c.collect(&map));
+    try testing.expectEqual(@as(u16, 202), later.status);
+    try testing.expectEqualStrings("later-body", later.body.items);
+    try testing.expectEqual(@as(usize, big_body_len), big.body.items.len);
+    var rest: [1024]u8 = undefined;
+    while (try sys.read(c.tcp.fd, &rest) > 0) {}
 }
 
 fn testH2ClientGoaway(backend: Backend) !void {
@@ -4122,6 +4192,80 @@ fn testShutdownManyIdle(backend: Backend) !void {
     r.stop();
     stopped = true;
     try testing.expect(sys.monotonicSeconds() - t0 <= 2);
+}
+
+test "io_uring: idle connections hold no input buffer while the ring is empty" {
+    if (sys.is_linux) {
+        const worker_uring = @import("./http/worker_uring.zig");
+        if (!worker_uring.available()) return error.SkipZigTest;
+        worker_uring.test_ring_closed.store(true, .monotonic);
+        defer worker_uring.test_ring_closed.store(false, .monotonic);
+        try testFallbacksReclaimed(worker_uring);
+    } else return error.SkipZigTest;
+}
+
+/// WebSockets (no idle timeout) and HTTP/2 connections served while the
+/// ring is empty: idle, none holds an input buffer (each waits for
+/// readability instead of receiving into one of its own), and each still
+/// works, then and once the ring fills again.
+fn testFallbacksReclaimed(comptime worker_uring: type) !void {
+    const r = try Running.start(.io_uring, h2Config());
+    defer r.stop();
+    const ws_count = 8;
+    const cs = try testing.allocator.alloc(Client, ws_count);
+    defer testing.allocator.free(cs);
+    var opened: usize = 0;
+    defer for (cs[0..opened]) |*c| c.close();
+    for (cs) |*c| {
+        c.* = try Client.connect(r.port);
+        opened += 1;
+        try c.send(Client.upgrade_request);
+        try c.readUpgrade();
+        try c.wsSend(true, .text, "one");
+        try c.expectWsText("one");
+    }
+    const h2 = try H2Client.connect(r.port);
+    defer h2.close();
+    var reply: H2Client.Reply = .{};
+    defer reply.deinit();
+    try h2.fetch(1, "GET", "/a", null, &reply);
+    // The last writes' completions re-arm the receives: give them time.
+    var waited: usize = 0;
+    while (connsHoldingInput(r.srv) > 0) : (waited += 1) {
+        if (waited == 40) return error.InputBuffersKept;
+        sleepMs(50);
+    }
+    for (0..2) |round| {
+        if (round == 1) worker_uring.test_ring_closed.store(false, .monotonic);
+        for (cs) |*c| {
+            try c.wsSend(true, .text, "two");
+            try c.expectWsText("two");
+        }
+        var again: H2Client.Reply = .{};
+        defer again.deinit();
+        try h2.fetch(@intCast(3 + 2 * round), "GET", "/b", null, &again);
+        try testing.expectEqualStrings("ok", again.body.items);
+    }
+}
+
+/// io_uring connections holding an input buffer while idle (WebSocket and
+/// HTTP/2 ones).
+fn connsHoldingInput(srv: *Server(TestHandler)) usize {
+    var n: usize = 0;
+    for (srv.workers) |*w| switch (w.*) {
+        .poll => {},
+        .uring => |*u| if (sys.is_linux) {
+            for (u.conns) |*c| {
+                if (!c.open) continue;
+                if (c.ws) |x| {
+                    if (x.decoder.buf.len > 0) n += 1;
+                } else if (c.h2) |x| {
+                    if (x.reader.buf.len > 0) n += 1;
+                }
+            }
+        },
+    };
+    return n;
 }
 
 /// HTTP/1.1, HTTP/2 and WebSocket connections used, left idle across two

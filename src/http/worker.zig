@@ -92,6 +92,9 @@ pub fn Worker(comptime Handler: type) type {
             open: bool = false,
             /// The kernel may have unread data (edge-triggered).
             read_ready: bool = false,
+            /// The poller saw the peer close: reads go on to the EOF, past
+            /// a short one (no further edge reports it).
+            hangup: bool = false,
             peer_closed: bool = false,
             /// Draining input after an error response (see Session.linger).
             lingering: bool = false,
@@ -360,7 +363,7 @@ pub fn Worker(comptime Handler: type) type {
             // Shutting down: tell HTTP/2 clients with one GOAWAY each
             // (best effort, one write), before deinit closes the sockets.
             for (self.conns) |*c| {
-                if (!c.open or c.h2 == null) continue;
+                if (!c.open or c.h2 == null or c.lingering) continue;
                 const conn = c.h2.?;
                 conn.shutdown();
                 if (userTls(c)) |t| {
@@ -414,7 +417,7 @@ pub fn Worker(comptime Handler: type) type {
                 if (!c.open or c.h2 == null or c.lingering) continue;
                 const ctx = self.h2Context(c);
                 c.h2.?.tick(Handler, &ctx);
-                if (!self.h2Flush(c)) continue;
+                self.h2Resume(c);
             }
         }
 
@@ -430,12 +433,12 @@ pub fn Worker(comptime Handler: type) type {
                     continue;
                 }
                 const c = &self.conns[e.conn_slot];
-                if (!c.open or c.gen != e.conn_gen) continue;
+                if (!c.open or c.gen != e.conn_gen or c.lingering) continue;
                 if (c.h2) |conn| {
                     // One stream's deadline: reset it, keep the connection.
                     const ctx = self.h2Context(c);
                     conn.onExchangeTimeout(Handler, &ctx, @intCast(slot));
-                    _ = self.h2Flush(c);
+                    self.h2Resume(c);
                 } else if (c.exchange == slot) {
                     self.closeConn(c);
                 }
@@ -751,7 +754,7 @@ pub fn Worker(comptime Handler: type) type {
                 if (c.lingering) return;
                 const ctx = self.h2Context(c);
                 conn.onExchangePosted(Handler, &ctx, slot);
-                _ = self.h2Flush(c);
+                self.h2Resume(c);
                 return;
             }
             if (c.exchange != slot or c.ws != null or c.lingering) return;
@@ -853,6 +856,15 @@ pub fn Worker(comptime Handler: type) type {
             return true;
         }
 
+        /// Output from outside the connection's events (exchanges, ticks):
+        /// written, and input that waited for it to drain read, as
+        /// writability would (the edge may already be spent).
+        fn h2Resume(self: *Self, c: *Conn) void {
+            if (!self.h2Flush(c)) return;
+            const tls_buffered = c.tls != null and c.tls.?.hasBufferedInput();
+            if ((c.read_ready or tls_buffered) and !c.h2HasWire()) self.h2Readable(c);
+        }
+
         fn onH2Event(self: *Self, c: *Conn, ev: Poller.Event) void {
             if (Poller.writable(ev) and c.h2HasWire()) {
                 if (!self.h2Flush(c)) return;
@@ -869,11 +881,41 @@ pub fn Worker(comptime Handler: type) type {
         /// the client may send nothing more until it is answered.
         fn h2Attached(self: *Self, c: *Conn) void {
             if (c.h2HasWire() and !self.h2Flush(c)) return;
-            if (!c.h2HasWire()) {
-                if (!self.h2Process(c)) return;
-                if (c.peer_closed) return self.closeConn(c);
-            }
+            // Our SETTINGS wait for room: writability carries on, frames
+            // included (onH2Event).
+            if (c.h2HasWire()) return self.h2Timer(c);
+            if (!self.h2Process(c)) return;
+            if (c.peer_closed) return self.h2PeerClosed(c);
             self.h2Readable(c);
+        }
+
+        /// The client half-closed: what it asked for is still answered
+        /// (output to write, exchanges to come) within the request timeout,
+        /// then the connection closes (h2Flush), at once if that needs more
+        /// from the client (`answerableAlone`).
+        fn h2PeerClosed(self: *Self, c: *Conn) void {
+            const conn = c.h2.?;
+            if (!conn.answerableAlone() or (!c.h2HasWire() and conn.activeStreams() == 0)) return self.closeConn(c);
+            self.h2Timer(c);
+        }
+
+        /// Our GOAWAY is written: half-close, and drain what the client
+        /// still sends (a PING, frames on their way) for a while before
+        /// closing, as after an HTTP/1.1 error response. Closing with
+        /// input unread makes the kernel reset the connection, which can
+        /// destroy the GOAWAY before the client reads it.
+        fn h2Linger(self: *Self, c: *Conn) void {
+            if (c.peer_closed) return self.closeConn(c);
+            if (c.tls) |t| {
+                if (t.isEstablished() and !t.hasWire()) {
+                    t.close();
+                    self.tlsWriteOnce(c, t);
+                }
+            }
+            sys.shutdownWrite(c.fd);
+            c.lingering = true;
+            self.arm(c, .active);
+            self.drainLingering(c);
         }
 
         fn h2Readable(self: *Self, c: *Conn) void {
@@ -890,7 +932,7 @@ pub fn Worker(comptime Handler: type) type {
                     if (!self.tlsDecrypt(c, t)) return;
                 }
                 if (!self.h2Process(c)) return;
-                if (c.peer_closed) return self.closeConn(c);
+                if (c.peer_closed) return self.h2PeerClosed(c);
             }
             self.h2Timer(c);
         }
@@ -908,7 +950,7 @@ pub fn Worker(comptime Handler: type) type {
                     .need_more => break,
                     .close => {
                         if (c.h2HasWire()) break;
-                        self.closeConn(c);
+                        self.h2Linger(c);
                         return false;
                     },
                 }
@@ -969,13 +1011,17 @@ pub fn Worker(comptime Handler: type) type {
                 }
             }
             if (conn.wantsClose()) {
-                self.closeConn(c);
+                self.h2Linger(c);
                 return false;
             }
             // Output drained: streams waiting for room continue.
             const ctx = self.h2Context(c);
             conn.pump(Handler, &ctx);
             if (conn.hasWire()) return self.h2Flush(c);
+            if (c.peer_closed and (conn.activeStreams() == 0 or !conn.answerableAlone())) {
+                self.closeConn(c);
+                return false;
+            }
             // Written: buffers go back (exchange posts and deadlines end
             // here, not in h2Process).
             conn.releaseIfIdle(&self.pool);
@@ -989,7 +1035,7 @@ pub fn Worker(comptime Handler: type) type {
         /// stream and exchange deadlines.
         fn h2Timer(self: *Self, c: *Conn) void {
             const conn = c.h2.?;
-            if (c.h2HasWire()) {
+            if (c.h2HasWire() or c.peer_closed) {
                 if (c.list != .active) self.arm(c, .active);
             } else if (conn.activeStreams() == 0 and !conn.inFrame()) {
                 self.arm(c, .idle);
@@ -1007,12 +1053,13 @@ pub fn Worker(comptime Handler: type) type {
             // The slot may have been closed (and reused) earlier in this batch.
             if (!c.open or c.gen != gen) return;
             if (Poller.readable(ev)) c.read_ready = true;
-            if (c.ws != null) return self.onWsEvent(c, ev);
-            if (c.h2 != null) return self.onH2Event(c, ev);
+            if (Poller.hangup(ev)) c.hangup = true;
             if (c.lingering) {
                 if (c.read_ready) self.drainLingering(c);
                 return;
             }
+            if (c.ws != null) return self.onWsEvent(c, ev);
+            if (c.h2 != null) return self.onH2Event(c, ev);
             if (Poller.writable(ev) and c.hasPending()) {
                 if (!self.writePending(c)) return;
             }
@@ -1083,7 +1130,7 @@ pub fn Worker(comptime Handler: type) type {
                 }
                 // A short read drained the socket; edge triggering reports
                 // any newer data. Saves a read() == EAGAIN.
-                if (n < space.len) c.read_ready = false;
+                if (n < space.len and !c.hangup) c.read_ready = false;
             } else |err| switch (err) {
                 error.WouldBlock => c.read_ready = false,
                 else => {

@@ -67,6 +67,12 @@ const Epoll = struct {
     pub inline fn writable(ev: Event) bool {
         return ev.events & (linux.EPOLL.OUT | linux.EPOLL.HUP | linux.EPOLL.ERR) != 0;
     }
+
+    /// The peer closed (or the connection failed): a read will end in EOF
+    /// or an error, even after one that came back short.
+    pub inline fn hangup(ev: Event) bool {
+        return ev.events & (linux.EPOLL.RDHUP | linux.EPOLL.HUP | linux.EPOLL.ERR) != 0;
+    }
 };
 
 const Kqueue = struct {
@@ -153,6 +159,12 @@ const Kqueue = struct {
 
     pub inline fn writable(ev: Event) bool {
         return ev.filter == EVFILT.WRITE;
+    }
+
+    /// The peer closed (or the connection failed): a read will end in EOF
+    /// or an error, even after one that came back short.
+    pub inline fn hangup(ev: Event) bool {
+        return ev.filter == EVFILT.READ and ev.flags & EV.EOF != 0;
     }
 };
 

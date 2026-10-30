@@ -2037,6 +2037,20 @@ pub const Conn = struct {
     pub fn activeStreams(self: *const Self) u32 {
         return self.stream_count;
     }
+
+    /// Once the client has closed its side: whether what is in flight
+    /// can still be answered with nothing more from it. Not if a request
+    /// lacks input (a stream open on its side, its head or body arriving
+    /// or a WebSocket; a field block in progress), or output waits for a
+    /// window only it can open.
+    pub fn answerableAlone(self: *const Self) bool {
+        if (self.hb_stream != 0 or self.conn_stalled) return false;
+        for (self.streams) |entry| {
+            const s = entry orelse continue;
+            if (s.active and (s.state == .open or s.stalled)) return false;
+        }
+        return true;
+    }
 };
 
 fn statusText(status: Status) []const u8 {
