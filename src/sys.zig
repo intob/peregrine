@@ -48,6 +48,38 @@ pub fn read(fd: fd_t, buf: []u8) IoError!usize {
     }
 }
 
+/// iovecs for `parts` (one stream) in `iov`, from byte `skip` on and at
+/// most `max` bytes; empty pieces are left out.
+pub fn iovecsOf(iov: []iovec_const, parts: []const []const u8, skip: usize, max: usize) []iovec_const {
+    var n: usize = 0;
+    var skipping = skip;
+    var taken: usize = 0;
+    for (parts) |p| {
+        const rest = p[@min(skipping, p.len)..];
+        skipping -|= p.len;
+        const take = @min(rest.len, max - taken);
+        if (take == 0) continue;
+        iov[n] = .{ .base = rest.ptr, .len = take };
+        n += 1;
+        taken += take;
+    }
+    return iov[0..n];
+}
+
+test iovecsOf {
+    var iov: [3]iovec_const = undefined;
+    const parts = [_][]const u8{ "head", "", "body", "tail" };
+    const a = iovecsOf(&iov, &parts, 2, 7);
+    try std.testing.expectEqual(3, a.len);
+    try std.testing.expectEqualStrings("ad", a[0].base[0..a[0].len]);
+    try std.testing.expectEqualStrings("body", a[1].base[0..a[1].len]);
+    try std.testing.expectEqualStrings("t", a[2].base[0..a[2].len]);
+    const b = iovecsOf(&iov, &parts, 9, 100);
+    try std.testing.expectEqual(1, b.len);
+    try std.testing.expectEqualStrings("ail", b[0].base[0..b[0].len]);
+    try std.testing.expectEqual(0, iovecsOf(&iov, &parts, 12, 100).len);
+}
+
 pub fn writev(fd: fd_t, iov: []const iovec_const) IoError!usize {
     while (true) {
         const rc = system.writev(fd, iov.ptr, @intCast(iov.len));

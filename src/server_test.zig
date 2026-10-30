@@ -2229,8 +2229,18 @@ const TlsClient = struct {
         try self.file_writer.interface.flush();
     }
 
+    const Head = struct { status: u16, body_len: usize, close: bool };
+
     /// Reads one response. The body is copied into `body` if given.
-    fn readResponse(self: *TlsClient, body: ?[]u8) !struct { status: u16, body_len: usize, close: bool } {
+    fn readResponse(self: *TlsClient, body: ?[]u8) !Head {
+        const head = try self.readHead();
+        const r = &self.client.reader;
+        if (body) |b| try r.readSliceAll(b[0..head.body_len]) else try r.discardAll(head.body_len);
+        return head;
+    }
+
+    /// Reads a response's head, up to its body.
+    fn readHead(self: *TlsClient) !Head {
         const r = &self.client.reader;
         const status_line = try r.takeDelimiterInclusive('\n');
         const status = try std.fmt.parseInt(u16, status_line[9..12], 10);
@@ -2245,7 +2255,6 @@ const TlsClient = struct {
                 closing = true;
             }
         }
-        if (body) |b| try r.readSliceAll(b[0..body_len]) else try r.discardAll(body_len);
         return .{ .status = status, .body_len = body_len, .close = closing };
     }
 
@@ -2256,17 +2265,9 @@ const TlsClient = struct {
     /// seen.
     fn readResponseKeyLimit(self: *TlsClient, body: []u8, limit: u64) !struct { body_len: usize, key_updates: usize } {
         const r = &self.client.reader;
-        const status_line = try r.takeDelimiterInclusive('\n');
-        try testing.expect(std.mem.startsWith(u8, status_line, "HTTP/1.1 200"));
-        var body_len: ?usize = null;
-        while (true) {
-            const line = try r.takeDelimiterInclusive('\n');
-            if (line.len == 2) break;
-            if (std.mem.startsWith(u8, line, "content-length: ")) {
-                body_len = try std.fmt.parseInt(usize, line[16 .. line.len - 2], 10);
-            }
-        }
-        const len = body_len orelse return error.NoContentLength;
+        const head = try self.readHead();
+        try testing.expectEqual(200, head.status);
+        const len = head.body_len;
         // std's client opens one record per fill and counts them in
         // read_seq, which a KeyUpdate resets.
         var seq = self.client.read_seq;

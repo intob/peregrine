@@ -929,15 +929,15 @@ pub fn Worker(comptime Handler: type) type {
                 }
                 const wire = conn.wireBytes();
                 if (wire.len == 0) break;
-                switch (self.kernelGate(c)) {
-                    .ready => {},
+                const max = switch (self.kernelGate(c)) {
+                    .ready => |max| max,
                     .blocked => {
                         self.h2Timer(c);
                         return true;
                     },
                     .closed => return false,
-                }
-                const bytes = wire[0..@min(wire.len, writeMax(c))];
+                };
+                const bytes = wire[0..@min(wire.len, max)];
                 const n = sys.write(c.fd, bytes) catch |err| switch (err) {
                     error.WouldBlock => {
                         self.h2Timer(c);
@@ -1240,32 +1240,20 @@ pub fn Worker(comptime Handler: type) type {
 
         /// Writes `parts` (one stream) until done or the socket is full:
         /// one writev, or through the kernel's TLS as many as the key's
-        /// record limit needs (`writeMax`), each after `kernelGate`.
-        /// Returns the bytes written, or null if the connection was closed.
+        /// record limit needs, each after `kernelGate`. Returns the bytes
+        /// written, or null if the connection was closed.
         fn writeParts(self: *Self, c: *Conn, parts: [3][]const u8) ?usize {
             const total = parts[0].len + parts[1].len + parts[2].len;
             var written: usize = 0;
             while (written < total) {
-                switch (self.kernelGate(c)) {
-                    .ready => {},
+                const max = switch (self.kernelGate(c)) {
+                    .ready => |max| max,
                     .blocked => return written,
                     .closed => return null,
-                }
+                };
                 var iov: [3]sys.iovec_const = undefined;
-                var iov_len: usize = 0;
-                var skip = written;
-                const max = writeMax(c);
-                var room = max;
-                for (parts) |p| {
-                    const rest = p[@min(skip, p.len)..];
-                    skip -|= p.len;
-                    const take = @min(rest.len, room);
-                    if (take == 0) continue;
-                    iov[iov_len] = .{ .base = rest.ptr, .len = take };
-                    iov_len += 1;
-                    room -= take;
-                }
-                const n = sys.writev(c.fd, iov[0..iov_len]) catch |err| switch (err) {
+                const want = @min(total - written, max);
+                const n = sys.writev(c.fd, sys.iovecsOf(&iov, &parts, written, want)) catch |err| switch (err) {
                     error.WouldBlock => return written,
                     else => {
                         self.closeConn(c);
@@ -1275,7 +1263,7 @@ pub fn Worker(comptime Handler: type) type {
                 written += n;
                 if (!self.kernelWrote(c, n)) return null;
                 // Short of what was asked: the socket is full.
-                if (n < max - room) return written;
+                if (n < want) return written;
             }
             return written;
         }
@@ -1292,15 +1280,15 @@ pub fn Worker(comptime Handler: type) type {
                     c.pending_file = null;
                     break;
                 }
-                switch (self.kernelGate(c)) {
-                    .ready => {},
+                const max = switch (self.kernelGate(c)) {
+                    .ready => |max| max,
                     .blocked => return progressed,
                     .closed => return null,
-                }
-                const count: usize = @intCast(@min(f.len, 1 << 30, writeMax(c)));
+                };
+                const count: usize = @intCast(@min(f.len, 1 << 30, max));
                 const n = sys.sendfile(c.fd, f.fd, f.offset, count) catch |err| switch (err) {
                     error.WouldBlock => return progressed,
-                    error.Unsupported => self.writeFileCopy(c, f) catch |e| switch (e) {
+                    error.Unsupported => self.writeFileCopy(c, f, count) catch |e| switch (e) {
                         error.WouldBlock => return progressed,
                         else => {
                             self.closeConn(c);
@@ -1329,13 +1317,6 @@ pub fn Worker(comptime Handler: type) type {
             return if (t.kernel_tx) null else t;
         }
 
-        /// The most one write may carry: no limit, except through the
-        /// kernel's TLS (`TlsConn.kernelWriteMax`). After `kernelGate`.
-        inline fn writeMax(c: *const Conn) usize {
-            const t = c.tls orelse return std.math.maxInt(usize);
-            return if (t.kernel_tx) t.kernelWriteMax() else std.math.maxInt(usize);
-        }
-
         /// Counts records the kernel made for `n` bytes written (kTLS).
         fn kernelWrote(_: *Self, c: *Conn, n: usize) bool {
             if (c.tls) |t| {
@@ -1344,16 +1325,22 @@ pub fn Worker(comptime Handler: type) type {
             return true;
         }
 
-        const Gate = enum { ready, blocked, closed };
+        const Gate = union(enum) {
+            /// The most the next write may carry (`TlsConn.writeMax`).
+            ready: usize,
+            blocked,
+            closed,
+        };
 
         /// Before writing data through the kernel (kTLS): our KeyUpdate,
         /// if due, goes first (RFC 8446 §4.6.3), then the kernel gets the
-        /// next key. `.blocked`: the socket is full, wait for room. Closes
-        /// the connection if the kernel can't switch keys (before TLS 1.3
-        /// rekey support).
+        /// next key. `.ready` says how much the write may carry, so the
+        /// next KeyUpdate comes in time. `.blocked`: the socket is full,
+        /// wait for room. Closes the connection if the kernel can't switch
+        /// keys (before TLS 1.3 rekey support).
         fn kernelGate(self: *Self, c: *Conn) Gate {
-            const t = c.tls orelse return .ready;
-            if (!t.kernel_tx or !t.kernel_key_update) return .ready;
+            const t = c.tls orelse return .{ .ready = std.math.maxInt(usize) };
+            if (!t.kernel_tx or !t.kernel_key_update) return .{ .ready = t.writeMax() };
             const msg = TlsConn.kernel_key_update_message;
             const n = sys.ktls.sendRecord(c.fd, tls_handshake, msg) catch |err| switch (err) {
                 error.WouldBlock => return .blocked,
@@ -1363,7 +1350,7 @@ pub fn Worker(comptime Handler: type) type {
                 t.kernelNextKey();
                 var info: [56]u8 = undefined;
                 defer std.crypto.secureZero(u8, &info);
-                if (sys.ktls.rekeyTx(c.fd, t.kernelTxInfo(&info))) |_| return .ready else |_| {}
+                if (sys.ktls.rekeyTx(c.fd, t.kernelTxInfo(&info))) |_| return .{ .ready = t.writeMax() } else |_| {}
             }
             // Our records no longer match the client's keys: no alert.
             t.close_sent = true;
@@ -1386,8 +1373,8 @@ pub fn Worker(comptime Handler: type) type {
             t.startKernelTx();
         }
 
-        fn writeFileCopy(self: *Self, c: *Conn, f: *const File) !usize {
-            const chunk = self.file_buf[0..@intCast(@min(f.len, self.file_buf.len, writeMax(c)))];
+        fn writeFileCopy(self: *Self, c: *Conn, f: *const File, count: usize) !usize {
+            const chunk = self.file_buf[0..@min(count, self.file_buf.len)];
             const got = try sys.pread(f.fd, chunk, f.offset);
             if (got < chunk.len) return error.FileTruncated;
             return sys.write(c.fd, chunk);
@@ -1618,15 +1605,15 @@ pub fn Worker(comptime Handler: type) type {
                 }
                 const wire = w.wireBytes();
                 if (wire.len == 0) break;
-                switch (self.kernelGate(c)) {
-                    .ready => {},
+                const max = switch (self.kernelGate(c)) {
+                    .ready => |max| max,
                     .blocked => {
                         self.wsTimer(c, false);
                         return true;
                     },
                     .closed => return false,
-                }
-                const bytes = wire[0..@min(wire.len, writeMax(c))];
+                };
+                const bytes = wire[0..@min(wire.len, max)];
                 const n = sys.write(c.fd, bytes) catch |err| switch (err) {
                     error.WouldBlock => {
                         self.wsTimer(c, false);

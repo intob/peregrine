@@ -179,7 +179,7 @@ pub const Conn = struct {
     kernel_alert: ?[2]u8 = null,
     /// Records made under the current key, ours before the kernel took
     /// over included, an upper bound (see `kernelWrote`); each write is
-    /// capped to stay within the limit (`kernelWriteMax`).
+    /// capped to stay within the limit (`writeMax`).
     kernel_records: u64 = 0,
     /// Our KeyUpdate is due (the client asked, or the record limit was
     /// reached): the event loop sends it before any more data, then
@@ -618,17 +618,19 @@ pub const Conn = struct {
     /// per full record's worth. At the key's record limit (see
     /// `key_update_after`) our KeyUpdate becomes due.
     pub fn kernelWrote(self: *Self, n: usize) void {
+        if (n == 0) return;
         self.kernel_records += 1 + n / record.max_plaintext;
         if (self.kernel_records >= self.key_update_limit) self.kernel_key_update = true;
     }
 
-    /// The most one write through the kernel may carry: the records it can
-    /// make (counted as in `kernelWrote`) stay within the key's limit, so
-    /// the KeyUpdate goes out in time however much the socket takes (a
-    /// sendfile to a fast reader can carry the whole file). Only while no
-    /// KeyUpdate is due.
-    pub fn kernelWriteMax(self: *const Self) usize {
-        std.debug.assert(self.kernel_tx and self.kernel_records < self.key_update_limit);
+    /// The most one write to the socket may carry. Through the kernel the
+    /// records it can make (counted as in `kernelWrote`) stay within the
+    /// key's limit, so the KeyUpdate goes out in time however much the
+    /// socket takes (a sendfile to a fast reader can carry the whole
+    /// file); only while no KeyUpdate is due. Otherwise no limit.
+    pub fn writeMax(self: *const Self) usize {
+        if (!self.kernel_tx) return std.math.maxInt(usize);
+        std.debug.assert(self.kernel_records < self.key_update_limit);
         const left = self.key_update_limit - self.kernel_records;
         return std.math.cast(usize, (left *| record.max_plaintext) - 1) orelse std.math.maxInt(usize);
     }
@@ -1005,12 +1007,15 @@ test "kernel TLS: each write is capped to the records left under the key" {
     // That record counts: three left, so at most 3 * max - 1 bytes
     // (counted as 1 + 2 records).
     try testing.expectEqual(1, conn.kernel_records);
-    try testing.expectEqual(3 * max - 1, conn.kernelWriteMax());
-    conn.kernelWrote(conn.kernelWriteMax());
+    try testing.expectEqual(3 * max - 1, conn.writeMax());
+    // A write that took nothing made no record.
+    conn.kernelWrote(0);
+    try testing.expectEqual(1, conn.kernel_records);
+    conn.kernelWrote(conn.writeMax());
     try testing.expectEqual(4, conn.kernel_records);
     try testing.expect(conn.kernel_key_update);
     conn.kernelNextKey();
-    try testing.expectEqual(4 * max - 1, conn.kernelWriteMax());
+    try testing.expectEqual(4 * max - 1, conn.writeMax());
 
     // Writes of any size, each capped and short or not: never more records
     // than the limit under one key, and the KeyUpdate comes at it.
@@ -1018,7 +1023,7 @@ test "kernel TLS: each write is capped to the records left under the key" {
     var updates: usize = 0;
     for (0..64) |i| {
         const want = sizes[i % sizes.len];
-        var n = @min(want, conn.kernelWriteMax());
+        var n = @min(want, conn.writeMax());
         if (i % 3 == 0) n -= n / 2; // the socket took part of it
         conn.kernelWrote(n);
         try testing.expect(conn.kernel_records <= conn.key_update_limit);

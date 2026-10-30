@@ -735,7 +735,7 @@ pub fn Worker(comptime Handler: type) type {
                     } else if (c.h2 != null) {
                         self.h2Drive(c);
                     } else if (c.sent < c.out.totalLen()) {
-                        self.submitWrite(c);
+                        _ = self.submitWrite(c);
                     } else if (c.out.file != null) {
                         self.sendFile(c);
                     }
@@ -886,22 +886,19 @@ pub fn Worker(comptime Handler: type) type {
             c.inflight += 1;
         }
 
-        fn submitWrite(self: *Self, c: *Conn) void {
-            if (!self.kernelGate(c)) return;
-            var n: usize = 0;
-            var skip = c.sent;
+        /// Queues a write of what is left of `out` (`.writing`, also when
+        /// waiting for room first), or closes the connection (`.closed`:
+        /// the caller must not touch it).
+        fn submitWrite(self: *Self, c: *Conn) Submit {
             // Through the kernel's TLS, no more than the key's records allow
             // (onWrite carries on with the rest).
-            var room = writeMax(c);
-            for ([_][]const u8{ c.out.buf[0..c.out.len], c.out.body, c.out.tail }) |p| {
-                const rest = p[@min(skip, p.len)..];
-                skip -|= p.len;
-                const take = @min(rest.len, room);
-                if (take == 0) continue;
-                c.iov[n] = .{ .base = rest.ptr, .len = take };
-                n += 1;
-                room -= take;
-            }
+            const max = switch (self.kernelGate(c)) {
+                .ready => |max| max,
+                .blocked => return .writing,
+                .closed => return .closed,
+            };
+            const parts = [_][]const u8{ c.out.buf[0..c.out.len], c.out.body, c.out.tail };
+            const n = sys.iovecsOf(&c.iov, &parts, c.sent, max).len;
             const sqe = self.getSqe();
             // send(msg) rather than writev: sockets only, so skip the VFS.
             if (n == 1) {
@@ -913,6 +910,7 @@ pub fn Worker(comptime Handler: type) type {
             sqe.user_data = userData(c.gen, self.slotOf(c), .write);
             c.write_inflight = true;
             c.inflight += 1;
+            return .writing;
         }
 
         // -- Time and timeouts (as in worker.zig) ----------------------------
@@ -1364,7 +1362,10 @@ pub fn Worker(comptime Handler: type) type {
             } else {
                 if (!self.kernelWrote(c, @intCast(cqe.res))) return;
                 c.sent += @intCast(cqe.res);
-                if (c.sent < c.out.totalLen()) return self.submitWrite(c);
+                if (c.sent < c.out.totalLen()) {
+                    _ = self.submitWrite(c);
+                    return;
+                }
                 if (c.out.file != null) return self.sendFile(c);
             }
             self.writeDone(c);
@@ -1378,8 +1379,11 @@ pub fn Worker(comptime Handler: type) type {
             const f = &c.out.file.?;
             var progressed = false;
             while (f.len > 0) {
-                if (!self.kernelGate(c)) return;
-                const count: usize = @intCast(@min(f.len, 1 << 30, writeMax(c)));
+                const max = switch (self.kernelGate(c)) {
+                    .ready => |max| max,
+                    .blocked, .closed => return,
+                };
+                const count: usize = @intCast(@min(f.len, 1 << 30, max));
                 const n = sys.sendfile(c.fd, f.fd, f.offset, count) catch |err| switch (err) {
                     error.WouldBlock => {
                         if (progressed) self.arm(c, .active);
@@ -1400,7 +1404,8 @@ pub fn Worker(comptime Handler: type) type {
                         c.out.body = "";
                         c.out.tail = "";
                         c.sent = 0;
-                        return self.submitWrite(c);
+                        _ = self.submitWrite(c);
+                        return;
                     },
                     // A connection error, or the file shrank.
                     else => return self.closeConn(c),
@@ -1423,13 +1428,6 @@ pub fn Worker(comptime Handler: type) type {
             return if (t.kernel_tx) null else t;
         }
 
-        /// The most one write may carry: no limit, except through the
-        /// kernel's TLS (`TlsConn.kernelWriteMax`). After `kernelGate`.
-        inline fn writeMax(c: *const Conn) usize {
-            const t = c.tls orelse return std.math.maxInt(usize);
-            return if (t.kernel_tx) t.kernelWriteMax() else std.math.maxInt(usize);
-        }
-
         /// Counts records the kernel made for `n` bytes written (kTLS).
         fn kernelWrote(_: *Self, c: *Conn, n: usize) bool {
             if (c.tls) |t| {
@@ -1438,15 +1436,24 @@ pub fn Worker(comptime Handler: type) type {
             return true;
         }
 
+        const Gate = union(enum) {
+            /// The most the next write may carry (`TlsConn.writeMax`).
+            ready: usize,
+            blocked,
+            closed,
+        };
+
         /// Before writing data through the kernel (kTLS), with no write in
         /// flight: our KeyUpdate, if due, goes first (RFC 8446 §4.6.3),
-        /// then the kernel gets the next key. Returns false if the caller
-        /// must stop: the socket is full (a POLLOUT wait is armed, and
-        /// `write_ready` resumes), or the connection was closed (the kernel
-        /// can't switch keys, before TLS 1.3 rekey support).
-        fn kernelGate(self: *Self, c: *Conn) bool {
-            const t = c.tls orelse return true;
-            if (!t.kernel_tx or !t.kernel_key_update) return true;
+        /// then the kernel gets the next key. `.ready` says how much the
+        /// write may carry, so the next KeyUpdate comes in time.
+        /// `.blocked`: the socket is full (a POLLOUT wait is armed, and
+        /// `write_ready` resumes). `.closed`: the kernel can't switch keys
+        /// (before TLS 1.3 rekey support), and the connection was closed,
+        /// its slot maybe released already: the caller must not touch it.
+        fn kernelGate(self: *Self, c: *Conn) Gate {
+            const t = c.tls orelse return .{ .ready = std.math.maxInt(usize) };
+            if (!t.kernel_tx or !t.kernel_key_update) return .{ .ready = t.writeMax() };
             const msg = TlsConn.kernel_key_update_message;
             const n = sys.ktls.sendRecord(c.fd, tls_handshake, msg) catch |err| switch (err) {
                 error.WouldBlock => {
@@ -1455,7 +1462,7 @@ pub fn Worker(comptime Handler: type) type {
                     sqe.user_data = userData(c.gen, self.slotOf(c), .write_ready);
                     c.write_inflight = true;
                     c.inflight += 1;
-                    return false;
+                    return .blocked;
                 },
                 else => 0,
             };
@@ -1463,12 +1470,12 @@ pub fn Worker(comptime Handler: type) type {
                 t.kernelNextKey();
                 var info: [56]u8 = undefined;
                 defer std.crypto.secureZero(u8, &info);
-                if (sys.ktls.rekeyTx(c.fd, t.kernelTxInfo(&info))) |_| return true else |_| {}
+                if (sys.ktls.rekeyTx(c.fd, t.kernelTxInfo(&info))) |_| return .{ .ready = t.writeMax() } else |_| {}
             }
             // Our records no longer match the client's keys: no alert.
             t.close_sent = true;
             self.closeConn(c);
-            return false;
+            return .closed;
         }
 
         /// Hands the sending side to the kernel, before an HTTP/1.1 file
@@ -1534,7 +1541,7 @@ pub fn Worker(comptime Handler: type) type {
                 c.after_write = if (r.done) .exchange_done else .none;
                 if (userTls(c)) |t| {
                     if (self.tlsSubmit(c, t) == .closed) return;
-                } else self.submitWrite(c);
+                } else if (self.submitWrite(c) == .closed) return;
                 if (c.list != .active) self.arm(c, .active);
                 return;
             }
@@ -1760,9 +1767,12 @@ pub fn Worker(comptime Handler: type) type {
             }
             const bytes = if (userTls(c) != null) "" else conn.wireBytes();
             if (bytes.len > 0) {
-                if (!self.kernelGate(c)) return;
+                const max = switch (self.kernelGate(c)) {
+                    .ready => |max| max,
+                    .blocked, .closed => return,
+                };
                 const sqe = self.getSqe();
-                sqe.prep_send(c.fd, bytes[0..@min(bytes.len, writeMax(c))], linux.MSG.NOSIGNAL);
+                sqe.prep_send(c.fd, bytes[0..@min(bytes.len, max)], linux.MSG.NOSIGNAL);
                 sqe.user_data = userData(c.gen, self.slotOf(c), .write);
                 c.write_inflight = true;
                 c.inflight += 1;
@@ -1848,7 +1858,7 @@ pub fn Worker(comptime Handler: type) type {
                     if (userTls(c)) |t| {
                         if (self.tlsSubmit(c, t) == .closed) return;
                     } else {
-                        self.submitWrite(c);
+                        if (self.submitWrite(c) == .closed) return;
                         // Everything received is answered: receive the
                         // next request in the same submission as this
                         // response instead of after its completion. A
@@ -2012,7 +2022,9 @@ pub fn Worker(comptime Handler: type) type {
                 return false;
             }
             if (t.peer_closed) c.peer_closed = true;
-            if (t.kernel_key_update and !c.write_inflight and !self.kernelGate(c)) return !c.closing;
+            // Our KeyUpdate, if due (the client asked for one): `.blocked`
+            // leaves a POLLOUT wait in flight, which the callers respect.
+            if (t.kernel_key_update and !c.write_inflight and self.kernelGate(c) == .closed) return false;
             return true;
         }
 
@@ -2133,9 +2145,12 @@ pub fn Worker(comptime Handler: type) type {
             }
             const bytes = if (userTls(c) != null) "" else w.wireBytes();
             if (bytes.len > 0) {
-                if (!self.kernelGate(c)) return;
+                const max = switch (self.kernelGate(c)) {
+                    .ready => |max| max,
+                    .blocked, .closed => return,
+                };
                 const sqe = self.getSqe();
-                sqe.prep_send(c.fd, bytes[0..@min(bytes.len, writeMax(c))], linux.MSG.NOSIGNAL);
+                sqe.prep_send(c.fd, bytes[0..@min(bytes.len, max)], linux.MSG.NOSIGNAL);
                 sqe.user_data = userData(c.gen, self.slotOf(c), .write);
                 c.write_inflight = true;
                 c.inflight += 1;
