@@ -1517,9 +1517,19 @@ const Run = struct {
 
     fn drain(r: *Run) !void {
         var buf: [record.max_plaintext]u8 = undefined;
+        // As the workers do: on while whole records are buffered. readPlain
+        // returns 0 once as 0-RTT data starts (input before it is never
+        // mixed with it); twice in a row would hang a worker.
+        var zeros: u8 = 0;
         while (true) {
             const k = r.conn.readPlain(buf[0..r.plain_buf_len]);
-            if (k == 0) break;
+            if (k == 0) {
+                if (r.stopped() or !r.conn.hasBufferedInput()) break;
+                zeros += 1;
+                if (zeros == 2) return error.ReadPlainStuck;
+                continue;
+            }
+            zeros = 0;
             if (r.conn.hs != null and !r.conn.inEarlyData()) return error.PlaintextBeforeHandshake;
             try r.result.plain.appendSlice(testing.allocator, buf[0..k]);
         }
@@ -2202,6 +2212,10 @@ const corpus = [_][]const u8{
     // illegal_parameter (§4.1.2).
     @embedFile("testdata/fuzz/retry-drop-sni-1.bin"),
     @embedFile("testdata/fuzz/retry-drop-sni-2.bin"),
+    // 0-RTT data starting at the end of a read, then a record the reference
+    // run fails on: the harness stopped at readPlain's one 0 as early data
+    // starts (the workers go on while records are buffered).
+    @embedFile("testdata/fuzz/early-data-at-read-end.bin"),
 };
 
 test "fuzz: tls.Conn handshake and record mutations" {
