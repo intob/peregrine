@@ -375,6 +375,31 @@ test "QUIC flow control: a 3 MB upload through 1 MB stream windows" {
     try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "{d}:{d}", .{ big.len, sum }), h.client.readAll(id));
 }
 
+test "QUIC flow control: lost stream credit is sent again (an upload blocked at its window)" {
+    // The server's MAX_STREAM_DATA (and every other datagram of its) lost
+    // while the client fills its 1 MB window: the stream has nothing else
+    // to send, so the credit must be queued again when declared lost, or
+    // the client waits forever (it did, with aioquic under load).
+    const h = try Harness.init(.{}, noTweak);
+    defer h.deinit();
+    try h.run(10);
+    const id = try h.client.openBidi();
+    const big = try testing.allocator.alloc(u8, 3 * 1024 * 1024);
+    defer testing.allocator.free(big);
+    var sum: u64 = 0;
+    @memcpy(big[0..3], "sum");
+    for (big[3..], 3..) |*b, i| b.* = @truncate(i * 7);
+    for (big) |b| sum +%= b;
+    try h.client.write(id, big, true);
+    h.path_max = 0;
+    try h.run(30);
+    try testing.expectEqual(@as(u64, 1 << 20), (try h.client.getStream(id)).send.max_data);
+    h.path_max = std.math.maxInt(usize);
+    try h.run(4000);
+    var want: [64]u8 = undefined;
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "{d}:{d}", .{ big.len, sum }), h.client.readAll(id));
+}
+
 test "QUIC download: 2 MB response under congestion control" {
     const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20 }, noTweak);
     defer h.deinit();

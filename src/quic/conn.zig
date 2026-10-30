@@ -1375,17 +1375,26 @@ pub const Conn = struct {
                 st.send.onLost(a, s.offset, s.len, s.fin) catch {};
                 self.queueSend(s.slot);
             },
+            // A stream's control frames go out from the send queue: one
+            // lost goes back on it (a stream blocked at its window has
+            // nothing else to send, and waited forever for its credit).
             .reset_stream => |s| {
                 const st = self.streamAt(s.slot, s.gen) orelse return;
-                if (!st.reset_acked) st.reset_sent = false;
+                if (st.reset_acked) return;
+                st.reset_sent = false;
+                self.queueSend(s.slot);
             },
             .stop_sending => |s| {
                 const st = self.streamAt(s.slot, s.gen) orelse return;
-                if (st.recv_reset == null and !st.recv.complete()) st.stop_sent = false;
+                if (st.recv_reset != null or st.recv.complete()) return;
+                st.stop_sent = false;
+                self.queueSend(s.slot);
             },
             .max_stream_data => |s| {
                 const st = self.streamAt(s.slot, s.gen) orelse return;
-                if (st.recv_reset == null and st.recv.final_size == null) st.max_data_pending = true;
+                if (st.recv_reset != null or st.recv.final_size != null) return;
+                st.max_data_pending = true;
+                self.queueSend(s.slot);
             },
             .max_data => self.max_data_pending = true,
             .max_streams_bidi => self.max_streams_bidi_pending = true,
