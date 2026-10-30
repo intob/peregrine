@@ -1467,6 +1467,7 @@ const Path = struct {
     loss: u8 = 0,
     ce: u8 = 0,
     reorder: u8 = 0,
+    gso: bool = false,
 
     fn arrival(p: Path, now: u64, rnd: std.Random) u64 {
         if (rnd.uintLessThan(u8, 100) < p.reorder) return now + 200;
@@ -1493,13 +1494,19 @@ fn runPath(h: *Harness, path: Path, ctx: anytype, comptime done: fn (@TypeOf(ctx
         }
         if (h.server) |s| {
             if (s.isClosed()) return error.Closed;
+            // With `gso`, the datagrams of one send with one codepoint go
+            // as one unit (one skb through netem on loopback).
+            var unit: ?struct { at: u64, ecn: packet.Ecn } = null;
             while (true) {
-                var ecn = s.sendEcn();
+                const sent_ecn = s.sendEcn();
+                var ecn = sent_ecn;
                 const n = s.send(&buf, h.now);
                 if (n == 0) break;
+                const at = if (path.gso and unit != null and unit.?.ecn == sent_ecn) unit.?.at else path.arrival(h.now, rnd);
+                unit = .{ .at = at, .ecn = sent_ecn };
                 if (rnd.uintLessThan(u8, 100) < path.loss) continue;
                 if (ecn != .not_ect and rnd.uintLessThan(u8, 100) < path.ce) ecn = .ce;
-                try queue.append(h.a, .{ .at = path.arrival(h.now, rnd), .to_server = false, .len = n, .buf = buf, .ecn = ecn });
+                try queue.append(h.a, .{ .at = at, .to_server = false, .len = n, .buf = buf, .ecn = ecn });
             }
         }
         var next: ?u64 = null;
@@ -1703,16 +1710,19 @@ test "verify ECN: undecryptable, foreign and duplicate packets count nothing" {
     try testing.expectEqual(before[0], s.spaces[2].ecn_rx[0]);
 }
 
-test "verify ECN: netem-style reordering (a quarter of datagrams undelayed): how often an honest client loses ECN" {
-    var outcome: [4]usize = @splat(0);
-    const runs = 100;
+test "verify ECN: netem-style reordering (30% of datagrams undelayed, GSO sends whole): an honest client keeps ECN" {
+    // By path model (datagrams alone, GSO units), then EcnState.
+    var outcome: [2][4]usize = @splat(@splat(0));
+    const runs = 200;
     for (0..runs) |run| {
         const h = try Harness.init(.{ .seed = @intCast(run % 250 + 1), .max_stream_data = 8 << 20, .max_data = 32 << 20 }, noTweak);
+        defer h.deinit();
         // Half of them unpaced: the first window leaves in one burst.
         h.cfg.pacing = run % 2 == 0;
-        defer h.deinit();
         h.prng = .init(run *% 104729 + 11);
-        const path: Path = .{ .delay = 10_000, .reorder = 25 };
+        // GSO sends travel whole on loopback (netem delays or reorders
+        // the skb): half the runs like that.
+        const path: Path = .{ .delay = 20_000, .reorder = 30, .gso = run % 4 < 2 };
         // The request goes with the client's Finished, as browsers do: the
         // server's first window carries HANDSHAKE_DONE and the response.
         try runPath(h, path, {}, clientReady);
@@ -1721,8 +1731,8 @@ test "verify ECN: netem-style reordering (a quarter of datagrams undelayed): how
         ids[0] = try h.client.openBidi();
         try h.client.write(ids[0], "big 100000", true);
         try runPath(h, path, @as([]const u64, &ids), allFinished);
-        outcome[@backingInt(s.ecn)] += 1;
+        outcome[@intFromBool(path.gso)][@backingInt(s.ecn)] += 1;
     }
-    std.debug.print("{d} connections: testing {d}, unknown {d}, capable {d}, failed {d}\n", .{ runs, outcome[0], outcome[1], outcome[2], outcome[3] });
-    try testing.expectEqual(@as(usize, runs), outcome[@backingInt(conn_mod.EcnState.capable)]);
+    for (outcome, 0..) |o, g| std.debug.print("{s}: testing {d}, unknown {d}, capable {d}, failed {d}\n", .{ if (g == 1) "GSO units" else "datagrams", o[0], o[1], o[2], o[3] });
+    try testing.expectEqual(@as(usize, runs), outcome[0][@backingInt(conn_mod.EcnState.capable)] + outcome[1][@backingInt(conn_mod.EcnState.capable)]);
 }
