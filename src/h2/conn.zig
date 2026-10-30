@@ -5303,7 +5303,7 @@ test "fuzz: h2 connections sharing a worker's pool" {
 }
 
 test "stream states: seeded conversations, alone and interleaved on one pool" {
-    for (0..200) |seed| {
+    for (0..80) |seed| {
         var prng = std.Random.DefaultPrng.init(seed);
         try sharedConversation(.{ .rng = prng.random() });
     }

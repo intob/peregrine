@@ -12,6 +12,10 @@
 //!   /t/OFF/LEN       later() + startStream, finished with a trailer
 //!                    `x-off: OFF` from another thread
 //!   /h/OFF/LEN/PAD   borrowed body after an `x-pad` header of PAD bytes
+//!   /e/OFF/LEN/PAD   a request body that must be that window, after a
+//!                    request `x-pad` header of PAD bytes (and an `x-off:
+//!                    OFF` trailer if any): answered with the window and
+//!                    `x-trailers: N`, or 500 saying what was wrong
 //!   /ws              WebSocket echo (extended CONNECT over h2)
 //!
 //! Usage: verify-server WORKERS BACKEND PORT tls|plain [out_limit=N]
@@ -84,6 +88,30 @@ const Handler = struct {
                     resp.status = .internal_server_error;
                     return;
                 };
+                resp.setBodyBorrowed(pattern[p.off..][0..p.len]);
+            },
+            'e' => {
+                const wrong: ?[]const u8 = check: {
+                    if (!std.mem.eql(u8, req.body, pattern[p.off..][0..p.len])) break :check "request body\n";
+                    var pad: ?[]const u8 = null;
+                    for (req.getHeaders()) |h| {
+                        if (std.mem.eql(u8, h.key, "x-pad")) pad = h.value;
+                    }
+                    if (p.pad > 0 and !std.mem.eql(u8, pad orelse "", pad_bytes[0..p.pad])) break :check "x-pad\n";
+                    var buf: [24]u8 = undefined;
+                    const off_s = std.fmt.bufPrint(&buf, "{d}", .{p.off}) catch unreachable;
+                    for (req.trailers) |t| {
+                        if (!std.mem.eql(u8, t.key, "x-off") or !std.mem.eql(u8, t.value, off_s)) break :check "trailer\n";
+                    }
+                    break :check null;
+                };
+                if (wrong) |what| {
+                    resp.status = .internal_server_error;
+                    resp.setBodyBorrowed(what);
+                    return;
+                }
+                const counts = [_][]const u8{ "0", "1", "2", "3" };
+                resp.addHeader(.{ .key = "x-trailers", .value = counts[@min(req.trailers.len, 3)] }) catch {};
                 resp.setBodyBorrowed(pattern[p.off..][0..p.len]);
             },
             's' => {

@@ -6,7 +6,8 @@ Each body is a window into the server's pattern (64-bit LE words, word w =
 w*8 | 0xA5<<56), so a byte from another response or connection is caught
 and its origin decoded. Connections vary: slow readers (small reads, late
 WINDOW_UPDATEs), large or small frame sizes and windows, HEAD, trailers,
-RST_STREAM mid-response, PINGs, WebSockets over h2 (extended CONNECT),
+RST_STREAM mid-response, PINGs, uploads (request bodies and headers the
+server checks, with and without trailers), WebSockets over h2 (extended CONNECT),
 GOAWAY, and abrupt closes with output queued.
 
 Usage: h2-churn.py HOST PORT tls|h2c SECONDS CONNS [seed]
@@ -36,7 +37,7 @@ SIZES = [0, 1, 13, 100, 1000, 16375, 16384, 16393, 32768, 65536, 65537,
          100_000, 262_144, 300_000, 1_048_576, 3_000_000]
 
 stats = {'requests': 0, 'bytes': 0, 'heads': 0, 'resets': 0, 'ws': 0,
-         'ws_msgs': 0, 'aborts': 0, 'goaways': 0, 'conns': 0, 'trailers': 0}
+         'ws_msgs': 0, 'aborts': 0, 'goaways': 0, 'conns': 0, 'trailers': 0, 'uploads': 0}
 failures = []
 live = set()
 WS_PROB = float(os.environ.get('WS_PROB', '0.04'))
@@ -343,15 +344,19 @@ class Client:
 
     async def request(self):
         r = self.rng
-        kind = r.choice('ppppffsstth')
+        kind = r.choice('ppppffsstthee')
         length = r.choice(SIZES)
-        if kind in 'st':
+        if kind in 'ste':
             length = min(length, 1_048_576)
         off = r.randrange(0, PATTERN_LEN - length + 1)
         path = f'/{kind}/{off}/{length}'
         if kind == 'h':
             path += f'/{r.choice([0, 100, 5000, 16000, 20000, 40000, 60000])}'
-        method = 'HEAD' if r.random() < 0.1 else 'GET'
+        pad = r.choice([0, 0, 100, 3000, 8000]) if kind == 'e' else 0
+        if kind == 'e':
+            path += f'/{pad}'
+        method = 'POST' if kind == 'e' else 'HEAD' if r.random() < 0.1 else 'GET'
+        trailers = kind == 'e' and r.random() < 0.4
         scheme = 'https' if self.tls else 'http'
         async with self.lock:
             if self.closed.done() or self.goaway:
@@ -361,9 +366,15 @@ class Client:
             if method == 'GET' and length > 0 and r.random() < 0.05:
                 s.reset_at = r.randrange(0, length)
             self.streams[sid] = s
-            self.conn.send_headers(sid, [(':method', method), (':scheme', scheme), (':path', path),
-                                         (':authority', self.host)], end_stream=True)
+            head = [(':method', method), (':scheme', scheme), (':path', path), (':authority', self.host)]
+            if pad:
+                head.append(('x-pad', ''.join(chr(ord('a') + i % 26) for i in range(pad))))
+            self.conn.send_headers(sid, head, end_stream=kind != 'e' or (length == 0 and not trailers))
             await self.flush()
+        if kind == 'e' and (length > 0 or trailers):
+            if not await self.upload(sid, s, pattern[off:off + length], [('x-off', str(off))] if trailers else None):
+                del self.streams[sid]
+                return
         res = await s.done
         del self.streams[sid]
         if res in ('reset', 'closed') or self.aborting or self.goaway:
@@ -372,7 +383,7 @@ class Client:
             return fail(f'{method} {path}: {res}')
         stats['requests'] += 1
         if s.status != '200':
-            return fail(f'{method} {path}: status {s.status}')
+            return fail(f'{method} {path}: status {s.status} {bytes(s.body[:40])}')
         if method == 'HEAD':
             stats['heads'] += 1
             if s.body:
@@ -387,6 +398,36 @@ class Client:
             stats['trailers'] += 1
             if not s.trailers or s.trailers.get('x-off') != str(off):
                 fail(f'GET {path}: trailers {s.trailers}')
+        if kind == 'e':
+            stats['uploads'] += 1
+            if s.headers.get('x-trailers') != ('1' if trailers else '0'):
+                fail(f'POST {path}: x-trailers {s.headers.get("x-trailers")}, sent {int(trailers)}')
+
+    async def upload(self, sid, s, body, trailers):
+        """Sends a request body as the windows allow, then trailers or
+        END_STREAM. False if the stream or connection ended first."""
+        pos = 0
+        while True:
+            async with self.lock:
+                if s.done.done() or self.closed.done() or self.goaway:
+                    return False
+                try:
+                    room = min(self.conn.local_flow_control_window(sid), self.conn.max_outbound_frame_size)
+                    if room > 0 and pos < len(body):
+                        k = min(room, len(body) - pos, self.rng.choice([100, 5000, 16384, 70000]))
+                        self.conn.send_data(sid, body[pos:pos + k])
+                        pos += k
+                    if pos == len(body):
+                        if trailers:
+                            self.conn.send_headers(sid, trailers, end_stream=True)
+                        elif body:
+                            self.conn.end_stream(sid)
+                except h2.exceptions.StreamClosedError:
+                    return False
+                await self.flush()
+                if pos == len(body):
+                    return True
+            await asyncio.sleep(0.002 if room <= 0 else 0)
 
     async def websocket(self):
         r = self.rng
