@@ -2863,7 +2863,8 @@ fn testKeyLimitsSlow(backend: Backend) !void {
             // Requests first, then nothing read for a while: every write
             // the server tries runs into a full socket.
             const res = runKfSlow(c, &k, &list);
-            expectKeyLimitOutcome(res, ktls) catch |err| {
+            // With no KeyUpdate due, the connection must not end early either.
+            expectKeyLimitOutcome(res, ktls and limit < 1000000) catch |err| {
                 std.debug.print("backend {s} limit {d} no_sendfile {}: {d} bytes, {d} key updates\n", .{ @tagName(backend), limit, no_sendfile, k.len, k.key_updates });
                 return err;
             };
