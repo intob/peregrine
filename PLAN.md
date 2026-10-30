@@ -1281,9 +1281,41 @@ which RFC 9113 deprecated).
 
       h2c 100 × 10 throughput 130-238K → 328-350K req/s (h2o 234-238K). "Hello" within
       noise. With this the 64 KiB rows in the h2o table above go to peregrine
-- [ ] Per-connection h2 memory: Stream slots (~168 KB allocated and cleared at init,
-      128 inline slots with `hdr[MAX_HEADERS]`), Stream.req/pending and the 4 KiB
-      enc_buf kept for the connection's life
+- [x] **Per-connection h2 memory.** A connection allocated 128 Stream slots at init
+      (~134 KB, cleared; `hdr[MAX_HEADERS]` inline), kept every slot's `req`/`pending`
+      at their largest, a 16 KiB HPACK scratch, a 4 KiB `enc_buf` and its last
+      CONTINUATION block for its life: 170 KB per new connection. Now it holds stream
+      pointers and its HPACK tables (13.8 KB + the 1.2 KB Conn): stream states come
+      from the worker's BufferPool (`h2_streams`, Recycler policy: as many as were in
+      use in the last second, trimmed on the tick) and go back on close, keeping at
+      most 16 KiB of buffer (all growth through `ensureRoom`; larger buffers use the
+      worker's large-buffer cache); one encoding scratch (back to 4 KiB after a second
+      without a larger head) and one decoding scratch per worker; a head in one frame
+      is decoded where it lies, one split over CONTINUATIONs is gathered in step with
+      what arrived (1 KiB from the pool, then doubling in the large-buffer cache) and
+      given back once decoded. No memory for a state: REFUSED_STREAM. Also fixed
+      (pre-existing): a stream closed while its block was arriving (the response
+      finished through the mailbox, or a timeout reset it) made the CONTINUATION a
+      connection error; the block is now still taken whole and decoded. Proof:
+      counting allocators (a new connection ≤ 16 KiB, an idle one holds exactly that
+      after 8 mixed bursts including split and empty-fragment heads, nothing allocated
+      per request by the connection or, once warm, the pool; two trims free all), an
+      allocation failing at every point, connections interleaved on one pool (seeded
+      test and a fuzz target, `fuzz: h2 connections sharing a worker's pool`),
+      Linux/macOS suites, h2spec unchanged, both h2 targets fuzzed 15 min on a Pi,
+      h2-churn with checked uploads to 1 MiB. Two review rounds and an adversarial
+      verifier who couldn't break it. Server RSS per idle h2c connection, 10k of them:
+      epoll 142 → 8.5 KB (after one request 157 → 15.5), io_uring 138 → 5.0 KB
+      (154 → 11.4). h2-bench CPU/req unchanged (interleaved A/B, h2c and TLS; e.g.
+      h2c 64k 10×10 epoll 9.9-11.1 µs before, 9.8-10.6 after)
+- [ ] What an idle h2 connection still holds (~14 KB): the two HPACK tables (~5.6 KB
+      each; the encoder's could be smaller than the peer's 4096), the slot, order and
+      idle-priority arrays (2.5 KB; the last could be allocated lazily), the Conn
+- [ ] h2-churn.sh never exits 0 on this Mac: slow-reader streams stall on a zero
+      window past `request_timeout_s` (RST CANCEL), exchanges time out (INTERNAL_ERROR),
+      the WebSocket client gives up after 2.5 s, and the odd GOAWAY ENHANCE_YOUR_CALM on
+      a slow reader. Same before and after the changes above; make the harness tell
+      expected slow-reader outcomes from failures so a clean run exits 0
 - [ ] h3/QUIC stream buffers (`SendStream`/`RecvStream`, up to `stream_buffer` per
       slot) and ws.Conn queues (`shared`, `wire`, `deflated`) keep their capacity while
       the connection lives: same treatment as the h2 output buffers
