@@ -13,12 +13,13 @@
 #   nginx and h2o do for both 64k cases)
 #   NGINX_KEEPALIVE=default: nginx's keepalive_requests 1000 (see nginx.conf)
 #   BUILD=0: use the peregrine binaries already in $OUT/linux/bin (A/B runs)
+#   SERVER_ARGS: more bench-server arguments (e.g. nopace, noecn)
 # TLS and h3 runs pin TLS_AES_128_GCM_SHA256 and X25519 and check them.
 # Images: peregrine-h3load (h2load 1.70 with HTTP/3, nginx 1.30), comp-h2o23
 # (docker build -t comp-h2o23 bench/competitors/h2o), peregrine-bench.
 source "$(dirname "$0")/env.sh"
 BIN=$OUT/linux/bin
-usage() { sed -n '2,18p' "$0"; exit 1; }
+usage() { sed -n '2,19p' "$0"; exit 1; }
 proto=$1; shift
 case $proto in h2c) port=8080 mode=plain ;; tls) port=8443 mode=tls ;; h3) port=8443 mode=h3 ;; *) usage ;; esac
 servers=${*:-peregrine-epoll peregrine-uring nginx h2o}
@@ -33,8 +34,8 @@ want_alpn=h2; [ "$proto" = h3 ] && want_alpn=h3
 
 server() { # NAME -> "IMAGE|CMD"
     case $1 in
-    peregrine-epoll) echo "peregrine-bench|exec /b/bench-server 6 epoll $port $mode" ;;
-    peregrine-uring) echo "peregrine-bench|exec /b/bench-server 6 io_uring $port $mode" ;;
+    peregrine-epoll) echo "peregrine-bench|exec /b/bench-server 6 epoll $port $mode ${SERVER_ARGS:-}" ;;
+    peregrine-uring) echo "peregrine-bench|exec /b/bench-server 6 io_uring $port $mode ${SERVER_ARGS:-}" ;;
     nginx) local sed="true"
         [ "${NGINX_KEEPALIVE:-}" = default ] && sed="sed -i 's/^ *keepalive_requests/#&/' /tmp/nginx.conf"
         echo "peregrine-h3load|mkdir -p /tmp/www && head -c 65536 /dev/zero | tr '\\0' x > /tmp/www/64k && cp /bench/competitors/nginx/nginx.conf /tmp/ && $sed && exec nginx -c /tmp/nginx.conf" ;;
