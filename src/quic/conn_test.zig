@@ -100,6 +100,16 @@ const Harness = struct {
     ce_skipped: u32 = 0,
     ce_first: u64 = 0,
     ce_last: u64 = 0,
+    /// The path's maximum datagram size towards the client: larger ones
+    /// are dropped (DF set, no ICMP). The largest the server sent, and
+    /// how many were too large.
+    path_max: usize = std.math.maxInt(usize),
+    largest_to_client: usize = 0,
+    too_big: usize = 0,
+    /// The client is at an IPv6 address.
+    ipv6: bool = false,
+    /// Until then, every datagram is lost both ways (an outage).
+    outage_until: u64 = 0,
 
     fn init(client_opts: test_client.Options, tweak: anytype) !*Harness {
         const a = testing.allocator;
@@ -133,6 +143,7 @@ const Harness = struct {
     }
 
     fn toServer(h: *Harness, dgram: []u8) !void {
+        if (h.now < h.outage_until) return;
         h.datagrams_to_server += 1;
         if (h.server == null) {
             const hdr = try packet.parseHeader(dgram, 8);
@@ -144,6 +155,7 @@ const Harness = struct {
                 .reset_token = @splat(0xee),
                 .entropy = &entropy,
                 .now = h.now,
+                .ipv6 = h.ipv6,
             });
             h.first_datagram_len = dgram.len;
         }
@@ -153,6 +165,12 @@ const Harness = struct {
 
     /// A datagram from the server, sent with `ecn`, over the path.
     fn toClient(h: *Harness, dgram: []const u8, ecn: packet.Ecn) !void {
+        if (h.now < h.outage_until) return;
+        h.largest_to_client = @max(h.largest_to_client, dgram.len);
+        if (dgram.len > h.path_max) {
+            h.too_big += 1;
+            return;
+        }
         var arrived = ecn;
         if (ecn != .not_ect) {
             if (h.drop_marked) return;
@@ -929,7 +947,6 @@ test "verify pacing: a stream blocked by flow control doesn't keep the timer bus
 }
 
 test "verify pacing: pacer arithmetic at extremes" {
-    const recovery = @import("./recovery.zig");
     var cc = recovery.Congestion.init(1200, .cubic);
     var rtt: recovery.Rtt = .{};
     var p = recovery.Pacer.init(1200, recovery.Pacer.default_burst_us);
@@ -1794,7 +1811,7 @@ test "QUIC ECN: a new peer address is a new path: tested afresh" {
     const marked = s.spaces[2].ecn_sent;
     // NAT rebinding to a path that carries them.
     h.bleach = false;
-    s.onPathChange();
+    s.onPathChange(h.now);
     try testing.expectEqual(conn_mod.EcnState.testing, s.ecn);
     try download(h, 200_000);
     try testing.expectEqual(conn_mod.EcnState.capable, s.ecn);
@@ -1878,7 +1895,7 @@ test "QUIC ECN: a new path isn't judged by the old one's packets: their loss doe
     const n = try heldWindow(h, "big 300000", &old);
     try testing.expectEqual(old.len, n);
     s.spaces[2].ecn_ce_pending = true;
-    s.onPathChange();
+    s.onPathChange(h.now);
     try testing.expect(!s.spaces[2].ecn_ce_pending);
     var fresh: [32]Flight = undefined;
     var m: usize = 0;
@@ -1915,7 +1932,7 @@ test "QUIC ECN: a new path isn't validated by the old one's packets: one droppin
     var flights: [64]Flight = undefined;
     const n = try heldWindow(h, "big 300000", &flights);
     try testing.expect(n > conn_mod.ecn_testing_packets);
-    s.onPathChange();
+    s.onPathChange(h.now);
     // The old mapping still delivers what it carried; the new path drops
     // every marked datagram.
     for (flights[0..n]) |*f| try h.toClient(f.buf[0..f.len], f.ecn);
@@ -1952,4 +1969,415 @@ test "QUIC: only the newest non-probing packet may move the peer's address (RFC 
     try h.client.write(id, "c", true);
     const n4 = try h.client.send(&older);
     try testing.expect(s.recv(older[0..n4], .not_ect, h.now));
+}
+
+// -- PMTU discovery (pmtud.zig; RFC 9000 §14.3, RFC 8899) ---------------------
+
+const pmtud = @import("./pmtud.zig");
+const recovery = @import("./recovery.zig");
+
+/// The server's defaults: 1350 bytes from the start, probing up to what a
+/// 1500-byte IPv4 packet carries (1472).
+fn pmtuOn(c: *conn_mod.Config) void {
+    c.max_datagram_size = 1350;
+    c.max_mtu = 1500;
+}
+
+fn pmtuOnCubicOrReno(comptime alg: recovery.Algorithm) fn (*conn_mod.Config) void {
+    return struct {
+        fn f(c: *conn_mod.Config) void {
+            pmtuOn(c);
+            c.congestion = alg;
+        }
+    }.f;
+}
+
+fn searchDone(_: void, h: *Harness) bool {
+    const s = h.server orelse return false;
+    return s.isEstablished() and s.pmtu.state == .complete;
+}
+
+fn finishedAndSearched(id: u64, h: *Harness) bool {
+    return h.client.finished(id) and searchDone({}, h);
+}
+
+/// Bytes in flight as the live packets count them.
+fn liveInFlight(s: *Conn) u64 {
+    var sum: u64 = 0;
+    for (&s.spaces) |*sp| {
+        var it = sp.sent.iterator();
+        while (it.next()) |e| if (e.packet.in_flight) {
+            sum += e.packet.size;
+        };
+    }
+    return sum;
+}
+
+fn expectBody(h: *Harness, id: u64, n: usize) !void {
+    const got = h.client.readAll(id);
+    try testing.expectEqual(n, got.len);
+    for (got, 0..) |b, i| if (b != @as(u8, @truncate(i))) return error.Corrupt;
+}
+
+test "QUIC PMTU: the search converges to the path's limit; data then goes at it; probe losses aren't congestion" {
+    const limits = [_]usize{ std.math.maxInt(usize), 1472, 1452, 1400, 1392, 1360 };
+    for (limits) |limit| {
+        const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20 }, pmtuOn);
+        defer h.deinit();
+        h.path_max = limit;
+        var bursts: std.ArrayList(Burst) = .empty;
+        defer bursts.deinit(h.a);
+        try h.runDelayed(10_000, {}, established, &bursts);
+        const id = try h.client.openBidi();
+        try h.client.write(id, "big 2000000", true);
+        try h.runDelayed(10_000, id, finishedAndSearched, &bursts);
+        try expectBody(h, id, 2_000_000);
+        const s = h.server.?;
+        const want = @min(limit, 1472);
+        try testing.expect(s.max_datagram <= want and want - s.max_datagram < pmtud.min_step);
+        // Every datagram dropped for its size was a probe, and each lost
+        // probe is a failed probe, not congestion: nothing else was lost,
+        // no congestion event, the window never shrank.
+        try testing.expectEqual(@as(usize, s.pmtu.probes_lost), h.too_big);
+        try testing.expectEqual(@as(u64, 0), s.lost_packets);
+        try testing.expectEqual(@as(?u64, null), s.cc.recovery_start);
+        try testing.expect(s.pmtu.probes_lost == 0 or limit < 1472);
+        // The congestion controller counts in the new size, and the
+        // pacer's floor is ten of them.
+        try testing.expectEqual(@as(u64, s.max_datagram), s.cc.mss);
+        try testing.expect(s.pacer.capacity(&s.cc, &s.rtt) >= 10 * @as(u64, s.max_datagram));
+        // The search took a few round trips: the data went at the larger
+        // size, not only the probes.
+        try testing.expect(h.largest_to_client >= s.max_datagram);
+        try testing.expectEqual(liveInFlight(s), s.cc.in_flight);
+    }
+}
+
+test "QUIC PMTU: no probe before the handshake is confirmed, nor without room in the window" {
+    const h = try Harness.init(.{}, pmtuOn);
+    defer h.deinit();
+    h.path_max = 1350;
+    var confirmed_at: ?usize = null;
+    for (0..40) |round| {
+        try h.run(1);
+        const s = h.server orelse continue;
+        if (!s.handshake_complete) {
+            try testing.expectEqual(@as(u32, 0), s.pmtu.probes_sent);
+            try testing.expectEqual(pmtud.State.disabled, s.pmtu.state);
+            try testing.expect(h.largest_to_client <= 1350);
+        } else if (confirmed_at == null) confirmed_at = round;
+    }
+    try testing.expect(confirmed_at != null);
+    const s = h.server.?;
+    try testing.expect(s.pmtu.probes_sent > 0);
+    // A probe due, and a window with less room than it: a probe waits
+    // (data that fits in the room still goes).
+    s.onPathChange(h.now);
+    try testing.expectEqual(@as(?u16, 1472), s.pmtu.due(h.now));
+    const pad = s.cc.window - s.cc.in_flight - 1400;
+    s.cc.in_flight += pad;
+    var buf: [1500]u8 = undefined;
+    const sent = s.pmtu.probes_sent;
+    while (true) {
+        const n = s.send(&buf, h.now);
+        if (n == 0) break;
+        try testing.expect(n <= s.max_datagram);
+    }
+    try testing.expectEqual(sent, s.pmtu.probes_sent);
+    s.cc.in_flight -= pad;
+    try testing.expectEqual(@as(usize, 1472), s.send(&buf, h.now));
+    try testing.expectEqual(sent + 1, s.pmtu.probes_sent);
+    // One at a time.
+    try testing.expect(s.send(&buf, h.now) <= s.max_datagram);
+    // Not into a buffer too small for it either (the worker's, when a GSO
+    // run has filled most of it): the probe waits for the next.
+    s.onPathChange(h.now);
+    try testing.expect(s.send(buf[0..1400], h.now) <= 1350);
+    try testing.expectEqual(@as(usize, 1472), s.send(&buf, h.now));
+}
+
+test "QUIC PMTU: lost probes on an idle connection end the search below the path's limit, no congestion" {
+    inline for (.{ .cubic, .new_reno }) |alg| {
+        const h = try Harness.init(.{}, pmtuOnCubicOrReno(alg));
+        defer h.deinit();
+        h.path_max = 1350;
+        var bursts: std.ArrayList(Burst) = .empty;
+        defer bursts.deinit(h.a);
+        try h.runDelayed(20_000, {}, searchDone, &bursts);
+        const s = h.server.?;
+        try testing.expectEqual(@as(u16, 1350), s.max_datagram);
+        // 1472, 1411, 1380 and 1365 failed, three probes each.
+        try testing.expectEqual(@as(u32, 4 * pmtud.max_probes), s.pmtu.probes_lost);
+        try testing.expectEqual(@as(u64, 0), s.lost_packets);
+        try testing.expectEqual(@as(?u64, null), s.cc.recovery_start);
+        try testing.expect(s.cc.window >= recovery.Congestion.initialWindow(1350));
+        try testing.expectEqual(@as(u64, 1350), s.cc.mss);
+        try testing.expectEqual(@as(u32, 0), s.pmtu.black_holes);
+        // And the connection still works.
+        const id = try h.client.openBidi();
+        try h.client.write(id, "big 100000", true);
+        try h.runDelayed(20_000, id, finishedStream, &bursts);
+        try expectBody(h, id, 100_000);
+    }
+}
+
+test "QUIC PMTU: a lost probe doesn't stretch a loss into persistent congestion" {
+    const h = try Harness.init(.{}, pmtuOn);
+    defer h.deinit();
+    try h.run(20);
+    const s = h.server.?;
+    try testing.expect(s.isEstablished());
+    const a = testing.allocator;
+    const sp = &s.spaces[2];
+    // A packet at t0, a probe 5 s later, another packet 50 ms after it,
+    // none of them seen by the client; then an ACK of the last alone.
+    const Fake = struct {
+        fn add(sp_: anytype, s_: *Conn, a_: std.mem.Allocator, t: u64, size: u32, probe: bool) !u64 {
+            const pn = sp_.sent.nextPn();
+            const mark = sp_.sent.recordMark();
+            try sp_.sent.addRecord(a_, .ping);
+            try sp_.sent.add(a_, mark, t, size, .{ .ack_eliciting = true, .in_flight = true, .pmtu_probe = probe });
+            s_.cc.onSent(size);
+            return pn;
+        }
+    };
+    const t0 = h.now;
+    _ = try Fake.add(sp, s, a, t0, 1350, false);
+    s.onPathChange(t0);
+    const probe = try Fake.add(sp, s, a, t0 + 5 * std.time.us_per_s, 1472, true);
+    s.pmtu.onProbeSent(probe);
+    const last = try Fake.add(sp, s, a, t0 + 5 * std.time.us_per_s + 50_000, 1350, false);
+    h.now = t0 + 5 * std.time.us_per_s + 60_000;
+    const window = s.cc.window;
+    var ack_buf: [32]u8 = undefined;
+    var w: packet.Writer = .{ .buf = &ack_buf };
+    frame.writeAckFrame(&w, &.{.{ .smallest = last, .largest = last }}, 0, null);
+    try h.client.injectFrames(w.written());
+    var buf: [1500]u8 = undefined;
+    const n = try h.client.send(&buf);
+    try h.toServer(buf[0..n]);
+    // The first packet's loss is a congestion event; with the probe, the
+    // losses would span 5 s, persistent congestion, the minimum window.
+    try testing.expect(s.cc.recovery_start != null);
+    try testing.expect(s.cc.window < window);
+    try testing.expect(s.cc.window > s.cc.minWindow());
+    try testing.expectEqual(@as(u32, 1), s.pmtu.probes_lost);
+    try testing.expectEqual(liveInFlight(s), s.cc.in_flight);
+}
+
+test "QUIC PMTU: a black hole after validation: back to 1200, then up to the new limit, with nothing stalled" {
+    // In a plain download every packet is full-sized: the probe
+    // timeouts' 1200-byte packets are what gets through.
+    for ([_]usize{ 1300, 1232, 1400 }) |new_limit| {
+        const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20 }, pmtuOn);
+        defer h.deinit();
+        var bursts: std.ArrayList(Burst) = .empty;
+        defer bursts.deinit(h.a);
+        try h.runDelayed(10_000, {}, established, &bursts);
+        const id = try h.client.openBidi();
+        try h.client.write(id, "big 4000000", true);
+        try h.runDelayed(15_000, id, halfway, &bursts);
+        const s = h.server.?;
+        try testing.expectEqual(@as(u16, 1472), s.max_datagram);
+        // The path shrinks (a route change into a tunnel), silently.
+        h.path_max = new_limit;
+        const changed = h.now;
+        try h.runDelayed(15_000, id, finishedAndSearched, &bursts);
+        try expectBody(h, id, 4_000_000);
+        try testing.expectEqual(@as(u32, 1), s.pmtu.black_holes);
+        try testing.expect(s.max_datagram <= new_limit and new_limit - s.max_datagram < pmtud.min_step);
+        try testing.expectEqual(@as(u64, s.max_datagram), s.cc.mss);
+        // Bytes in flight stayed what the live packets add up to.
+        try testing.expectEqual(liveInFlight(s), s.cc.in_flight);
+        // Recovered within a few seconds (simulated) of the change.
+        const took = h.now - changed;
+        try testing.expect(took < 5 * std.time.us_per_s);
+    }
+}
+
+test "QUIC PMTU: a path below the start size from the beginning: the handshake completes, datagrams fall to 1200" {
+    // A 1280-byte IPv6 MTU (1232 bytes of payload) under our 1350.
+    const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20 }, pmtuOn);
+    defer h.deinit();
+    h.path_max = 1232;
+    try runPath(h, .{ .delay = 10_000 }, {}, established);
+    const id = try h.client.openBidi();
+    try h.client.write(id, "big 300000", true);
+    try runPath(h, .{ .delay = 10_000 }, id, finishedAndSearched);
+    try expectBody(h, id, 300_000);
+    const s = h.server.?;
+    try testing.expectEqual(@as(u32, 1), s.pmtu.black_holes);
+    try testing.expect(s.max_datagram <= 1232 and 1232 - s.max_datagram < pmtud.min_step);
+}
+
+test "QUIC PMTU: the client's max_udp_payload_size bounds every datagram, probes included" {
+    {
+        const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20, .max_udp_payload_size = 1400 }, pmtuOn);
+        defer h.deinit();
+        var bursts: std.ArrayList(Burst) = .empty;
+        defer bursts.deinit(h.a);
+        try h.runDelayed(10_000, {}, established, &bursts);
+        const id = try h.client.openBidi();
+        try h.client.write(id, "big 500000", true);
+        try h.runDelayed(10_000, id, finishedAndSearched, &bursts);
+        const s = h.server.?;
+        try testing.expectEqual(@as(u16, 1400), s.max_datagram);
+        try testing.expectEqual(@as(usize, 1400), h.largest_to_client);
+        try testing.expectEqual(@as(u32, 1), s.pmtu.probes_sent);
+    }
+    {
+        // Under our start size: from the start, with the congestion
+        // window counted in it (RFC 9002 §7.2), and nothing to probe for.
+        const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20, .max_udp_payload_size = 1250 }, pmtuOn);
+        defer h.deinit();
+        try h.run(1);
+        const s = h.server.?;
+        try testing.expectEqual(@as(u16, 1250), s.max_datagram);
+        try testing.expectEqual(@as(u64, 1250), s.cc.mss);
+        try testing.expectEqual(@as(u64, 12500), s.cc.window);
+        var bursts: std.ArrayList(Burst) = .empty;
+        defer bursts.deinit(h.a);
+        try h.runDelayed(10_000, {}, established, &bursts);
+        const id = try h.client.openBidi();
+        try h.client.write(id, "big 300000", true);
+        try h.runDelayed(10_000, id, finishedAndSearched, &bursts);
+        try testing.expectEqual(@as(usize, 1250), h.largest_to_client);
+        try testing.expectEqual(@as(u32, 0), s.pmtu.probes_sent);
+    }
+    {
+        // Off: our start size throughout, whatever the path.
+        const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20 }, struct {
+            fn f(c: *conn_mod.Config) void {
+                c.max_datagram_size = 1350;
+            }
+        }.f);
+        defer h.deinit();
+        var bursts: std.ArrayList(Burst) = .empty;
+        defer bursts.deinit(h.a);
+        try h.runDelayed(10_000, {}, established, &bursts);
+        const id = try h.client.openBidi();
+        try h.client.write(id, "big 300000", true);
+        try h.runDelayed(10_000, id, finishedStream, &bursts);
+        try testing.expectEqual(@as(usize, 1350), h.largest_to_client);
+        try testing.expectEqual(@as(u32, 0), h.server.?.pmtu.probes_sent);
+    }
+}
+
+test "QUIC PMTU: an IPv6 path's ceiling is 20 bytes lower; EMSGSIZE fails a probe at once" {
+    const h = try Harness.init(.{}, pmtuOn);
+    defer h.deinit();
+    h.ipv6 = true;
+    try h.run(20);
+    const s = h.server.?;
+    try testing.expect(s.isEstablished());
+    try testing.expectEqual(@as(u16, 1452), s.max_datagram);
+    // A new path: back to the start size, searched again.
+    s.onPathChange(h.now);
+    try testing.expectEqual(@as(u16, 1350), s.max_datagram);
+    try testing.expectEqual(@as(u64, 1350), s.cc.mss);
+    var buf: [1500]u8 = undefined;
+    const in_flight = s.cc.in_flight;
+    try testing.expectEqual(@as(usize, 1452), s.send(&buf, h.now));
+    try testing.expectEqual(in_flight + 1452, s.cc.in_flight);
+    // The interface refused it: out of the flight, the size failed, the
+    // next probe halves the range at once.
+    s.onProbeTooBig(h.now);
+    try testing.expectEqual(in_flight, s.cc.in_flight);
+    try testing.expectEqual(liveInFlight(s), s.cc.in_flight);
+    try testing.expectEqual(@as(u16, 1451), s.pmtu.ceiling);
+    try testing.expectEqual(@as(usize, 1350 + (1451 - 1350 + 1) / 2), s.send(&buf, h.now));
+    s.onProbeTooBig(h.now);
+    try testing.expectEqual(@as(u16, 1400), s.pmtu.ceiling);
+    // A refusal with no probe in flight changes nothing.
+    s.onProbeTooBig(h.now);
+    try testing.expectEqual(@as(u16, 1400), s.pmtu.ceiling);
+    try testing.expectEqual(in_flight, s.cc.in_flight);
+    try testing.expectEqual(@as(u16, 1350), s.max_datagram);
+}
+
+/// Everything lost both ways for `ms` once the download is halfway.
+const Outage = struct {
+    id: u64,
+    ms: u64,
+    started: bool = false,
+
+    fn done(c: *Outage, h: *Harness) bool {
+        if (!c.started and halfway(c.id, h)) {
+            c.started = true;
+            h.outage_until = h.now + c.ms * 1000;
+        }
+        return finishedAndSearched(c.id, h);
+    }
+};
+
+test "QUIC PMTU: an outage isn't a black hole: the size stays" {
+    for ([_]u64{ 200, 700, 3000 }) |ms| {
+        const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20 }, pmtuOn);
+        defer h.deinit();
+        var bursts: std.ArrayList(Burst) = .empty;
+        defer bursts.deinit(h.a);
+        try h.runDelayed(15_000, {}, established, &bursts);
+        const id = try h.client.openBidi();
+        try h.client.write(id, "big 2000000", true);
+        var outage: Outage = .{ .id = id, .ms = ms };
+        try h.runDelayed(15_000, &outage, Outage.done, &bursts);
+        try expectBody(h, id, 2_000_000);
+        const s = h.server.?;
+        try testing.expect(s.lost_packets > 0);
+        try testing.expectEqual(@as(u32, 0), s.pmtu.black_holes);
+        try testing.expectEqual(@as(u16, 1472), s.max_datagram);
+    }
+}
+
+/// A path whose datagram limit changes when the download is halfway.
+const MtuChange = struct {
+    id: u64,
+    to: usize,
+    changed: bool = false,
+
+    fn done(c: *MtuChange, h: *Harness) bool {
+        if (!c.changed and halfway(c.id, h)) {
+            c.changed = true;
+            h.path_max = c.to;
+        }
+        return finishedAndSearched(c.id, h);
+    }
+};
+
+test "verify PMTU: random paths, limits, losses and changes: every download completes, sizes within the path" {
+    var prng = std.Random.DefaultPrng.init(0x9e3779b9);
+    const r = prng.random();
+    for (0..40) |seed| {
+        const h = try Harness.init(.{ .seed = @intCast(seed + 1), .max_stream_data = 8 << 20, .max_data = 16 << 20 }, pmtuOn);
+        defer h.deinit();
+        h.prng = .init(seed);
+        const limits = [_]usize{ 1232, 1252, 1280, 1300, 1350, 1380, 1400, 1420, 1452, 1472, 1500 };
+        h.path_max = limits[r.uintLessThan(usize, limits.len)];
+        const path: Path = .{
+            .delay = 2_000 + r.uintLessThan(u64, 40_000),
+            .jitter = if (r.boolean()) r.uintLessThan(u64, 5_000) else 0,
+            .loss = if (r.boolean()) r.uintLessThan(u8, 6) else 0,
+        };
+        runPath(h, path, {}, established) catch |err| {
+            std.debug.print("seed {d}: handshake {s} (path {any}, limit {d})\n", .{ seed, @errorName(err), path, h.path_max });
+            return err;
+        };
+        const id = try h.client.openBidi();
+        try h.client.write(id, "big 1000000", true);
+        var change: MtuChange = .{ .id = id, .to = limits[r.uintLessThan(usize, limits.len)] };
+        const start = h.now;
+        runPath(h, path, &change, MtuChange.done) catch |err| {
+            std.debug.print("seed {d}: {s} (path {any}, limit {d} -> {d}, {d} black holes, max {d})\n", .{ seed, @errorName(err), path, h.path_max, change.to, h.server.?.pmtu.black_holes, h.server.?.max_datagram });
+            return err;
+        };
+        try expectBody(h, id, 1_000_000);
+        const s = h.server.?;
+        try testing.expect(s.max_datagram <= @min(h.path_max, 1472));
+        try testing.expectEqual(@as(u64, s.max_datagram), s.cc.mss);
+        try testing.expectEqual(liveInFlight(s), s.cc.in_flight);
+        if (h.now - start > 60 * std.time.us_per_s) {
+            std.debug.print("seed {d}: {d} ms\n", .{ seed, (h.now - start) / 1000 });
+            return error.TooSlow;
+        }
+    }
 }

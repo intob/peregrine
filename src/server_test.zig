@@ -4678,7 +4678,8 @@ const quic_udp = @import("./quic/udp.zig");
 const H3Client = struct {
     fd: sys.fd_t,
     c: *quic_test_client.Client,
-    batch: *quic_udp.RecvBatch(8, 2048),
+    /// Room for the largest UDP payload (PMTU discovery on loopback).
+    batch: *quic_udp.RecvBatch(8, 65536),
     /// Datagrams to the server wait this long (a path with a round trip
     /// of at least this), in `queue`.
     delay_ns: u64 = 0,
@@ -4705,7 +4706,7 @@ const H3Client = struct {
         sys.randomBytes(&dcid);
         const c = try quic_test_client.Client.init(testing.allocator, .{ .dcid = dcid, .max_stream_data = 16 << 20, .max_data = 64 << 20 });
         errdefer c.deinit();
-        return .{ .fd = fd, .c = c, .batch = try testing.allocator.create(quic_udp.RecvBatch(8, 2048)) };
+        return .{ .fd = fd, .c = c, .batch = try testing.allocator.create(quic_udp.RecvBatch(8, 65536)) };
     }
 
     fn close(self: *H3Client) void {
@@ -5097,6 +5098,114 @@ fn testHttp3(backend: Backend) !void {
     var e = try cl.response(echo);
     defer e.body.deinit(testing.allocator);
     try testing.expectEqualStrings("an upload body", e.body.items);
+}
+
+test "http3: PMTU discovery: datagrams grow to what a 1500-byte packet carries, IPv6 and IPv4-mapped clients too" {
+    try forEachBackend(testHttp3Pmtu);
+}
+
+fn testHttp3Pmtu(backend: Backend) !void {
+    var cfg = tlsConfig();
+    cfg.http3 = .{};
+    cfg.backend = backend;
+    cfg.handle_signals = false;
+    cfg.worker_thread_count = 2;
+    cfg.max_connections_per_worker = 256;
+    cfg.buffer_pool_size = 4;
+    // Dual stack where there is IPv6.
+    const v6 = blk: {
+        var probe: std.Io.net.IpAddress = .{ .ip6 = .{ .bytes = std.mem.zeroes([16]u8), .port = 0 } };
+        probe.ip6.bytes[15] = 1;
+        const fd = quic_udp.bind(probe, false) catch break :blk false;
+        sys.close(fd);
+        break :blk true;
+    };
+    if (v6) cfg.ip = "::";
+    const srv = try Server(TestHandler).init(testing.allocator, 0, cfg);
+    const thread = try std.Thread.spawn(.{}, Running.runServer, .{srv});
+    const r: Running = .{ .srv = srv, .thread = thread, .port = srv.getPort() };
+    defer r.stop();
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    for ([_]bool{ false, true }) |ipv6| {
+        if (ipv6 and !v6) continue;
+        var cl = try h3ClientAt(r.srv.getQuicPort(), ipv6);
+        defer cl.close();
+        try cl.start();
+        const id = try cl.request("GET", "/big", "");
+        try cl.waitFinished(&.{id});
+        var a = try cl.response(id);
+        defer a.body.deinit(testing.allocator);
+        try testing.expect(std.mem.eql(u8, &big_body, a.body.items));
+        // The probe arrived whole (its own sendmsg, not cut into a GSO
+        // run's segments), and the data went at its size: most of 8 MB.
+        const want: usize = if (ipv6) 1452 else 1472;
+        try testing.expectEqual(want, cl.c.largest_datagram);
+        try testing.expect(cl.c.largest_datagrams > big_body.len / want / 2);
+    }
+}
+
+test "http3: a GSO run stays within one UDP datagram's 65507 bytes, whatever the segment size" {
+    try forEachBackend(testHttp3GsoLimit);
+}
+
+fn testHttp3GsoLimit(backend: Backend) !void {
+    var cfg = tlsConfig();
+    // A ceiling of 1365 bytes over IPv4: 48 segments of it, all that fit in
+    // 64 KiB, would be 65520 bytes, which the kernel refuses whole (the
+    // runs were lost, and 8 MB took minutes of probe timeouts). Whole
+    // windows at once (no pacing, a 20 ms round trip), so runs are full.
+    cfg.http3 = .{ .max_mtu = 1365 + 28, .pacing = false };
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    var cl = try H3Client.connect(r.srv.getQuicPort());
+    defer cl.close();
+    cl.delay_ns = 20 * std.time.ns_per_ms;
+    try cl.start();
+    for (0..2) |_| {
+        const began = sys.nanoTimestamp();
+        const id = try cl.request("GET", "/big", "");
+        try cl.waitFinished(&.{id});
+        var a = try cl.response(id);
+        defer a.body.deinit(testing.allocator);
+        try testing.expect(std.mem.eql(u8, &big_body, a.body.items));
+        // Well under a second (not probe timeouts).
+        try testing.expect(sys.nanoTimestamp() - began < 3 * std.time.ns_per_s);
+    }
+    try testing.expectEqual(@as(usize, 1365), cl.c.largest_datagram);
+}
+
+test "http3: PMTU probes larger than the interface fail at once (EMSGSIZE, DF set); the search settles below it" {
+    try forEachBackend(testHttp3PmtuInterface);
+}
+
+fn testHttp3PmtuInterface(backend: Backend) !void {
+    var cfg = tlsConfig();
+    // As large as an IP packet goes: above macOS's 16384-byte lo0 (Linux
+    // loopback takes 65536).
+    cfg.http3 = .{ .max_mtu = 65535 };
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    var cl = try H3Client.connect(r.srv.getQuicPort());
+    defer cl.close();
+    try cl.start();
+    // The search takes a dozen round trips from 1350 bytes up; the
+    // second download goes at the size it found.
+    for (0..2) |_| {
+        const id = try cl.request("GET", "/big", "");
+        try cl.waitFinished(&.{id});
+        var a = try cl.response(id);
+        defer a.body.deinit(testing.allocator);
+        try testing.expect(std.mem.eql(u8, &big_body, a.body.items));
+    }
+    const lo_mtu: usize = if (sys.is_linux) 65535 else 16384;
+    const limit = lo_mtu - 28;
+    std.debug.print("{s}: largest datagram {d} ({d} of them)\n", .{ @tagName(backend), cl.c.largest_datagram, cl.c.largest_datagrams });
+    try testing.expect(cl.c.largest_datagram <= limit and limit - cl.c.largest_datagram < 16);
+    // Data went at it, not only the probe (the search ends during the
+    // second download).
+    try testing.expect(cl.c.largest_datagrams > 16);
 }
 
 test "verify ECN: HTTP/3 on an IPv6 address: IPv6 clients, and IPv4 ones through a dual-stack socket" {

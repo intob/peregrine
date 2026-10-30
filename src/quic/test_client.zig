@@ -26,6 +26,9 @@ pub const Options = struct {
     seed: u8 = 1,
     max_stream_data: u64 = 1 << 20,
     max_data: u64 = 1 << 24,
+    /// The max_udp_payload_size transport parameter (none: the default,
+    /// 65527).
+    max_udp_payload_size: ?u64 = null,
 };
 
 const Space = struct {
@@ -113,6 +116,9 @@ pub const Client = struct {
     ecn_mode: EcnMode = .honest,
     /// Datagrams received with each codepoint (by its value).
     datagrams_ecn: [4]u64 = @splat(0),
+    /// The largest datagram received, and how many of that size.
+    largest_datagram: usize = 0,
+    largest_datagrams: u64 = 0,
 
     pub fn init(a: Allocator, opts: Options) !*Self {
         const self = try a.create(Self);
@@ -171,6 +177,7 @@ pub const Client = struct {
         put(&w, 0x08, 100);
         put(&w, 0x09, 100);
         put(&w, 0x01, 30_000);
+        if (self.opts.max_udp_payload_size) |v| put(&w, 0x03, v);
         w.varint(0x0f);
         w.varint(self.opts.scid.len);
         w.bytes(self.opts.scid);
@@ -244,6 +251,11 @@ pub const Client = struct {
     /// A datagram that arrived with the ECN codepoint `ecn`.
     pub fn recvEcn(self: *Self, datagram: []const u8, ecn: packet.Ecn) !void {
         self.datagrams_ecn[@backingInt(ecn)] += 1;
+        if (datagram.len > self.largest_datagram) {
+            self.largest_datagram = datagram.len;
+            self.largest_datagrams = 0;
+        }
+        if (datagram.len == self.largest_datagram) self.largest_datagrams += 1;
         var copy = try self.a.dupe(u8, datagram);
         defer self.a.free(copy);
         var rest: []u8 = copy[0..];

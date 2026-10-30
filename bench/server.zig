@@ -4,7 +4,7 @@
 //! plaintext HTTP/1.1), and `/ws`, a WebSocket echo (HTTP/1.1 Upgrade, or
 //! extended CONNECT on HTTP/2 and HTTP/3); request bodies are read and
 //! discarded.
-//! Usage: bench-server [workers] [auto|epoll|io_uring] [port] [tls|h3|plain] [stream] [rsa] [noktls] [0rtt] [sni] [deflate] [nopace] [noecn]
+//! Usage: bench-server [workers] [auto|epoll|io_uring] [port] [tls|h3|plain] [stream] [rsa] [noktls] [0rtt] [sni] [deflate] [nopace] [noecn] [mtu=N]
 //! With `tls`, serves TLS 1.3 with the self-signed P-256 certificate in
 //! this directory (`rsa`: the RSA-2048 one), with ALPN "h2" and
 //! "http/1.1"; `h3` adds HTTP/3 on the
@@ -18,7 +18,8 @@
 //! b.example. With `deflate`, WebSockets offered permessage-deflate are
 //! compressed (`deflate-nct`: and clients are asked not to use context
 //! takeover). With `nopace`, HTTP/3 sends without pacing; with `noecn`,
-//! without ECN (no codepoints read or marked).
+//! without ECN (no codepoints read or marked); `mtu=N` sets HTTP/3's PMTU
+//! discovery ceiling (`Http3Options.max_mtu`, 1500 by default; 0: off).
 const std = @import("std");
 const per = @import("peregrine");
 
@@ -123,6 +124,7 @@ fn serve(comptime H: type, args: []const [:0]const u8) !void {
     var ws_deflate: ?per.ws.deflate.Options = null;
     var pacing = true;
     var ecn = true;
+    var max_mtu: u16 = 1500;
     for (args[@min(args.len, 5)..]) |arg| {
         if (std.mem.eql(u8, arg, "deflate")) ws_deflate = .{};
         if (std.mem.eql(u8, arg, "deflate-nct")) ws_deflate = .{ .client_no_context_takeover = true };
@@ -132,6 +134,7 @@ fn serve(comptime H: type, args: []const [:0]const u8) !void {
         if (std.mem.eql(u8, arg, "0rtt")) max_early = 16384;
         if (std.mem.eql(u8, arg, "nopace")) pacing = false;
         if (std.mem.eql(u8, arg, "noecn")) ecn = false;
+        if (std.mem.startsWith(u8, arg, "mtu=")) max_mtu = try std.fmt.parseInt(u16, arg[4..], 10);
     }
     const srv = try per.Server(H).init(std.heap.smp_allocator, port, .{
         .worker_thread_count = workers,
@@ -148,7 +151,7 @@ fn serve(comptime H: type, args: []const [:0]const u8) !void {
                 .{ .cert_pem = @embedFile("sni-wild.pem"), .key_pem = @embedFile("sni-wild.key") },
             } else &.{},
         } else null,
-        .http3 = if (use_h3) .{ .pacing = pacing, .ecn = ecn } else null,
+        .http3 = if (use_h3) .{ .pacing = pacing, .ecn = ecn, .max_mtu = max_mtu } else null,
         .websocket_deflate = ws_deflate,
     });
     std.debug.print("listening on :{d} ({s}, {d} workers{s}{s})\n", .{ srv.getPort(), @tagName(srv.getBackend()), srv.workers.len, if (use_h3) ", tls, h3" else if (use_tls) ", tls" else "", if (H == StreamHandler) ", streamed bodies" else "" });

@@ -1,0 +1,413 @@
+//! Datagram Packetization Layer PMTU Discovery (RFC 8899, RFC 9000 §14.3)
+//! for one path: which probe to send next, and what the acknowledgment
+//! or loss of each probe, and of full-sized packets, says about the path.
+//! I/O-free like the rest; conn.zig sends the probes (PING and PADDING,
+//! one in flight at a time) and reports their fate, and the PLPMTU is
+//! its maximum datagram size.
+//!
+//! States (RFC 8899 §5.2): `disabled` until the handshake is confirmed
+//! (§14.3.1: QUIC is an acknowledged PL, and the handshake has confirmed
+//! BASE_PLPMTU, 1200 bytes, the client's Initials being at least that),
+//! then `searching`, then `complete`. Searching sends the ceiling first
+//! (most paths carry a full Ethernet frame, so one probe usually ends the
+//! search), then halves the range between the PLPMTU and the largest
+//! size not known to fail, until it is under `min_step`. A size fails
+//! when `max_probes` probes of it in a row are lost, or at once when the
+//! local interface refuses it (EMSGSIZE). After `raise_interval_us` in
+//! `complete` below the ceiling, the search runs again (PMTU_RAISE_TIMER).
+//!
+//! Black holes (§4.3, the third indicator: loss of data sent at one
+//! size): full-sized packets (the PLPMTU's size) lost `black_hole_packets`
+//! times in a row over at least a probe timeout, with none of that size
+//! acknowledged since, while smaller ones sent after the first of them
+//! are acknowledged and none of those is lost (an outage loses both). The PLPMTU goes back to BASE_PLPMTU and the search
+//! runs again below the size that failed. (conn.zig sends its probe
+//! timeouts' packets at BASE_PLPMTU after two in a row, so a bulk sender
+//! whose every packet is full-sized still has small ones acknowledged.)
+const std = @import("std");
+
+/// BASE_PLPMTU and MIN_PLPMTU (RFC 9000 §14.3): QUIC's smallest maximum
+/// datagram size.
+pub const base: u16 = 1200;
+/// MAX_PROBES (RFC 8899 §5.1.2).
+pub const max_probes = 3;
+/// PMTU_RAISE_TIMER (RFC 8899 §5.1.1).
+pub const raise_interval_us: u64 = 600 * std.time.us_per_s;
+/// The search ends when the range left is smaller than this (§5.3.2: not
+/// every size is worth a probe).
+pub const min_step: u16 = 16;
+/// Full-sized packets lost in a row before a black hole is suspected.
+pub const black_hole_packets = 3;
+
+/// UDP and IP headers: what a datagram of an MTU-sized IP packet loses.
+pub const ipv4_overhead: u16 = 20 + 8;
+pub const ipv6_overhead: u16 = 40 + 8;
+
+pub const State = enum(u8) { disabled, searching, complete };
+
+pub const Search = struct {
+    const Self = @This();
+
+    state: State = .disabled,
+    /// The PLPMTU: the maximum datagram size in use.
+    current: u16,
+    /// MAX_PLPMTU: the configured ceiling, the peer's max_udp_payload_size
+    /// and what the local interface took.
+    ceiling: u16,
+    /// The largest size not known to fail, in this search.
+    high: u16 = 0,
+    /// PROBED_SIZE: the next probe's size (or the one in flight).
+    probe: u16 = 0,
+    /// The probe in flight, by packet number (its acknowledgment or loss
+    /// is matched by it, so a probe from before a restart counts nothing).
+    probe_pn: ?u64 = null,
+    /// PROBE_COUNT: probes of `probe`'s size lost in a row.
+    lost: u8 = 0,
+    /// When `complete` searches again.
+    raise_at: u64 = 0,
+
+    // Black hole detection.
+    /// Full-sized packets lost in a row (none acknowledged since), and
+    /// when the first and last of them were sent.
+    full_lost: u32 = 0,
+    full_lost_first: u64 = 0,
+    full_lost_last: u64 = 0,
+    /// The newest send time of a full-sized packet acknowledged, and of a
+    /// smaller one.
+    full_acked: u64 = 0,
+    small_acked: u64 = 0,
+
+    // Counters, for tests and stats.
+    probes_sent: u32 = 0,
+    probes_lost: u32 = 0,
+    black_holes: u32 = 0,
+
+    /// `current` is the size the connection starts with; `ceiling` at or
+    /// below it: nothing to search for (black holes are still detected).
+    pub fn init(current: u16, ceiling: u16) Self {
+        return .{ .current = current, .ceiling = @max(ceiling, base) };
+    }
+
+    /// The handshake is confirmed: probing may begin.
+    pub fn start(self: *Self, now: u64) void {
+        if (self.state != .disabled) return;
+        self.search(self.ceiling, now);
+    }
+
+    /// Searches from `current` up to `high`, sending `high` first.
+    fn search(self: *Self, high: u16, now: u64) void {
+        self.high = high;
+        self.lost = 0;
+        self.probe_pn = null;
+        if (high <= self.current) return self.finish(now);
+        self.state = .searching;
+        self.probe = high;
+    }
+
+    fn finish(self: *Self, now: u64) void {
+        self.state = .complete;
+        self.probe = 0;
+        self.probe_pn = null;
+        self.raise_at = now +| raise_interval_us;
+    }
+
+    /// The next probe's size, between `current` and `high` (or ends the
+    /// search when the range is too small).
+    fn bisect(self: *Self, now: u64) void {
+        self.lost = 0;
+        if (self.high <= self.current or self.high - self.current < min_step) return self.finish(now);
+        self.probe = self.current + (self.high - self.current + 1) / 2;
+    }
+
+    /// The size of a probe to send now, if one is due.
+    pub fn due(self: *Self, now: u64) ?u16 {
+        switch (self.state) {
+            .disabled => return null,
+            .complete => {
+                if (self.current >= self.ceiling or now < self.raise_at) return null;
+                self.search(self.ceiling, now);
+                if (self.state != .searching) return null;
+            },
+            .searching => {},
+        }
+        if (self.probe_pn != null) return null;
+        return self.probe;
+    }
+
+    pub fn onProbeSent(self: *Self, pn: u64) void {
+        self.probe_pn = pn;
+        self.probes_sent += 1;
+    }
+
+    /// A probe was acknowledged: the path carries `size`. Returns the new
+    /// PLPMTU if it grew.
+    pub fn onProbeAcked(self: *Self, pn: u64, size: u16, now: u64) ?u16 {
+        if (self.probe_pn != pn) return null;
+        self.probe_pn = null;
+        if (size <= self.current) {
+            self.bisect(now);
+            return null;
+        }
+        self.current = size;
+        self.bisect(now);
+        // A new size: the black hole record starts again at it.
+        self.full_lost = 0;
+        return size;
+    }
+
+    /// A probe was declared lost.
+    pub fn onProbeLost(self: *Self, pn: u64, now: u64) void {
+        if (self.probe_pn != pn) return;
+        self.probe_pn = null;
+        self.probes_lost += 1;
+        self.lost += 1;
+        if (self.lost < max_probes) return;
+        self.fail(self.probe, now);
+    }
+
+    /// The local interface refused the probe (EMSGSIZE): that size fails
+    /// at once, and the ceiling comes down for good.
+    pub fn onProbeTooBig(self: *Self, now: u64) void {
+        if (self.state != .searching or self.probe_pn == null) return;
+        self.probe_pn = null;
+        self.probes_lost += 1;
+        self.ceiling = @max(self.probe - 1, base);
+        self.fail(self.probe, now);
+    }
+
+    fn fail(self: *Self, size: u16, now: u64) void {
+        self.high = @min(self.high, size - 1);
+        self.bisect(now);
+    }
+
+    /// A packet other than a probe was acknowledged.
+    pub fn onPacketAcked(self: *Self, size: u32, time_sent: u64) void {
+        if (size >= self.current) {
+            self.full_acked = @max(self.full_acked, time_sent);
+            self.full_lost = 0;
+        } else {
+            self.small_acked = @max(self.small_acked, time_sent);
+        }
+    }
+
+    /// An ack-eliciting packet other than a probe was declared lost.
+    pub fn onPacketLost(self: *Self, size: u32, time_sent: u64) void {
+        if (size < self.current) {
+            // A smaller packet lost too, sent after the run began: the
+            // path lost everything for a while (an outage), not only what
+            // was too large.
+            if (self.full_lost > 0 and time_sent > self.full_lost_first) self.full_lost = 0;
+            return;
+        }
+        // Only full-sized ones sent after the last full-sized one that
+        // arrived say anything about the size.
+        if (self.current <= base or time_sent <= self.full_acked) return;
+        if (self.full_lost == 0) {
+            self.full_lost_first = time_sent;
+            self.full_lost_last = time_sent;
+        }
+        self.full_lost += 1;
+        self.full_lost_first = @min(self.full_lost_first, time_sent);
+        self.full_lost_last = @max(self.full_lost_last, time_sent);
+    }
+
+    /// Whether the losses so far look like a black hole: `span` is the
+    /// shortest time they must cover (a probe timeout).
+    pub fn blackHole(self: *const Self, span: u64) bool {
+        return self.current > base and self.full_lost >= black_hole_packets and
+            self.full_lost_last - self.full_lost_first >= span and
+            self.small_acked > self.full_lost_first;
+    }
+
+    /// A black hole: back to BASE_PLPMTU, and the search runs again below
+    /// the size that stopped arriving. Returns the new PLPMTU.
+    pub fn onBlackHole(self: *Self, now: u64) u16 {
+        const failed = self.current;
+        self.current = base;
+        self.black_holes += 1;
+        self.full_lost = 0;
+        self.full_acked = 0;
+        self.small_acked = 0;
+        self.search(failed - 1, now);
+        // The size that failed isn't probed first: halve the range.
+        if (self.state == .searching) self.bisect(now);
+        return base;
+    }
+
+    /// The peer moved to a new address: a new path, searched afresh from
+    /// `current` (what the connection started with).
+    pub fn restart(self: *Self, current: u16, now: u64) void {
+        const started = self.state != .disabled;
+        self.* = .{ .current = current, .ceiling = self.ceiling, .probes_sent = self.probes_sent, .probes_lost = self.probes_lost, .black_holes = self.black_holes };
+        if (started) self.search(self.ceiling, now);
+    }
+};
+
+const testing = std.testing;
+
+/// Runs a search against a path carrying datagrams up to `mtu` bytes:
+/// every probe larger is lost, every other acknowledged. Returns the
+/// probes sent.
+fn converge(s: *Search, path: u16, now: *u64) !u32 {
+    var pn: u64 = 0;
+    var sent: u32 = 0;
+    while (s.due(now.*)) |size| {
+        try testing.expect(size > s.current and size <= s.ceiling);
+        s.onProbeSent(pn);
+        sent += 1;
+        if (size <= path) {
+            _ = s.onProbeAcked(pn, size, now.*);
+        } else s.onProbeLost(pn, now.*);
+        pn += 1;
+        now.* += 10_000;
+        if (sent > 100) return error.NoEnd;
+    }
+    return sent;
+}
+
+test "the search: the ceiling at once, or bisection to within a step of the path" {
+    var now: u64 = 1_000_000;
+    // Nothing before the handshake is confirmed.
+    var s: Search = .init(1350, 1472);
+    try testing.expectEqual(@as(?u16, null), s.due(now));
+    s.start(now);
+    // A path carrying the ceiling: one probe.
+    try testing.expectEqual(@as(u32, 1), try converge(&s, 1500, &now));
+    try testing.expectEqual(@as(u16, 1472), s.current);
+    try testing.expectEqual(State.complete, s.state);
+    // Paths below it (a WireGuard tunnel's 1420 MTU over IPv4: 1392; the
+    // IPv6 minimum's 1232 under a start of 1350 never probes below it).
+    for ([_]u16{ 1392, 1452, 1400, 1351, 1471 }) |path| {
+        s = .init(1350, 1472);
+        s.start(now);
+        _ = try converge(&s, path, &now);
+        try testing.expect(s.current <= path);
+        try testing.expect(path - s.current < min_step);
+        try testing.expectEqual(State.complete, s.state);
+    }
+    // No room: complete at once.
+    s = .init(1350, 1300);
+    s.start(now);
+    try testing.expectEqual(State.complete, s.state);
+    try testing.expectEqual(@as(?u16, null), s.due(now));
+}
+
+test "the search: isolated probe losses don't fail a size; MAX_PROBES do" {
+    const now: u64 = 0;
+    var s: Search = .init(1350, 1472);
+    s.start(now);
+    for (0..max_probes - 1) |i| {
+        try testing.expectEqual(@as(?u16, 1472), s.due(now));
+        s.onProbeSent(i);
+        // One probe at a time.
+        try testing.expectEqual(@as(?u16, null), s.due(now));
+        s.onProbeLost(i, now);
+    }
+    s.onProbeSent(10);
+    try testing.expectEqual(@as(?u16, 1472), s.onProbeAcked(10, 1472, now).?);
+    // A stale probe's fate counts nothing.
+    s = .init(1350, 1472);
+    s.start(now);
+    s.onProbeSent(20);
+    s.onProbeLost(19, now);
+    try testing.expectEqual(@as(?u16, null), s.onProbeAcked(21, 1472, now));
+    try testing.expectEqual(@as(u8, 0), s.lost);
+    // Three in a row: the size fails and the search halves the range.
+    for (0..max_probes) |i| {
+        if (i > 0) s.onProbeSent(20 + i);
+        s.onProbeLost(20 + i, now);
+    }
+    try testing.expectEqual(@as(u16, 1471), s.high);
+    try testing.expectEqual(@as(?u16, 1350 + (1471 - 1350 + 1) / 2), s.due(now));
+}
+
+test "the search: EMSGSIZE fails a size at once and lowers the ceiling; the raise timer searches again" {
+    const now: u64 = 0;
+    var s: Search = .init(1350, 65507);
+    s.start(now);
+    s.onProbeSent(1);
+    s.onProbeTooBig(now);
+    try testing.expectEqual(@as(u16, 65506), s.ceiling);
+    // An interface of 16384 (macOS loopback) and a path that carries it.
+    var pn: u64 = 2;
+    while (s.due(now)) |size| : (pn += 1) {
+        s.onProbeSent(pn);
+        if (size > 16384 - ipv4_overhead) s.onProbeTooBig(now) else _ = s.onProbeAcked(pn, size, now);
+    }
+    try testing.expect(s.current <= 16384 - ipv4_overhead and 16384 - ipv4_overhead - s.current < min_step);
+    try testing.expectEqual(State.complete, s.state);
+    // The raise timer: after 600 s, the ceiling (lowered by the
+    // refusals, so not far past the interface) is tried again.
+    try testing.expectEqual(@as(?u16, null), s.due(now + raise_interval_us - 1));
+    try testing.expectEqual(s.ceiling, s.due(now + raise_interval_us).?);
+    try testing.expect(s.ceiling < 16384);
+}
+
+test "black holes: full-sized losses over a PTO while smaller packets arrive" {
+    var s: Search = .init(1350, 1472);
+    s.start(0);
+    s.onProbeSent(0);
+    _ = s.onProbeAcked(0, 1472, 0);
+    const pto: u64 = 30_000;
+    // Losses alone, or a short run, aren't one.
+    s.onPacketAcked(1472, 100);
+    s.onPacketLost(1472, 1000);
+    s.onPacketLost(1472, 2000);
+    s.onPacketLost(1472, 40_000);
+    try testing.expect(!s.blackHole(pto));
+    // A smaller packet sent before the run arrived: no evidence either.
+    s.onPacketAcked(300, 500);
+    try testing.expect(!s.blackHole(pto));
+    // One sent after the run's start: a black hole.
+    s.onPacketAcked(1200, 41_000);
+    try testing.expect(s.blackHole(pto));
+    // Unless a full-sized one arrives: the run is over.
+    s.onPacketAcked(1472, 41_500);
+    try testing.expect(!s.blackHole(pto));
+    // Losses of packets older than a full-sized arrival don't count.
+    s.onPacketLost(1472, 41_000);
+    s.onPacketLost(1472, 40_000);
+    s.onPacketLost(1472, 1_000);
+    try testing.expect(!s.blackHole(pto));
+    // Smaller packets' losses don't make a run.
+    for (0..10) |i| s.onPacketLost(1300, 42_000 + i * 100);
+    try testing.expect(!s.blackHole(pto));
+    for (0..3) |i| s.onPacketLost(1472, 50_000 + i * 20_000);
+    s.onPacketAcked(80, 100_000);
+    try testing.expect(s.blackHole(pto));
+    // An outage: a smaller packet sent during the run was lost as well.
+    var outage = s;
+    outage.onPacketLost(1200, 60_000);
+    try testing.expect(!outage.blackHole(pto));
+    // (One sent before the run began says nothing.)
+    outage = s;
+    outage.onPacketLost(1200, 49_000);
+    try testing.expect(outage.blackHole(pto));
+    try testing.expectEqual(base, s.onBlackHole(200_000));
+    try testing.expectEqual(@as(u16, base), s.current);
+    // The search runs again below the size that failed, from its middle.
+    try testing.expectEqual(@as(u16, 1471), s.high);
+    try testing.expectEqual(@as(?u16, 1200 + (1471 - 1200 + 1) / 2), s.due(200_000));
+    var now: u64 = 200_000;
+    _ = try converge(&s, 1400, &now);
+    try testing.expect(s.current <= 1400 and 1400 - s.current < min_step);
+    // At BASE_PLPMTU, nothing is a black hole.
+    s = .init(1200, 1200);
+    for (0..10) |i| s.onPacketLost(1200, i * 100_000);
+    s.onPacketAcked(50, 2_000_000);
+    try testing.expect(!s.blackHole(pto));
+}
+
+test "a restart (new path) forgets the probe in flight" {
+    var s: Search = .init(1350, 1472);
+    s.start(0);
+    s.onProbeSent(5);
+    s.restart(1350, 10);
+    try testing.expectEqual(@as(?u16, null), s.onProbeAcked(5, 1472, 20));
+    try testing.expectEqual(@as(u16, 1350), s.current);
+    try testing.expectEqual(@as(?u16, 1472), s.due(20));
+    // Before the handshake, a restart doesn't start the search.
+    s = .init(1350, 1472);
+    s.restart(1350, 0);
+    try testing.expectEqual(@as(?u16, null), s.due(0));
+}

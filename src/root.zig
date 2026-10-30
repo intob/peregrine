@@ -81,6 +81,7 @@ test {
     _ = @import("./quic/recovery.zig");
     _ = @import("./quic/stream.zig");
     _ = @import("./quic/sent.zig");
+    _ = @import("./quic/pmtud.zig");
     _ = @import("./quic/udp.zig");
     _ = @import("./quic/conn_test.zig");
     _ = @import("./h3/qpack.zig");

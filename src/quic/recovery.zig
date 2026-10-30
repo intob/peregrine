@@ -90,6 +90,16 @@ pub const Congestion = struct {
         return 2 * self.mss;
     }
 
+    /// The maximum datagram size changed (PMTU discovery; RFC 9002 §7.2):
+    /// increases and the minimum window follow it. The window is in bytes
+    /// and stays (above the new minimum), and bytes in flight need nothing:
+    /// each packet leaves the flight with the size it was sent at.
+    pub fn setMss(self: *Self, mss: u64) void {
+        self.mss = mss;
+        self.window = @max(self.window, self.minWindow());
+        if (self.ssthresh != std.math.maxInt(u64)) self.ssthresh = @max(self.ssthresh, self.minWindow());
+    }
+
     pub fn available(self: *const Self) u64 {
         return self.window -| self.in_flight;
     }
@@ -388,6 +398,39 @@ test "slow start, a loss, recovery, then growth again" {
         try testing.expect(c.window < 3 * reduced);
         c.onPersistentCongestion();
         try testing.expectEqual(c.minWindow(), c.window);
+    }
+}
+
+test "a new maximum datagram size: the window's floor and increases follow, the pacer's floor too" {
+    for ([_]Algorithm{ .cubic, .new_reno }) |alg| {
+        var c = Congestion.init(1350, alg);
+        var rtt: Rtt = .{};
+        rtt.update(10_000, 0);
+        var p = Pacer.init(1350, Pacer.default_burst_us);
+        c.onPersistentCongestion();
+        try testing.expectEqual(@as(u64, 2700), c.window);
+        c.setMss(1472);
+        try testing.expectEqual(@as(u64, 2944), c.window);
+        try testing.expectEqual(@as(u64, 14720), p.capacity(&c, &rtt));
+        // Smaller: the window stays, the floor drops.
+        c.setMss(1200);
+        try testing.expectEqual(@as(u64, 2944), c.window);
+        try testing.expectEqual(@as(u64, 2400), c.minWindow());
+        try testing.expectEqual(@as(u64, 12000), p.capacity(&c, &rtt));
+        // A loss now goes no lower than two of the new datagrams.
+        c.onSent(2944);
+        c.onCongestionEvent(0, 1);
+        try testing.expect(c.window >= 2400);
+        // NewReno grows by one datagram of the current size per window.
+        if (alg == .new_reno) {
+            c.recovery_start = null;
+            c.ssthresh = c.window;
+            c.setMss(9000);
+            const w = c.window;
+            c.onSent(w);
+            c.onAcked(w, 10, 20_000, &rtt, w);
+            try testing.expectEqual(w + 9000, c.window);
+        }
     }
 }
 

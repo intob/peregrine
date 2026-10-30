@@ -39,9 +39,19 @@ pub const Http3Options = struct {
     max_connections_per_worker: u32 = 4096,
     /// Concurrent requests per connection.
     max_streams: u32 = 100,
-    /// Largest UDP payload sent. 1200 bytes is safe on every path; 1350
-    /// fits typical Ethernet paths with room for tunnels.
+    /// Largest UDP payload sent until PMTU discovery finds more. 1200 bytes
+    /// is safe on every path; 1350 fits typical Ethernet paths with room
+    /// for tunnels (and black hole detection falls back to 1200 where it
+    /// doesn't).
     max_datagram_size: u16 = 1350,
+    /// PMTU discovery (DPLPMTUD, RFC 8899, RFC 9000 §14.3): once the
+    /// handshake is confirmed, datagrams grow by probing up to what an IP
+    /// packet of this size carries (at 1500, Ethernet's: 1472 bytes over
+    /// IPv4, 1452 over IPv6), the client's max_udp_payload_size and the
+    /// path allow; when larger datagrams stop arriving they fall back to
+    /// 1200 bytes. Larger values help only where the path is larger
+    /// (jumbo frames, loopback). 0: off (`max_datagram_size` throughout).
+    max_mtu: u16 = 1500,
     /// Milliseconds without traffic before a connection is closed.
     idle_timeout_ms: u64 = 30_000,
     congestion: recovery.Algorithm = .cubic,
@@ -465,6 +475,8 @@ pub fn Server(comptime Handler: type) type {
                         var ua = address;
                         ua.setPort(srv.quic_port);
                         udp_fds[i] = try udp.bind(ua, sys.is_linux);
+                        // RFC 9000 §14: DF, where the kernel lets us.
+                        _ = udp.setDontFragment(udp_fds[i], ua == .ip6);
                         if (o.ecn) udp.enableEcn(udp_fds[i], ua == .ip6);
                         if (i == 0 and srv.quic_port == 0) srv.quic_port = try udp.localPort(udp_fds[0]);
                     }
@@ -549,6 +561,7 @@ pub fn Server(comptime Handler: type) type {
                     .max_stream_data_bidi = o.max_stream_data,
                     .max_streams_bidi = o.max_streams,
                     .max_datagram_size = o.max_datagram_size,
+                    .max_mtu = o.max_mtu,
                     .congestion = o.congestion,
                     .pacing = o.pacing,
                     .ecn = o.ecn,

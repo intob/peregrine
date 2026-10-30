@@ -32,8 +32,18 @@
 //! address (`onPathChange`) is a new path, tested afresh. A CE count
 //! increase is a congestion event, like a loss (RFC 9002 §7.1).
 //!
+//! PMTU discovery (DPLPMTUD, RFC 9000 §14.3, pmtud.zig): once the
+//! handshake is confirmed, `send` returns a probe (PING and PADDING,
+//! larger than the maximum datagram size, so the worker sends it alone,
+//! not in a GSO run) when one is due and the window has room for it. An
+//! acknowledged probe raises `max_datagram`, and the congestion
+//! controller's datagram size and the pacer's floor with it; a lost one
+//! is neither congestion nor a loss for persistent congestion. Full-sized
+//! packets that stop arriving while smaller ones get through (a black
+//! hole) bring it back to 1200 bytes.
+//!
 //! Not yet: connection migration and NEW_CONNECTION_ID, Retry tokens
-//! (the worker's job), PMTU discovery, DATAGRAM frames.
+//! (the worker's job), DATAGRAM frames.
 const std = @import("std");
 const builtin = @import("builtin");
 const packet = @import("./packet.zig");
@@ -44,6 +54,7 @@ const recovery = @import("./recovery.zig");
 const stream_mod = @import("./stream.zig");
 const sent_mod = @import("./sent.zig");
 const ranges = @import("./ranges.zig");
+const pmtud = @import("./pmtud.zig");
 const handshake = @import("../tls/handshake.zig");
 const tls_errors = @import("../tls/errors.zig");
 const Allocator = std.mem.Allocator;
@@ -77,8 +88,17 @@ pub const Config = struct {
     /// Our unidirectional streams (HTTP/3 opens three).
     local_uni_streams: u32 = 3,
     max_ack_delay_ms: u64 = 25,
-    /// Largest UDP payload we send (until PMTU discovery exists).
+    /// Largest UDP payload we send until PMTU discovery finds more (and
+    /// the client's max_udp_payload_size allows it).
     max_datagram_size: u16 = 1200,
+    /// PMTU discovery (RFC 8899): the largest IP packet probed for once
+    /// the handshake is confirmed (1500: Ethernet), so datagrams of up to
+    /// 28 bytes less over IPv4, 48 over IPv6 (`InitOptions.ipv6`). 0: off,
+    /// `max_datagram_size` throughout.
+    max_mtu: u16 = 0,
+    /// The largest UDP payload we receive whole (our max_udp_payload_size
+    /// transport parameter).
+    max_recv_datagram_size: u16 = 65527,
     congestion: recovery.Algorithm = .cubic,
     /// Pace sending (RFC 9002 §7.7) at 1.25 · cwnd / smoothed RTT, in
     /// bursts of at most `pacing_burst_us` of that rate (and at least ten
@@ -341,7 +361,13 @@ pub const Conn = struct {
     address_validated: bool = false,
     bytes_received: u64 = 0,
     bytes_sent: u64 = 0,
+    /// The maximum datagram size: the PLPMTU (RFC 8899), within the
+    /// client's max_udp_payload_size.
     max_datagram: u16,
+    /// PMTU discovery's state (`cfg.max_mtu` nonzero), and the IP
+    /// packet's overhead on this path.
+    pmtu: pmtud.Search,
+    ipv6: bool,
 
     rtt: recovery.Rtt = .{},
     cc: recovery.Congestion,
@@ -427,6 +453,9 @@ pub const Conn = struct {
         retry_scid: ?[]const u8 = null,
         entropy: *const [handshake.entropy_len]u8,
         now: u64,
+        /// The client is at an IPv6 address (not IPv4-mapped): 20 more
+        /// bytes of IP header in every packet, for PMTU discovery.
+        ipv6: bool = false,
     };
 
     pub fn init(allocator: Allocator, cfg: *const Config, opts: InitOptions) !*Self {
@@ -445,6 +474,8 @@ pub const Conn = struct {
             .odcid = .init(opts.odcid),
             .retry_scid = if (opts.retry_scid) |r| Cid.init(r) else null,
             .max_datagram = cfg.max_datagram_size,
+            .pmtu = .init(cfg.max_datagram_size, cfg.max_datagram_size),
+            .ipv6 = opts.ipv6,
             .cc = .init(cfg.max_datagram_size, cfg.congestion),
             .pacer = .init(cfg.max_datagram_size, cfg.pacing_burst_us),
             .last_activity = opts.now,
@@ -820,7 +851,6 @@ pub const Conn = struct {
     }
 
     fn onHandshakeComplete(self: *Self, now: u64) void {
-        _ = now;
         const hs = self.hs.?;
         self.negotiated_alpn = hs.alpn;
         hs.deinit();
@@ -833,6 +863,82 @@ pub const Conn = struct {
         self.handshake_done_pending = true;
         self.address_validated = true;
         self.discardSpace(.handshake);
+        // §14.3.1: DPLPMTUD's BASE state; 1200 bytes are confirmed (the
+        // client's Initials), and the search may begin.
+        if (self.pmtuEnabled()) self.pmtu.start(now);
+    }
+
+    // -- PMTU discovery (RFC 9000 §14, pmtud.zig) --------------------------
+
+    fn pmtuEnabled(self: *const Self) bool {
+        return self.cfg.max_mtu != 0;
+    }
+
+    /// MAX_PLPMTU as configured, for this path's IP version.
+    fn pmtuCeiling(self: *const Self) u16 {
+        if (!self.pmtuEnabled()) return self.max_datagram;
+        const overhead = if (self.ipv6) pmtud.ipv6_overhead else pmtud.ipv4_overhead;
+        return @max(self.cfg.max_mtu -| overhead, pmtud.base);
+    }
+
+    /// A new PLPMTU: the congestion controller counts in it, and the
+    /// pacer's floor (ten datagrams) follows.
+    fn setMaxDatagram(self: *Self, size: u16) void {
+        self.max_datagram = size;
+        self.cc.setMss(size);
+    }
+
+    /// The probe `send` last returned couldn't be sent: the local
+    /// interface refused its size (EMSGSIZE). It leaves the flight, and
+    /// the size fails at once.
+    pub fn onProbeTooBig(self: *Self, now: u64) void {
+        const pn = self.pmtu.probe_pn orelse return;
+        const sp = &self.spaces[@backingInt(Space.application)];
+        if (sp.sent.get(pn)) |p| {
+            if (p.in_flight) self.cc.onDiscarded(p.size);
+            if (p.ecn and self.onPath(.application, pn)) self.ecn_marked_lost += 1;
+            sp.sent.remove(p);
+            sp.sent.compact();
+        }
+        self.pmtu.onProbeTooBig(now);
+        self.setLossTimer(now);
+    }
+
+    /// Writes a PMTU probe if one is due: PING and PADDING to the probed
+    /// size (§14.4), in a 1-RTT packet of its own, sent when the window
+    /// has room for it (it is in flight like any packet). Not after two
+    /// probe timeouts in a row (packets aren't arriving; see `send`), and
+    /// not into a buffer too small for it.
+    fn sendPmtuProbe(self: *Self, out: []u8, now: u64) usize {
+        if (!self.pmtuEnabled() or self.pto_count >= 2) return 0;
+        const size = self.pmtu.due(now) orelse return 0;
+        if (out.len < size or self.cc.in_flight + size > self.cc.window) return 0;
+        const sp = &self.spaces[@backingInt(Space.application)];
+        if (sp.tx == null) return 0;
+        var b: Builder = .{ .out = out[0..size], .ecn = self.sendEcn() == .ect0, .pmtu_probe = true };
+        const pn = sp.sent.nextPn();
+        var fw = self.openPacket(&b, .application);
+        fw.byte(0x01); // PING
+        sp.sent.addRecord(self.allocator, .ping) catch {
+            sp.sent.discardRecordsSince(b.rec_mark);
+            return 0;
+        };
+        b.last_eliciting = true;
+        b.pos += fw.pos;
+        b.packets = 1;
+        b.padTo(size);
+        self.sealLast(&b, now);
+        if (sp.sent.get(pn) == null) return 0;
+        self.pmtu.onProbeSent(pn);
+        self.bytes_sent += b.pos;
+        return b.pos;
+    }
+
+    /// After an ACK or a loss timeout: a black hole is losses of full-sized
+    /// packets over at least a probe timeout while smaller ones arrive.
+    fn checkBlackHole(self: *Self, now: u64) void {
+        if (!self.pmtuEnabled() or !self.pmtu.blackHole(self.rtt.pto(self.peerMaxAckDelay()))) return;
+        self.setMaxDatagram(self.pmtu.onBlackHole(now));
     }
 
     const TlsSink = struct {
@@ -876,7 +982,16 @@ pub const Conn = struct {
             if (!isc.eql(c.dcid.slice())) return error.TransportParameter;
             c.tx_max_data = c.peer.initial_max_data;
             c.peer_max_uni = c.peer.initial_max_streams_uni;
-            c.max_datagram = @intCast(@min(c.cfg.max_datagram_size, c.peer.max_udp_payload_size));
+            // §14: within what the client takes; a smaller start than
+            // ours resets the congestion window's units before anything
+            // is sent (RFC 9002 §7.2).
+            const peer_max: u16 = @intCast(@min(c.peer.max_udp_payload_size, std.math.maxInt(u16)));
+            if (peer_max < c.max_datagram) {
+                c.max_datagram = peer_max;
+                c.cc = .init(peer_max, c.cfg.congestion);
+                c.pacer = .init(peer_max, c.cfg.pacing_burst_us);
+            }
+            c.pmtu = .init(c.max_datagram, @min(c.pmtuCeiling(), peer_max));
             const ours: tp.Params = .{
                 .original_destination_connection_id = c.odcid,
                 .initial_source_connection_id = c.scid,
@@ -889,6 +1004,7 @@ pub const Conn = struct {
                 .initial_max_streams_bidi = c.cfg.max_streams_bidi,
                 .initial_max_streams_uni = c.cfg.max_streams_uni,
                 .max_ack_delay = c.cfg.max_ack_delay_ms,
+                .max_udp_payload_size = c.cfg.max_recv_datagram_size,
                 .disable_active_migration = true,
             };
             return tp.encodeServer(&c.our_params_buf, &ours);
@@ -967,6 +1083,8 @@ pub const Conn = struct {
         var largest_time: u64 = 0;
         var any_eliciting = false;
         var newly_marked: u64 = 0;
+        var probe_acked: ?struct { pn: u64, size: u16 } = null;
+        const pmtu = space == .application and self.pmtuEnabled();
         // Packets below the oldest live one were all resolved already.
         if (sp.sent.oldest()) |floor| {
             var it = ack.iterator();
@@ -985,6 +1103,11 @@ pub const Conn = struct {
                         if (space == .application and pn >= self.tx_phase_start) self.tx_phase_acked = true;
                         for (sp.sent.recordsOf(p)) |rec| self.onRecordAcked(space, rec);
                         if (p.in_flight) self.cc.onAcked(p.size, p.time_sent, now, &self.rtt, in_flight_before);
+                        // A probe raises the size once losses are
+                        // counted at the old one, below.
+                        if (p.pmtu_probe) {
+                            probe_acked = .{ .pn = pn, .size = @intCast(p.size) };
+                        } else if (pmtu) self.pmtu.onPacketAcked(p.size, p.time_sent);
                         sp.sent.remove(p);
                     }
                     if (pn == low) break;
@@ -1002,6 +1125,9 @@ pub const Conn = struct {
             self.rtt.update(now -| largest_time, ack_delay);
         }
         self.detectLoss(space, now);
+        if (probe_acked) |pa| {
+            if (self.pmtu.onProbeAcked(pa.pn, pa.size, now)) |size| self.setMaxDatagram(size);
+        }
         self.pto_count = 0;
         sp.sent.compact();
         self.setLossTimer(now);
@@ -1108,11 +1234,18 @@ pub const Conn = struct {
     }
 
     /// The peer's address changed (NAT rebinding): ECN is validated per
-    /// path (RFC 9000 §13.4.2), so the new one is tested. Congestion
-    /// control and the RTT are kept (§9.4 would reset them for a migration
-    /// to a new path; we ask clients not to migrate and follow rebinding
+    /// path (RFC 9000 §13.4.2), so the new one is tested; and the maximum
+    /// datagram size is per path too (§14.2): back to the size the
+    /// connection started with, and searched afresh. Congestion control
+    /// and the RTT are kept (§9.4 would reset them for a migration to a
+    /// new path; we ask clients not to migrate and follow rebinding
     /// without path validation).
-    pub fn onPathChange(self: *Self) void {
+    pub fn onPathChange(self: *Self, now: u64) void {
+        if (self.pmtuEnabled()) {
+            const start: u16 = @intCast(@min(self.cfg.max_datagram_size, self.peer.max_udp_payload_size));
+            self.pmtu.restart(start, now);
+            self.setMaxDatagram(start);
+        }
         if (!self.cfg.ecn) return;
         self.ecn_retests = 0;
         self.restartEcn();
@@ -1190,12 +1323,23 @@ pub const Conn = struct {
         var lost_any = false;
         var newest_lost_time: u64 = 0;
         var oldest_lost_time: u64 = std.math.maxInt(u64);
+        const pmtu = space == .application and self.pmtuEnabled();
         var it = sp.sent.iterator();
         while (it.next()) |e| {
             if (e.pn > largest_acked) break;
             const p = e.packet;
             if (p.time_sent <= lost_send_time or largest_acked >= e.pn + recovery.packet_threshold) {
                 for (sp.sent.recordsOf(p)) |rec| self.onRecordLost(space, rec);
+                if (p.pmtu_probe) {
+                    // §14.4: a failed probe, not congestion; and not a
+                    // loss towards persistent congestion either.
+                    if (p.in_flight) self.cc.onLost(p.size);
+                    if (p.ecn and self.onPath(space, e.pn)) self.ecn_marked_lost += 1;
+                    sp.sent.remove(p);
+                    self.pmtu.onProbeLost(e.pn, now);
+                    continue;
+                }
+                if (pmtu and p.ack_eliciting) self.pmtu.onPacketLost(p.size, p.time_sent);
                 if (p.in_flight) {
                     self.cc.onLost(p.size);
                     lost_any = true;
@@ -1223,6 +1367,8 @@ pub const Conn = struct {
                 if (newest_lost_time - oldest_lost_time > duration) self.cc.onPersistentCongestion();
             }
         }
+        // (The evidence can come in an ACK that loses nothing new.)
+        if (pmtu) self.checkBlackHole(now);
     }
 
     fn ackElicitingInFlight(self: *const Self) bool {
@@ -1743,8 +1889,14 @@ pub const Conn = struct {
     // -- Sending --------------------------------------------------------------
 
     /// Fills `out` with the next datagram. Returns its length, 0 when there
-    /// is nothing to send now.
+    /// is nothing to send now. A datagram longer than `max_datagram` is a
+    /// PMTU probe, which goes alone (not in a GSO run); one is written
+    /// only when `out` has room for it.
     pub fn send(self: *Self, out: []u8, now: u64) usize {
+        if (self.state == .established) {
+            const n = self.sendPmtuProbe(out, now);
+            if (n > 0) return n;
+        }
         const was_holding = self.pacing_hold != null;
         self.pacing_hold = null;
         switch (self.state) {
@@ -1753,6 +1905,11 @@ pub const Conn = struct {
             else => {},
         }
         var max = @min(out.len, self.max_datagram);
+        // Two probe timeouts in a row, nothing acknowledged: datagrams
+        // over 1200 bytes may be what isn't arriving (a black hole after
+        // the path changed), so the probe timeouts' packets go at 1200,
+        // and their acknowledgment is the evidence pmtud.zig looks for.
+        if (self.pto_count >= 2 and self.pmtuEnabled()) max = @min(max, pmtud.base);
         if (!self.address_validated) {
             const budget = 3 * self.bytes_received -| self.bytes_sent;
             if (budget < max) max = @intCast(budget);
@@ -1827,6 +1984,8 @@ pub const Conn = struct {
         held: bool = false,
         /// The datagram goes out ECT(0).
         ecn: bool = false,
+        /// The datagram is a PMTU probe.
+        pmtu_probe: bool = false,
 
         fn room(b: *const Builder) usize {
             return b.out.len - b.pos;
@@ -1863,7 +2022,12 @@ pub const Conn = struct {
         sp.tx.?.protect(pkt, b.pn_offset - b.start, b.pn_len, b.pn);
         b.pos = end;
         const size: u32 = @intCast(end - b.start);
-        sp.sent.add(self.allocator, b.rec_mark, now, size, b.last_eliciting, b.last_in_flight or b.last_eliciting, b.ecn) catch {
+        sp.sent.add(self.allocator, b.rec_mark, now, size, .{
+            .ack_eliciting = b.last_eliciting,
+            .in_flight = b.last_in_flight or b.last_eliciting,
+            .ecn = b.ecn,
+            .pmtu_probe = b.pmtu_probe,
+        }) catch {
             self.fail(.internal_error, 0, now);
             return;
         };
@@ -1882,7 +2046,7 @@ pub const Conn = struct {
                 self.sent_since_rx = true;
                 self.last_activity = now;
             }
-            if (sp.probes > 0) sp.probes -= 1;
+            if (sp.probes > 0 and !b.pmtu_probe) sp.probes -= 1;
         }
         if (b.space == .application) self.tx_phase_packets += 1;
         self.setLossTimer(now);
@@ -1942,45 +2106,9 @@ pub const Conn = struct {
         self.sealLast(b, now);
         if (b.room() < 64) return;
 
-        // Header.
-        const pn = sp.sent.nextPn();
-        const pn_len = packet.pnLen(pn, sp.largest_acked);
-        var w: packet.Writer = .{ .buf = b.out[b.pos..] };
-        const long = space != .application;
-        if (long) {
-            w.byte(0xc0 | packet.longTypeBits(space.packetType()) | @as(u8, @intCast(pn_len - 1)));
-            w.int(u32, packet.version_1);
-            w.byte(self.dcid.len);
-            w.bytes(self.dcid.slice());
-            w.byte(self.scid.len);
-            w.bytes(self.scid.slice());
-            if (space == .initial) w.varint(0); // no token
-            w.int(u16, 0); // Length, filled when sealed
-        } else {
-            w.byte(0x40 | (@as(u8, self.tx_phase) << 2) | @as(u8, @intCast(pn_len - 1)));
-            w.bytes(self.dcid.slice());
-        }
-        const pn_offset = b.pos + w.pos;
-        var pn_buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &pn_buf, @truncate(pn), .big);
-        w.bytes(pn_buf[4 - pn_len ..]);
-        const header_end = w.pos;
-
-        const mark = sp.sent.recordMark();
-        b.open = true;
-        b.start = b.pos;
-        b.pn_offset = pn_offset;
-        b.pn_len = pn_len;
-        b.pn = pn;
-        b.long = long;
-        b.space = space;
-        b.last_eliciting = false;
-        b.last_in_flight = false;
-        b.rec_mark = mark;
-
-        // Room for frames: what's left minus the tag.
-        const limit = w.buf.len -| protection.tag_len;
-        var fw: packet.Writer = .{ .buf = w.buf[0..limit], .pos = header_end };
+        var fw = self.openPacket(b, space);
+        const header_end = fw.pos;
+        const mark = b.rec_mark;
 
         if (want_ack) try self.writeAck(sp, &fw, now);
         if (path_response and fw.left() >= 9) {
@@ -2009,6 +2137,49 @@ pub const Conn = struct {
         b.last_eliciting = eliciting;
         b.pos += fw.pos;
         b.packets += 1;
+    }
+
+    /// Starts a packet of `space` at `b.pos`: its header, with the Length
+    /// (long headers) left for `sealLast`. Returns a writer for its frames,
+    /// past the header and short of the tag's room.
+    fn openPacket(self: *Self, b: *Builder, space: Space) packet.Writer {
+        const sp = &self.spaces[@backingInt(space)];
+        const pn = sp.sent.nextPn();
+        const pn_len = packet.pnLen(pn, sp.largest_acked);
+        var w: packet.Writer = .{ .buf = b.out[b.pos..] };
+        const long = space != .application;
+        if (long) {
+            w.byte(0xc0 | packet.longTypeBits(space.packetType()) | @as(u8, @intCast(pn_len - 1)));
+            w.int(u32, packet.version_1);
+            w.byte(self.dcid.len);
+            w.bytes(self.dcid.slice());
+            w.byte(self.scid.len);
+            w.bytes(self.scid.slice());
+            if (space == .initial) w.varint(0); // no token
+            w.int(u16, 0); // Length, filled when sealed
+        } else {
+            w.byte(0x40 | (@as(u8, self.tx_phase) << 2) | @as(u8, @intCast(pn_len - 1)));
+            w.bytes(self.dcid.slice());
+        }
+        const pn_offset = b.pos + w.pos;
+        var pn_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &pn_buf, @truncate(pn), .big);
+        w.bytes(pn_buf[4 - pn_len ..]);
+
+        b.open = true;
+        b.start = b.pos;
+        b.pn_offset = pn_offset;
+        b.pn_len = pn_len;
+        b.pn = pn;
+        b.long = long;
+        b.space = space;
+        b.last_eliciting = false;
+        b.last_in_flight = false;
+        b.rec_mark = sp.sent.recordMark();
+
+        // Room for frames: what's left minus the tag.
+        const limit = w.buf.len -| protection.tag_len;
+        return .{ .buf = w.buf[0..limit], .pos = w.pos };
     }
 
     fn recordsElicit(_: *Self, sp: *PnSpace, mark: u64) bool {
@@ -2208,7 +2379,7 @@ pub const Conn = struct {
         if (long) _ = packet.writeVarintLen(out[pn_offset - 2 ..], end - pn_offset, 2);
         sp.tx.?.protect(out[0..end], pn_offset, pn_len, pn);
         // Consume the packet number (nothing is tracked for it).
-        sp.sent.add(self.allocator, sp.sent.recordMark(), 0, @intCast(end), false, false, false) catch {};
+        sp.sent.add(self.allocator, sp.sent.recordMark(), 0, @intCast(end), .{}) catch {};
         if (sp.sent.get(pn)) |p| sp.sent.remove(p);
         return end;
     }

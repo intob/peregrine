@@ -8,6 +8,11 @@
 //! as a control message beside it; sends set the codepoint per sendmsg
 //! (IP_TOS or IPV6_TCLASS control message), so connections that mark and
 //! connections that don't share the socket. One GSO send has one codepoint.
+//!
+//! Datagram size (RFC 9000 §14): `setDontFragment` sets DF, so a datagram
+//! too large for the path is dropped rather than fragmented; PMTU
+//! discovery (pmtud.zig) finds the size that arrives. A send larger than
+//! the local interface takes fails with `error.MessageTooBig`.
 const std = @import("std");
 const builtin = @import("builtin");
 const sys = @import("../sys.zig");
@@ -122,6 +127,31 @@ pub fn attachSteering(fd: fd_t, workers: u32) !void {
     const fprog: SockFprog = .{ .len = prog.len, .filter = &prog };
     const rc = linux.setsockopt(fd, posix.SOL.SOCKET, linux.SO.ATTACH_REUSEPORT_CBPF, @ptrCast(&fprog), @sizeOf(SockFprog));
     if (posix.errno(rc) != .SUCCESS) return error.SteeringFailed;
+}
+
+// -- Fragmentation --------------------------------------------------------------
+
+/// Sets DF on our datagrams (RFC 9000 §14: "the Don't Fragment (DF) bit
+/// MUST be set if possible"), best effort. Linux: IP_PMTUDISC_PROBE, which
+/// sets DF and ignores the kernel's path MTU cache (learnt from ICMP, which
+/// DPLPMTUD needn't trust: RFC 9000 §14.2.1), so a probe goes at any size
+/// up to the interface's and larger ones fail with EMSGSIZE; on an IPv6
+/// socket for both families (IPv4-mapped traffic follows the IP option).
+/// macOS: IP_DONTFRAG or IPV6_DONTFRAG (it refuses IP-level options on an
+/// IPv6 socket, as with ECN). Whether every option took.
+pub fn setDontFragment(fd: fd_t, ipv6: bool) bool {
+    var ok = true;
+    if (sys.is_linux) {
+        if (ipv6) ok = sys.trySetsockoptInt(fd, posix.IPPROTO.IPV6, linux.IPV6.MTU_DISCOVER, linux.IPV6.PMTUDISC_PROBE) and ok;
+        ok = sys.trySetsockoptInt(fd, posix.IPPROTO.IP, linux.IP.MTU_DISCOVER, linux.IP.PMTUDISC_PROBE) and ok;
+        return ok;
+    }
+    if (ipv6) {
+        if (!@hasDecl(posix.IPV6, "DONTFRAG")) return false;
+        return sys.trySetsockoptInt(fd, posix.IPPROTO.IPV6, posix.IPV6.DONTFRAG, 1);
+    }
+    if (!@hasDecl(posix.IP, "DONTFRAG")) return false;
+    return sys.trySetsockoptInt(fd, posix.IPPROTO.IP, posix.IP.DONTFRAG, 1);
 }
 
 // -- ECN ----------------------------------------------------------------------
@@ -253,15 +283,27 @@ pub const SendError = error{
     /// unmarked from then on, per `tosKind` (ECN validation then ends each
     /// connection's marking).
     TosRefused,
+    /// The datagram is larger than the local interface takes, with DF set
+    /// (EMSGSIZE): not sent. For a PMTU probe, a failed probe.
+    MessageTooBig,
 };
 
 /// The control message that sets a send's codepoint: IP_TOS (0) for IPv4
 /// (on Linux, IPv4-mapped addresses on an IPv6 socket too), else
 /// IPV6_TCLASS (1). A kernel may refuse one and not the other.
 pub fn tosKind(to: *const Addr) u1 {
-    const v4 = to.storage.family == posix.AF.INET or
-        (sys.is_linux and std.mem.eql(u8, to.storage.addr[0..12], &[12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff }));
+    const v4 = to.storage.family == posix.AF.INET or (sys.is_linux and isMapped(to));
     return if (v4) 0 else 1;
+}
+
+fn isMapped(to: *const Addr) bool {
+    return std.mem.eql(u8, to.storage.addr[0..12], &[12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff });
+}
+
+/// Whether datagrams to `to` travel in IPv6 packets (not IPv4, nor
+/// IPv4-mapped on a dual-stack socket): 20 more bytes of header each.
+pub fn isIpv6(to: *const Addr) bool {
+    return to.storage.family == posix.AF.INET6 and !isMapped(to);
 }
 
 /// One sendmsg of `data` to `to` with `control`, retried on EINTR.
@@ -324,6 +366,7 @@ pub fn send(fd: fd_t, to: *const Addr, data: []const u8, segment: ?u16, ecn: Ecn
             .SUCCESS => {},
             // (The refusal is news the caller keeps.)
             .AGAIN => return if (refused) error.TosRefused else error.WouldBlock,
+            .MSGSIZE => return error.MessageTooBig,
             // EIO: GSO unsupported by the device; ECONNREFUSED and
             // friends: ICMP errors from earlier sends. Drop.
             else => return if (refused) error.TosRefused else error.Unexpected,
@@ -477,4 +520,51 @@ test "verify ECN: a send failing EINVAL for another reason doesn't stop marking"
     addr.setPort(try localPort(fd));
     const to = Addr.fromIp(addr);
     try expectCodepoints(fd, fd, &to, null);
+}
+
+test "DF: a datagram larger than the interface fails with MessageTooBig instead of being fragmented" {
+    var addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    const fd = try bind(addr, false);
+    defer sys.close(fd);
+    try testing.expect(setDontFragment(fd, false));
+    addr.setPort(try localPort(fd));
+    const self_addr: Addr = .fromIp(addr);
+    const big = try testing.allocator.alloc(u8, 16384);
+    defer testing.allocator.free(big);
+    @memset(big, 0x5a);
+    if (sys.is_linux) {
+        var v: c_int = 0;
+        var len: posix.socklen_t = @sizeOf(c_int);
+        try testing.expectEqual(posix.E.SUCCESS, posix.errno(linux.getsockopt(fd, posix.IPPROTO.IP, linux.IP.MTU_DISCOVER, @ptrCast(&v), &len)));
+        try testing.expectEqual(@as(c_int, linux.IP.PMTUDISC_PROBE), v);
+        // Out of an Ethernet-sized interface (Docker's), where there is a
+        // route: 1600 bytes don't fit in 1500 and aren't fragmented.
+        const far: Addr = .fromIp(.{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 9 } });
+        const plain_fd = try bind(.{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } }, false);
+        defer sys.close(plain_fd);
+        const routed = if (send(plain_fd, &far, big[0..1600], null, .not_ect)) true else |_| false;
+        if (routed) {
+            const df = try bind(.{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } }, false);
+            defer sys.close(df);
+            try testing.expect(setDontFragment(df, false));
+            send(df, &far, big[0..1600], null, .not_ect) catch |err| try testing.expectEqual(error.MessageTooBig, err);
+        }
+        return;
+    }
+    // macOS: lo0's MTU is 16384, so a 16384-byte payload needs fragments.
+    try testing.expectError(error.MessageTooBig, send(fd, &self_addr, big, null, .not_ect));
+    try send(fd, &self_addr, big[0 .. 16384 - 28], null, .not_ect);
+    // Without DF the kernel fragments it.
+    const plain = try bind(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, false);
+    defer sys.close(plain);
+    try send(plain, &self_addr, big, null, .not_ect);
+    // IPv6 too, where there is IPv6.
+    var a6: std.Io.net.IpAddress = .{ .ip6 = .{ .bytes = std.mem.zeroes([16]u8), .port = 0 } };
+    a6.ip6.bytes[15] = 1;
+    const s6 = bind(a6, false) catch return;
+    defer sys.close(s6);
+    try testing.expect(setDontFragment(s6, true));
+    a6.setPort(try localPort(s6));
+    const to6: Addr = .fromIp(a6);
+    try testing.expectError(error.MessageTooBig, send(s6, &to6, big, null, .not_ect));
 }

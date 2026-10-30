@@ -34,6 +34,10 @@ pub const exchange_slot_flag: u32 = 0x8000_0000;
 /// 1200-1500).
 const batch_len = 32;
 const datagram_buf = 2048;
+/// The most one GSO send carries: the kernel takes the whole run as one
+/// UDP datagram (65535 bytes of IPv4 packet, less its headers) and refuses
+/// a larger one with EMSGSIZE. 48 segments of 1365 bytes would be 65520.
+const gso_max_bytes = 65535 - 20 - 8;
 
 pub const RetryMode = enum {
     /// Never: the anti-amplification limit protects us.
@@ -141,6 +145,8 @@ pub fn Endpoint(comptime Handler: type) type {
             };
             sys.randomBytes(&self.reset_key);
             sys.randomBytes(&self.token_key);
+            // Larger datagrams wouldn't fit our receive buffers.
+            self.opts.quic.max_recv_datagram_size = @min(self.opts.quic.max_recv_datagram_size, datagram_buf);
             try self.free.ensureTotalCapacity(allocator, opts.max_connections);
             var i = opts.max_connections;
             while (i > 0) {
@@ -256,7 +262,7 @@ pub fn Endpoint(comptime Handler: type) type {
                 // reordered datagram from the old one doesn't count, RFC
                 // 9000 §9.3): answer there, and test ECN on the new path.
                 st.peer = from.*;
-                st.q.?.onPathChange();
+                st.q.?.onPathChange(now_us);
             }
             self.markDirty(s);
         }
@@ -302,6 +308,7 @@ pub fn Endpoint(comptime Handler: type) type {
                 .retry_scid = retry_scid,
                 .entropy = &entropy,
                 .now = now_us,
+                .ipv6 = udp.isIpv6(from),
             }) catch {
                 self.free.appendAssumeCapacity(slot);
                 return null;
@@ -439,16 +446,27 @@ pub fn Endpoint(comptime Handler: type) type {
             var ecn: packet.Ecn = .not_ect;
             while (true) {
                 const next_ecn: packet.Ecn = if (self.tos_refused[udp.tosKind(&st.peer)]) .not_ect else q.sendEcn();
-                if (pos + seg > self.send_buf.len or (pos > 0 and next_ecn != ecn)) {
+                if (pos + seg > gso_max_bytes or (pos > 0 and next_ecn != ecn)) {
                     self.sendOut(st, pos, seg, segments, ecn);
                     pos = 0;
                     segments = 0;
                 }
                 ecn = next_ecn;
-                const n = q.send(self.send_buf[pos..][0..seg], now_us);
+                // The rest of the buffer: datagrams are at most `seg`
+                // bytes, but a PMTU probe is larger, when it fits.
+                const n = q.send(self.send_buf[pos..], now_us);
                 if (n == 0) break;
+                if (n > seg) {
+                    // A probe goes in a sendmsg of its own, after the run
+                    // before it (GSO segments are all `seg` bytes).
+                    self.sendOut(st, pos, seg, segments, ecn);
+                    if (self.sendTo(&st.peer, self.send_buf[pos..][0..n], null, ecn) == .too_big) q.onProbeTooBig(now_us);
+                    pos = 0;
+                    segments = 0;
+                    continue;
+                }
                 if (!self.gso) {
-                    self.sendTo(&st.peer, self.send_buf[0..n], null, ecn);
+                    _ = self.sendTo(&st.peer, self.send_buf[0..n], null, ecn);
                     continue;
                 }
                 pos += n;
@@ -466,16 +484,27 @@ pub fn Endpoint(comptime Handler: type) type {
 
         fn sendOut(self: *Self, st: *Slot, len: usize, seg: usize, segments: usize, ecn: packet.Ecn) void {
             if (len == 0) return;
-            self.sendTo(&st.peer, self.send_buf[0..len], if (segments > 1) @intCast(seg) else null, ecn);
+            _ = self.sendTo(&st.peer, self.send_buf[0..len], if (segments > 1) @intCast(seg) else null, ecn);
         }
 
-        fn sendTo(self: *Self, to: *const udp.Addr, data: []const u8, segment: ?u16, ecn: packet.Ecn) void {
+        const Sent = enum { sent, failed, too_big };
+
+        fn sendTo(self: *Self, to: *const udp.Addr, data: []const u8, segment: ?u16, ecn: packet.Ecn) Sent {
             udp.send(self.fd, to, data, segment, ecn) catch |err| switch (err) {
-                error.TosRefused => self.tos_refused[udp.tosKind(to)] = true,
+                error.TosRefused => {
+                    self.tos_refused[udp.tosKind(to)] = true;
+                    return .sent;
+                },
+                // Larger than the interface (DF is set): for a PMTU probe,
+                // the size fails; for other datagrams (the interface
+                // shrank), a loss like any other, until black hole
+                // detection lowers the size.
+                error.MessageTooBig => return .too_big,
                 // A send that fails is a lost packet to QUIC; recovery
                 // resends.
-                error.WouldBlock, error.Unexpected => {},
+                error.WouldBlock, error.Unexpected => return .failed,
             };
+            return .sent;
         }
 
         fn destroy(self: *Self, slot: u32, now_us: u64) void {

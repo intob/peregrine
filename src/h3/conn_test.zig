@@ -200,6 +200,9 @@ const Harness = struct {
     /// the path clears the server's marks.
     client_ecn: packet.Ecn = .not_ect,
     bleach: bool = false,
+    /// The path's largest datagram towards the client (larger ones are
+    /// dropped).
+    path_max: usize = std.math.maxInt(usize),
 
     fn init() !*Harness {
         const a = testing.allocator;
@@ -320,6 +323,7 @@ const Harness = struct {
                     const n = s.send(&buf, h.now_us);
                     if (n == 0) break;
                     progress = true;
+                    if (n > h.path_max) continue;
                     try h.client.recvEcn(buf[0..n], if (h.bleach) .not_ect else ecn);
                 }
                 if (s.isClosed()) return;
@@ -1198,7 +1202,9 @@ test "HTTP/3: GOAWAY finishes requests in flight, then closes" {
 /// counts among them), bytes on request and unidirectional streams (with
 /// or without FIN), and ECN: the codepoint of the client's datagrams, a
 /// path that clears the server's, and the client's counts reported,
-/// withheld, frozen or inflated.
+/// withheld, frozen or inflated; and PMTU discovery: the path's datagram
+/// limit (1200-1510 bytes, or none), probes refused by the interface, and
+/// path changes.
 /// Checked: no crash, leak or out-of-bounds access; a connection that
 /// closes does so with a transport or HTTP/3 error code; every response
 /// the client sees parses as HTTP/3 frames.
@@ -1208,6 +1214,8 @@ fn fuzzH3(_: void, smith: *std.testing.Smith) anyerror!void {
     h.h3_opts.limits.max_body_size = 4096;
     h.h3_opts.enable_connect_protocol = true;
     h.h3_opts.websocket = .{ .max_message_size = 2048, .max_send_queue_bytes = 8192 };
+    h.cfg.max_datagram_size = 1350;
+    h.cfg.max_mtu = 1500;
     try h.startClient();
     var ids: [4]u64 = undefined;
     var nids: usize = 0;
@@ -1273,6 +1281,10 @@ fn fuzzH3(_: void, smith: *std.testing.Smith) anyerror!void {
                         break :blk h.client.ecn_mode;
                     },
                 };
+                const p: u8 = if (n > 1) bytes[1] else 0xff;
+                h.path_max = if (p & 0x80 != 0) std.math.maxInt(usize) else 1200 + @as(usize, p & 0x1f) * 10;
+                if (p & 0x40 != 0) h.server.?.onProbeTooBig(h.now_us);
+                if (p & 0x20 != 0) h.server.?.onPathChange(h.now_us);
             },
             else => {},
         }
@@ -1304,6 +1316,8 @@ test "fuzz: h3 connection" {
             &[_]u8{ 0x03, 0x04, 0x00, 0x07, 0x01, 0x00, 0x03, 0x01, 0x02 },
             // ECT(0) from the client; an ACK_ECN frame.
             &[_]u8{ 0x17, 0x00, 0x00, 0x00, 0x03, 0x02, 0x00, 0x00, 0x02, 0x05, 0x00, 0x01 },
+            // A path carrying 1300 bytes, a request; a path change.
+            &[_]u8{ 0x07, 0x01, 0x00, 0x0a, 0x04, 0x00, 0x00, 0x07, 0x01, 0x00, 0x2a },
         },
     });
 }

@@ -18,6 +18,9 @@ pub fn SentPackets(comptime Record: type) type {
             in_flight: bool,
             /// Sent with the ECT(0) codepoint.
             ecn: bool = false,
+            /// A PMTU probe (pmtud.zig): its loss is a failed probe, not
+            /// congestion (RFC 9000 §14.4).
+            pmtu_probe: bool = false,
             live: bool = true,
             rec_start: u32,
             rec_count: u32,
@@ -62,8 +65,15 @@ pub fn SentPackets(comptime Record: type) type {
             return self.rec_next;
         }
 
+        pub const Flags = struct {
+            ack_eliciting: bool = false,
+            in_flight: bool = false,
+            ecn: bool = false,
+            pmtu_probe: bool = false,
+        };
+
         /// Records the next packet, with the records added since `mark`.
-        pub fn add(self: *Self, a: Allocator, mark: u64, time_sent: u64, size: u32, ack_eliciting: bool, in_flight: bool, ecn: bool) Allocator.Error!void {
+        pub fn add(self: *Self, a: Allocator, mark: u64, time_sent: u64, size: u32, flags: Flags) Allocator.Error!void {
             if (self.live_count == 0) {
                 // Nothing outstanding: start both arrays afresh.
                 const pn = self.nextPn();
@@ -79,14 +89,15 @@ pub fn SentPackets(comptime Record: type) type {
             try self.packets.append(a, .{
                 .time_sent = time_sent,
                 .size = size,
-                .ack_eliciting = ack_eliciting,
-                .in_flight = in_flight,
-                .ecn = ecn,
+                .ack_eliciting = flags.ack_eliciting,
+                .in_flight = flags.in_flight,
+                .ecn = flags.ecn,
+                .pmtu_probe = flags.pmtu_probe,
                 .rec_start = @intCast(mark - self.rec_base),
                 .rec_count = @intCast(self.rec_next - mark),
             });
             self.live_count += 1;
-            if (ack_eliciting and in_flight) self.ack_eliciting_in_flight += 1;
+            if (flags.ack_eliciting and flags.in_flight) self.ack_eliciting_in_flight += 1;
         }
 
         pub fn get(self: *Self, pn: u64) ?*Packet {
@@ -177,7 +188,7 @@ test "packets, records, removal and compaction" {
             try s.addRecord(a, 999);
             s.discardRecordsSince(m2);
         }
-        try s.add(a, mark, i, 1200, n > 0, true, i % 3 == 0);
+        try s.add(a, mark, i, 1200, .{ .ack_eliciting = n > 0, .in_flight = true, .ecn = i % 3 == 0, .pmtu_probe = i % 5 == 0 });
     }
     try testing.expectEqual(@as(u64, 100), s.nextPn());
     // Resolve in a scattered order, checking records each time.
@@ -189,6 +200,7 @@ test "packets, records, removal and compaction" {
         const p = s.get(pn).?;
         try testing.expectEqualSlices(u32, expected_records[pn], s.recordsOf(p));
         try testing.expectEqual(pn % 3 == 0, p.ecn);
+        try testing.expectEqual(pn % 5 == 0, p.pmtu_probe);
         s.remove(p);
         try testing.expectEqual(@as(?*SentPackets(u32).Packet, null), s.get(pn));
         if (k % 10 == 0) s.compact();
@@ -200,7 +212,7 @@ test "packets, records, removal and compaction" {
     // After everything resolved, a new packet restarts the arrays.
     const mark = s.recordMark();
     try s.addRecord(a, 7);
-    try s.add(a, mark, 0, 100, true, true, false);
+    try s.add(a, mark, 0, 100, .{ .ack_eliciting = true, .in_flight = true });
     try testing.expectEqual(@as(u64, 100), s.oldest().?);
     try testing.expectEqualSlices(u32, &.{7}, s.recordsOf(s.get(100).?));
     try testing.expectEqual(@as(usize, 1), s.packets.items.len);
