@@ -190,6 +190,8 @@ pub const Conn = struct {
     /// pools and goes back once the handshake is done.
     pub fn init(pools: *Pools, config: *const Config, entropy: *const [entropy_len]u8) !Self {
         const hs = try pools.acquireHandshake(config, entropy);
+        // At least one record per key (`writeMax`).
+        std.debug.assert((test_key_update_limit orelse 1) > 0);
         return .{ .pools = pools, .hs = hs, .key_update_limit = test_key_update_limit orelse key_update_after };
     }
 

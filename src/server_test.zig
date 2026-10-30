@@ -281,10 +281,14 @@ const TestHandler = struct {
             // /km/LEN: big_body[0..LEN] from memory.
             var it = std.mem.tokenizeScalar(u8, path[4..], '/');
             const a = std.fmt.parseInt(usize, it.next() orelse "0", 10) catch 0;
+            const len = if (path[2] == 'm') 0 else std.fmt.parseInt(usize, it.next() orelse "0", 10) catch 0;
+            if (a > big_body_len or len > big_body_len - a) {
+                resp.status = .bad_request;
+                return;
+            }
             if (path[2] == 'm') {
                 resp.setBodyBorrowed(big_body[0..a]);
             } else {
-                const len = std.fmt.parseInt(usize, it.next() orelse "0", 10) catch 0;
                 resp.sendFile(.{ .fd = test_file_fd, .offset = a, .len = len });
             }
             return;
@@ -2316,37 +2320,6 @@ const TlsClient = struct {
         return .{ .status = status, .body_len = body_len, .close = closing };
     }
 
-    /// Reads one response with a body (into `body`) a record at a time,
-    /// as `readResponse` but failing if more than `limit` records came
-    /// under one key: the server's KeyUpdate is due after that many
-    /// (`key_update_limit`). Returns the body's length and the KeyUpdates
-    /// seen.
-    fn readResponseKeyLimit(self: *TlsClient, body: []u8, limit: u64) !struct { body_len: usize, key_updates: usize } {
-        const r = &self.client.reader;
-        const head = try self.readHead();
-        try testing.expectEqual(200, head.status);
-        const len = head.body_len;
-        // std's client opens one record per fill and counts them in
-        // read_seq, which a KeyUpdate resets.
-        var seq = self.client.read_seq;
-        var key_updates: usize = 0;
-        var got: usize = 0;
-        while (true) {
-            if (self.client.read_seq > limit) return error.KeyUpdateMissed;
-            if (self.client.read_seq < seq) key_updates += 1;
-            seq = self.client.read_seq;
-            if (got == len) return .{ .body_len = len, .key_updates = key_updates };
-            if (r.bufferedLen() == 0) {
-                try r.fillMore();
-                continue;
-            }
-            const k = @min(r.bufferedLen(), len - got);
-            @memcpy(body[got..][0..k], r.buffered()[0..k]);
-            r.toss(k);
-            got += k;
-        }
-    }
-
     /// The server's close_notify ends the stream cleanly; a bare FIN would
     /// make std's client report a truncation attack.
     fn expectCleanClose(self: *TlsClient) !void {
@@ -2595,12 +2568,15 @@ fn testKernelTls(backend: Backend) !void {
     const c2 = try TlsClient.connect(r.port);
     defer c2.close();
     try c2.send("GET /file HTTP/1.1\r\nHost: x\r\n\r\n");
-    if (c2.readResponseKeyLimit(got, 4)) |res2| {
+    const kbuf = try testing.allocator.alloc(u8, big_body_len + 4096);
+    defer testing.allocator.free(kbuf);
+    var k = KeyChecker.init(c2, 4, kbuf);
+    var pos: usize = 0;
+    if (k.expectResponse(&pos, &big_body)) |_| {
         try testing.expect(!ktls or kernelRekeySupported());
-        try testing.expect(std.mem.eql(u8, &big_body, got[0..res2.body_len]));
-        try testing.expect(res2.key_updates >= big_body_len / (4 * 16384));
+        try testing.expect(k.key_updates >= big_body_len / (4 * 16384));
     } else |err| {
-        try testing.expect(err != error.KeyUpdateMissed);
+        try testing.expect(err != error.KeyUpdateMissed and err != error.BodyMismatch);
         try testing.expect(ktls and !kernelRekeySupported());
     }
 }
@@ -2707,6 +2683,8 @@ const KeyChecker = struct {
             hl = 10;
         }
         try testing.expectEqual(@backingInt(opcode), b0 & 0x0f);
+        // A server's frames are never masked (RFC 6455 §5.1).
+        try testing.expectEqual(0, self.buf[pos.* + 1] & 0x80);
         try self.untilLen(pos.* + hl + len);
         if (!std.mem.eql(u8, payload, self.buf[pos.* + hl ..][0..len])) return error.PayloadMismatch;
         pos.* += hl + len;
@@ -3012,6 +2990,72 @@ fn runKeyUpdateRequested(c: *TlsClient, k: *KeyChecker) !void {
     try sendKeyUpdateRequest(c);
     try c.send("GET /kf/9/100000 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
     try k.expectResponse(&pos, big_body[9..][0..100000]);
+    try k.untilClose();
+}
+
+test "tls: key record limits: a request while our KeyUpdate waits for room" {
+    // Linux clamps tiny socket buffers to its minimum; macOS fails writes.
+    if (!sys.is_linux) return error.SkipZigTest;
+    try forEachBackend(testKeyUpdateWaitsForRoom);
+}
+
+fn testKeyUpdateWaitsForRoom(backend: Backend) !void {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try setupKfFile(&tmp);
+    defer file.close(testing.io);
+    defer test_file_fd = -1;
+    const r = try Running.start(backend, tlsConfig());
+    defer r.stop();
+    const ktls = ktlsOk();
+    const buf = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(buf);
+    defer tls_conn.test_key_update_limit = null;
+    // Our KeyUpdate due because the client asked for one, or because our
+    // last write reached the limit (1: after every write; kernels without
+    // rekey close at the first, before the case comes up).
+    for ([_]u64{ 1000000, 1 }) |limit| for ([_]usize{ 100000, 300000 }) |len| {
+        tls_conn.test_key_update_limit = limit;
+        const c = try TlsClient.connect(r.port);
+        defer c.close();
+        var k = KeyChecker.init(c, limit, buf);
+        const start = sys.nanoTimestamp();
+        const res = runKeyUpdateWaitsForRoom(c, &k, len, limit == 1000000);
+        expectKeyLimitOutcome(res, ktls) catch |err| {
+            std.debug.print("backend {s} limit {d} len {d}: {d} bytes, {d} key updates\n", .{ @tagName(backend), limit, len, k.len, k.key_updates });
+            return err;
+        };
+        // Answered (or, without kernel rekey, closed) as soon as there is
+        // room, not left until a timeout (the client's 5 s receive
+        // timeout, the server's keep-alive timeout).
+        const ms = (sys.nanoTimestamp() - start) / std.time.ns_per_ms;
+        if (ms >= 3000) {
+            std.debug.print("backend {s} limit {d} len {d}: {d} ms ({s})\n", .{ @tagName(backend), limit, len, ms, if (res) |_| "complete" else |e| @errorName(e) });
+            return error.TooSlow;
+        }
+    };
+}
+
+fn runKeyUpdateWaitsForRoom(c: *TlsClient, k: *KeyChecker, len: usize, request_key_update: bool) !void {
+    var pos: usize = 0;
+    try c.send("GET /kf/0/1 HTTP/1.1\r\nHost: x\r\n\r\n");
+    try k.expectResponse(&pos, big_body[0..1]);
+    // The next response, unread: the client takes what its window allows
+    // (it doesn't grow while nothing is read) and the server's socket the
+    // rest. Then the server's buffer shrinks to the smallest: the KeyUpdate
+    // due next finds no room.
+    var path: [64]u8 = undefined;
+    try c.send(try std.fmt.bufPrint(&path, "GET /km/{d} HTTP/1.1\r\nHost: x\r\n\r\n", .{len}));
+    sleepMs(100);
+    const server_fd = peerSocket(c.fd) orelse return error.NoServerSocket;
+    try sys.setsockoptInt(server_fd, posix.SOL.SOCKET, posix.SO.SNDBUF, 1);
+    // The next request arrives while the KeyUpdate waits: it is answered
+    // once the client reads and there is room again.
+    if (request_key_update) try sendKeyUpdateRequest(c);
+    try c.send("GET /km/10 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    sleepMs(100);
+    try k.expectResponse(&pos, big_body[0..len]);
+    try k.expectResponse(&pos, big_body[0..10]);
     try k.untilClose();
 }
 

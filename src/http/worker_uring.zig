@@ -738,6 +738,12 @@ pub fn Worker(comptime Handler: type) type {
                         _ = self.submitWrite(c);
                     } else if (c.out.file != null) {
                         self.sendFile(c);
+                    } else if (c.exchange != NIL) {
+                        self.exchangeDrive(c);
+                    } else {
+                        // Our KeyUpdate waited for room (`tlsDecrypt`),
+                        // with input it held back.
+                        self.drive(c);
                     }
                 },
                 .cancel => {},
@@ -1381,7 +1387,11 @@ pub fn Worker(comptime Handler: type) type {
             while (f.len > 0) {
                 const max = switch (self.kernelGate(c)) {
                     .ready => |max| max,
-                    .blocked, .closed => return,
+                    .blocked => {
+                        if (progressed) self.arm(c, .active);
+                        return;
+                    },
+                    .closed => return,
                 };
                 const count: usize = @intCast(@min(f.len, 1 << 30, max));
                 const n = sys.sendfile(c.fd, f.fd, f.offset, count) catch |err| switch (err) {
@@ -1769,7 +1779,12 @@ pub fn Worker(comptime Handler: type) type {
             if (bytes.len > 0) {
                 const max = switch (self.kernelGate(c)) {
                     .ready => |max| max,
-                    .blocked, .closed => return,
+                    .blocked => {
+                        // Waiting for room, like a write in flight.
+                        if (c.list != .active) self.arm(c, .active);
+                        return;
+                    },
+                    .closed => return,
                 };
                 const sqe = self.getSqe();
                 sqe.prep_send(c.fd, bytes[0..@min(bytes.len, max)], linux.MSG.NOSIGNAL);
@@ -2022,8 +2037,10 @@ pub fn Worker(comptime Handler: type) type {
                 return false;
             }
             if (t.peer_closed) c.peer_closed = true;
-            // Our KeyUpdate, if due (the client asked for one): `.blocked`
-            // leaves a POLLOUT wait in flight, which the callers respect.
+            // Our KeyUpdate, if due (the client asked for one, or our
+            // last write reached the limit): `.blocked` leaves a POLLOUT
+            // wait in flight, which the callers respect, and `write_ready`
+            // carries on from there.
             if (t.kernel_key_update and !c.write_inflight and self.kernelGate(c) == .closed) return false;
             return true;
         }
@@ -2147,7 +2164,12 @@ pub fn Worker(comptime Handler: type) type {
             if (bytes.len > 0) {
                 const max = switch (self.kernelGate(c)) {
                     .ready => |max| max,
-                    .blocked, .closed => return,
+                    .blocked => {
+                        // Waiting for room, like a write in flight.
+                        if (c.list != .active) self.arm(c, .active);
+                        return;
+                    },
+                    .closed => return,
                 };
                 const sqe = self.getSqe();
                 sqe.prep_send(c.fd, bytes[0..@min(bytes.len, max)], linux.MSG.NOSIGNAL);

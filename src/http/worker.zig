@@ -1097,11 +1097,6 @@ pub fn Worker(comptime Handler: type) type {
                 if (!self.out.isEmpty()) {
                     if (!self.writeOut(c)) return .gone;
                     if (c.hasPending()) {
-                        // Stalled output gets the request timeout from
-                        // now: a pipelined response after one that just
-                        // finished in `writePending` (its progress) must
-                        // not inherit that one's deadline.
-                        self.arm(c, .active);
                         c.after_flush = switch (action) {
                             .close => .close,
                             .upgrade => .upgrade,
@@ -1200,11 +1195,11 @@ pub fn Worker(comptime Handler: type) type {
         fn writePending(self: *Self, c: *Conn) bool {
             const progressed = (if (userTls(c)) |t| self.tlsWritePending(c, t) else self.writePendingPlain(c)) orelse
                 return false;
-            if (c.hasPending()) {
-                // Progress extends the deadline; a stalled reader still times out.
-                if (progressed) self.arm(c, .active);
-                return true;
-            }
+            // Progress extends the deadline, also for the pipelined response
+            // that may stall right after this one (`updateTimer` keeps an
+            // active deadline); a stalled reader still times out.
+            if (progressed) self.arm(c, .active);
+            if (c.hasPending()) return true;
             self.freePending(c);
             switch (c.after_flush) {
                 .close => {
