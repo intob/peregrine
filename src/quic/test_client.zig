@@ -265,11 +265,8 @@ pub const Client = struct {
             const pk = if (idx == 2 and ((pkt[0] >> 2) & 1) != self.rx_phase and self.prev_rx_packet != null) self.prev_rx_packet.? else keys.packet;
             const payload = pk.open(pkt, h.pn_offset + pn_info.len, pn) catch return error.Undecryptable;
             if (sp.largest_rx == null or pn > sp.largest_rx.?) sp.largest_rx = pn;
-            if (!sp.rx_pns.contains(pn) and self.ecn_mode != .frozen) switch (ecn) {
-                .not_ect => {},
-                .ect0 => sp.ecn[if (self.ecn_mode == .all_ce) 2 else 0] += 1,
-                .ect1 => sp.ecn[1] += 1,
-                .ce => sp.ecn[2] += 1,
+            if (!sp.rx_pns.contains(pn) and self.ecn_mode != .frozen) if (ecn.countIndex()) |i| {
+                sp.ecn[if (i == 0 and self.ecn_mode == .all_ce) 2 else i] += 1;
             };
             sp.rx_pns.insert(self.a, pn, pn + 1, 1 << 20) catch unreachable;
             var r: packet.Reader = .{ .data = payload };

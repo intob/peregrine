@@ -1736,3 +1736,108 @@ test "verify ECN: netem-style reordering (30% of datagrams undelayed, GSO sends 
     for (outcome, 0..) |o, g| std.debug.print("{s}: testing {d}, unknown {d}, capable {d}, failed {d}\n", .{ if (g == 1) "GSO units" else "datagrams", o[0], o[1], o[2], o[3] });
     try testing.expectEqual(@as(usize, runs), outcome[0][@backingInt(conn_mod.EcnState.capable)] + outcome[1][@backingInt(conn_mod.EcnState.capable)]);
 }
+
+test "QUIC ECN: testing packets declared lost that arrive after all: the path is tested again" {
+    const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 32 << 20 }, noPacing);
+    defer h.deinit();
+    var buf: [1500]u8 = undefined;
+    // Marked datagrams wait (a path reordering them behind the unmarked
+    // ones that follow) until every testing packet is declared lost.
+    var held: std.ArrayList(Flight) = .empty;
+    defer held.deinit(testing.allocator);
+    var id: ?u64 = null;
+    var rounds: usize = 0;
+    while (h.server == null or h.server.?.ecn != .failed) : (rounds += 1) {
+        if (rounds == 200) return error.TestUnexpectedResult;
+        // (A request that went before the server had its keys.)
+        if (rounds % 20 == 19) try h.client.retransmit();
+        while (true) {
+            const n = try h.client.send(&buf);
+            if (n == 0) break;
+            try h.toServer(buf[0..n]);
+        }
+        if (h.server) |s| while (true) {
+            const ecn = s.sendEcn();
+            const n = s.send(&buf, h.now);
+            if (n == 0) break;
+            if (ecn != .not_ect) {
+                try held.append(testing.allocator, .{ .at = h.now, .to_server = false, .len = n, .buf = buf, .ecn = ecn });
+            } else try h.toClient(buf[0..n], ecn);
+        };
+        if (id == null and h.client.handshake_complete) {
+            id = try h.client.openBidi();
+            try h.client.write(id.?, "big 60000", true);
+        }
+        h.now += 1000;
+    }
+    const s = h.server.?;
+    try testing.expectEqual(@as(usize, conn_mod.ecn_testing_packets), held.items.len);
+    try testing.expectEqual(s.ecn_marked, s.ecn_marked_lost);
+    // They arrive: the counts rise, and the path is tested again.
+    for (held.items) |*f| try h.toClient(f.buf[0..f.len], f.ecn);
+    try h.run(3000);
+    try testing.expect(h.client.finished(id.?));
+    try download(h, 200_000);
+    try testing.expectEqual(conn_mod.EcnState.capable, s.ecn);
+    try testing.expectEqual(@as(u8, 1), s.ecn_retests);
+    try testing.expectEqual(s.spaces[2].ecn_sent, h.client.spaces[2].ecn[0]);
+}
+
+test "QUIC ECN: a new peer address is a new path: tested afresh" {
+    const h = try ecnCapable();
+    defer h.deinit();
+    const s = h.server.?;
+    // This path clears the marks: ECN fails.
+    h.bleach = true;
+    try download(h, 100_000);
+    try testing.expectEqual(conn_mod.EcnState.failed, s.ecn);
+    const marked = s.spaces[2].ecn_sent;
+    // NAT rebinding to a path that carries them.
+    h.bleach = false;
+    s.onPathChange();
+    try testing.expectEqual(conn_mod.EcnState.testing, s.ecn);
+    try download(h, 200_000);
+    try testing.expectEqual(conn_mod.EcnState.capable, s.ecn);
+    // (A window went out unmarked while the testing packets waited for
+    // their ACK.) Marking every datagram again:
+    const at_capable = s.spaces[2].ecn_sent;
+    try testing.expect(at_capable > marked + conn_mod.ecn_testing_packets);
+    try download(h, 100_000);
+    try testing.expect(s.spaces[2].ecn_sent > at_capable + 80);
+    try testing.expectEqual(@as(u64, 0), s.ecn_ce_events);
+}
+
+test "QUIC ECN: a CE event takes the window before the ACK carrying it grew it" {
+    const h = try ecnCapable();
+    defer h.deinit();
+    const s = h.server.?;
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), s.cc.ssthresh);
+    const id = try h.client.openBidi();
+    try h.client.write(id, "big 400000", true);
+    var buf: [1500]u8 = undefined;
+    while (true) {
+        const n = try h.client.send(&buf);
+        if (n == 0) break;
+        try h.toServer(buf[0..n]);
+    }
+    // A window's worth, one datagram marked CE on the way, then the
+    // client's ACK of all of it.
+    h.ce_marks = 1;
+    var sent: usize = 0;
+    while (true) : (sent += 1) {
+        const ecn = s.sendEcn();
+        const n = s.send(&buf, h.now);
+        if (n == 0) break;
+        try h.toClient(buf[0..n], ecn);
+    }
+    try testing.expect(sent > 10);
+    const n = try h.client.send(&buf);
+    const before = s.cc.window;
+    try h.toServer(buf[0..n]);
+    try testing.expectEqual(@as(u64, 1), s.ecn_ce_events);
+    // CUBIC's β: 0.7 of the window the ACK found, not of the one its
+    // acknowledged bytes would have grown (RFC 9002 §A.7: ECN first).
+    try testing.expectEqual(@as(u64, @intFromFloat(@as(f64, @floatFromInt(before)) * 0.7)), s.cc.window);
+    try h.run(100);
+    try testing.expect(h.client.finished(id));
+}

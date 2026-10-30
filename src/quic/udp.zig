@@ -31,6 +31,11 @@ pub const Addr = extern struct {
         return @ptrCast(&a.storage);
     }
 
+    /// The port (the same place in IPv4 and IPv6 sockaddrs).
+    pub fn port(a: *const Addr) u16 {
+        return std.mem.bigToNative(u16, a.storage.port);
+    }
+
     /// Address bytes and port, for tokens and logs.
     pub fn bytes(a: *const Addr) []const u8 {
         return std.mem.asBytes(&a.storage)[0..a.len];
@@ -119,33 +124,30 @@ pub fn attachSteering(fd: fd_t, workers: u32) !void {
 const ip_tos_recv: i32 = if (sys.is_linux) posix.IP.TOS else posix.IP.RECVTOS;
 
 /// Asks for each datagram's ECN codepoint (best effort: a kernel that
-/// won't say leaves every datagram Not-ECT). An IPv6 socket also takes
-/// IPv4-mapped traffic, whose codepoint comes as IP_TOS.
+/// won't say leaves every datagram Not-ECT). On Linux an IPv6 socket's
+/// IPv4-mapped traffic reports IP_TOS, asked for with an IP-level option
+/// that macOS refuses on IPv6 sockets.
 pub fn enableEcn(fd: fd_t, ipv6: bool) void {
-    if (ipv6) sys.setsockoptInt(fd, posix.IPPROTO.IPV6, posix.IPV6.RECVTCLASS, 1) catch {};
-    sys.setsockoptInt(fd, posix.IPPROTO.IP, posix.IP.RECVTOS, 1) catch {};
+    if (ipv6) _ = sys.trySetsockoptInt(fd, posix.IPPROTO.IPV6, posix.IPV6.RECVTCLASS, 1);
+    if (!ipv6 or sys.is_linux) _ = sys.trySetsockoptInt(fd, posix.IPPROTO.IP, posix.IP.RECVTOS, 1);
 }
 
-/// A control buffer's room for one TOS or Traffic Class message (an int at
-/// most), aligned as the kernel's cmsghdr.
-const cmsg_hdr_len = if (sys.is_linux) @sizeOf(linux.cmsghdr) else std.mem.alignForward(usize, @sizeOf(std.c.cmsghdr), 4);
-const cmsg_align = if (sys.is_linux) linux.cmsg_align else 4;
-const cmsg_space = cmsg_hdr_len + std.mem.alignForward(usize, @sizeOf(c_int), cmsg_align);
-const CmsgHdr = if (sys.is_linux) linux.cmsghdr else std.c.cmsghdr;
+/// Room for one TOS or Traffic Class message (an int at most).
+const ecn_cmsg_space = sys.cmsgSpace(@sizeOf(c_int));
 
 /// The ECN codepoint in a received datagram's control messages.
 fn ecnFromControl(control: []const u8) Ecn {
     var pos: usize = 0;
-    while (pos + cmsg_hdr_len <= control.len) {
-        const hdr: *align(1) const CmsgHdr = @ptrCast(control[pos..].ptr);
+    while (pos + sys.cmsg_hdr_len <= control.len) {
+        const hdr: *align(1) const sys.cmsghdr = @ptrCast(control[pos..].ptr);
         const len: usize = @intCast(hdr.len);
-        if (len < cmsg_hdr_len or pos + len > control.len) break;
-        const data = control[pos + cmsg_hdr_len .. pos + len];
+        if (len < sys.cmsg_hdr_len or pos + len > control.len) break;
+        const data = control[pos + sys.cmsg_hdr_len .. pos + len];
         const tos = (hdr.level == posix.IPPROTO.IP and (hdr.type == ip_tos_recv or hdr.type == posix.IP.TOS)) or
             (hdr.level == posix.IPPROTO.IPV6 and hdr.type == posix.IPV6.TCLASS);
         // One byte (IP_TOS) or an int (IPV6_TCLASS); ECN is in the low bits.
         if (tos and data.len > 0) return @fromBackingInt(@as(u2, @truncate(if (data.len >= 4) std.mem.readInt(u32, data[0..4], builtin.cpu.arch.endian()) else data[0])));
-        pos += std.mem.alignForward(usize, len, cmsg_align);
+        pos += std.mem.alignForward(usize, len, sys.cmsg_align);
     }
     return .not_ect;
 }
@@ -163,7 +165,7 @@ pub fn RecvBatch(comptime n: usize, comptime size: usize) type {
         addrs: [n]Addr = undefined,
         iovs: [n]posix.iovec = undefined,
         msgs: if (sys.is_linux) [n]linux.mmsghdr else void = undefined,
-        control: [n][cmsg_space]u8 align(@alignOf(CmsgHdr)) = undefined,
+        control: [n][ecn_cmsg_space]u8 align(@alignOf(sys.cmsghdr)) = undefined,
         lens: [n]usize = undefined,
         ecns: [n]Ecn = undefined,
 
@@ -179,7 +181,7 @@ pub fn RecvBatch(comptime n: usize, comptime size: usize) type {
                             .iov = @ptrCast(&self.iovs[i]),
                             .iovlen = 1,
                             .control = &self.control[i],
-                            .controllen = cmsg_space,
+                            .controllen = ecn_cmsg_space,
                             .flags = 0,
                         },
                         .len = 0,
@@ -193,7 +195,7 @@ pub fn RecvBatch(comptime n: usize, comptime size: usize) type {
                                 const hdr = &self.msgs[i].hdr;
                                 self.addrs[i].len = hdr.namelen;
                                 self.lens[i] = self.msgs[i].len;
-                                self.ecns[i] = if (hdr.controllen == 0) .not_ect else ecnFromControl(self.control[i][0..@min(hdr.controllen, cmsg_space)]);
+                                self.ecns[i] = if (hdr.controllen == 0) .not_ect else ecnFromControl(self.control[i][0..@min(hdr.controllen, ecn_cmsg_space)]);
                             }
                             return rc;
                         },
@@ -211,14 +213,14 @@ pub fn RecvBatch(comptime n: usize, comptime size: usize) type {
                     .iov = @ptrCast(&self.iovs[count]),
                     .iovlen = 1,
                     .control = &self.control[count],
-                    .controllen = cmsg_space,
+                    .controllen = ecn_cmsg_space,
                     .flags = 0,
                 };
                 const rc = std.c.recvmsg(fd, &msg, 0);
                 if (rc < 0) break;
                 self.addrs[count].len = msg.namelen;
                 self.lens[count] = @intCast(rc);
-                self.ecns[count] = if (msg.controllen == 0) .not_ect else ecnFromControl(self.control[count][0..@min(msg.controllen, cmsg_space)]);
+                self.ecns[count] = if (msg.controllen == 0) .not_ect else ecnFromControl(self.control[count][0..@min(msg.controllen, ecn_cmsg_space)]);
                 count += 1;
             }
             return count;
@@ -235,12 +237,15 @@ pub fn RecvBatch(comptime n: usize, comptime size: usize) type {
 const SOL_UDP = 17;
 const UDP_SEGMENT = 103;
 
-pub const SendError = error{ WouldBlock, Unexpected };
-
-/// A kernel refused a TOS control message on send (EINVAL): send unmarked
-/// from then on. ECN validation then fails on every connection, which
-/// stops asking.
-var tos_refused: std.atomic.Value(bool) = .init(false);
+pub const SendError = error{
+    WouldBlock,
+    Unexpected,
+    /// Sent, but unmarked: the kernel refused the TOS control message
+    /// (EINVAL with it, success without). The caller sends unmarked from
+    /// then on (per socket: ECN validation then ends each connection's
+    /// marking).
+    TosRefused,
+};
 
 /// The control message that sets a send's codepoint: IP_TOS for IPv4
 /// (on Linux, IPv4-mapped addresses on an IPv6 socket too), else
@@ -251,94 +256,70 @@ fn tosLevelType(to: *const Addr) struct { i32, i32 } {
     return if (v4) .{ posix.IPPROTO.IP, posix.IP.TOS } else .{ posix.IPPROTO.IPV6, posix.IPV6.TCLASS };
 }
 
-/// Appends a control message with an int (or u16) payload at `pos`;
-/// returns the new length.
-fn putCmsg(control: []u8, pos: usize, level: i32, ty: i32, comptime T: type, value: T) usize {
-    const hdr: *align(1) CmsgHdr = @ptrCast(control[pos..].ptr);
-    hdr.* = std.mem.zeroes(CmsgHdr);
-    hdr.len = @intCast(cmsg_hdr_len + @sizeOf(T));
-    hdr.level = level;
-    hdr.type = ty;
-    std.mem.writeInt(T, control[pos + cmsg_hdr_len ..][0..@sizeOf(T)], value, builtin.cpu.arch.endian());
-    return pos + std.mem.alignForward(usize, cmsg_hdr_len + @sizeOf(T), cmsg_align);
+/// One sendmsg of `data` to `to` with `control`, retried on EINTR.
+fn sendmsg(fd: fd_t, to: *const Addr, data: []const u8, control: []u8) posix.E {
+    var iov = [1]posix.iovec_const{.{ .base = data.ptr, .len = data.len }};
+    const Msg = if (sys.is_linux) linux.msghdr_const else std.c.msghdr_const;
+    const msg: Msg = .{
+        .name = to.sockaddr(),
+        .namelen = to.len,
+        .iov = &iov,
+        .iovlen = 1,
+        .control = if (control.len > 0) control.ptr else null,
+        .controllen = @intCast(control.len),
+        .flags = 0,
+    };
+    while (true) {
+        const e = if (sys.is_linux) posix.errno(linux.sendmsg(fd, &msg, 0)) else posix.errno(std.c.sendmsg(fd, &msg, 0));
+        if (e != .INTR) return e;
+    }
 }
 
 /// Sends `data` to `to`: one datagram, or (Linux, `segment` set) several
 /// datagrams of `segment` bytes each, the last possibly shorter, all with
-/// the ECN codepoint `ecn`.
+/// the ECN codepoint `ecn` (no control message for Not-ECT).
 pub fn send(fd: fd_t, to: *const Addr, data: []const u8, segment: ?u16, ecn: Ecn) SendError!void {
-    var control: [2 * cmsg_space]u8 align(@alignOf(CmsgHdr)) = @splat(0);
-    var tos_len: usize = 0;
-    if (ecn != .not_ect and !tos_refused.load(.monotonic)) {
-        const lt = tosLevelType(to);
-        tos_len = putCmsg(&control, 0, lt[0], lt[1], c_int, @backingInt(ecn));
-    }
+    var control: [2 * ecn_cmsg_space]u8 align(@alignOf(sys.cmsghdr)) = @splat(0);
+    var len: usize = 0;
     if (sys.is_linux) {
-        var iov = [1]posix.iovec_const{.{ .base = data.ptr, .len = data.len }};
-        var len = tos_len;
         if (segment) |seg| {
-            if (data.len > seg) len = putCmsg(&control, len, SOL_UDP, UDP_SEGMENT, u16, seg);
-        }
-        var msg: linux.msghdr_const = .{
-            .name = to.sockaddr(),
-            .namelen = to.len,
-            .iov = &iov,
-            .iovlen = 1,
-            .control = if (len > 0) &control else null,
-            .controllen = len,
-            .flags = 0,
-        };
-        while (true) {
-            const rc = linux.sendmsg(fd, &msg, 0);
-            switch (posix.errno(rc)) {
-                .SUCCESS => return,
-                .INTR => continue,
-                .AGAIN => return error.WouldBlock,
-                .INVAL => {
-                    if (tos_len == 0) return error.Unexpected;
-                    // No TOS control messages here: send unmarked.
-                    tos_refused.store(true, .monotonic);
-                    std.mem.copyForwards(u8, control[0 .. len - tos_len], control[tos_len..len]);
-                    len -= tos_len;
-                    tos_len = 0;
-                    msg.control = if (len > 0) &control else null;
-                    msg.controllen = len;
-                },
-                // EIO: GSO unsupported by the device; ECONNREFUSED and
-                // friends: ICMP errors from earlier sends. Drop.
-                else => return error.Unexpected,
-            }
+            if (data.len > seg) len = sys.putCmsg(&control, len, SOL_UDP, UDP_SEGMENT, std.mem.asBytes(&seg));
         }
     }
-    // Elsewhere: datagram by datagram.
+    // The TOS message last, so it can be dropped.
+    const plain = len;
+    if (ecn != .not_ect) {
+        const lt = tosLevelType(to);
+        const v: c_int = @backingInt(ecn);
+        len = sys.putCmsg(&control, len, lt[0], lt[1], std.mem.asBytes(&v));
+    }
+    var refused = false;
     var rest = data;
-    const seg = segment orelse data.len;
+    // Elsewhere than Linux: datagram by datagram.
+    const seg = if (sys.is_linux) data.len else segment orelse data.len;
     while (rest.len > 0) {
         const n = @min(rest.len, seg);
-        var iov = [1]posix.iovec_const{.{ .base = rest.ptr, .len = n }};
-        var msg: std.c.msghdr_const = .{
-            .name = to.sockaddr(),
-            .namelen = to.len,
-            .iov = &iov,
-            .iovlen = 1,
-            .control = if (tos_len > 0) &control else null,
-            .controllen = @intCast(tos_len),
-            .flags = 0,
-        };
-        const rc = std.c.sendmsg(fd, &msg, 0);
-        if (rc < 0) {
-            switch (posix.errno(rc)) {
-                .AGAIN => return error.WouldBlock,
-                .INVAL => if (tos_len > 0) {
-                    tos_refused.store(true, .monotonic);
-                    tos_len = 0;
-                    continue;
-                } else return error.Unexpected,
-                else => return error.Unexpected,
+        var e = sendmsg(fd, to, rest[0..n], control[0..len]);
+        if (e == .INVAL and len > plain) {
+            // EINVAL has other causes (a peer at port 0, a GSO segment
+            // over the route's MTU): it is the TOS message only if the
+            // send goes without it.
+            e = sendmsg(fd, to, rest[0..n], control[0..plain]);
+            if (e == .SUCCESS) {
+                refused = true;
+                len = plain;
             }
+        }
+        switch (e) {
+            .SUCCESS => {},
+            .AGAIN => return error.WouldBlock,
+            // EIO: GSO unsupported by the device; ECONNREFUSED and
+            // friends: ICMP errors from earlier sends. Drop.
+            else => return error.Unexpected,
         }
         rest = rest[n..];
     }
+    if (refused) return error.TosRefused;
 }
 
 /// Whether the kernel supports UDP_SEGMENT on this socket.
@@ -355,22 +336,26 @@ pub fn localPort(fd: fd_t) !u16 {
 
 const testing = std.testing;
 
+fn putInt(control: []u8, pos: usize, level: i32, ty: i32, comptime T: type, value: T) usize {
+    return sys.putCmsg(control, pos, level, ty, std.mem.asBytes(&value));
+}
+
 test "ECN codepoint from control messages" {
-    var control: [3 * cmsg_space]u8 align(@alignOf(CmsgHdr)) = @splat(0);
+    var control: [3 * ecn_cmsg_space]u8 align(@alignOf(sys.cmsghdr)) = @splat(0);
     // IP_TOS as one byte (Linux), DSCP bits above the ECN field.
-    var len = putCmsg(&control, 0, posix.IPPROTO.IP, ip_tos_recv, u8, 0xb8 | 3);
+    var len = putInt(&control, 0, posix.IPPROTO.IP, ip_tos_recv, u8, 0xb8 | 3);
     try testing.expectEqual(Ecn.ce, ecnFromControl(control[0..len]));
     // IPV6_TCLASS as an int, after a message of another kind.
-    len = putCmsg(&control, 0, posix.SOL.SOCKET, 1, c_int, 7);
-    len = putCmsg(&control, len, posix.IPPROTO.IPV6, posix.IPV6.TCLASS, c_int, 0x22);
+    len = putInt(&control, 0, posix.SOL.SOCKET, 1, c_int, 7);
+    len = putInt(&control, len, posix.IPPROTO.IPV6, posix.IPV6.TCLASS, c_int, 0x22);
     try testing.expectEqual(Ecn.ect0, ecnFromControl(control[0..len]));
     // Nothing, a cut header, a length beyond the buffer or under a header.
     try testing.expectEqual(Ecn.not_ect, ecnFromControl(control[0..0]));
-    try testing.expectEqual(Ecn.not_ect, ecnFromControl(control[0 .. cmsg_hdr_len - 1]));
-    len = putCmsg(&control, 0, posix.IPPROTO.IP, ip_tos_recv, c_int, 1);
+    try testing.expectEqual(Ecn.not_ect, ecnFromControl(control[0 .. sys.cmsg_hdr_len - 1]));
+    len = putInt(&control, 0, posix.IPPROTO.IP, ip_tos_recv, c_int, 1);
     try testing.expectEqual(Ecn.ect1, ecnFromControl(control[0..len]));
-    try testing.expectEqual(Ecn.not_ect, ecnFromControl(control[0 .. len - cmsg_align]));
-    const hdr: *align(1) CmsgHdr = @ptrCast(&control);
+    try testing.expectEqual(Ecn.not_ect, ecnFromControl(control[0 .. len - sys.cmsg_align]));
+    const hdr: *align(1) sys.cmsghdr = @ptrCast(&control);
     hdr.len = 2;
     try testing.expectEqual(Ecn.not_ect, ecnFromControl(control[0..len]));
 }
@@ -500,7 +485,6 @@ test "verify ECN: IPv6 loopback, and IPv4-mapped peers on a dual-stack socket" {
 
 test "verify ECN: a send failing EINVAL for another reason doesn't stop marking" {
     if (!sys.is_linux) return error.SkipZigTest;
-    defer tos_refused.store(false, .monotonic);
     var addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
     const fd = try bind(addr, false);
     defer sys.close(fd);

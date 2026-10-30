@@ -86,6 +86,10 @@ pub fn Endpoint(comptime Handler: type) type {
         opts: Options,
         fd: sys.fd_t,
         gso: bool,
+        /// The kernel refused the TOS control message on this socket:
+        /// everything goes unmarked (each connection's ECN validation then
+        /// fails, which ends its marking).
+        tos_refused: bool = false,
         slots: []Slot,
         free: std.ArrayList(u32) = .empty,
         count: u32 = 0,
@@ -214,7 +218,8 @@ pub fn Endpoint(comptime Handler: type) type {
         }
 
         fn onDatagram(self: *Self, data: []u8, from: *const udp.Addr, ecn: packet.Ecn, now_us: u64) void {
-            if (data.len == 0) return;
+            // Port 0 is no address to answer at (and a send there fails).
+            if (data.len == 0 or from.port() == 0) return;
             const cid_len = self.opts.quic.cid_len;
             var slot: ?u32 = null;
             if (data[0] & 0x80 == 0) {
@@ -246,8 +251,10 @@ pub fn Endpoint(comptime Handler: type) type {
             const st = &self.slots[s];
             if (st.q.?.recv(data, ecn, now_us) and !st.peer.eql(from)) {
                 // An authenticated packet from a new address (NAT rebinding;
-                // we ask clients not to migrate): answer there.
+                // we ask clients not to migrate): answer there, and test ECN
+                // on the new path.
                 st.peer = from.*;
+                st.q.?.onPathChange();
             }
             self.markDirty(s);
         }
@@ -429,7 +436,7 @@ pub fn Endpoint(comptime Handler: type) type {
             // One GSO send has one ECN codepoint: a change ends the batch.
             var ecn: packet.Ecn = .not_ect;
             while (true) {
-                const next_ecn = q.sendEcn();
+                const next_ecn: packet.Ecn = if (self.tos_refused) .not_ect else q.sendEcn();
                 if (pos + seg > self.send_buf.len or (pos > 0 and next_ecn != ecn)) {
                     self.sendOut(st, pos, seg, segments, ecn);
                     pos = 0;
@@ -439,7 +446,7 @@ pub fn Endpoint(comptime Handler: type) type {
                 const n = q.send(self.send_buf[pos..][0..seg], now_us);
                 if (n == 0) break;
                 if (!self.gso) {
-                    udp.send(self.fd, &st.peer, self.send_buf[0..n], null, ecn) catch {};
+                    self.sendTo(&st.peer, self.send_buf[0..n], null, ecn);
                     continue;
                 }
                 pos += n;
@@ -457,8 +464,16 @@ pub fn Endpoint(comptime Handler: type) type {
 
         fn sendOut(self: *Self, st: *Slot, len: usize, seg: usize, segments: usize, ecn: packet.Ecn) void {
             if (len == 0) return;
-            // A send that fails is a lost packet to QUIC; recovery resends.
-            udp.send(self.fd, &st.peer, self.send_buf[0..len], if (segments > 1) @intCast(seg) else null, ecn) catch {};
+            self.sendTo(&st.peer, self.send_buf[0..len], if (segments > 1) @intCast(seg) else null, ecn);
+        }
+
+        fn sendTo(self: *Self, to: *const udp.Addr, data: []const u8, segment: ?u16, ecn: packet.Ecn) void {
+            udp.send(self.fd, to, data, segment, ecn) catch |err| switch (err) {
+                error.TosRefused => self.tos_refused = true,
+                // A send that fails is a lost packet to QUIC; recovery
+                // resends.
+                error.WouldBlock, error.Unexpected => {},
+            };
         }
 
         fn destroy(self: *Self, slot: u32, now_us: u64) void {

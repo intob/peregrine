@@ -98,7 +98,9 @@ pub const Congestion = struct {
         self.in_flight += bytes;
     }
 
-    fn inRecovery(self: *const Self, time_sent: u64) bool {
+    /// A packet sent at `time_sent` belongs to the current recovery period
+    /// (a congestion event for it would be the same one).
+    pub fn inRecovery(self: *const Self, time_sent: u64) bool {
         return if (self.recovery_start) |r| time_sent <= r else false;
     }
 

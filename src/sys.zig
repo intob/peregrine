@@ -223,10 +223,8 @@ pub const ktls = struct {
     /// call, a plain write is one.
     pub fn sendRecord(fd: fd_t, content_type: u8, data: []const u8) IoError!usize {
         if (!is_linux) return error.Unexpected;
-        var control: [@sizeOf(linux.cmsghdr) + linux.cmsg_align]u8 align(@alignOf(linux.cmsghdr)) = @splat(0);
-        const hdr: *linux.cmsghdr = @ptrCast(&control);
-        hdr.* = .{ .len = @sizeOf(linux.cmsghdr) + 1, .level = linux.SOL.TLS, .type = tls_set_record_type };
-        control[@sizeOf(linux.cmsghdr)] = content_type;
+        var control: [cmsgSpace(1)]u8 align(@alignOf(cmsghdr)) = @splat(0);
+        _ = putCmsg(&control, 0, linux.SOL.TLS, tls_set_record_type, &.{content_type});
         const iov = [_]iovec_const{.{ .base = data.ptr, .len = data.len }};
         const msg: linux.msghdr_const = .{
             .name = null,
@@ -328,6 +326,38 @@ pub fn isNonBlocking(fd: fd_t) bool {
 
 pub fn setsockoptInt(fd: fd_t, level: i32, opt: u32, value: c_int) !void {
     try posix.setsockopt(fd, level, opt, std.mem.asBytes(&value));
+}
+
+/// An int socket option that may be refused: whether the kernel took it.
+/// (std.posix.setsockopt treats some errnos, EINVAL among them, as
+/// unreachable.)
+pub fn trySetsockoptInt(fd: fd_t, level: i32, opt: u32, value: c_int) bool {
+    const rc = system.setsockopt(fd, level, opt, std.mem.asBytes(&value), @sizeOf(c_int));
+    return posix.errno(rc) == .SUCCESS;
+}
+
+// -- Control messages (sendmsg/recvmsg ancillary data) ---------------------
+
+pub const cmsghdr = if (is_linux) linux.cmsghdr else std.c.cmsghdr;
+pub const cmsg_align: usize = if (is_linux) linux.cmsg_align else 4;
+/// CMSG_LEN(0): where a message's data starts.
+pub const cmsg_hdr_len = std.mem.alignForward(usize, @sizeOf(cmsghdr), cmsg_align);
+
+/// CMSG_SPACE(n): room for a message with `n` bytes of data.
+pub fn cmsgSpace(n: usize) usize {
+    return cmsg_hdr_len + std.mem.alignForward(usize, n, cmsg_align);
+}
+
+/// Writes a control message at `pos` (aligned) of `control`, which has
+/// room for it; returns where the next one goes.
+pub fn putCmsg(control: []u8, pos: usize, level: i32, ty: i32, data: []const u8) usize {
+    const hdr: *align(1) cmsghdr = @ptrCast(control[pos..].ptr);
+    hdr.* = std.mem.zeroes(cmsghdr);
+    hdr.len = @intCast(cmsg_hdr_len + data.len);
+    hdr.level = level;
+    hdr.type = ty;
+    @memcpy(control[pos + cmsg_hdr_len ..][0..data.len], data);
+    return pos + cmsgSpace(data.len);
 }
 
 pub fn getsockoptInt(fd: fd_t, level: i32, opt: u32) !c_int {

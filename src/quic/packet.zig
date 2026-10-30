@@ -20,6 +20,16 @@ pub const Ecn = enum(u2) {
     ect1 = 1,
     ect0 = 2,
     ce = 3,
+
+    /// Its count's place in ACK_ECN (ECT(0), ECT(1), CE); null for Not-ECT.
+    pub fn countIndex(e: Ecn) ?usize {
+        return switch (e) {
+            .not_ect => null,
+            .ect0 => 0,
+            .ect1 => 1,
+            .ce => 2,
+        };
+    }
 };
 
 pub const Error = error{
