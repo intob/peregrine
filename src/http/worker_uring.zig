@@ -42,6 +42,13 @@ const h2_preface = @import("../h2/frame.zig").preface;
 const NIL: u32 = std.math.maxInt(u32);
 const NIL16: u16 = std.math.maxInt(u16);
 
+const is_test = @import("builtin").is_test;
+
+/// Tests give every provided-buffer ring this many buffers (0: none
+/// posted), so that receives find none (ENOBUFS) and fall back to pooled
+/// ones (`armRecvPlain`), as under a burst of connections.
+pub var test_ring_buffers: ?u16 = null;
+
 /// The ALPN protocol is HTTP/2.
 fn isH2(alpn: ?[]const u8) bool {
     return if (alpn) |p| std.mem.eql(u8, p, "h2") else false;
@@ -267,6 +274,7 @@ const RecvBuffers = struct {
     fn topUp(self: *RecvBuffers) void {
         self.taken_max = @max(self.taken_max, self.taken);
         self.taken = 0;
+        if (is_test and test_ring_buffers == 0) return;
         const mask = IoUring.buf_ring_mask(self.count);
         var added: u16 = 0;
         while (self.posted + added < self.target and self.free_len > 0) : (added += 1) {
@@ -507,7 +515,7 @@ pub fn Worker(comptime Handler: type) type {
                 self.ring.fd,
                 allocator,
                 @intCast(opts.read_buffer_size),
-                cfg.recv_buffer_count,
+                if (is_test) @max(1, test_ring_buffers orelse cfg.recv_buffer_count) else cfg.recv_buffer_count,
             );
             self.buffers_live = true;
             self.exchanges = try exchange.Slab.init(allocator, opts.max_exchanges, &self.mailbox, opts.exchange);
@@ -873,6 +881,36 @@ pub fn Worker(comptime Handler: type) type {
             return c.session.buf.len > 0;
         }
 
+        /// A receive armed by `armRecvPlain` is writing into the
+        /// connection's own input buffer (TLS's, else the protocol's). The
+        /// kernel owns that buffer until the completion: nothing may
+        /// release, compact or replace it meanwhile, or the pool would
+        /// hand it to another connection. Idle connections are driven
+        /// meanwhile (ticks, posts from other threads, write completions).
+        fn plainRecvArmed(c: *const Conn) bool {
+            return c.recv_armed and c.recv_op == .recv_plain;
+        }
+
+        /// Returns the buffers that hold nothing to their pools, except
+        /// the one a plain receive is writing into.
+        fn releaseIdle(self: *Self, c: *Conn) void {
+            const armed = plainRecvArmed(c);
+            if (c.tls) |t| {
+                if (!armed) t.releaseInputIfIdle();
+                t.releaseOutputIfIdle();
+            }
+            // Under TLS the kernel writes ciphertext, not into these.
+            const input_armed = armed and c.tls == null;
+            if (c.h2) |conn| {
+                if (!input_armed) conn.reader.releaseIfIdle(&self.pool);
+                conn.releaseOutputIfIdle();
+            } else if (c.ws) |w| {
+                if (!input_armed) w.decoder.releaseIfIdle();
+            } else if (!input_armed and !c.borrowed) {
+                c.session.releaseIfIdle(&self.pool);
+            }
+        }
+
         /// Receives into a pooled buffer: the one holding partial input, or
         /// a fresh one when the provided-buffer ring is exhausted.
         fn armRecvPlain(self: *Self, c: *Conn) void {
@@ -1081,7 +1119,9 @@ pub fn Worker(comptime Handler: type) type {
                 c.session.buf = &.{};
                 c.borrowed = false;
             }
-            c.session.deinit(&self.pool);
+            // A plain receive into the session's buffer (one armed while
+            // the response was written) frees it as it completes.
+            if (!plainRecvArmed(c) or c.tls != null) c.session.deinit(&self.pool);
             // Parked input is discarded like the rest.
             self.buffers.unparkAll(&c.parked);
             c.lingering = true;
@@ -1218,7 +1258,10 @@ pub fn Worker(comptime Handler: type) type {
                 if (c.closing) return;
                 if (cqe.err() == .NOBUFS) {
                     self.buffers.starve();
-                    if (!c.lingering) return self.armRecvPlain(c);
+                    // Parked input goes in first (drive takes it, then
+                    // receives); after it would come out of order.
+                    if (c.parked.head != NIL16) return self.carryOn(c);
+                    return self.armRecvPlain(c);
                 }
                 // Cancelled for backpressure: receive again once ready.
                 if (cqe.err() == .CANCELED) return self.carryOn(c);
@@ -1274,6 +1317,15 @@ pub fn Worker(comptime Handler: type) type {
             c.recv_cancelling = false;
             if (c.closing) return;
             if (cqe.res < 0) return self.closeConn(c);
+            if (c.lingering) {
+                // Drained input (armed for want of a kernel buffer, or
+                // before the final response went out: see finish) is
+                // discarded like the rest.
+                c.session.deinit(&self.pool);
+                c.lingered +|= @intCast(cqe.res);
+                if (cqe.res == 0 or c.lingered > sys.max_linger_bytes) return self.closeConn(c);
+                return self.armRecv(c);
+            }
             if (c.tls) |t| {
                 if (cqe.res == 0) {
                     c.peer_closed = true;
@@ -1795,8 +1847,7 @@ pub fn Worker(comptime Handler: type) type {
                 return;
             }
             if (conn.wantsClose() or c.peer_closed) return self.closeConn(c);
-            conn.releaseIfIdle(&self.pool);
-            if (c.tls) |t| t.releaseIfIdle();
+            self.releaseIdle(c);
             if (conn.activeStreams() == 0 and !conn.inFrame()) {
                 self.arm(c, .idle);
             } else {
@@ -1883,7 +1934,7 @@ pub fn Worker(comptime Handler: type) type {
                             c.session.start == c.session.end and c.out.file == null and
                             c.parked.head == NIL16)
                         {
-                            if (!c.borrowed) c.session.releaseIfIdle(&self.pool);
+                            self.releaseIdle(c);
                             self.armRecvBuffered(c);
                         }
                     }
@@ -1927,8 +1978,7 @@ pub fn Worker(comptime Handler: type) type {
             if (c.peer_closed) return self.closeConn(c);
             // Keep a partial request before the kernel buffer goes back.
             if (c.borrowed) self.unborrow(c) catch return self.closeConn(c);
-            c.session.releaseIfIdle(&self.pool);
-            if (c.tls) |t| t.releaseIfIdle();
+            self.releaseIdle(c);
             self.updateTimer(c);
             self.armRecv(c);
         }
@@ -2031,8 +2081,10 @@ pub fn Worker(comptime Handler: type) type {
                 }
             }
             if (t.failed) {
-                // No write is in flight while input is processed.
-                tlsWriteOnce(c, t);
+                // The alert, unless a write is in flight (HTTP/2 and
+                // WebSockets receive while writing): a direct write would
+                // overtake it.
+                if (!c.write_inflight) tlsWriteOnce(c, t);
                 self.closeConn(c);
                 return false;
             }
@@ -2104,6 +2156,9 @@ pub fn Worker(comptime Handler: type) type {
             }
             if (!t.hasWire()) return .idle;
             const bytes = t.wireBytes();
+            // Input processed during the write may seal records (a
+            // KeyUpdate answer): they mustn't move these bytes.
+            t.wireSending();
             const sqe = self.getSqe();
             sqe.prep_send(c.fd, bytes, linux.MSG.NOSIGNAL);
             sqe.user_data = userData(c.gen, self.slotOf(c), .write);
@@ -2180,8 +2235,7 @@ pub fn Worker(comptime Handler: type) type {
                 return;
             }
             if (w.wantsClose() or c.peer_closed) return self.closeConn(c);
-            w.decoder.releaseIfIdle();
-            if (c.tls) |t| t.releaseIfIdle();
+            self.releaseIdle(c);
             // Only a pending close handshake has a deadline.
             if (w.closeSent()) {
                 if (c.list != .active) self.arm(c, .active);

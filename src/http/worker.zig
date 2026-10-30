@@ -863,6 +863,19 @@ pub fn Worker(comptime Handler: type) type {
             if ((c.read_ready or tls_buffered) and !c.h2HasWire()) self.h2Readable(c);
         }
 
+        /// The connection just switched to HTTP/2. Frames that came with
+        /// the preface, or with the client's Finished, are processed now:
+        /// the read that brought them was short (`read_ready` is off), and
+        /// the client may send nothing more until it is answered.
+        fn h2Attached(self: *Self, c: *Conn) void {
+            if (c.h2HasWire() and !self.h2Flush(c)) return;
+            if (!c.h2HasWire()) {
+                if (!self.h2Process(c)) return;
+                if (c.peer_closed) return self.closeConn(c);
+            }
+            self.h2Readable(c);
+        }
+
         fn h2Readable(self: *Self, c: *Conn) void {
             // Our SETTINGS, queued when the connection switched to
             // HTTP/2, go out first: input already decrypted (the client's
@@ -1016,16 +1029,16 @@ pub fn Worker(comptime Handler: type) type {
                 if (c.tls) |t| {
                     if (!self.tlsDecrypt(c, t)) return;
                 }
-                if (c.h2 != null) return self.h2Readable(c);
+                if (c.h2 != null) return self.h2Attached(c);
                 if (!self.decideProto(c)) {
                     if (!c.open) return;
-                    if (c.h2 != null) return self.h2Readable(c);
+                    if (c.h2 != null) return self.h2Attached(c);
                     if (c.peer_closed) return self.closeConn(c);
                     // Part of a preface: wait for the rest.
                     if (!c.read_ready) break;
                     continue;
                 }
-                if (c.h2 != null) return self.h2Readable(c);
+                if (c.h2 != null) return self.h2Attached(c);
                 switch (self.processBuffered(c)) {
                     .ok => {},
                     .blocked => return self.updateTimer(c),

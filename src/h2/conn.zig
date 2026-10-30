@@ -489,6 +489,12 @@ pub const Conn = struct {
     /// everything read was processed, the output buffers once written.
     pub fn releaseIfIdle(self: *Self, pool: *BufferPool) void {
         self.reader.releaseIfIdle(pool);
+        self.releaseOutputIfIdle();
+    }
+
+    /// The output buffers alone (they may go while a receive into the
+    /// input buffer is in flight).
+    pub fn releaseOutputIfIdle(self: *Self) void {
         if (self.out.items.len == 0) self.giveBack(&self.out);
         if (self.wire_pos == self.wire.items.len) self.retireWire();
     }

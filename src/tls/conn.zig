@@ -159,6 +159,12 @@ pub const Conn = struct {
     wire_buf: []u8 = &.{},
     wire_start: usize = 0,
     wire_end: usize = 0,
+    /// The wire's bytes are being written asynchronously (`wireSending`):
+    /// they stay where they are until `advance`.
+    wire_sending: bool = false,
+    /// The wire buffer a record sealed during such a write moved off
+    /// (`reserve`), freed by `advance`.
+    wire_retired: []u8 = &.{},
 
     early_data_left: usize = 0,
     /// Accepted 0-RTT data received so far (`Config.max_early_data`).
@@ -201,6 +207,7 @@ pub const Conn = struct {
         if (self.write) |*p| p.wipe();
         if (self.in_buf.len > 0 and !self.borrowed) self.pools.in.release(self.in_buf);
         if (self.wire_buf.len > 0) self.pools.out.release(self.wire_buf);
+        if (self.wire_retired.len > 0) self.pools.out.release(self.wire_retired);
         self.* = undefined;
     }
 
@@ -357,14 +364,24 @@ pub const Conn = struct {
         return n;
     }
 
-    /// Return the input buffer to the pool when nothing is buffered.
+    /// Return the buffers to the pools when nothing is buffered.
     pub fn releaseIfIdle(self: *Self) void {
+        self.releaseInputIfIdle();
+        self.releaseOutputIfIdle();
+    }
+
+    /// The input buffer alone (the output's may go while a receive into
+    /// the input buffer is in flight).
+    pub fn releaseInputIfIdle(self: *Self) void {
         if (self.in_buf.len > 0 and !self.borrowed and self.in_start == self.in_end and self.plain.len == 0) {
             self.pools.in.release(self.in_buf);
             self.in_buf = &.{};
             self.in_start = 0;
             self.in_end = 0;
         }
+    }
+
+    pub fn releaseOutputIfIdle(self: *Self) void {
         if (self.wire_buf.len > 0 and self.wire_start == self.wire_end) {
             self.pools.out.release(self.wire_buf);
             self.wire_buf = &.{};
@@ -649,7 +666,20 @@ pub const Conn = struct {
         self.kernel_key_update = false;
     }
 
+    /// The event loop hands `wireBytes` to an asynchronous write (io_uring)
+    /// that reads them until `advance`. Records sealed meanwhile (a
+    /// KeyUpdate answer, an alert, a session ticket) go after them without
+    /// moving them.
+    pub fn wireSending(self: *Self) void {
+        self.wire_sending = true;
+    }
+
     pub fn advance(self: *Self, n: usize) void {
+        self.wire_sending = false;
+        if (self.wire_retired.len > 0) {
+            self.pools.out.release(self.wire_retired);
+            self.wire_retired = &.{};
+        }
         self.wire_start += n;
         if (self.wire_start == self.wire_end) {
             self.wire_start = 0;
@@ -666,14 +696,25 @@ pub const Conn = struct {
         }
         if (self.wire_buf.len - self.wire_end >= min) return self.wire_buf[self.wire_end..];
         const len = self.wire_end - self.wire_start;
-        if (self.wire_buf.len - len >= min) {
+        if (!self.wire_sending and self.wire_buf.len - len >= min) {
             std.mem.copyForwards(u8, self.wire_buf[0..len], self.wire_buf[self.wire_start..self.wire_end]);
         } else {
             // Rare: a handshake flight larger than the buffer (a long
-            // certificate chain).
-            const new_buf = try self.pools.allocator.alloc(u8, len + min);
+            // certificate chain), or bytes being written that must stay
+            // put: a copy goes on in another buffer, and a buffer being
+            // written is freed once the write completes.
+            const new_buf = if (len + min <= out_buffer_size)
+                try self.pools.out.acquire()
+            else
+                try self.pools.allocator.alloc(u8, len + min);
             @memcpy(new_buf[0..len], self.wire_buf[self.wire_start..self.wire_end]);
-            self.pools.out.release(self.wire_buf);
+            if (self.wire_sending) {
+                std.debug.assert(self.wire_retired.len == 0);
+                self.wire_retired = self.wire_buf;
+                self.wire_sending = false;
+            } else {
+                self.pools.out.release(self.wire_buf);
+            }
             self.wire_buf = new_buf;
         }
         self.wire_start = 0;
@@ -1698,6 +1739,52 @@ test "KeyUpdate in both directions" {
     conn.commitRead(n);
     try testing.expectEqual(0, conn.readPlain(&buf));
     try testing.expect(conn.failed);
+}
+
+test "a KeyUpdate answered while the wire is being written leaves those bytes in place" {
+    const td = credentials.testdata;
+    var server: TestServer = undefined;
+    try server.init(td.p256_cert, td.p256_key);
+    defer server.deinit();
+    var conn = try Conn.init(&server.pools, &server.config, &testEntropy(5));
+    defer conn.deinit();
+    conn.freeHandshake();
+    const c_secret: [32]u8 = @splat(1);
+    const s_secret: [32]u8 = @splat(2);
+    conn.read = .init(.aes_128_gcm_sha256, &c_secret);
+    conn.write = .init(.aes_128_gcm_sha256, &s_secret);
+    var client_tx: Protection = .init(.aes_128_gcm_sha256, &c_secret);
+
+    // A full wire, partly written; an asynchronous write of the rest is
+    // in flight (io_uring), reading it where it is.
+    const data = try testing.allocator.alloc(u8, out_buffer_size);
+    defer testing.allocator.free(data);
+    @memset(data, 'd');
+    _ = try conn.encrypt(&.{data});
+    conn.advance(1000);
+    const sending = conn.wireBytes();
+    const expected = try testing.allocator.dupe(u8, sending);
+    defer testing.allocator.free(expected);
+    try testing.expect(conn.wire_buf.len - conn.wire_end < record.overhead + 5);
+    conn.wireSending();
+
+    // Meanwhile the client asks for a KeyUpdate: the answer is sealed
+    // after those bytes, without moving them (compacting the buffer
+    // would).
+    const space = try conn.readSpace();
+    conn.commitRead(client_tx.seal(space, .handshake, &.{ 24, 0, 0, 1, 1 }));
+    var buf: [16]u8 = undefined;
+    try testing.expectEqual(0, conn.readPlain(&buf));
+    try testing.expect(!conn.failed);
+    try testing.expectEqualSlices(u8, expected, sending);
+    const wire = conn.wireBytes();
+    try testing.expectEqualSlices(u8, expected, wire[0..expected.len]);
+    try testing.expectEqual(expected.len + record.overhead + 5, wire.len);
+
+    // The write completes; the buffer it read goes back.
+    conn.advance(expected.len);
+    try testing.expectEqual(0, conn.wire_retired.len);
+    try testing.expectEqual(record.overhead + 5, conn.wireBytes().len);
 }
 
 /// Appends a plaintext handshake record holding `msg`.

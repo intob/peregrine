@@ -58,7 +58,8 @@ const TestHandler = struct {
     const Upload = struct {
         len: u64 = 0,
         hash: std.hash.Fnv1a_32 = .init(),
-        pause: enum { none, each, hold } = .none,
+        /// `early`: answered on the first chunk, before the rest.
+        pause: enum { none, each, hold, early } = .none,
     };
 
     pub fn init(allocator: std.mem.Allocator) !*TestHandler {
@@ -111,6 +112,11 @@ const TestHandler = struct {
                 up.pause = .none;
                 self.held = ex;
                 return .pause;
+            },
+            .early => {
+                _ = self.uploads.remove(ex);
+                ex.respond(.{}, "early") catch unreachable;
+                return .more;
             },
         }
     }
@@ -235,7 +241,14 @@ const TestHandler = struct {
             self.uploads_mutex.lock();
             defer self.uploads_mutex.unlock();
             self.uploads.put(self.allocator, ex, .{
-                .pause = if (std.mem.eql(u8, path, "/upload-pause")) .each else if (std.mem.eql(u8, path, "/upload-hold")) .hold else .none,
+                .pause = if (std.mem.eql(u8, path, "/upload-pause"))
+                    .each
+                else if (std.mem.eql(u8, path, "/upload-hold"))
+                    .hold
+                else if (std.mem.eql(u8, path, "/upload-early"))
+                    .early
+                else
+                    .none,
             }) catch unreachable;
             return;
         }
@@ -1468,6 +1481,15 @@ fn testUploads(backend: Backend) !void {
     c2.send(big_body[0..200000]) catch {};
     try c2.expectClosed();
 
+    // The same from the exchange, as the body starts arriving.
+    var c4 = try Client.connect(r.port);
+    defer c4.close();
+    try c4.send("POST /upload-early HTTP/1.1\r\nHost: x\r\nContent-Length: 300000\r\n\r\n");
+    try c4.send(big_body[0..1000]);
+    try expectResponse(&c4, 200, "early");
+    c4.send(big_body[0..299000]) catch {};
+    try c4.expectClosed();
+
     // A client that leaves mid-body: the handler hears of it.
     const aborts = r.srv.handler.aborts.load(.monotonic);
     var c3 = try Client.connect(r.port);
@@ -1542,6 +1564,11 @@ const H2Client = struct {
     max_frame_size: u32 = 16384,
     /// The server sent SETTINGS_ENABLE_CONNECT_PROTOCOL=1.
     connect_protocol: bool = false,
+    /// Over TLS (ALPN h2) instead of `tcp` alone.
+    tls: ?*TlsAlpnClient = null,
+    /// SETTINGS and PING go unanswered: nothing is sent that would make
+    /// the server read again.
+    quiet: bool = false,
 
     const Reply = struct {
         status: u16 = 0,
@@ -1561,24 +1588,42 @@ const H2Client = struct {
     };
 
     fn connect(port: u16) !*H2Client {
+        const self = try open(port, false);
+        try self.send(h2frame.preface);
+        var buf: [64]u8 = undefined;
+        try self.send(try settings(&buf));
+        return self;
+    }
+
+    /// Connected (over TLS, with the handshake done but for our
+    /// Finished), nothing sent yet.
+    fn open(port: u16, tls: bool) !*H2Client {
         const a = testing.allocator;
         const self = try a.create(H2Client);
         errdefer a.destroy(self);
+        const t = if (tls) try TlsAlpnClient.connect(port, "h2") else null;
+        errdefer if (t) |x| x.close();
         self.* = .{
-            .tcp = try Client.connect(port),
+            .tcp = if (t) |x| x.tcp else try Client.connect(port),
+            .tls = t,
             .enc = try hpack.Encoder.init(a, 4096),
             .dec = try hpack.Decoder.init(a, .{ .max_header_list_size = 1 << 20 }),
             .pool = try BufferPool.init(a, 16 * 1024 + 9, 1),
         };
-        try self.tcp.send(h2frame.preface);
-        var buf: [64]u8 = undefined;
-        const n = try h2frame.writeSettings(&buf, &.{.{ .id = .max_concurrent_streams, .value = 1000 }});
-        try self.tcp.send(buf[0..n]);
         return self;
     }
 
+    fn settings(buf: []u8) ![]const u8 {
+        return buf[0..try h2frame.writeSettings(buf, &.{.{ .id = .max_concurrent_streams, .value = 1000 }})];
+    }
+
+    fn send(self: *H2Client, bytes: []const u8) !void {
+        if (self.tls) |t| return t.send(bytes);
+        try self.tcp.send(bytes);
+    }
+
     fn close(self: *H2Client) void {
-        self.tcp.close();
+        if (self.tls) |t| t.close() else self.tcp.close();
         self.enc.deinit();
         self.dec.deinit();
         self.reader.deinit(&self.pool);
@@ -1587,17 +1632,8 @@ const H2Client = struct {
     }
 
     fn request(self: *H2Client, stream: u31, method: []const u8, path: []const u8, body: ?[]const u8) !void {
-        var block: [1024]u8 = undefined;
-        var bn: usize = 0;
-        bn += try self.enc.encode(block[bn..], ":method", method, .{});
-        bn += try self.enc.encode(block[bn..], ":scheme", "http", .{});
-        bn += try self.enc.encode(block[bn..], ":path", path, .{});
-        bn += try self.enc.encode(block[bn..], ":authority", "localhost", .{});
         var hdr: [1100]u8 = undefined;
-        var flags: u8 = h2frame.flag.end_headers;
-        if (body == null) flags |= h2frame.flag.end_stream;
-        const n = try h2frame.writeHeaders(&hdr, stream, flags, block[0..bn]);
-        try self.tcp.send(hdr[0..n]);
+        try self.send(try self.headers(&hdr, stream, method, path, body == null));
         if (body) |b| {
             var rest = b;
             while (true) {
@@ -1605,17 +1641,30 @@ const H2Client = struct {
                 const out = try testing.allocator.alloc(u8, k + h2frame.header_len);
                 defer testing.allocator.free(out);
                 const dn = try h2frame.writeData(out, stream, k == rest.len, rest[0..k]);
-                try self.tcp.send(out[0..dn]);
+                try self.send(out[0..dn]);
                 rest = rest[k..];
                 if (rest.len == 0) break;
             }
         }
     }
 
+    /// A request's HEADERS frame, in `out`.
+    fn headers(self: *H2Client, out: []u8, stream: u31, method: []const u8, path: []const u8, end_stream: bool) ![]const u8 {
+        var block: [1024]u8 = undefined;
+        var bn: usize = 0;
+        bn += try self.enc.encode(block[bn..], ":method", method, .{});
+        bn += try self.enc.encode(block[bn..], ":scheme", if (self.tls != null) "https" else "http", .{});
+        bn += try self.enc.encode(block[bn..], ":path", path, .{});
+        bn += try self.enc.encode(block[bn..], ":authority", "localhost", .{});
+        var flags: u8 = h2frame.flag.end_headers;
+        if (end_stream) flags |= h2frame.flag.end_stream;
+        return out[0..try h2frame.writeHeaders(out, stream, flags, block[0..bn])];
+    }
+
     fn sendWindow(self: *H2Client, stream: u31, inc: u31) !void {
         var buf: [h2frame.header_len + 4]u8 = undefined;
         const n = try h2frame.writeWindowUpdate(&buf, stream, inc);
-        try self.tcp.send(buf[0..n]);
+        try self.send(buf[0..n]);
     }
 
     /// Reads frames until every response in `responses` (indexed by
@@ -1645,7 +1694,7 @@ const H2Client = struct {
         const a = testing.allocator;
         {
             const space = try self.reader.readSpace(&self.pool, .{});
-            const n = try sys.read(self.tcp.fd, space);
+            const n = if (self.tls) |t| try t.read(space) else try sys.read(self.tcp.fd, space);
             if (n == 0) return error.EndOfStream;
             self.reader.commitRead(n);
             while (true) {
@@ -1660,15 +1709,16 @@ const H2Client = struct {
                                 if (setting.id == .max_frame_size) self.max_frame_size = setting.value;
                                 if (setting.id == .enable_connect_protocol) self.connect_protocol = setting.value == 1;
                             }
+                            if (self.quiet) continue;
                             var buf: [h2frame.header_len]u8 = undefined;
                             _ = try h2frame.writeSettingsAck(&buf);
-                            try self.tcp.send(&buf);
+                            try self.send(&buf);
                         },
                         .ping => |p| {
-                            if (p.ack) continue;
+                            if (p.ack or self.quiet) continue;
                             var buf: [h2frame.header_len + 8]u8 = undefined;
                             const pn = try h2frame.writePing(&buf, true, p.data);
-                            try self.tcp.send(buf[0..pn]);
+                            try self.send(buf[0..pn]);
                         },
                         .goaway => |g| return g.code,
                         .headers => |h| {
@@ -1726,7 +1776,7 @@ const H2Client = struct {
             bn += try self.enc.encode(block[bn..], f[0], f[1], .{});
         var hdr: [1100]u8 = undefined;
         const n = try h2frame.writeHeaders(&hdr, stream, h2frame.flag.end_headers, block[0..bn]);
-        try self.tcp.send(hdr[0..n]);
+        try self.send(hdr[0..n]);
     }
 
     /// One masked WebSocket frame, in DATA frames.
@@ -1740,7 +1790,7 @@ const H2Client = struct {
             const out = try a.alloc(u8, k + h2frame.header_len);
             defer a.free(out);
             const dn = try h2frame.writeData(out, stream, end and k == rest.len, rest[0..k]);
-            try self.tcp.send(out[0..dn]);
+            try self.send(out[0..dn]);
             rest = rest[k..];
             if (rest.len == 0) break;
         }
@@ -1824,6 +1874,40 @@ fn testH2Streams(backend: Backend) !void {
     try bad2.send("PRI * HTTP/2.0\r\n\r\nSX\r\n\r\n");
     const res2 = try bad2.readResponse(&head, null);
     try testing.expectEqual(@as(u16, 501), res2.status);
+}
+
+test "h2c: a request in the write with the preface is answered with no more input" {
+    try forEachBackend(testH2FirstWrite);
+}
+
+fn testH2FirstWrite(backend: Backend) !void {
+    const r = try Running.start(backend, h2Config());
+    defer r.stop();
+    try expectFirstWriteAnswered(r.port, false);
+}
+
+/// The preface, SETTINGS and a request in one write (over TLS, with the
+/// client's Finished too) are answered with nothing more sent, not even
+/// the SETTINGS ACK: the server must not wait for another read.
+fn expectFirstWriteAnswered(port: u16, tls: bool) !void {
+    const c = try H2Client.open(port, tls);
+    defer c.close();
+    if (c.tls) |t| try testing.expectEqualStrings("h2", t.alpn[0..t.alpn_len]);
+    c.quiet = true;
+    var buf: [2048]u8 = undefined;
+    var n = h2frame.preface.len;
+    @memcpy(buf[0..n], h2frame.preface);
+    n += (try H2Client.settings(buf[n..])).len;
+    n += (try c.headers(buf[n..], 1, "GET", "/first", true)).len;
+    try c.send(buf[0..n]);
+    var reply: H2Client.Reply = .{};
+    defer reply.deinit();
+    var map = std.AutoHashMap(u31, *H2Client.Reply).init(testing.allocator);
+    defer map.deinit();
+    try map.put(1, &reply);
+    try testing.expectEqual(@as(?h2frame.ErrorCode, null), try c.collect(&map));
+    try testing.expectEqual(@as(u16, 200), reply.status);
+    try testing.expectEqualStrings("ok", reply.body.items);
 }
 
 test "h2c: large bodies through flow control, both directions" {
@@ -2335,6 +2419,270 @@ const TlsClient = struct {
         if (len == 126) len = try r.takeInt(u16, .big) else if (len == 127) len = @intCast(try r.takeInt(u64, .big));
         try r.readSliceAll(payload[0..len]);
         return .{ .opcode = ws.Opcode.fromByte(b0 & 0x0f).?, .data = payload[0..len] };
+    }
+};
+
+/// A TLS 1.3 client for what std's can't do: ALPN, and its Finished held
+/// back to go out in one write with the first application data (as some
+/// clients send them). TLS_AES_128_GCM_SHA256 with X25519 only; the
+/// certificate is not checked (the server's Finished is).
+const TlsAlpnClient = struct {
+    const ks = @import("./tls/key_schedule.zig").Sha256;
+    const Aes = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const X25519 = std.crypto.dh.X25519;
+    const max_record = 5 + 16 * 1024 + 256;
+
+    tcp: Client,
+    tx: Keys = undefined,
+    rx: Keys = undefined,
+    /// The negotiated protocol, if any.
+    alpn: [16]u8 = undefined,
+    alpn_len: usize = 0,
+    /// Our Finished, sealed, until the first `send`.
+    finished: [64]u8 = undefined,
+    finished_len: usize = 0,
+    /// Received records not yet opened.
+    in: [2 * max_record]u8 = undefined,
+    in_start: usize = 0,
+    in_end: usize = 0,
+    /// Application data opened and not yet read.
+    plain: []const u8 = &.{},
+
+    const Keys = struct {
+        key: [Aes.key_length]u8,
+        iv: [Aes.nonce_length]u8,
+        seq: u64 = 0,
+
+        fn init(secret: ks.Secret) Keys {
+            return .{ .key = ks.trafficKey(Aes.key_length, secret), .iv = ks.trafficIv(secret) };
+        }
+
+        fn nonce(k: *const Keys) [Aes.nonce_length]u8 {
+            var n = k.iv;
+            var seq: [8]u8 = undefined;
+            std.mem.writeInt(u64, &seq, k.seq, .big);
+            for (seq, 0..) |b, i| n[4 + i] ^= b;
+            return n;
+        }
+
+        /// A record of content type `ty` holding `data`, in `out`.
+        fn seal(k: *Keys, out: []u8, ty: u8, data: []const u8) []const u8 {
+            var inner: [16 * 1024 + 1]u8 = undefined;
+            @memcpy(inner[0..data.len], data);
+            inner[data.len] = ty;
+            const len = data.len + 1 + Aes.tag_length;
+            out[0..5].* = .{ 23, 3, 3, 0, 0 };
+            std.mem.writeInt(u16, out[3..5], @intCast(len), .big);
+            Aes.encrypt(out[5..][0 .. data.len + 1], out[5 + data.len + 1 ..][0..Aes.tag_length], inner[0 .. data.len + 1], out[0..5], k.nonce(), k.key);
+            k.seq += 1;
+            return out[0 .. 5 + len];
+        }
+
+        /// Opens a record in place: its content type and data.
+        fn open(k: *Keys, rec: []u8) !struct { ty: u8, data: []u8 } {
+            if (rec.len < 5 + 1 + Aes.tag_length) return error.BadRecord;
+            const body = rec[5 .. rec.len - Aes.tag_length];
+            try Aes.decrypt(body, body, rec[rec.len - Aes.tag_length ..][0..Aes.tag_length].*, rec[0..5], k.nonce(), k.key);
+            k.seq += 1;
+            var end = body.len;
+            while (end > 0 and body[end - 1] == 0) end -= 1;
+            if (end == 0) return error.BadRecord;
+            return .{ .ty = body[end - 1], .data = body[0 .. end - 1] };
+        }
+    };
+
+    /// Connects and runs the handshake, offering `alpn` if given.
+    fn connect(port: u16, alpn: ?[]const u8) !*TlsAlpnClient {
+        const self = try testing.allocator.create(TlsAlpnClient);
+        errdefer testing.allocator.destroy(self);
+        self.* = .{ .tcp = try Client.connect(port) };
+        errdefer self.tcp.close();
+        var seed: [32]u8 = undefined;
+        sys.randomBytes(&seed);
+        const kp = X25519.KeyPair.generateDeterministic(seed);
+        var transcript: std.crypto.hash.sha2.Sha256 = .init(.{});
+
+        // ClientHello: TLS 1.3, AES-128-GCM, X25519, ECDSA P-256 (the
+        // test certificate) and RSA-PSS signatures, SNI, ALPN.
+        var hello: [512]u8 = undefined;
+        var w: std.Io.Writer = .fixed(hello[5..]);
+        const exts_len: usize = 7 + 18 + 8 + 10 + 42 + if (alpn) |p| 7 + p.len else 0;
+        try w.writeAll(&.{ 1, 0, 0, 0, 3, 3 });
+        try w.writeAll(&@as([32]u8, @splat(7)));
+        try w.writeAll(&.{ 0, 0, 2, 0x13, 0x01, 1, 0 });
+        try w.writeInt(u16, @intCast(exts_len), .big);
+        try w.writeAll(&.{ 0, 43, 0, 3, 2, 3, 4 }); // supported_versions
+        try w.writeAll(&[_]u8{ 0, 0, 0, 14, 0, 12, 0, 0, 9 } ++ "localhost"); // server_name
+        try w.writeAll(&.{ 0, 10, 0, 4, 0, 2, 0, 0x1d }); // supported_groups
+        try w.writeAll(&.{ 0, 13, 0, 6, 0, 4, 4, 3, 8, 4 }); // signature_algorithms
+        try w.writeAll(&.{ 0, 51, 0, 38, 0, 36, 0, 0x1d, 0, 32 }); // key_share
+        try w.writeAll(&kp.public_key);
+        if (alpn) |p| {
+            try w.writeAll(&.{ 0, 16 });
+            try w.writeInt(u16, @intCast(3 + p.len), .big);
+            try w.writeInt(u16, @intCast(1 + p.len), .big);
+            try w.writeByte(@intCast(p.len));
+            try w.writeAll(p);
+        }
+        const msg = w.buffered();
+        std.mem.writeInt(u24, msg[1..4], @intCast(msg.len - 4), .big);
+        std.debug.assert(msg.len - 4 == 43 + exts_len);
+        hello[0..5].* = .{ 22, 3, 1, 0, 0 };
+        std.mem.writeInt(u16, hello[3..5], @intCast(msg.len), .big);
+        transcript.update(msg);
+        try self.tcp.send(hello[0 .. 5 + msg.len]);
+
+        // The server's flight: ServerHello, then handshake messages under
+        // the handshake keys, perhaps several to a record.
+        var hs_secret: ks.Secret = undefined;
+        var c_hs: ks.Secret = undefined;
+        var s_hs: ks.Secret = undefined;
+        var msgs: [16 * 1024]u8 = undefined;
+        var msgs_len: usize = 0;
+        while (true) {
+            const rec = try self.nextRecord();
+            switch (rec[0]) {
+                20 => continue, // change_cipher_spec
+                22 => {
+                    // ServerHello: the key share is the last 32 bytes of
+                    // its key_share extension.
+                    const sh = rec[5..];
+                    if (sh[0] != 2) return error.UnexpectedMessage;
+                    const ks_at = std.mem.indexOf(u8, sh, &.{ 0, 51, 0, 36, 0, 0x1d, 0, 32 }) orelse return error.NoKeyShare;
+                    const shared = try X25519.scalarmult(kp.secret_key, sh[ks_at + 8 ..][0..32].*);
+                    transcript.update(sh);
+                    hs_secret = ks.handshakeSecret(ks.earlySecret(), &shared);
+                    const th = hashOf(transcript);
+                    c_hs = ks.deriveSecret(hs_secret, "c hs traffic", &th);
+                    s_hs = ks.deriveSecret(hs_secret, "s hs traffic", &th);
+                    self.rx = .init(s_hs);
+                },
+                23 => {
+                    const r = try self.rx.open(rec);
+                    if (r.ty != 22) return error.UnexpectedRecord;
+                    @memcpy(msgs[msgs_len..][0..r.data.len], r.data);
+                    msgs_len += r.data.len;
+                    var used: usize = 0;
+                    while (msgs_len - used >= 4) {
+                        const m = msgs[used..msgs_len];
+                        const len = std.mem.readInt(u24, m[1..4], .big);
+                        if (m.len < 4 + len) break;
+                        used += 4 + len;
+                        if (m[0] == 8) self.readAlpn(m[4..][0..len]);
+                        if (m[0] != 20) {
+                            transcript.update(m[0 .. 4 + len]);
+                            continue;
+                        }
+                        // The server's Finished: ours, then application keys.
+                        if (!std.mem.eql(u8, m[4..][0..len], &ks.finishedVerifyData(s_hs, &hashOf(transcript)))) return error.BadFinished;
+                        transcript.update(m[0 .. 4 + len]);
+                        const th = hashOf(transcript);
+                        const master = ks.masterSecret(hs_secret);
+                        const fin = [4]u8{ 20, 0, 0, 32 } ++ ks.finishedVerifyData(c_hs, &th);
+                        var hs_tx: Keys = .init(c_hs);
+                        self.finished_len = hs_tx.seal(&self.finished, 22, &fin).len;
+                        self.tx = .init(ks.deriveSecret(master, "c ap traffic", &th));
+                        self.rx = .init(ks.deriveSecret(master, "s ap traffic", &th));
+                        return self;
+                    }
+                    std.mem.copyForwards(u8, msgs[0 .. msgs_len - used], msgs[used..msgs_len]);
+                    msgs_len -= used;
+                },
+                else => return error.UnexpectedRecord,
+            }
+        }
+    }
+
+    fn hashOf(transcript: std.crypto.hash.sha2.Sha256) [32]u8 {
+        var t = transcript;
+        var h: [32]u8 = undefined;
+        t.final(&h);
+        return h;
+    }
+
+    fn readAlpn(self: *TlsAlpnClient, ee: []const u8) void {
+        var i: usize = 2;
+        while (i + 4 <= ee.len) {
+            const ty = std.mem.readInt(u16, ee[i..][0..2], .big);
+            const len = std.mem.readInt(u16, ee[i + 2 ..][0..2], .big);
+            if (ty == 16) {
+                self.alpn_len = ee[i + 6];
+                @memcpy(self.alpn[0..self.alpn_len], ee[i + 7 ..][0..self.alpn_len]);
+            }
+            i += 4 + len;
+        }
+    }
+
+    fn close(self: *TlsAlpnClient) void {
+        self.tcp.close();
+        testing.allocator.destroy(self);
+    }
+
+    /// The next whole record, valid until the next call.
+    fn nextRecord(self: *TlsAlpnClient) ![]u8 {
+        while (true) {
+            const avail = self.in[self.in_start..self.in_end];
+            if (avail.len >= 5) {
+                const len = 5 + @as(usize, std.mem.readInt(u16, avail[3..5], .big));
+                if (len > max_record) return error.BadRecord;
+                if (avail.len >= len) {
+                    self.in_start += len;
+                    return avail[0..len];
+                }
+            }
+            if (self.in_end + max_record > self.in.len) {
+                std.mem.copyForwards(u8, self.in[0..avail.len], avail);
+                self.in_start = 0;
+                self.in_end = avail.len;
+            }
+            const n = try sys.read(self.tcp.fd, self.in[self.in_end..]);
+            if (n == 0) return error.EndOfStream;
+            self.in_end += n;
+        }
+    }
+
+    /// Our Finished if not sent yet, then `bytes`, in one write.
+    fn send(self: *TlsAlpnClient, bytes: []const u8) !void {
+        const out = try testing.allocator.alloc(u8, self.finished_len + bytes.len + (bytes.len / (16 * 1024) + 1) * 32);
+        defer testing.allocator.free(out);
+        var n = self.finished_len;
+        @memcpy(out[0..n], self.finished[0..n]);
+        self.finished_len = 0;
+        var rest = bytes;
+        while (rest.len > 0) {
+            const k = @min(rest.len, 16 * 1024);
+            n += self.tx.seal(out[n..], 23, rest[0..k]).len;
+            rest = rest[k..];
+        }
+        try self.tcp.send(out[0..n]);
+    }
+
+    /// Application data into `buf`; 0 at the server's close_notify.
+    fn read(self: *TlsAlpnClient, buf: []u8) !usize {
+        while (self.plain.len == 0) {
+            const r = try self.rx.open(try self.nextRecord());
+            switch (r.ty) {
+                23 => self.plain = r.data,
+                22 => {}, // NewSessionTicket
+                21 => return 0,
+                else => return error.UnexpectedRecord,
+            }
+        }
+        const n = @min(buf.len, self.plain.len);
+        @memcpy(buf[0..n], self.plain[0..n]);
+        self.plain = self.plain[n..];
+        return n;
+    }
+
+    /// Reads into `buf` until it holds `needle`.
+    fn readUntil(self: *TlsAlpnClient, buf: []u8, needle: []const u8) ![]const u8 {
+        var len: usize = 0;
+        while (std.mem.indexOf(u8, buf[0..len], needle) == null) {
+            const n = try self.read(buf[len..]);
+            if (n == 0) return error.EndOfStream;
+            len += n;
+        }
+        return buf[0..len];
     }
 };
 
@@ -3164,6 +3512,40 @@ fn kernelTlsAvailable() bool {
     return std.posix.errno(rc) == .SUCCESS;
 }
 
+test "tls: application data in the write with the client's Finished is answered" {
+    try forEachBackend(testTlsFinishedWithData);
+}
+
+fn testTlsFinishedWithData(backend: Backend) !void {
+    var cfg = tlsConfig();
+    cfg.tls.?.alpn = &.{ "h2", "http/1.1" };
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    // HTTP/2 (ALPN): the preface, SETTINGS and a request.
+    try expectFirstWriteAnswered(r.port, true);
+    var buf: [4096]u8 = undefined;
+    // HTTP/1.1: a request.
+    {
+        const t = try TlsAlpnClient.connect(r.port, "http/1.1");
+        defer t.close();
+        try t.send("GET /first HTTP/1.1\r\nHost: x\r\n\r\n");
+        const got = try t.readUntil(&buf, "\r\n\r\nok");
+        try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 "));
+    }
+    // A WebSocket upgrade and its first frame.
+    {
+        const t = try TlsAlpnClient.connect(r.port, null);
+        defer t.close();
+        var first: [512]u8 = undefined;
+        var n = Client.upgrade_request.len;
+        @memcpy(first[0..n], Client.upgrade_request);
+        n += Client.wsFrame(first[n..], true, .text, "early").len;
+        try t.send(first[0..n]);
+        const got = try t.readUntil(&buf, "\x81\x05early");
+        try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 101 "));
+    }
+}
+
 test "tls: plaintext HTTP to a TLS port gets an alert" {
     try forEachBackend(testTlsPlaintextRejected);
 }
@@ -3187,6 +3569,74 @@ test "tls: bad credentials fail init" {
     cfg.handle_signals = false;
     cfg.tls.?.key_pem = tls_testdata.p384_key;
     try testing.expectError(error.KeyCertificateMismatch, Server(TestHandler).init(testing.allocator, 0, cfg));
+}
+
+// -- io_uring with receives through pooled buffers --------------------------
+
+test "io_uring: receives fall back to pooled buffers while the ring is empty" {
+    if (sys.is_linux) {
+        const worker_uring = @import("./http/worker_uring.zig");
+        if (!worker_uring.available()) return error.SkipZigTest;
+        // Each receive gets ENOBUFS and goes into a buffer of the
+        // connection's own, which the kernel writes until the completion:
+        // nothing may release or move it meanwhile, while the connection
+        // is driven by ticks, posts from other threads and writes.
+        worker_uring.test_ring_buffers = 0;
+        defer worker_uring.test_ring_buffers = null;
+        try testIdleAcrossTicks(.io_uring);
+        inline for (.{
+            testKeepAlive,    testPipelinedBurst, testLater,        testUploads,   testLingering,
+            testWebSocket,    testH2Streams,      testH2Exchanges,  testH2Uploads, testH2WebSocket,
+            testTlsKeepAlive, testTlsUpload,      testTlsWebSocket,
+        }) |f| try f(.io_uring);
+        // Two buffers: one is borrowed, the next parked for want of room,
+        // and the receive after them finds none.
+        worker_uring.test_ring_buffers = 2;
+        inline for (.{ testPipelinedBurst, testKeepAlive, testUploads, testUploadHold }) |f| try f(.io_uring);
+    } else return error.SkipZigTest;
+}
+
+/// HTTP/1.1, HTTP/2 and WebSocket connections used, left idle across two
+/// worker ticks (which drive every HTTP/2 connection), sent to from
+/// another thread while idle (WebSocket), then used again.
+fn testIdleAcrossTicks(backend: Backend) !void {
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    var cfg = h2Config();
+    cfg.keep_alive_timeout_s = 10;
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    const h2 = try H2Client.connect(r.port);
+    defer h2.close();
+    var w = try Client.connect(r.port);
+    defer w.close();
+    var h1 = try Client.connect(r.port);
+    defer h1.close();
+    var head: [4096]u8 = undefined;
+    const body = try testing.allocator.alloc(u8, big_body_len);
+    defer testing.allocator.free(body);
+    for (0..2) |round| {
+        var reply: H2Client.Reply = .{};
+        defer reply.deinit();
+        try h2.fetch(@intCast(2 * round + 1), "GET", "/h2", null, &reply);
+        try testing.expectEqualStrings("ok", reply.body.items);
+        if (round == 0) {
+            try w.send(Client.upgrade_request);
+            try w.readUpgrade();
+        }
+        try w.wsSend(true, .text, "echo");
+        try w.expectWsText("echo");
+        // Answered from another thread while the connection waits.
+        try w.wsSend(true, .text, "async");
+        try w.expectWsText("later");
+        // A response written in pieces while the next receive waits.
+        try h1.send("GET /big HTTP/1.1\r\nHost: x\r\n\r\n");
+        var res = try h1.readResponse(&head, body);
+        try testing.expect(std.mem.eql(u8, &big_body, body[0..res.body_len]));
+        try h1.send("GET /h1 HTTP/1.1\r\nHost: x\r\n\r\n");
+        res = try h1.readResponse(&head, body);
+        try testing.expectEqualStrings("ok", body[0..res.body_len]);
+        if (round == 0) sleepMs(2200);
+    }
 }
 
 // -- HTTP/3 over UDP ------------------------------------------------------------
