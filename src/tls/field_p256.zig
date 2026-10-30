@@ -70,12 +70,29 @@ pub const Fe = struct {
         return @bitCast(a.l);
     }
 
+    /// 0 − bit (all ones for 1) for a bit that may be secret, hidden from
+    /// the optimizer: knowing a mask is 0 or all ones, LLVM turns the
+    /// masked selections into selects, and on x86_64 below v3 its
+    /// cmov-to-branch pass turns those in a loop into branches on the bit
+    /// (16 per row of `mulBase`, on carries of the coordinates).
+    pub inline fn mask64(bit: u64) u64 {
+        return asm (""
+            : [r] "=r" (-> u64),
+            : [x] "0" (0 -% bit),
+        );
+    }
+
+    inline fn mask(bit: u64) u256 {
+        const m = mask64(bit);
+        return @bitCast([4]u64{ m, m, m, m });
+    }
+
     /// r − p if r ≥ p, for r = c·2^256 + lo below 2p.
     inline fn subP(lo: u256, c: u1) Fe {
         @setRuntimeSafety(safe);
         const d = @subWithOverflow(lo, p);
         // r < p exactly when there is no carry and lo − p borrows.
-        const keep: u256 = 0 -% @as(u256, d[1] & ~c);
+        const keep = mask(d[1] & ~c);
         return .{ .l = @bitCast((lo & keep) | (d[0] & ~keep)) };
     }
 
@@ -89,7 +106,7 @@ pub const Fe = struct {
         @setRuntimeSafety(safe);
         const d = @subWithOverflow(a.val(), b_.val());
         // A borrow added 2^256: add p back (the sum wraps to a − b + p).
-        return .{ .l = @bitCast(d[0] +% (p & (0 -% @as(u256, d[1])))) };
+        return .{ .l = @bitCast(d[0] +% (p & mask(d[1]))) };
     }
 
     pub inline fn dbl(a: Fe) Fe {
@@ -99,8 +116,7 @@ pub const Fe = struct {
     /// a/2: (a + p)/2 for an odd a.
     pub inline fn half(a: Fe) Fe {
         @setRuntimeSafety(safe);
-        const odd: u256 = a.l[0] & 1;
-        return .{ .l = @bitCast(@as(u256, @truncate((@as(u257, a.val()) + (p & (0 -% odd))) >> 1))) };
+        return .{ .l = @bitCast(@as(u256, @truncate((@as(u257, a.val()) + (p & mask(a.l[0] & 1))) >> 1))) };
     }
 
     pub inline fn neg(a: Fe) Fe {
@@ -261,8 +277,8 @@ pub const Fe = struct {
 
     /// a = b if c is 1 (c is 0 or 1), in constant time.
     pub inline fn cMov(a: *Fe, b_: Fe, c: u64) void {
-        const mask = 0 -% c;
-        inline for (0..4) |i| a.l[i] ^= (a.l[i] ^ b_.l[i]) & mask;
+        const m = mask64(c);
+        inline for (0..4) |i| a.l[i] ^= (a.l[i] ^ b_.l[i]) & m;
     }
 };
 
