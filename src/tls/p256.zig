@@ -1044,6 +1044,27 @@ test "verify: the incompleteness argument's integer model, on boundary scalars" 
     }
 }
 
+// Fuzz target: boundary scalars (the kind and the generator's seed from the
+// input) on peers that are small multiples of G or k × G, through the
+// watched arithmetic, the model and std.
+fn fuzzBoundary(_: void, smith: *std.testing.Smith) anyerror!void {
+    var in: [1 + 8 + 1 + 32]u8 = undefined;
+    smith.bytes(&in);
+    var prng = std.Random.DefaultPrng.init(std.mem.readInt(u64, in[1..9], .little));
+    const s = boundaryScalar(prng.random(), in[0] % 12);
+    var k = std.mem.readInt(u256, in[10..42], .little) % (n - 1) + 1;
+    if (in[9] & 0x80 == 0) k = in[9] % 64 + 1;
+    const pk = stdPublic(k);
+    try expectWatched(s, try decodePoint(&pk), &pk, true);
+}
+
+test "fuzz: p256 boundary scalars, watched, against std" {
+    try std.testing.fuzz({}, fuzzBoundary, .{ .corpus = &.{
+        &([_]u8{0} ++ @as([41]u8, @splat(0))),
+        &([_]u8{7} ++ @as([41]u8, @splat(0x5a))),
+    } });
+}
+
 test "verify: the point arithmetic meets only the exceptional additions the model predicts" {
     var prng = std.Random.DefaultPrng.init(0x7e57_ad5f);
     const r = prng.random();
