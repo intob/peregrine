@@ -3682,7 +3682,7 @@ test "io_uring: the rest of the suite with the ring at 0, 1 and 2 buffers" {
                 testH2ClientGoaway,           testH2ShutdownStuck,        testH2OutputFreed, testTlsSni,
                 testTlsFinishedWithData,      testTlsPlaintextRejected,   testShutdown,      testTlsKeyUpdateDuringSend,
                 testH2TlsKeyUpdateDuringSend, testTlsBadRecordDuringSend, testTlsLingering,  testH2FirstWriteVariants,
-                testIdleAcrossTicks,          testWsFramesBehindUpgrade,  testLingerTrickle,
+                testIdleAcrossTicks,          testWsFramesBehindUpgrade,  testLingerTrickle, testWsBurstBehindUpgrade,
             }) |f| try f(.io_uring);
             if (count != 0) {
                 inline for (.{
@@ -3856,7 +3856,7 @@ fn testTlsLingering(backend: Backend) !void {
     }
 }
 
-test "h2: frames in the preface's write: a body, GOAWAY, a bad frame, more than a read buffer" {
+test "h2: frames in the preface's write: a body, GOAWAY, bad frames, more than a read buffer" {
     try forEachBackend(testH2FirstWriteVariants);
 }
 
@@ -3873,7 +3873,7 @@ fn testH2FirstWriteVariants(backend: Backend) !void {
     for (body, 0..) |*b, i| b.* = @truncate(i *% 13);
     for ([_]bool{ false, true }) |tls| {
         const port = if (tls) rt.port else rp.port;
-        for (0..4) |variant| {
+        for (0..6) |variant| {
             const c = try H2Client.open(port, tls);
             defer c.close();
             c.quiet = true;
@@ -3881,7 +3881,7 @@ fn testH2FirstWriteVariants(backend: Backend) !void {
             defer a.free(out);
             var n = h2frame.preface.len;
             @memcpy(out[0..n], h2frame.preface);
-            n += (try H2Client.settings(out[n..])).len;
+            if (variant != 4) n += (try H2Client.settings(out[n..])).len;
             var streams: u31 = 1;
             switch (variant) {
                 // A request with a body larger than a read buffer.
@@ -3919,6 +3919,15 @@ fn testH2FirstWriteVariants(backend: Backend) !void {
                     n += (try c.headers(out[n..], 1, "GET", "/first", true)).len;
                     n += try h2frame.writeData(out[n..], 0, false, "x");
                 },
+                // The preface, then a PING instead of SETTINGS.
+                4 => n += try h2frame.writePing(out[n..], false, "12345678"),
+                // A request, then HTTP/1.1 (read as a frame too large).
+                5 => {
+                    n += (try c.headers(out[n..], 1, "GET", "/first", true)).len;
+                    const h1 = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+                    @memcpy(out[n..][0..h1.len], h1);
+                    n += h1.len;
+                },
                 else => unreachable,
             }
             try c.send(out[0..n]);
@@ -3929,7 +3938,7 @@ fn testH2FirstWriteVariants(backend: Backend) !void {
             var id: u31 = 1;
             while (id <= streams) : (id += 2) try map.put(id, &replies[id / 2]);
             const code = c.collect(&map) catch |err| switch (err) {
-                error.EndOfStream => if (variant == 1 or variant == 3) null else return err,
+                error.EndOfStream => if (variant == 1) null else return err,
                 else => return err,
             };
             switch (variant) {
@@ -3942,7 +3951,8 @@ fn testH2FirstWriteVariants(backend: Backend) !void {
                     try testing.expectEqual(@as(?h2frame.ErrorCode, null), code);
                     for (replies) |rep| try testing.expectEqualStrings("ok", rep.body.items);
                 },
-                3 => try testing.expectEqual(@as(?h2frame.ErrorCode, .protocol_error), code),
+                3, 4 => try testing.expectEqual(@as(?h2frame.ErrorCode, .protocol_error), code),
+                5 => try testing.expectEqual(@as(?h2frame.ErrorCode, .frame_size_error), code),
                 else => unreachable,
             }
         }
@@ -3972,6 +3982,43 @@ fn testWsFramesBehindUpgrade(backend: Backend) !void {
         }
         try c.readUpgrade();
         for (0..12) |k| try c.expectWsText(try std.fmt.bufPrint(&msg, "m{d}-{d}", .{ round, k }));
+    }
+}
+
+test "websocket: 60 KiB of frames in the upgrade request's write, with small request limits" {
+    try forEachBackend(testWsBurstBehindUpgrade);
+}
+
+/// More arrives behind the upgrade request than the HTTP/1.1 session may
+/// hold (its limits are small): on io_uring the rest waits in kernel
+/// buffers (parked) while the 101 is written, and must reach the
+/// WebSocket after the upgrade.
+fn testWsBurstBehindUpgrade(backend: Backend) !void {
+    const r = try Running.start(backend, .{ .limits = .{ .max_body_size = 1024 } });
+    defer r.stop();
+    const a = testing.allocator;
+    const out = try a.alloc(u8, 64 * 1024);
+    defer a.free(out);
+    const frames = 60;
+    for (0..4) |round| {
+        var c = try Client.connect(r.port);
+        defer c.close();
+        var n = Client.upgrade_request.len;
+        @memcpy(out[0..n], Client.upgrade_request);
+        var payload: [1000]u8 = undefined;
+        for (0..frames) |k| {
+            @memset(&payload, @truncate(k + round));
+            n += Client.wsFrame(out[n..], true, .binary, &payload).len;
+        }
+        try c.send(out[0..n]);
+        try c.readUpgrade();
+        var got: [1024]u8 = undefined;
+        for (0..frames) |k| {
+            const f = try c.wsRead(&got);
+            try testing.expectEqual(ws.Opcode.binary, f.opcode);
+            try testing.expectEqual(@as(usize, 1000), f.payload.len);
+            try testing.expectEqual(@as(u8, @truncate(k + round)), f.payload[0]);
+        }
     }
 }
 
