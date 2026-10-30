@@ -940,18 +940,18 @@ const KeyExchange = struct {
         switch (share.group) {
             .x25519 => try self.x25519(share.key_exchange, entropy[32..64]),
             .secp256r1 => {
-                // Only the uncompressed form is allowed (RFC 8446 §4.2.8.2).
-                if (share.key_exchange.len != 65 or share.key_exchange[0] != 4) return error.IllegalParameter;
-                const pk = EcdsaP256Sha256.PublicKey.fromSec1(share.key_exchange) catch return error.IllegalParameter;
-                const kp = p256_base.keyPair(entropy[64..96].*) catch return error.InternalError;
-                // Constant time: the scalar is our secret.
-                const point = pk.p.mul(kp.secret_key, .big) catch return error.IllegalParameter;
-                const shared = point.affineCoordinates().x.toBytes(.big);
-                const public = kp.public_key;
-                @memcpy(self.share_buf[0..public.len], &public);
-                self.share_len = public.len;
-                @memcpy(self.shared_buf[0..shared.len], &shared);
-                self.shared_len = shared.len;
+                // Our public key and the shared secret, in constant time
+                // (both equal std's). Only the uncompressed form of a
+                // point on the curve is accepted (RFC 8446 §4.2.8.2).
+                var ks = p256_base.keyShare(entropy[64..96].*, share.key_exchange) catch |err| return switch (err) {
+                    error.InvalidEncoding, error.NonCanonical => error.IllegalParameter,
+                    error.IdentityElement => error.InternalError,
+                };
+                defer std.crypto.secureZero(u8, &ks.shared_secret);
+                @memcpy(self.share_buf[0..ks.public_key.len], &ks.public_key);
+                self.share_len = ks.public_key.len;
+                @memcpy(self.shared_buf[0..ks.shared_secret.len], &ks.shared_secret);
+                self.shared_len = ks.shared_secret.len;
             },
             .x25519_ml_kem768 => {
                 // ML-KEM-768 encapsulation key then X25519 share, in both

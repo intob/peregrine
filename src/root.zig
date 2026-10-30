@@ -60,6 +60,8 @@ test {
     _ = @import("./tls/record.zig");
     _ = @import("./tls/credentials.zig");
     _ = @import("./tls/p256.zig");
+    _ = @import("./tls/field_p256.zig");
+    _ = @import("./tls/p256_verify.zig");
     _ = @import("./tls/x25519.zig");
     _ = @import("./tls/field25519.zig");
     _ = @import("./tls/x25519_verify.zig");

@@ -9,7 +9,8 @@
 # Usage: tls-interop.sh [epoll|io_uring] (default: both)
 # IMAGE: any image with OpenSSL 3.5+ (X25519MLKEM768) and curl with
 # HTTP/3 (default peregrine-h3load: OpenSSL 3.5, curl 8.23 with ngtcp2).
-# TLS_GROUPS overrides the groups (default "X25519 X25519MLKEM768").
+# TLS_GROUPS overrides the groups (default "X25519 X25519MLKEM768"; P-256
+# too).
 source "$(dirname "$0")/env.sh"
 IMAGE=${IMAGE:-peregrine-h3load}
 GROUPS_=${TLS_GROUPS:-X25519 X25519MLKEM768}
@@ -30,16 +31,18 @@ done
 fail=0
 check() { if [ "$2" = ok ]; then echo "PASS $1"; else echo "FAIL $1 ($3)"; fail=1; fi; }
 for g in $2; do
+    # How OpenSSL and curl print the group (P-256 has other names).
+    case $g in P-256) name="P-256|prime256v1|secp256r1" ;; *) name=$g ;; esac
     out=$(printf "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n" |
         openssl s_client -connect 127.0.0.1:9443 -groups $g -alpn http/1.1 -brief -ign_eof 2>&1)
     grp=$(echo "$out" | grep -iE "Negotiated TLS1.3 group|Peer Temp Key" | head -1)
     st=$(echo "$out" | grep -m1 "^HTTP/1.1")
-    echo "$st" | grep -q " 200" && echo "$grp" | grep -qi "${g}" && r=ok || r=bad
+    echo "$st" | grep -q " 200" && echo "$grp" | grep -qiE "$name" && r=ok || r=bad
     check "openssl s_client $g http/1.1: $grp" $r "$st"
     for v in --http1.1 --http2 --http3-only; do
         res=$(curl -sk -v --curves $g $v https://127.0.0.1:9443/ -o /dev/null -w "%{http_code} %{http_version}" 2>/tmp/curl.err)
         used=$(grep -o "SSL connection using .*" /tmp/curl.err | head -1 | tr -d "\r")
-        echo "$res" | grep -q "^200" && echo "$used" | grep -qi "/ ${g} /" && r=ok || r=bad
+        echo "$res" | grep -q "^200" && echo "$used" | grep -qiE "/ ($name) /" && r=ok || r=bad
         check "curl $g $v: $res, $used" $r "$(tail -1 /tmp/curl.err | tr -d "\r")"
     done
     pids=""

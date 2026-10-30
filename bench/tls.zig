@@ -322,7 +322,7 @@ fn handshakes() !void {
             seed[0] = @truncate(i);
             const pk = try P256.PublicKey.fromSec1(&p_share);
             const kp = try P256.KeyPair.generateDeterministic(seed);
-            const point = try pk.p.mulPublic(kp.secret_key.bytes, .big);
+            const point = try pk.p.mul(kp.secret_key.bytes, .big);
             std.mem.doNotOptimizeAway(point.affineCoordinates().x.toBytes(.big));
             std.mem.doNotOptimizeAway(kp.public_key.toUncompressedSec1());
         }
@@ -332,12 +332,48 @@ fn handshakes() !void {
         const start = sys.nanoTimestamp();
         for (0..n) |i| {
             seed[0] = @truncate(i);
+            std.mem.doNotOptimizeAway(try p256.keyShare(seed, &p_share));
+        }
+        reportOp("P-256 key pair + shared secret", n, sys.nanoTimestamp() - start);
+    }
+    {
+        const kp = try P256.KeyPair.generateDeterministic(seeds[96..128].*);
+        var sk = kp.secret_key.bytes;
+        const start = sys.nanoTimestamp();
+        for (0..n) |i| {
+            sk[31] = @truncate(i);
             const pk = try P256.PublicKey.fromSec1(&p_share);
-            const kp = try p256.keyPair(seed);
-            const point = try pk.p.mul(kp.secret_key, .big);
+            const point = try pk.p.mul(sk, .big);
             std.mem.doNotOptimizeAway(point.affineCoordinates().x.toBytes(.big));
         }
-        reportOp("P-256 key pair (table) + shared secret (ct)", n, sys.nanoTimestamp() - start);
+        reportOp("P-256 shared secret (std)", n, sys.nanoTimestamp() - start);
+    }
+    {
+        const kp = try P256.KeyPair.generateDeterministic(seeds[96..128].*);
+        var sk = kp.secret_key.bytes;
+        const start = sys.nanoTimestamp();
+        for (0..n) |i| {
+            sk[31] = @truncate(i);
+            std.mem.doNotOptimizeAway(try p256.sharedSecret(sk, &p_share));
+        }
+        reportOp("P-256 shared secret", n, sys.nanoTimestamp() - start);
+    }
+    {
+        const start = sys.nanoTimestamp();
+        for (0..n) |i| {
+            seed[0] = @truncate(i);
+            const kp = try P256.KeyPair.generateDeterministic(seed);
+            std.mem.doNotOptimizeAway(kp.public_key.toUncompressedSec1());
+        }
+        reportOp("P-256 key pair (std)", n, sys.nanoTimestamp() - start);
+    }
+    {
+        const start = sys.nanoTimestamp();
+        for (0..n) |i| {
+            seed[0] = @truncate(i);
+            std.mem.doNotOptimizeAway(try p256.keyPair(seed));
+        }
+        reportOp("P-256 key pair (table)", n, sys.nanoTimestamp() - start);
     }
     {
         const start = sys.nanoTimestamp();
