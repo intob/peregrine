@@ -357,10 +357,12 @@ pub fn send(fd: fd_t, to: *const Addr, data: []const u8, segment: ?u16, ecn: Ecn
             e = sendmsg(fd, to, rest[0..n], control[0..putControl(&control, to, gso, .not_ect)]);
             if (e == .SUCCESS) refused = true;
         }
-        if (e == .INVAL and gso != null) {
-            // A GSO segment larger than the route takes (udp_send_skb
-            // says EINVAL, not EMSGSIZE): one at a time, where EMSGSIZE
-            // tells (nothing has left: the first datagram is the largest).
+        if ((e == .INVAL or e == .MSGSIZE) and gso != null) {
+            // A GSO segment larger than the route takes (EMSGSIZE, or
+            // EINVAL from older kernels' udp_send_skb), DF or not: one at
+            // a time, which the kernel fragments without DF and refuses
+            // with EMSGSIZE with it (nothing has left: the first datagram
+            // is the largest).
             gso = null;
             seg = segment.?;
             continue;

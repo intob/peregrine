@@ -20,7 +20,8 @@
 #               1200 at once (curl's 1 MiB in well under the second two
 #               probe timeouts would take), then the search finds 1257-1272
 #   server-1300-off  the same with discovery off (mtu=0): no DF, so the
-#               kernel fragments the 1350-byte datagrams, which arrive
+#               kernel fragments the 1350-byte datagrams, which arrive (GSO
+#               runs, refused with EMSGSIZE whatever DF says, go one by one)
 #   drop-1300   1500, then the client's MTU drops to 1300 2 s into a 6 s
 #               h2load run (a black hole after validation): no request
 #               fails, and the rate after the drop is reported
