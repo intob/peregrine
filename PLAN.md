@@ -56,7 +56,7 @@ Design rules that apply to every layer:
 | M3. WebSockets over HTTP/1.1 | ✅ reworked; benchmarked against uWebSockets (even on small messages, 15-20% less CPU at 16-64 KiB); Autobahn 301/301 strict on every backend, plain and TLS; decoder fuzzed; permessage-deflate (Autobahn 517/517; with compression both ways 18-30% less CPU than uWebSockets' zlib on small messages, 4-7x less at 16-64 KiB) |
 | M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; tables for P-256 and X25519, RSA-PSS, session tickets, kTLS, 0-RTT and SNI certificates done; the rest of "faster handshakes" open |
 | M5. HTTP/2 | ✅ h2 over TLS (ALPN) and h2c on every backend, h2spec 146/146 over TLS, fuzzed, benchmarked; streamed request bodies on every protocol; WebSockets over h2 (RFC 8441); RFC 9218 priorities |
-| M6. HTTP/3 and QUIC | 🟡 HTTP/3 over QUIC v1 on every backend, interop-tested (aioquic, curl/ngtcp2, h2load), benchmarked against nginx and Caddy; WebSockets over h3 (RFC 9220); 0-RTT; pacing; migration, ECN, PMTUD open |
+| M6. HTTP/3 and QUIC | 🟡 HTTP/3 over QUIC v1 on every backend, interop-tested (aioquic, curl/ngtcp2, h2load), benchmarked against nginx and Caddy; WebSockets over h3 (RFC 9220); 0-RTT; pacing; ECN; migration, PMTUD open |
 | M7. Verification and benchmarking | 🟡 ongoing for each milestone |
 
 Source layout:
@@ -1442,10 +1442,57 @@ Done on the `m6-h3` branch, as I/O-free layers like the rest:
       allow smaller bursts. Measuring: netem's random loss in Docker drops
       whole GSO packets and tbf counts drops per skb, so compare completion
       times, not drop counts
-- [ ] ECN: ACK_ECN counts are parsed (`frame.zig`) but ignored; needs ECT(0)
-      on the socket (IP_TOS / IPV6_TCLASS), IP_RECVTOS / IPV6_RECVTCLASS with
-      per-datagram control buffers in `udp.RecvBatch` (recvmsg on macOS),
-      per-space counts in our ACKs, and validation (RFC 9000 §13.4.2)
+- [x] ECN (RFC 9000 §13.4, RFC 9002 §7.1; `Http3Options.ecn`, on by
+      default): IP_RECVTOS / IPV6_RECVTCLASS (IPv6 sockets: TCLASS only on
+      macOS, which refuses the IP option there) with a preallocated
+      control buffer per `udp.RecvBatch` slot (recvmmsg on Linux, recvmsg
+      on macOS); the codepoint per send as an IP_TOS / IPV6_TCLASS control
+      message beside UDP_SEGMENT (one per GSO send; the endpoint ends a
+      batch when `Conn.sendEcn` changes; EINVAL with the message and
+      success without it: that socket sends unmarked, per message kind).
+      `Conn.recv` takes each datagram's codepoint: ECT(0)/ECT(1)/CE
+      counted per packet number space (not duplicates), ACK_ECN once
+      nonzero, CE acknowledged at once. Our 1-RTT datagrams go ECT(0): ten
+      testing packets, unmarked until an ACK validates them, then all
+      (Appendix A.4). ACKs raising the largest acknowledged are validated
+      (§13.4.2.1: counts missing, falling, ECT(1), ECT(0)+CE beyond what
+      we marked, or short of the marked packets acknowledged, those of
+      ACKs that didn't raise the largest included); a failure stops
+      marking; testing packets all declared lost stop it until the counts
+      show they arrived (retested, at most 3 times). A new peer address
+      is a new path, tested afresh with only its own packets counted.
+      Also fixed (pre-existing): rebinding followed any datagram from a new
+      address, so a reordered one flipped the peer back; it now follows
+      only the newest non-probing packet (§9.3), and datagrams from port 0
+      are dropped. A valid CE increase is a congestion event, once per
+      recovery period, taken before the ACK grows the window (§A.7).
+      Tests: in memory (counts, CE once per round trip with no loss on
+      CUBIC and NewReno, eight validation failures, a path dropping marked
+      packets, reordered and non-raising ACKs, netem-style reordering,
+      retest after spurious loss of the testing packets, path changes with
+      the old path's packets lost or delivered, §9.3 rebinding, ECN off;
+      mutants of each rule caught), UDP codepoint round trips on IPv4,
+      IPv6 and dual stack through GSO (udp.zig's tests now run: root.zig
+      had left them out), end to end on every backend (IPv4, IPv6,
+      IPv4-mapped); `bench/scripts/h3-ecn.sh`: ngtcp2's osslclient (marks
+      and validates) keeps marking with our counts and we with its, CE
+      from netem both ways, and 120 connections under `delay 20ms reorder
+      30%` all keep ECN both ways on each backend (1 in 120 lost it before
+      the non-raising-ACK fix); curl reports codepoints (we keep marking),
+      h2load and aioquic don't (we stop after the testing burst); none
+      marks its own packets. h3spec 77/77 and h3-interop.sh on epoll and
+      io_uring; `fuzz: h3 connection` (varying codepoints, bleaching and
+      the client's reports) 15 min on a Pi. Three review rounds and an
+      adversarial verifier (who found the macOS IPv6 crash, the global
+      refusal latch and the stuck `unknown` state). No cost in the HTTP/3
+      benchmark (64 KiB 10×10 epoll 28.9-30.2 µs/req before, 29.5-30.6
+      after; Hello 1.63-1.66 both; h2load reports no counts, so this
+      measures the receive side, not marked GSO sends)
+- [ ] ECN, what's left: revalidation after a validation failure; a validated
+      path that later drops ECT packets outright isn't detected; losses still
+      grow the window before the congestion event (§A.7; only CE was
+      reordered); congestion control and RTT aren't reset on NAT rebinding;
+      `TosRefused` and the port-0 drop have no end-to-end test
 - [ ] PMTU discovery (DPLPMTUD); `max_datagram_size` is 1350. Needs DF
       (IP_MTU_DISCOVER=IP_PMTUDISC_PROBE, IPV6_DONTFRAG, IP_DONTFRAG on
       macOS), PING+PADDING probes flagged in `sent.zig` so a lost probe isn't
