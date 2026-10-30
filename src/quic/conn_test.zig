@@ -2613,3 +2613,78 @@ test "verify PMTU: random paths, limits, losses and changes: every download comp
         }
     }
 }
+
+test "verify PMTU: a stale probe acknowledged with the current one doesn't hide the current one's acknowledgment" {
+    // NAT rebinding while a probe is in flight: the search restarts and
+    // sends a new probe; the client gets both and acknowledges them in
+    // one ACK.
+    const h = try Harness.init(.{}, pmtuOn);
+    defer h.deinit();
+    var bursts: std.ArrayList(Burst) = .empty;
+    defer bursts.deinit(h.a);
+    try h.runDelayed(10_000, {}, searchDone, &bursts);
+    const s = h.server.?;
+    try testing.expectEqual(@as(u16, 1472), s.max_datagram);
+    var p1: [1500]u8 = undefined;
+    var p2: [1500]u8 = undefined;
+    s.onPathChange(h.now, h.ipv6, true);
+    const n1 = s.send(&p1, h.now);
+    try testing.expectEqual(@as(usize, 1472), n1);
+    h.now += 1000;
+    s.onPathChange(h.now, h.ipv6, true);
+    const n2 = s.send(&p2, h.now);
+    try testing.expectEqual(@as(usize, 1472), n2);
+    try h.toClient(p1[0..n1], .not_ect);
+    try h.toClient(p2[0..n2], .not_ect);
+    h.now += 1000;
+    var buf: [1500]u8 = undefined;
+    while (true) {
+        const n = try h.client.send(&buf);
+        if (n == 0) break;
+        try h.toServer(buf[0..n]);
+    }
+    // P2's acknowledgment counted: the size grew back, and nothing waits
+    // for a probe that was acknowledged (else the search would hang in
+    // `searching` for good: no probe, no raise timer).
+    const id = try h.client.openBidi();
+    try h.client.write(id, "big 300000", true);
+    try h.runDelayed(10_000, id, finishedStream, &bursts);
+    try expectBody(h, id, 300_000);
+    if (s.pmtu.probe_pn != null) std.debug.print("search stuck: probe_pn {d} acknowledged long ago, state {s}, max_datagram {d}\n", .{ s.pmtu.probe_pn.?, @tagName(s.pmtu.state), s.max_datagram });
+    try testing.expectEqual(@as(?u64, null), s.pmtu.probe_pn);
+    try testing.expectEqual(@as(u16, 1472), s.max_datagram);
+}
+
+test "verify PMTU: odd client max_udp_payload_size values, IPv4 and IPv6: no datagram over them, probes included" {
+    const limits = [_]u64{ 1200, 1201, 1349, 1350, 1351, 1451, 1452, 1453, 1471, 1472, 1473, 2048, 65527, 1 << 40 };
+    for ([_]bool{ false, true }) |v6| {
+        for ([_]usize{ std.math.maxInt(usize), 1300 }) |path_max| {
+            for (limits) |limit| {
+                const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20, .max_udp_payload_size = limit }, pmtuOn);
+                defer h.deinit();
+                h.ipv6 = v6;
+                h.path_max = path_max;
+                try runPath(h, .{ .delay = 10_000 }, {}, established);
+                const id = try h.client.openBidi();
+                try h.client.write(id, "big 400000", true);
+                runPath(h, .{ .delay = 10_000 }, id, finishedAndSearched) catch |err| {
+                    std.debug.print("limit {d} v6 {} path {d}: {s}\n", .{ limit, v6, path_max, @errorName(err) });
+                    return err;
+                };
+                try expectBody(h, id, 400_000);
+                const s = h.server.?;
+                const ceiling: u64 = if (v6) 1452 else 1472;
+                const want = @min(limit, ceiling, path_max);
+                if (h.largest_to_client > limit) {
+                    std.debug.print("limit {d} v6 {} path {d}: sent {d}\n", .{ limit, v6, path_max, h.largest_to_client });
+                    return error.OverPeerLimit;
+                }
+                try testing.expect(s.max_datagram <= want);
+                try testing.expect(want - s.max_datagram < pmtud.min_step);
+                try testing.expectEqual(@as(u64, s.max_datagram), s.cc.mss);
+                if (limit <= 1350 and path_max > 1350) try testing.expectEqual(@as(u32, 0), s.pmtu.probes_sent);
+                try testing.expectEqual(liveInFlight(s), s.cc.in_flight);
+            }
+        }
+    }
+}

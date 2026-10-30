@@ -1180,7 +1180,10 @@ pub const Conn = struct {
                         // A probe raises the size once losses are
                         // counted at the old one, below.
                         if (p.pmtu_probe) {
-                            probe_acked = .{ .pn = pn, .size = @intCast(p.size) };
+                            // The probe in flight only: a stale one (from
+                            // before a restart) acknowledged in the same
+                            // ACK must not take its place.
+                            if (self.pmtu.probe_pn == pn) probe_acked = .{ .pn = pn, .size = @intCast(p.size) };
                         } else if (pmtu) self.pmtu.onPacketAcked(p.size, p.time_sent);
                         sp.sent.remove(p);
                     }
