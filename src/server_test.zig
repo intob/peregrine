@@ -3682,7 +3682,7 @@ test "io_uring: the rest of the suite with the ring at 0, 1 and 2 buffers" {
                 testH2ClientGoaway,           testH2ShutdownStuck,        testH2OutputFreed, testTlsSni,
                 testTlsFinishedWithData,      testTlsPlaintextRejected,   testShutdown,      testTlsKeyUpdateDuringSend,
                 testH2TlsKeyUpdateDuringSend, testTlsBadRecordDuringSend, testTlsLingering,  testH2FirstWriteVariants,
-                testIdleAcrossTicks,
+                testIdleAcrossTicks,          testWsFramesBehindUpgrade,  testLingerTrickle,
             }) |f| try f(.io_uring);
             if (count != 0) {
                 inline for (.{
@@ -3946,6 +3946,60 @@ fn testH2FirstWriteVariants(backend: Backend) !void {
                 else => unreachable,
             }
         }
+    }
+}
+
+test "websocket: frames sent right behind the upgrade request, before the 101" {
+    try forEachBackend(testWsFramesBehindUpgrade);
+}
+
+/// The client doesn't wait for the 101: frames arrive (in separate
+/// writes) while the upgrade response is being written, and on io_uring
+/// may be received into the session's buffer that the WebSocket then
+/// takes over.
+fn testWsFramesBehindUpgrade(backend: Backend) !void {
+    const r = try Running.start(backend, .{});
+    defer r.stop();
+    for (0..10) |round| {
+        var c = try Client.connect(r.port);
+        defer c.close();
+        try c.send(Client.upgrade_request);
+        var frame: [64]u8 = undefined;
+        var msg: [16]u8 = undefined;
+        for (0..12) |k| {
+            try c.send(Client.wsFrame(&frame, true, .text, try std.fmt.bufPrint(&msg, "m{d}-{d}", .{ round, k })));
+            if (k % 4 == round % 4) sleepMs(1);
+        }
+        try c.readUpgrade();
+        for (0..12) |k| try c.expectWsText(try std.fmt.bufPrint(&msg, "m{d}-{d}", .{ round, k }));
+    }
+}
+
+test "lingering close ends in bounded time for a client that keeps sending" {
+    try forEachBackend(testLingerTrickle);
+}
+
+fn testLingerTrickle(backend: Backend) !void {
+    const r = try Running.start(backend, .{ .limits = .{ .max_body_size = 1024 }, .request_timeout_s = 1 });
+    defer r.stop();
+    var head: [4096]u8 = undefined;
+    for (0..2) |_| {
+        var c = try Client.connect(r.port);
+        defer c.close();
+        try c.send("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 4194304\r\n\r\n");
+        var chunk: [1024]u8 = @splat('u');
+        try c.send(&chunk);
+        const res = try c.readResponse(&head, null);
+        try testing.expectEqual(@as(u16, 413), res.status);
+        try testing.expectEqual(@as(usize, 0), try sys.read(c.fd, &c.buf));
+        // Trickling on: the server drains it for a while, then closes
+        // (writes fail), well before the client gives up.
+        var ms: u64 = 0;
+        while (ms < 6000) : (ms += 50) {
+            _ = sys.write(c.fd, &chunk) catch break;
+            sleepMs(50);
+        }
+        try testing.expect(ms < 4000);
     }
 }
 
