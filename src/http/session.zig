@@ -14,6 +14,7 @@ const exchange = @import("./exchange.zig");
 const ws_deflate = @import("../ws/deflate.zig");
 const ws_inflate = @import("../ws/inflate.zig");
 const H2Stream = @import("../h2/conn.zig").Stream;
+const sys = @import("../sys.zig");
 
 /// A bounded stack of things waiting for reuse: BufferPool's buffers, and
 /// tls/conn.zig's connection and handshake states.
@@ -67,20 +68,34 @@ pub fn Recycling(comptime Item: type) type {
         peak: usize = 0,
 
         pub fn acquire(self: *Self, allocator: std.mem.Allocator) !Item {
-            if (self.free.pop()) |b| {
-                self.take();
-                return b;
-            }
-            // Room for every one to come back.
+            if (self.reuse()) |b| return b;
+            try self.reserve(allocator);
+            errdefer self.unreserve();
+            return self.make(allocator);
+        }
+
+        /// One kept for reuse, if any, counted in use.
+        pub fn reuse(self: *Self) ?Item {
+            const b = self.free.pop() orelse return null;
+            self.take();
+            return b;
+        }
+
+        /// Counts one more in use, with room for it to come back, without
+        /// making it: for a caller that makes it outside a lock
+        /// (`WsQueues`), or gives up (`unreserve`).
+        pub fn reserve(self: *Self, allocator: std.mem.Allocator) !void {
             if (self.free.items.len < self.in_use + 1) {
                 const items = try allocator.alloc(Item, @max(8, 2 * (self.in_use + 1)));
                 @memcpy(items[0..self.free.len], self.free.slice());
                 allocator.free(self.free.items);
                 self.free.items = items;
             }
-            const b = try self.make(allocator);
             self.take();
-            return b;
+        }
+
+        pub fn unreserve(self: *Self) void {
+            self.in_use -= 1;
         }
 
         fn make(self: *const Self, allocator: std.mem.Allocator) !Item {
@@ -114,7 +129,16 @@ pub fn Recycling(comptime Item: type) type {
         }
 
         pub fn trim(self: *Self, allocator: std.mem.Allocator) void {
-            while (self.free.len > self.peak -| self.in_use) destroy(allocator, self.free.pop().?);
+            self.trimInto(allocator, null);
+        }
+
+        /// `trim`, with what goes appended to `doomed` (if there is room
+        /// for it), for the caller to free later, outside a lock.
+        pub fn trimInto(self: *Self, allocator: std.mem.Allocator, doomed: ?*std.ArrayList(Item)) void {
+            while (self.free.len > self.peak -| self.in_use) {
+                const x = self.free.pop().?;
+                if (doomed) |d| d.append(allocator, x) catch destroy(allocator, x) else destroy(allocator, x);
+            }
             self.peak = self.in_use;
             // The list shrinks with them: room for twice what is out now.
             const count = self.in_use + self.free.len;
@@ -142,6 +166,120 @@ pub fn Recycling(comptime Item: type) type {
         }
     };
 }
+
+/// WebSocket send queues (`ws.Conn`): buffers of power-of-two sizes,
+/// each size kept as a Recycler keeps its own (as many as were in use at
+/// once since the trim before), and buffers larger than the largest size
+/// allocated and freed at once. A connection holds one only while it has
+/// bytes queued, so an idle WebSocket holds none, whatever it sent before.
+/// `send` runs on any thread, so buffers are taken and given back under a
+/// mutex, held only to count them and to push or pop a free list
+/// (uncontended unless other threads send to this worker's connections as
+/// it writes): buffers are allocated and freed outside it. The worker
+/// trims on its tick.
+pub const WsQueues = struct {
+    const Self = @This();
+
+    pub const min_size = 256;
+    /// A message of the largest size received by default (16 MiB) fits,
+    /// with its header and room for more.
+    pub const max_size = 32 * 1024 * 1024;
+    const min_shift = std.math.log2_int(usize, min_size);
+    const count = std.math.log2_int(usize, max_size) - min_shift + 1;
+
+    mutex: sys.Mutex = .{},
+    sizes: [count]Recycler = blk: {
+        var r: [count]Recycler = undefined;
+        for (&r, 0..) |*x, i| x.* = .{ .size = min_size << i };
+        break :blk r;
+    },
+    /// Buffers larger than `max_size` in use.
+    oversized: usize = 0,
+    /// Buffers in use or kept, for the worker's loop (whether to keep
+    /// ticking) and for tests: changed under the mutex, read without it.
+    held: std.atomic.Value(usize) = .init(0),
+
+    /// The size of buffer that holds `n` bytes.
+    pub fn sizeFor(n: usize) usize {
+        if (n <= min_size) return min_size;
+        if (n > max_size) return n;
+        return std.math.ceilPowerOfTwoAssert(usize, n);
+    }
+
+    fn of(self: *Self, size: usize) *Recycler {
+        return &self.sizes[std.math.log2_int(usize, size) - min_shift];
+    }
+
+    /// A buffer of `sizeFor(n)` bytes. Any thread.
+    pub fn acquire(self: *Self, allocator: std.mem.Allocator, n: usize) ![]u8 {
+        const size = sizeFor(n);
+        if (size > max_size) {
+            const b = try allocator.alloc(u8, size);
+            self.mutex.lock();
+            self.oversized += 1;
+            _ = self.held.fetchAdd(1, .monotonic);
+            self.mutex.unlock();
+            return b;
+        }
+        const r = self.of(size);
+        self.mutex.lock();
+        if (r.reuse()) |b| {
+            self.mutex.unlock();
+            return b;
+        }
+        r.reserve(allocator) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        _ = self.held.fetchAdd(1, .monotonic);
+        self.mutex.unlock();
+        return allocator.alloc(u8, size) catch |err| {
+            self.mutex.lock();
+            r.unreserve();
+            _ = self.held.fetchSub(1, .monotonic);
+            self.mutex.unlock();
+            return err;
+        };
+    }
+
+    /// Gives back a buffer from `acquire`. Any thread.
+    pub fn release(self: *Self, allocator: std.mem.Allocator, buf: []u8) void {
+        if (buf.len > max_size) {
+            allocator.free(buf);
+            self.mutex.lock();
+            self.oversized -= 1;
+            _ = self.held.fetchSub(1, .monotonic);
+            self.mutex.unlock();
+            return;
+        }
+        self.mutex.lock();
+        self.of(buf.len).release(buf);
+        self.mutex.unlock();
+    }
+
+    /// Once a second, from the worker's tick (only the worker trims).
+    pub fn trim(self: *Self, allocator: std.mem.Allocator) void {
+        var doomed: std.ArrayList([]u8) = .empty;
+        defer doomed.deinit(allocator);
+        self.mutex.lock();
+        var n = self.oversized;
+        for (&self.sizes) |*r| {
+            r.trimInto(allocator, &doomed);
+            n += r.in_use + r.free.len;
+        }
+        self.held.store(n, .monotonic);
+        self.mutex.unlock();
+        for (doomed.items) |b| allocator.free(b);
+    }
+
+    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+        std.debug.assert(self.oversized == 0);
+        for (&self.sizes) |*r| {
+            std.debug.assert(r.in_use == 0);
+            r.deinit(allocator);
+        }
+    }
+};
 
 /// Fixed-size read buffers shared by a worker's connections. A connection
 /// only holds one while it has unprocessed bytes, so idle keep-alive
@@ -187,13 +325,16 @@ pub const BufferPool = struct {
     /// The largest block encoded since the last trim.
     h2_enc_peak: usize = 0,
     h2_dec: []u8 = &.{},
-    /// Output buffers and stream states held or kept, as of the last
-    /// trim, for other threads (tests) to read.
+    /// Output buffers, stream states and WebSocket queues held or kept,
+    /// as of the last trim, for other threads (tests) to read.
     output_held: std.atomic.Value(usize) = .init(0),
     /// The worker's WebSocket compressor and inflate tables, made on
     /// first use.
     ws_deflater: ?*ws_deflate.Deflater = null,
     ws_inflate_tables: ?*ws_inflate.Tables = null,
+    /// WebSocket send queues: the one pool here other threads use (see
+    /// `wsAcquire`).
+    ws_queues: WsQueues = .{},
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, buffer_size: usize, count: usize) !Self {
@@ -219,6 +360,17 @@ pub const BufferPool = struct {
         self.allocator.free(self.h2_dec);
         if (self.ws_deflater) |d| self.allocator.destroy(d);
         if (self.ws_inflate_tables) |t| self.allocator.destroy(t);
+        self.ws_queues.deinit(self.allocator);
+    }
+
+    /// A WebSocket send queue buffer of at least `n` bytes. Unlike the
+    /// rest of the pool, any thread may call this and `wsRelease`.
+    pub fn wsAcquire(self: *Self, n: usize) ![]u8 {
+        return self.ws_queues.acquire(self.allocator, n);
+    }
+
+    pub fn wsRelease(self: *Self, buf: []u8) void {
+        self.ws_queues.release(self.allocator, buf);
     }
 
     /// The worker's inflate tables (permessage-deflate), about 95 KiB.
@@ -249,8 +401,9 @@ pub const BufferPool = struct {
         if (buf.len != self.buffer_size or !self.free.push(buf)) self.allocator.free(buf);
     }
 
-    /// Once a second, from the worker's tick: output buffers and stream
-    /// states beyond what was in use recently are freed.
+    /// Once a second, from the worker's tick: output buffers, stream
+    /// states and WebSocket queues beyond what was in use recently are
+    /// freed.
     pub fn trim(self: *Self) void {
         self.out_small.trim(self.allocator);
         self.out_large.trim(self.allocator);
@@ -262,8 +415,10 @@ pub const BufferPool = struct {
             self.h2_enc.ensureTotalCapacityPrecise(self.allocator, h2_enc_kept) catch {};
         }
         self.h2_enc_peak = 0;
+        self.ws_queues.trim(self.allocator);
         const held = self.out_small.in_use + self.out_small.free.len + self.out_large.in_use + self.out_large.free.len +
-            self.h2_streams.in_use + self.h2_streams.free.len + self.h2_blocks.in_use + self.h2_blocks.free.len;
+            self.h2_streams.in_use + self.h2_streams.free.len + self.h2_blocks.in_use + self.h2_blocks.free.len +
+            self.ws_queues.held.load(.monotonic);
         self.output_held.store(held, .release);
     }
 
@@ -272,10 +427,11 @@ pub const BufferPool = struct {
         self.h2_enc_peak = @max(self.h2_enc_peak, self.h2_enc.items.len);
     }
 
-    /// Output buffers or stream states are held or kept: the worker must
-    /// keep ticking.
+    /// Output buffers, stream states or WebSocket queues are held or kept:
+    /// the worker must keep ticking.
     pub inline fn holdsOutput(self: *const Self) bool {
-        return self.out_small.holds() or self.out_large.holds() or self.h2_streams.holds() or self.h2_blocks.holds();
+        return self.out_small.holds() or self.out_large.holds() or self.h2_streams.holds() or self.h2_blocks.holds() or
+            self.ws_queues.held.load(.monotonic) > 0;
     }
 
     /// A buffer of at least `min` bytes: the smallest cached one that
@@ -860,7 +1016,6 @@ fn writeResponse(
 // Tests: drive the state machine without sockets.
 
 const testing = std.testing;
-const sys = @import("../sys.zig");
 const Mailbox = @import("../mailbox.zig").Mailbox;
 
 const EchoHandler = struct {
@@ -1275,6 +1430,125 @@ test "recycler: keeps as many as were in use at once recently, frees the rest on
     // Nothing is left, the list included.
     try testing.expectEqual(counting.allocations, counting.deallocations);
     try testing.expect(!r.holds());
+}
+
+test "ws queues: power-of-two sizes kept as recently used, larger ones freed at once, from any thread" {
+    try testing.expectEqual(@as(usize, 256), WsQueues.sizeFor(0));
+    try testing.expectEqual(@as(usize, 256), WsQueues.sizeFor(256));
+    try testing.expectEqual(@as(usize, 512), WsQueues.sizeFor(257));
+    try testing.expectEqual(@as(usize, 128 * 1024), WsQueues.sizeFor(64 * 1024 + 4));
+    try testing.expectEqual(@as(usize, WsQueues.max_size), WsQueues.sizeFor(WsQueues.max_size));
+    try testing.expectEqual(@as(usize, WsQueues.max_size + 1), WsQueues.sizeFor(WsQueues.max_size + 1));
+
+    var counting = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const a = counting.allocator();
+    var q: WsQueues = .{};
+    defer q.deinit(a);
+    // Bursts of one size, then the next, between trims: allocated once.
+    var held: [10][]u8 = undefined;
+    var warm: usize = 0;
+    for (0..4) |round| {
+        if (round == 1) warm = counting.allocations;
+        for (&held, 0..) |*b, i| b.* = try q.acquire(a, @as(usize, 100) << @intCast(i));
+        for (held, 0..) |b, i| try testing.expectEqual(WsQueues.sizeFor(@as(usize, 100) << @intCast(i)), b.len);
+        try testing.expectEqual(@as(usize, 10), q.held.load(.monotonic));
+        for (held) |b| q.release(a, b);
+        q.trim(a);
+    }
+    try testing.expectEqual(warm, counting.allocations);
+    // Beyond the largest size: allocated and freed each time, counted
+    // while held.
+    const huge = try q.acquire(a, WsQueues.max_size + 1);
+    try testing.expectEqual(@as(usize, 11), q.held.load(.monotonic));
+    q.release(a, huge);
+    try testing.expectEqual(@as(usize, 10), q.held.load(.monotonic));
+    // A quiet tick, then another: nothing kept, everything freed.
+    q.trim(a);
+    q.trim(a);
+    try testing.expectEqual(@as(usize, 0), q.held.load(.monotonic));
+    try testing.expectEqual(counting.allocated_bytes, counting.freed_bytes);
+
+    // Threads taking and giving back while the owner trims: no buffer is
+    // handed to two at once, and the books balance (testing.allocator is
+    // thread-safe; the counting one isn't).
+    const Taker = struct {
+        fn run(qq: *WsQueues, seed: u64, done: *std.atomic.Value(usize)) void {
+            defer _ = done.fetchAdd(1, .release);
+            var prng = std.Random.DefaultPrng.init(seed);
+            const rand = prng.random();
+            var mine: [4][]u8 = @splat(&.{});
+            for (0..3000) |_| {
+                const k = rand.uintLessThan(usize, mine.len);
+                if (mine[k].len > 0) {
+                    for (mine[k][0..8]) |x| std.debug.assert(x == @as(u8, @truncate(seed)));
+                    qq.release(testing.allocator, mine[k]);
+                    mine[k] = &.{};
+                } else {
+                    mine[k] = qq.acquire(testing.allocator, rand.uintLessThan(usize, 20_000)) catch unreachable;
+                    @memset(mine[k][0..8], @truncate(seed));
+                }
+            }
+            for (mine) |b| if (b.len > 0) qq.release(testing.allocator, b);
+        }
+    };
+    var shared: WsQueues = .{};
+    defer shared.deinit(testing.allocator);
+    var done: std.atomic.Value(usize) = .init(0);
+    var ts: [4]std.Thread = undefined;
+    for (&ts, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Taker.run, .{ &shared, i + 1, &done });
+    while (done.load(.acquire) < ts.len) {
+        shared.trim(testing.allocator);
+        std.Thread.yield() catch {};
+    }
+    for (ts) |t| t.join();
+    for (shared.sizes) |r| try testing.expectEqual(@as(usize, 0), r.in_use);
+    shared.trim(testing.allocator);
+    shared.trim(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), shared.held.load(.monotonic));
+}
+
+test "ws queues: buffers are allocated and freed outside the mutex" {
+    // Other threads' sends wait for it: no mmap or munmap while it is
+    // held. (The free lists, aligned for slices, may grow under it.)
+    const Checked = struct {
+        q: WsQueues = .{},
+        buffers: usize = 0,
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+        }
+
+        fn check(self: *@This(), alignment: std.mem.Alignment) void {
+            if (alignment != .@"1") return;
+            self.buffers += 1;
+            std.debug.assert(self.q.mutex.tryLock());
+            self.q.mutex.unlock();
+        }
+
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.check(alignment);
+            return testing.allocator.rawAlloc(len, alignment, ra);
+        }
+
+        fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.check(alignment);
+            testing.allocator.rawFree(memory, alignment, ra);
+        }
+    };
+    var c: Checked = .{};
+    const a = c.allocator();
+    defer c.q.deinit(a);
+    // Size classes from 256 B to the largest, and one beyond.
+    var held: [7][]u8 = undefined;
+    for (held[0..6], 0..) |*b, i| b.* = try c.q.acquire(a, @as(usize, 300) << @intCast(3 * i + 1));
+    held[6] = try c.q.acquire(a, WsQueues.max_size + 1);
+    for (held) |b| c.q.release(a, b);
+    c.q.trim(a);
+    c.q.trim(a);
+    try testing.expectEqual(@as(usize, 0), c.q.held.load(.monotonic));
+    try testing.expectEqual(@as(usize, 14), c.buffers);
 }
 
 test "recycling objects: kept with what they own, freed with it" {

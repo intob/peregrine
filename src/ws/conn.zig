@@ -16,6 +16,7 @@ const protocol = @import("./protocol.zig");
 const deflate = @import("./deflate.zig");
 const inflate = @import("./inflate.zig");
 const BufferPool = @import("../http/session.zig").BufferPool;
+const WsQueues = @import("../http/session.zig").WsQueues;
 
 pub const Frame = protocol.Frame;
 pub const Opcode = protocol.Opcode;
@@ -46,8 +47,22 @@ pub const SendError = error{
 pub const Mailbox = @import("../mailbox.zig").Mailbox;
 const MailboxEntry = @import("../mailbox.zig").Entry;
 
+/// Queued frames in a buffer from the worker's pool (`BufferPool.wsAcquire`),
+/// held only while there are some: `buf` is empty when `len` is 0.
+const Queue = struct {
+    buf: []u8 = &.{},
+    len: usize = 0,
+
+    fn bytes(q: Queue) []u8 {
+        return q.buf[0..q.len];
+    }
+};
+
 pub const Conn = struct {
     const Self = @This();
+
+    /// A queue's buffer has room for one more frame up to this size.
+    const room_for_another = 64 * 1024;
 
     /// The socket. Only for identification (logging); never read or write
     /// it directly. Every WebSocket on one HTTP/2 connection shares its
@@ -57,6 +72,9 @@ pub const Conn = struct {
     user: ?*anyopaque = null,
 
     allocator: std.mem.Allocator,
+    /// The owning worker's: input buffers, and the send queues' (the
+    /// part any thread may use, `wsAcquire`).
+    pool: *BufferPool,
     opts: Options,
     decoder: protocol.Decoder,
     mailbox: *Mailbox,
@@ -67,7 +85,7 @@ pub const Conn = struct {
 
     mutex: sys.Mutex = .{},
     /// Frames queued by send() from any thread. Guarded by `mutex`.
-    shared: std.ArrayList(u8) = .empty,
+    shared: Queue = .{},
     /// Guarded by `mutex`: true while `slot` sits in the mailbox.
     posted: bool = false,
     /// Guarded by `mutex`: a close frame has been queued; nothing more may
@@ -75,9 +93,14 @@ pub const Conn = struct {
     close_sent: bool = false,
     /// Guarded by `mutex`: bytes in `shared` plus unsent bytes on the wire.
     queued: usize = 0,
+    /// Guarded by `mutex`: how many bytes `shared` held when the wire last
+    /// took it, so that the next batch's buffer is taken large enough at
+    /// once instead of growing (and copying) through the sizes, which a
+    /// buffer kept for the connection's life did once.
+    batch_hint: usize = 0,
 
     /// Bytes being written. Owned by the worker.
-    wire: std.ArrayList(u8) = .empty,
+    wire: Queue = .{},
     wire_pos: usize = 0,
     /// permessage-deflate, as negotiated. Set before the handler sees the
     /// connection, then only read.
@@ -85,9 +108,6 @@ pub const Conn = struct {
     /// Guarded by `mutex`: `shared` holds messages to compress (marked
     /// with RSV1 and still uncompressed).
     to_compress: bool = false,
-    /// Worker only: where compressed frames are assembled before they
-    /// replace `wire`.
-    deflated: std.ArrayList(u8) = .empty,
     /// Worker only: the peer sent a close frame.
     close_received: bool = false,
     /// Worker only: the connection was failed (protocol error, limit).
@@ -98,6 +118,7 @@ pub const Conn = struct {
         self.* = .{
             .fd = fd,
             .allocator = allocator,
+            .pool = pool,
             .opts = opts,
             .decoder = protocol.Decoder.init(pool, opts.max_message_size),
             .mailbox = mailbox,
@@ -108,9 +129,8 @@ pub const Conn = struct {
 
     pub fn destroy(self: *Self) void {
         self.decoder.deinit();
-        self.shared.deinit(self.allocator);
-        self.wire.deinit(self.allocator);
-        self.deflated.deinit(self.allocator);
+        if (self.shared.buf.len > 0) self.pool.wsRelease(self.shared.buf);
+        if (self.wire.buf.len > 0) self.pool.wsRelease(self.wire.buf);
         self.allocator.destroy(self);
     }
 
@@ -179,9 +199,22 @@ pub const Conn = struct {
             if (opcode != .close and self.queued > 0 and self.queued + total > self.opts.max_send_queue_bytes) {
                 return error.SendQueueFull;
             }
-            try self.shared.ensureUnusedCapacity(self.allocator, total);
-            self.shared.appendSliceAssumeCapacity(h);
-            self.shared.appendSliceAssumeCapacity(payload);
+            const q = &self.shared;
+            if (q.buf.len - q.len < total) {
+                // A larger buffer (the first: an empty queue holds none),
+                // for what the last batch held if that is more, and a
+                // small frame's room for another like it (two of 2^k bytes
+                // and their headers don't fit in 2^(k+1)).
+                const want = q.len + total;
+                const room = @max(want, self.batch_hint) + if (total <= room_for_another) total else 0;
+                const buf = try self.pool.wsAcquire(room);
+                @memcpy(buf[0..q.len], q.bytes());
+                if (q.buf.len > 0) self.pool.wsRelease(q.buf);
+                q.buf = buf;
+            }
+            @memcpy(q.buf[q.len..][0..h.len], h);
+            @memcpy(q.buf[q.len + h.len ..][0..payload.len], payload);
+            q.len += total;
             self.queued += total;
             if (compress) self.to_compress = true;
             if (opcode == .close) self.close_sent = true;
@@ -245,32 +278,39 @@ pub const Conn = struct {
         self.queueFrame(.close, &payload) catch {};
     }
 
-    /// Bytes to write next, refilled from the shared queue when the wire
-    /// is empty. Empty means nothing is pending.
+    /// Bytes to write next, taken from the shared queue when the wire is
+    /// empty (its buffer and all). Empty means nothing is pending.
     pub fn wireBytes(self: *Self) []const u8 {
-        if (self.wire_pos == self.wire.items.len) {
-            self.wire.clearRetainingCapacity();
-            self.wire_pos = 0;
+        if (self.wire_pos == self.wire.len) {
+            self.releaseWire();
             self.mutex.lock();
-            std.mem.swap(std.ArrayList(u8), &self.shared, &self.wire);
+            if (self.shared.len > 0) self.batch_hint = self.shared.len;
+            self.wire = self.shared;
+            self.shared = .{};
             const compress = self.to_compress;
             self.to_compress = false;
             self.mutex.unlock();
             if (compress) self.compressWire();
         }
-        return self.wire.items[self.wire_pos..];
+        return self.wire.bytes()[self.wire_pos..];
     }
 
-    /// Compresses the messages marked in `wire`. One that doesn't shrink,
-    /// or meets a failure, goes out as it is (RSV1 cleared).
+    /// The wire is written: its buffer goes back to the pool.
+    fn releaseWire(self: *Self) void {
+        if (self.wire.buf.len > 0) self.pool.wsRelease(self.wire.buf);
+        self.wire = .{};
+        self.wire_pos = 0;
+    }
+
+    /// Compresses the messages marked in `wire` into a buffer that
+    /// replaces it. One that doesn't shrink, or meets a failure, goes out
+    /// as it is (RSV1 cleared).
     fn compressWire(self: *Self) void {
-        const src = self.wire.items;
-        const out = &self.deflated;
-        out.clearRetainingCapacity();
+        const src = self.wire.bytes();
         // Frames only shrink, and a frame is compressed after a gap the size
         // of the longest header.
-        out.ensureTotalCapacity(self.allocator, src.len + 10) catch return self.uncompressWire();
-        const d = self.decoder.pool.wsDeflater() catch null;
+        var out: Queue = .{ .buf = self.pool.wsAcquire(src.len + 10) catch return self.uncompressWire() };
+        const d = self.pool.wsDeflater() catch null;
         var i: usize = 0;
         while (i < src.len) {
             const b1 = src[i + 1] & 0x7f;
@@ -288,7 +328,7 @@ pub const Conn = struct {
             i += frame.len;
             if (frame[0] & 0x40 != 0) {
                 if (d) |deflater| {
-                    const room = out.unusedCapacitySlice();
+                    const room = out.buf[out.len..];
                     // Only output smaller than the payload is kept.
                     if (deflater.compress(frame[hl..], room[10..][0 .. n - 1], self.deflate.server_window_bits)) |c| {
                         var hdr: [10]u8 = undefined;
@@ -296,24 +336,26 @@ pub const Conn = struct {
                         @memcpy(room[0..h.len], h);
                         room[0] |= 0x40;
                         std.mem.copyForwards(u8, room[h.len..][0..c], room[10..][0..c]);
-                        out.items.len += h.len + c;
+                        out.len += h.len + c;
                         continue;
                     }
                 }
             }
-            out.appendSliceAssumeCapacity(frame);
-            out.items[out.items.len - frame.len] &= ~@as(u8, 0x40);
+            @memcpy(out.buf[out.len..][0..frame.len], frame);
+            out.buf[out.len] &= ~@as(u8, 0x40);
+            out.len += frame.len;
         }
         self.mutex.lock();
-        self.queued = self.queued - src.len + out.items.len;
+        self.queued = self.queued - src.len + out.len;
         self.mutex.unlock();
-        std.mem.swap(std.ArrayList(u8), &self.wire, &self.deflated);
+        self.pool.wsRelease(self.wire.buf);
+        self.wire = out;
     }
 
     /// Sends the marked messages uncompressed.
     fn uncompressWire(self: *Self) void {
         var i: usize = 0;
-        const w = self.wire.items;
+        const w = self.wire.bytes();
         while (i < w.len) {
             w[i] &= ~@as(u8, 0x40);
             const b1 = w[i + 1] & 0x7f;
@@ -331,16 +373,20 @@ pub const Conn = struct {
         }
     }
 
+    /// `n` bytes of `wireBytes` are written (and no longer read: an
+    /// asynchronous write has completed). A wire written to the end gives
+    /// its buffer back at once.
     pub fn advance(self: *Self, n: usize) void {
         self.wire_pos += n;
         self.mutex.lock();
         self.queued -= n;
         self.mutex.unlock();
+        if (self.wire_pos == self.wire.len) self.releaseWire();
     }
 
     /// Unsent bytes already taken onto the wire (a stalled write).
     pub inline fn hasWire(self: *const Self) bool {
-        return self.wire_pos < self.wire.items.len;
+        return self.wire_pos < self.wire.len;
     }
 
     /// Whether anything is queued, on the wire or in the shared queue.
@@ -348,7 +394,7 @@ pub const Conn = struct {
         if (self.hasWire()) return true;
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.shared.items.len > 0;
+        return self.shared.len > 0;
     }
 
     /// Called by the worker when it drains its mailbox.
@@ -404,9 +450,14 @@ const Harness = struct {
     action: Conn.Action = .ok,
 
     fn init(opts: Options) !*Harness {
+        return initWith(opts, testing.allocator);
+    }
+
+    /// With the pool's (and so the send queues') memory from `pool_allocator`.
+    fn initWith(opts: Options, pool_allocator: std.mem.Allocator) !*Harness {
         const h = try testing.allocator.create(Harness);
         h.* = .{
-            .pool = try BufferPool.init(testing.allocator, 1024, 2),
+            .pool = try BufferPool.init(pool_allocator, 1024, 2),
             .mailbox = try Mailbox.init(testing.allocator, 4, try sys.Waker.init()),
             .conn = undefined,
         };
@@ -649,4 +700,351 @@ test "a send from another thread wakes the owning worker" {
     try testing.expectEqual(@as(usize, 1), h.drainMailbox());
     try h.flush();
     try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 14 } ++ "from elsewhere".*, h.out.items);
+}
+
+// -- Send queues: from the worker's pool, held only while they hold bytes ---
+
+/// One frame the server wrote, taken from the front of `rest`.
+const OutFrame = struct { op: u4, rsv1: bool, payload: []const u8 };
+
+fn takeFrame(rest: *[]const u8) !OutFrame {
+    const r = rest.*;
+    if (r.len < 2) return error.Truncated;
+    if (r[0] & 0x80 == 0 or r[1] & 0x80 != 0) return error.BadFrame;
+    const b1 = r[1] & 0x7f;
+    const hl: usize = switch (b1) {
+        126 => 4,
+        127 => 10,
+        else => 2,
+    };
+    if (r.len < hl) return error.Truncated;
+    const n: usize = switch (b1) {
+        126 => std.mem.readInt(u16, r[2..4], .big),
+        127 => @intCast(std.mem.readInt(u64, r[2..10], .big)),
+        else => b1,
+    };
+    if (r.len < hl + n) return error.Truncated;
+    rest.* = r[hl + n ..];
+    return .{ .op = @truncate(r[0]), .rsv1 = r[0] & 0x40 != 0, .payload = r[hl..][0..n] };
+}
+
+/// The message a data frame carries, inflated into `got` if compressed.
+fn messageOf(pool: *BufferPool, f: OutFrame, got: *inflate.Out) ![]const u8 {
+    if (!f.rsv1) return f.payload;
+    const with_trailer = try std.mem.concat(testing.allocator, u8, &.{ f.payload, &deflate.trailer });
+    defer testing.allocator.free(with_trailer);
+    got.len = 0;
+    _ = try inflate.inflate(try pool.wsInflateTables(), null, with_trailer, got);
+    return got.buf[0..got.len];
+}
+
+/// Message `seq` of sender `t`, made from the two alone: mostly small, now
+/// and then a few KiB, one in 64 larger than 64 KiB (the queue's buffer
+/// grows under the others' appends); compressible.
+fn testMsgLen(t: usize, seq: usize) usize {
+    var x: u64 = @as(u64, t) << 32 | seq;
+    x = (x +% 0x9E3779B97F4A7C15) *% 0xBF58476D1CE4E5B9;
+    x ^= x >> 31;
+    return 5 + switch (x % 64) {
+        0 => 70_000 + x % 1000,
+        1...8 => 1000 + x % 4000,
+        else => x % 300,
+    };
+}
+
+fn testMsgFill(buf: []u8, t: usize, seq: usize) void {
+    buf[0] = @intCast(t);
+    std.mem.writeInt(u32, buf[1..5], @intCast(seq), .little);
+    for (buf[5..], 0..) |*b, i| b.* = 'a' + @as(u8, @intCast((i + seq + t) % 16));
+}
+
+/// Threads sending numbered messages until `count` or until the
+/// connection is closed, retrying while the queue is full.
+const Senders = struct {
+    conn: *Conn,
+    count: usize,
+    done: std.atomic.Value(usize) = .init(0),
+    /// How many each had accepted.
+    sent: [8]usize = @splat(0),
+
+    fn run(self: *Senders, t: usize) void {
+        const buf = std.heap.page_allocator.alloc(u8, 72 * 1024) catch unreachable;
+        defer std.heap.page_allocator.free(buf);
+        var seq: usize = 0;
+        while (seq < self.count) {
+            const msg = buf[0..testMsgLen(t, seq)];
+            testMsgFill(msg, t, seq);
+            self.conn.send(msg, true) catch |err| switch (err) {
+                error.SendQueueFull => {
+                    std.Thread.yield() catch {};
+                    continue;
+                },
+                error.Closed => break,
+                else => unreachable,
+            };
+            seq += 1;
+        }
+        self.sent[t] = seq;
+        _ = self.done.fetchAdd(1, .release);
+    }
+};
+
+/// The worker's side while `threads` senders run: drains the mailbox and
+/// writes what is queued in pieces of random size until every sender is
+/// done and nothing is left; closes once `close_after` bytes are out.
+fn workUntilDone(h: *Harness, s: *Senders, threads: usize, rand: std.Random, close_after: ?usize) !void {
+    while (true) {
+        const finished = s.done.load(.acquire) == threads;
+        _ = h.drainMailbox();
+        h.conn.clearPosted();
+        if (close_after) |n| {
+            if (h.out.items.len >= n and !h.conn.closeSent()) try h.conn.close(1000, "bye");
+        }
+        const bytes = h.conn.wireBytes();
+        if (bytes.len == 0) {
+            if (finished) return;
+            std.Thread.yield() catch {};
+            continue;
+        }
+        const k = 1 + rand.uintLessThan(usize, @min(bytes.len, 20_000));
+        try h.out.appendSlice(testing.allocator, bytes[0..k]);
+        h.conn.advance(k);
+    }
+}
+
+/// Every message accepted went out once, whole, in each sender's order;
+/// then the close frame if one was sent, and nothing after it.
+fn expectSent(h: *Harness, threads: usize, sent: []const usize, close: bool) !void {
+    var next: [8]usize = @splat(0);
+    const want = try testing.allocator.alloc(u8, 72 * 1024);
+    defer testing.allocator.free(want);
+    var got: inflate.Out = .{ .buf = &.{}, .max = 1 << 20, .pool = &h.pool };
+    defer if (got.buf.len > 0) h.pool.releaseLarge(got.buf);
+    var rest: []const u8 = h.out.items;
+    var closed = false;
+    var compressed: usize = 0;
+    while (rest.len > 0) {
+        const f = try takeFrame(&rest);
+        try testing.expect(!closed);
+        if (f.op == 8) {
+            try testing.expectEqualSlices(u8, "\x03\xe8bye", f.payload);
+            closed = true;
+            continue;
+        }
+        try testing.expectEqual(@as(u4, 2), f.op);
+        if (f.rsv1) compressed += 1;
+        const m = try messageOf(&h.pool, f, &got);
+        try testing.expect(m.len >= 5 and m[0] < threads);
+        const t = m[0];
+        const seq = std.mem.readInt(u32, m[1..5], .little);
+        try testing.expectEqual(next[t], seq);
+        const w = want[0..testMsgLen(t, seq)];
+        testMsgFill(w, t, seq);
+        try testing.expectEqualSlices(u8, w, m);
+        next[t] += 1;
+    }
+    try testing.expectEqualSlices(usize, sent[0..threads], next[0..threads]);
+    try testing.expectEqual(close, closed);
+    try testing.expectEqual(h.conn.deflate.enabled, compressed > 0);
+    try testing.expectEqual(@as(usize, 0), h.conn.queued);
+}
+
+/// The connection holds no queue buffer; two quiet ticks later the pool
+/// keeps none either.
+fn expectHoldsNothing(h: *Harness) !void {
+    try testing.expectEqual(@as(usize, 0), h.conn.shared.buf.len + h.conn.wire.buf.len);
+    for (h.pool.ws_queues.sizes) |r| try testing.expectEqual(@as(usize, 0), r.in_use);
+    h.pool.trim();
+    h.pool.trim();
+    try testing.expectEqual(@as(usize, 0), h.pool.ws_queues.held.load(.monotonic));
+}
+
+test "send queues: many threads at once while the worker writes in pieces: every message once, in order" {
+    for ([_]bool{ false, true }) |compress| {
+        const h = try Harness.init(.{ .max_send_queue_bytes = 32 * 1024, .deflate = .{ .min_size = 32 } });
+        defer h.deinit();
+        if (compress) h.conn.enableDeflate(.{ .enabled = true });
+        const threads = 6;
+        var s: Senders = .{ .conn = h.conn, .count = 1500 };
+        var ts: [threads]std.Thread = undefined;
+        for (&ts, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Senders.run, .{ &s, i });
+        var prng = std.Random.DefaultPrng.init(@intFromBool(compress));
+        const res = workUntilDone(h, &s, threads, prng.random(), null);
+        for (ts) |t| t.join();
+        try res;
+        try expectSent(h, threads, &s.sent, false);
+        try testing.expectEqual(@as(usize, 1500), s.sent[threads - 1]);
+        try expectHoldsNothing(h);
+    }
+}
+
+test "send queues: closing while other threads send: what was accepted goes out whole, then the close frame, then nothing" {
+    for ([_]bool{ false, true }) |compress| {
+        const h = try Harness.init(.{ .max_send_queue_bytes = 32 * 1024, .deflate = .{ .min_size = 32 } });
+        defer h.deinit();
+        if (compress) h.conn.enableDeflate(.{ .enabled = true });
+        const threads = 4;
+        var s: Senders = .{ .conn = h.conn, .count = std.math.maxInt(usize) };
+        var ts: [threads]std.Thread = undefined;
+        for (&ts, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Senders.run, .{ &s, i });
+        var prng = std.Random.DefaultPrng.init(3);
+        const res = workUntilDone(h, &s, threads, prng.random(), 300 * 1024);
+        for (ts) |t| t.join();
+        try res;
+        try expectSent(h, threads, &s.sent, true);
+        try testing.expectError(error.Closed, h.conn.send("late", false));
+        try expectHoldsNothing(h);
+    }
+}
+
+/// Bytes `counting` has handed out and not had back.
+fn heldBy(counting: *const std.testing.FailingAllocator) usize {
+    return counting.allocated_bytes - counting.freed_bytes;
+}
+
+test "send queues: an idle connection holds no queue buffer whatever it sent; once warm nothing is allocated" {
+    // `shared` and `wire` kept their capacity for the connection's life
+    // (one that once sent 1 MiB twice held 2 MiB), `deflated` too.
+    const big = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i *% 7 % 251);
+    for ([_]bool{ false, true }) |compress| {
+        var counting = std.testing.FailingAllocator.init(testing.allocator, .{});
+        const h = try Harness.initWith(.{ .deflate = .{} }, counting.allocator());
+        defer h.deinit();
+        if (compress) {
+            h.conn.enableDeflate(.{ .enabled = true });
+            _ = try h.pool.wsDeflater();
+        }
+        const base = heldBy(&counting);
+        var warm: usize = 0;
+        for (0..6) |round| {
+            if (round == 1) warm = counting.allocations;
+            try h.conn.send(big, true);
+            for (0..10) |_| try h.conn.send("small", false);
+            try h.flush();
+            // Written: no buffer held.
+            try testing.expectEqual(@as(usize, 0), h.conn.shared.buf.len + h.conn.wire.buf.len);
+            // The wire partly written while more is queued behind it.
+            try h.conn.send(big, true);
+            const w = h.conn.wireBytes();
+            try h.out.appendSlice(testing.allocator, w[0 .. w.len - 1]);
+            h.conn.advance(w.len - 1);
+            try testing.expect(h.conn.wire.buf.len > 0);
+            try h.conn.send(big, true);
+            try h.flush();
+            try testing.expectEqual(@as(usize, 0), h.conn.shared.buf.len + h.conn.wire.buf.len);
+            try testing.expectEqual(@as(usize, 0), h.conn.queued);
+            var rest: []const u8 = h.out.items;
+            var frames: usize = 0;
+            while (rest.len > 0) : (frames += 1) {
+                const f = try takeFrame(&rest);
+                try testing.expectEqual(compress and f.op == 2, f.rsv1);
+            }
+            try testing.expectEqual(@as(usize, 13), frames);
+            h.out.clearRetainingCapacity();
+        }
+        // Bursts after the first allocate nothing: the pool kept what they use.
+        try testing.expectEqual(warm, counting.allocations);
+        try testing.expect(h.pool.ws_queues.held.load(.monotonic) > 0);
+        // Two ticks without sends: the pool gives it all back.
+        h.pool.trim();
+        h.pool.trim();
+        try testing.expectEqual(@as(usize, 0), h.pool.ws_queues.held.load(.monotonic));
+        try testing.expectEqual(base, heldBy(&counting));
+    }
+}
+
+test "send queues: after the first batch, a batch like it fits the buffer its first message takes" {
+    // Growing through the sizes copies what is queued each time: four
+    // 16 KiB messages and their headers overflowed a 64 KiB buffer.
+    const msg = try testing.allocator.alloc(u8, 300 * 1024);
+    defer testing.allocator.free(msg);
+    @memset(msg, 'q');
+    for ([_]usize{ 20, 1000, 16 * 1024, 64 * 1024, 300 * 1024 }) |size| {
+        for ([_]usize{ 1, 2, 4, 7 }) |batch| {
+            const h = try Harness.init(.{ .max_send_queue_bytes = 16 << 20 });
+            defer h.deinit();
+            for (0..3) |round| {
+                var first: []u8 = &.{};
+                for (0..batch) |k| {
+                    try h.conn.send(msg[0..size], true);
+                    if (k == 0) first = h.conn.shared.buf;
+                    if (round > 0) try testing.expectEqual(first.ptr, h.conn.shared.buf.ptr);
+                }
+                try h.flush();
+            }
+        }
+    }
+}
+
+test "send queues: a connection destroyed with output queued and half written gives its buffers back" {
+    var counting = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const h = try Harness.initWith(.{}, counting.allocator());
+    defer h.deinit();
+    const base = heldBy(&counting);
+    const big: [100_000]u8 = @splat('b');
+    try h.conn.send(&big, true);
+    h.conn.advance(h.conn.wireBytes().len / 2);
+    try h.conn.send(&big, true);
+    try testing.expect(h.conn.shared.buf.len > 0 and h.conn.wire.buf.len > 0);
+    h.conn.destroy();
+    for (h.pool.ws_queues.sizes) |r| try testing.expectEqual(@as(usize, 0), r.in_use);
+    h.pool.trim();
+    h.pool.trim();
+    try testing.expectEqual(base, heldBy(&counting));
+    h.conn = try Conn.create(testing.allocator, &h.pool, 7, .{}, &h.mailbox, .{ .kind = .ws, .slot = 0, .gen = 1 });
+}
+
+test "send queues: an allocation failing at any point fails one send whole; what was queued goes out intact" {
+    // Messages of every header length, compressed or not, sent while the
+    // wire is half written (the queue grows, from small to beyond 64 KiB).
+    const lens = [_]usize{ 100, 3000, 5, 70_000, 200, 300_000, 40, 20 };
+    var msgs: [lens.len][]u8 = undefined;
+    for (&msgs, lens, 0..) |*m, n, k| {
+        m.* = try testing.allocator.alloc(u8, n);
+        for (m.*, 0..) |*b, i| b.* = @truncate((i + k) % 13 + 'a');
+    }
+    defer for (msgs) |m| testing.allocator.free(m);
+    var fail_at: usize = 0;
+    while (true) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+        const h = try Harness.initWith(.{ .deflate = .{ .min_size = 32 } }, failing.allocator());
+        defer h.deinit();
+        h.conn.enableDeflate(.{ .enabled = true });
+        failing.fail_index = failing.alloc_index + fail_at;
+        var accepted: [lens.len]bool = @splat(false);
+        for (msgs, 0..) |m, k| {
+            if (h.conn.send(m, true)) {
+                accepted[k] = true;
+            } else |err| try testing.expectEqual(error.OutOfMemory, err);
+            switch (k) {
+                // The wire taken (compressed, unless that fails) and
+                // half written; the queue fills behind it.
+                2 => {
+                    const w = h.conn.wireBytes();
+                    try h.out.appendSlice(testing.allocator, w[0 .. w.len / 2]);
+                    h.conn.advance(w.len / 2);
+                },
+                5 => try h.flush(),
+                else => {},
+            }
+        }
+        try h.flush();
+        const induced = failing.has_induced_failure;
+        failing.fail_index = std.math.maxInt(usize);
+        try testing.expectEqual(@as(usize, 0), h.conn.queued);
+        var got: inflate.Out = .{ .buf = &.{}, .max = 1 << 20, .pool = &h.pool };
+        defer if (got.buf.len > 0) h.pool.releaseLarge(got.buf);
+        var rest: []const u8 = h.out.items;
+        for (msgs, accepted) |m, ok| {
+            if (!ok) continue;
+            const f = try takeFrame(&rest);
+            try testing.expectEqualSlices(u8, m, try messageOf(&h.pool, f, &got));
+        }
+        try testing.expectEqual(@as(usize, 0), rest.len);
+        try expectHoldsNothing(h);
+        if (!induced) break;
+    }
+    try testing.expect(fail_at > 5);
 }

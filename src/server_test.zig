@@ -179,6 +179,26 @@ const TestHandler = struct {
                 }
             }.run, .{conn}) catch unreachable;
             t.detach();
+        } else if (std.mem.eql(u8, data, "from-threads")) {
+            // Two threads at once, three messages each (see
+            // threadMessageLen): the queue grows under one thread's
+            // appends while the other's and the worker's go on.
+            for (0..2) |t| {
+                const th = std.Thread.spawn(.{}, struct {
+                    fn run(c: *ws.Conn, tt: u8) void {
+                        const msg = std.heap.page_allocator.alloc(u8, threadMessageLen(1, 2)) catch unreachable;
+                        defer std.heap.page_allocator.free(msg);
+                        for (0..3) |k| {
+                            const m = msg[0..threadMessageLen(tt, @intCast(k))];
+                            m[0] = tt;
+                            m[1] = @intCast(k);
+                            @memset(m[2..], 'a' + 3 * tt + @as(u8, @intCast(k)));
+                            c.send(m, true) catch unreachable;
+                        }
+                    }
+                }.run, .{ conn, @as(u8, @intCast(t)) }) catch unreachable;
+                th.detach();
+            }
         } else if (std.mem.eql(u8, data, "async")) {
             // Sends from another thread must wake the owning worker.
             const t = std.Thread.spawn(.{}, struct {
@@ -385,6 +405,10 @@ const Running = struct {
     port: u16,
 
     fn start(backend: Backend, cfg: Config) !Running {
+        return startWith(backend, cfg, testing.allocator);
+    }
+
+    fn startWith(backend: Backend, cfg: Config, allocator: std.mem.Allocator) !Running {
         var c = cfg;
         c.backend = backend;
         c.ip = "127.0.0.1";
@@ -392,7 +416,7 @@ const Running = struct {
         if (c.worker_thread_count == 0) c.worker_thread_count = 2;
         c.max_connections_per_worker = 256;
         c.buffer_pool_size = 4;
-        const srv = try Server(TestHandler).init(testing.allocator, 0, c);
+        const srv = try Server(TestHandler).init(allocator, 0, c);
         std.debug.assert(srv.getBackend() == backend);
         const thread = try std.Thread.spawn(.{}, runServer, .{srv});
         return .{ .srv = srv, .thread = thread, .port = srv.getPort() };
@@ -594,7 +618,8 @@ const Client = struct {
         try self.send(wsFrame(out, fin, opcode, payload));
     }
 
-    const WsFrame = struct { opcode: ws.Opcode, fin: bool, payload: []u8 };
+    /// `compressed`: RSV1 set (permessage-deflate).
+    const WsFrame = struct { opcode: ws.Opcode, fin: bool, payload: []u8, compressed: bool = false };
 
     /// Reads one (unmasked) server frame into `payload_buf`.
     fn wsRead(self: *Client, payload_buf: []u8) !WsFrame {
@@ -630,6 +655,7 @@ const Client = struct {
         return .{
             .opcode = ws.Opcode.fromByte(b0 & 0x0F) orelse return error.BadOpcode,
             .fin = b0 & 0x80 != 0,
+            .compressed = b0 & 0x40 != 0,
             .payload = payload_buf[0..len],
         };
     }
@@ -1144,6 +1170,244 @@ fn testWebSocket(backend: Backend) !void {
     var head: [4096]u8 = undefined;
     const res = try c3.readResponse(&head, null);
     try testing.expectEqual(@as(u16, 200), res.status);
+}
+
+test "websocket: idle after large messages (echoes, sends from other threads) a connection holds no send queue (plain, TLS, permessage-deflate)" {
+    try forEachBackend(testWsQueuesFreed);
+}
+
+/// testing.allocator, counting the bytes allocated and not yet freed
+/// (any thread).
+const LiveAllocator = struct {
+    live: std.atomic.Value(usize) = .init(0),
+
+    fn allocator(self: *LiveAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *LiveAllocator = @ptrCast(@alignCast(ctx));
+        const p = testing.allocator.rawAlloc(len, alignment, ra) orelse return null;
+        _ = self.live.fetchAdd(len, .monotonic);
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *LiveAllocator = @ptrCast(@alignCast(ctx));
+        if (!testing.allocator.rawResize(memory, alignment, new_len, ra)) return false;
+        _ = self.live.fetchAdd(new_len, .monotonic);
+        _ = self.live.fetchSub(memory.len, .monotonic);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *LiveAllocator = @ptrCast(@alignCast(ctx));
+        const p = testing.allocator.rawRemap(memory, alignment, new_len, ra) orelse return null;
+        _ = self.live.fetchAdd(new_len, .monotonic);
+        _ = self.live.fetchSub(memory.len, .monotonic);
+        return p;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *LiveAllocator = @ptrCast(@alignCast(ctx));
+        testing.allocator.rawFree(memory, alignment, ra);
+        _ = self.live.fetchSub(memory.len, .monotonic);
+    }
+
+    fn get(self: *const LiveAllocator) usize {
+        return self.live.load(.monotonic);
+    }
+
+    /// What is live once it has stayed the same for over two of the
+    /// workers' ticks (what they keep for reuse is freed by then).
+    fn settled(self: *const LiveAllocator) !usize {
+        var last = self.get();
+        var same: u32 = 0;
+        var tries: u32 = 0;
+        while (same < 25) : (tries += 1) {
+            if (tries == 150) return error.NeverSettled;
+            sleepMs(100);
+            const now = self.get();
+            same = if (now == last) same + 1 else 0;
+            last = now;
+        }
+        return last;
+    }
+};
+
+/// A WebSocket client over TCP or TLS, permessage-deflate offered or not.
+const WsPeer = union(enum) {
+    plain: Client,
+    tls: *TlsClient,
+
+    const offer = "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n" ++
+        "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
+
+    fn open(port: u16, tls: bool, deflate: bool) !WsPeer {
+        const upgrade = if (deflate) offer else Client.upgrade_request;
+        if (tls) {
+            const t = try TlsClient.connect(port);
+            errdefer t.close();
+            try t.send(upgrade);
+            const head = try t.client.reader.takeDelimiterInclusive('\n');
+            try testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 101 "));
+            var agreed = false;
+            while (true) {
+                const line = try t.client.reader.takeDelimiterInclusive('\n');
+                if (line.len == 2) break;
+                if (std.mem.indexOf(u8, line, "permessage-deflate") != null) agreed = true;
+            }
+            try testing.expectEqual(deflate, agreed);
+            return .{ .tls = t };
+        }
+        var c = try Client.connect(port);
+        errdefer c.close();
+        try c.send(upgrade);
+        try c.readUpgrade();
+        return .{ .plain = c };
+    }
+
+    fn close(self: *WsPeer) void {
+        switch (self.*) {
+            .plain => |*c| c.close(),
+            .tls => |t| t.close(),
+        }
+    }
+
+    fn send(self: *WsPeer, op: ws.Opcode, payload: []const u8) !void {
+        const out = try testing.allocator.alloc(u8, payload.len + ws.protocol.max_header_len);
+        defer testing.allocator.free(out);
+        const frame = Client.wsFrame(out, true, op, payload);
+        switch (self.*) {
+            .plain => |*c| try c.send(frame),
+            .tls => |t| try t.send(frame),
+        }
+    }
+
+    const Message = struct { op: ws.Opcode, data: []const u8, compressed: bool };
+
+    /// The next message, inflated into `inflated` if it came compressed.
+    fn read(self: *WsPeer, buf: []u8, pool: *BufferPool, inflated: *ws.inflate.Out) !Message {
+        var m: Message = switch (self.*) {
+            .plain => |*c| blk: {
+                const f = try c.wsRead(buf);
+                try testing.expect(f.fin);
+                break :blk .{ .op = f.opcode, .data = f.payload, .compressed = f.compressed };
+            },
+            .tls => |t| blk: {
+                const f = try t.wsRead(buf);
+                break :blk .{ .op = f.opcode, .data = f.data, .compressed = f.compressed };
+            },
+        };
+        if (!m.compressed) return m;
+        const with_trailer = try std.mem.concat(testing.allocator, u8, &.{ m.data, &ws.deflate.trailer });
+        defer testing.allocator.free(with_trailer);
+        inflated.len = 0;
+        _ = try ws.inflate.inflate(try pool.wsInflateTables(), null, with_trailer, inflated);
+        m.data = inflated.buf[0..inflated.len];
+        return m;
+    }
+};
+
+/// Two 1 MiB echoes, six 300 KiB messages from two other threads at once
+/// ("from-threads": queued while the first are written), then a small
+/// echo.
+fn wsQueueTraffic(p: *WsPeer, deflate: bool, big: []const u8, buf: []u8, pool: *BufferPool) !void {
+    var inflated: ws.inflate.Out = .{ .buf = &.{}, .max = 2 << 20, .pool = pool };
+    defer if (inflated.buf.len > 0) pool.releaseLarge(inflated.buf);
+    for (0..2) |k| {
+        try p.send(.binary, big[k..]);
+        const m = try p.read(buf, pool, &inflated);
+        try testing.expectEqual(ws.Opcode.binary, m.op);
+        try testing.expectEqual(deflate, m.compressed);
+        try testing.expectEqualSlices(u8, big[k..], m.data);
+    }
+    try p.send(.text, "from-threads");
+    var next: [2]u8 = @splat(0);
+    for (0..6) |_| {
+        const m = try p.read(buf, pool, &inflated);
+        try testing.expectEqual(ws.Opcode.binary, m.op);
+        try testing.expectEqual(deflate, m.compressed);
+        const t = m.data[0];
+        try testing.expect(t < 2);
+        try testing.expectEqual(next[t], m.data[1]);
+        try testing.expectEqual(threadMessageLen(t, next[t]), m.data.len);
+        for (m.data[2..]) |b| try testing.expectEqual('a' + 3 * t + next[t], b);
+        next[t] += 1;
+    }
+    try p.send(.text, "again");
+    const m = try p.read(buf, pool, &inflated);
+    try testing.expectEqualStrings("again", m.data);
+}
+
+/// "from-threads": message `k` of thread `t`.
+fn threadMessageLen(t: u8, k: u8) usize {
+    return 300 * 1024 + 1000 * @as(usize, 3 * t + k);
+}
+
+fn testWsQueuesFreed(backend: Backend) !void {
+    // A connection kept `shared` and `wire` (and `deflated`) at their
+    // largest for its life: 2 MiB or more after two 1 MiB messages.
+    const big = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i *% 7 % 251);
+    const buf = try testing.allocator.alloc(u8, big.len);
+    defer testing.allocator.free(buf);
+    var pool = try BufferPool.init(testing.allocator, 1024, 1);
+    defer pool.deinit();
+    for ([_]bool{ false, true }) |tls| {
+        var live: LiveAllocator = .{};
+        var cfg: Config = if (tls) tlsConfig() else .{};
+        cfg.worker_thread_count = 1;
+        cfg.websocket_deflate = .{};
+        const r = try Running.startWith(backend, cfg, live.allocator());
+        defer r.stop();
+        // Idle meanwhile: one connection plain, one with permessage-deflate.
+        var idle: [2]WsPeer = undefined;
+        for (&idle, 0..) |*p, i| p.* = try WsPeer.open(r.port, tls, i == 1);
+        defer for (&idle) |*p| p.close();
+        // The same traffic on connections that close first: what the
+        // worker keeps for good (its large-message cache, TLS state
+        // pools) is in the baseline.
+        for ([_]bool{ false, true }) |deflate| {
+            var p = try WsPeer.open(r.port, tls, deflate);
+            defer p.close();
+            try wsQueueTraffic(&p, deflate, big, buf, &pool);
+        }
+        var tries: u32 = 0;
+        while (r.srv.handler.ws_disconns.load(.monotonic) < 2) : (tries += 1) {
+            if (tries == 100) return error.NotClosed;
+            sleepMs(20);
+        }
+        const baseline = try live.settled();
+        for (&idle, 0..) |*p, i| try wsQueueTraffic(p, i == 1, big, buf, &pool);
+        // With both connections open and idle, within a few ticks the
+        // server holds no more than before (each held 2 MiB or more).
+        tries = 0;
+        while (live.get() > baseline + 32 * 1024 or workersWsHeld(r.srv) > 0) : (tries += 1) {
+            if (tries == 60) {
+                std.debug.print("{s} {s}: {d} bytes more than before, {d} queue buffers held\n", .{
+                    @tagName(backend),      if (tls) "TLS" else "plain",
+                    live.get() -| baseline, workersWsHeld(r.srv),
+                });
+                return error.SendQueuesKept;
+            }
+            sleepMs(100);
+        }
+    }
+}
+
+/// Send queue buffers the workers hold or keep for reuse.
+fn workersWsHeld(srv: *Server(TestHandler)) usize {
+    var n: usize = 0;
+    for (srv.workers) |*w| switch (w.*) {
+        .poll => |*p| n += p.pool.ws_queues.held.load(.monotonic),
+        .uring => |*u| if (sys.is_linux) {
+            n += u.pool.ws_queues.held.load(.monotonic);
+        },
+    };
+    return n;
 }
 
 test "websocket: protocol violations fail with the right close code" {
@@ -2812,14 +3076,14 @@ const TlsClient = struct {
         try testing.expectError(error.EndOfStream, self.client.reader.readSliceAll(&b));
     }
 
-    fn wsRead(self: *TlsClient, payload: []u8) !struct { opcode: ws.Opcode, data: []u8 } {
+    fn wsRead(self: *TlsClient, payload: []u8) !struct { opcode: ws.Opcode, data: []u8, compressed: bool } {
         const r = &self.client.reader;
         const b0 = try r.takeByte();
         const b1 = try r.takeByte();
         var len: usize = b1 & 0x7f;
         if (len == 126) len = try r.takeInt(u16, .big) else if (len == 127) len = @intCast(try r.takeInt(u64, .big));
         try r.readSliceAll(payload[0..len]);
-        return .{ .opcode = ws.Opcode.fromByte(b0 & 0x0f).?, .data = payload[0..len] };
+        return .{ .opcode = ws.Opcode.fromByte(b0 & 0x0f).?, .data = payload[0..len], .compressed = b0 & 0x40 != 0 };
     }
 };
 
