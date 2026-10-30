@@ -119,4 +119,20 @@ pub fn build(b: *std.Build) !void {
     });
     const ws_load_step = b.step("ws-load", "Build the WebSocket load generator (Linux)");
     ws_load_step.dependOn(&b.addInstallArtifact(ws_load, .{}).step);
+
+    // TLS handshake load generator (Linux): zig build tls-load -Dtarget=...
+    const tls_load = b.addExecutable(.{
+        .name = "tls-load",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/tls_load.zig"),
+            .target = target,
+            .optimize = .fast,
+            .imports = &.{.{ .name = "peregrine", .module = lib_fast }},
+        }),
+    });
+    const tls_load_step = b.step("tls-load", "Build the TLS handshake load generator (Linux)");
+    tls_load_step.dependOn(&b.addInstallArtifact(tls_load, .{}).step);
+    const tls_load_test = b.addTest(.{ .name = "tls-load-test", .root_module = tls_load.root_module });
+    const tls_load_test_step = b.step("test-tls-load", "Test tls-load's CertificateVerify check");
+    tls_load_test_step.dependOn(&b.addRunArtifact(tls_load_test).step);
 }
