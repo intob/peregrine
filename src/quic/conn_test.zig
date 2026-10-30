@@ -3330,3 +3330,60 @@ test "verify PMTU r2: an interface flapping under GSO runs, with key updates, re
         }
     }
 }
+
+test "verify PMTU r2: a probe timeout's datagrams the interface refuses still go (at 1200), not a probe timeout later" {
+    // A bulk download at 1472 whose window's worth is lost (the tail: no
+    // ACK comes back), then a probe timeout; meanwhile the interface
+    // shrank to 1400. The timeout's two probe datagrams (allowed past the
+    // full window) are refused; they never left, so the probe timeout has
+    // sent nothing yet and its probes are still owed.
+    for ([_]bool{ false, true }) |shrink| {
+        {
+            const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20 }, pmtuOn);
+            defer h.deinit();
+            var gp: GsoPath = .{ .delay = 10_000 };
+            try runGso(h, &gp, {}, established);
+            const id = try h.client.openBidi();
+            try h.client.write(id, "big 3000000", true);
+            try runGso(h, &gp, id, halfway);
+            const s = h.server.?;
+            try testing.expectEqual(@as(u16, 1472), s.max_datagram);
+            // Whatever is in flight now is lost: send until the window is
+            // full, deliver nothing.
+            var dropped: std.ArrayList(Flight) = .empty;
+            defer dropped.deinit(h.a);
+            var fill: usize = 0;
+            while (s.cc.in_flight + 1472 <= s.cc.window and fill < 1000) : (fill += 1) {
+                _ = try gsoFlushRun(h, &dropped, &gp, &gso_buf);
+                h.now += 500; // the pacer
+            }
+            try testing.expect(s.cc.in_flight + 1472 > s.cc.window);
+            dropped.clearRetainingCapacity();
+            // To the probe timeout (loss timers first, if any).
+            var guard: usize = 0;
+            while (s.pto_count == 0) : (guard += 1) {
+                if (guard > 20) return error.NoProbeTimeout;
+                h.now = @max(h.now, s.deadline().?);
+                s.onTimeout(h.now);
+                if (s.pto_count == 0) {
+                    _ = try gsoFlushRun(h, &dropped, &gp, &gso_buf);
+                    dropped.clearRetainingCapacity();
+                }
+            }
+            if (shrink) h.iface_max = 1400;
+            const before = h.datagrams_to_client;
+            const refused = gp.runs_refused;
+            for (0..3) |_| {
+                if (!try gsoFlushRun(h, &dropped, &gp, &gso_buf)) break;
+            }
+            const went = h.datagrams_to_client - before;
+            var eliciting: usize = 0;
+            for (dropped.items) |f| if (f.len >= 100) {
+                eliciting += 1;
+            };
+            if (went == 0 or eliciting == 0) std.debug.print("shrink {}: refused runs {d}; then {d} datagrams went ({d} of 100+ bytes); in flight {d} window {d}; next deadline in {d} µs\n", .{ shrink, gp.runs_refused - refused, went, eliciting, s.cc.in_flight, s.cc.window, (s.deadline() orelse h.now) - h.now });
+            try testing.expect(eliciting > 0);
+            try testing.expectEqual(liveInFlight(s), s.cc.in_flight);
+        }
+    }
+}
