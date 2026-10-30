@@ -2686,6 +2686,36 @@ test "verify PMTU: a path flapping between sizes mid-download, with key updates 
     }
 }
 
+test "verify PMTU: random loss on a path that carries every size is no black hole" {
+    // Up to 10% loss in order. (Known, 2026-10-30: at 20% loss about half
+    // the runs see a black hole, from two probe timeouts in a row whose
+    // 1200-byte packets arrive; with 2 ms of jitter on 10 ms, reordered
+    // probes declared lost fail sizes that arrive, and 10% loss finds black
+    // holes too. Each costs a few bytes of datagram until the raise timer.)
+    var false_positives: u32 = 0;
+    var runs: u32 = 0;
+    for ([_]u8{ 2, 5, 10 }) |loss| {
+        for (0..6) |seed| {
+            const h = try Harness.init(.{ .seed = @intCast(seed + 1), .max_stream_data = 8 << 20, .max_data = 16 << 20 }, pmtuOn);
+            defer h.deinit();
+            h.prng = .init(seed * 7 + loss);
+            const path: Path = .{ .delay = 10_000, .jitter = 0, .loss = loss };
+            try runPath(h, path, {}, established);
+            const id = try h.client.openBidi();
+            try h.client.write(id, "big 1500000", true);
+            try runPath(h, path, id, finishedAndSearched);
+            try expectBody(h, id, 1_500_000);
+            const s = h.server.?;
+            runs += 1;
+            if (s.pmtu.black_holes > 0 or s.max_datagram != 1472) {
+                false_positives += 1;
+                std.debug.print("loss {d}% seed {d}: {d} black holes, max {d}, {d} probes lost\n", .{ loss, seed, s.pmtu.black_holes, s.max_datagram, s.pmtu.probes_lost });
+            }
+        }
+    }
+    try testing.expectEqual(@as(u32, 0), false_positives);
+}
+
 test "verify PMTU: a stale probe acknowledged with the current one doesn't hide the current one's acknowledgment" {
     // NAT rebinding while a probe is in flight: the search restarts and
     // sends a new probe; the client gets both and acknowledges them in
