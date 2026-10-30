@@ -900,13 +900,54 @@ Later in M4:
       aioquic over HTTP/3 on epoll and io_uring (`bench-server ... sni`).
       Linear in the number of certificates
 - [ ] OCSP stapling
-- [ ] **kTLS KeyUpdate missed on x86_64.** "tls: kernel TLS … a file with
-      sendfile, close_notify" fails on the Hetzner box (Ubuntu 6.8, no
-      kernel rekey) in ReleaseSafe every time, Debug passes: with
-      `test_key_update_limit = 4` the 8 MiB download completes instead of
-      closing. Records sent through the kernel are counted only after each
-      write, so a single sendfile that fills the socket never stops for the
-      KeyUpdate (`kernel_tx_count` rose by 1). Count or cap per sendfile call
+- [x] **kTLS KeyUpdate missed on x86_64.** "tls: kernel TLS … a file with
+      sendfile, close_notify" failed on the Hetzner box (Ubuntu 6.8, no kernel
+      rekey) in ReleaseSafe and passed in Debug: with `test_key_update_limit = 4`
+      the 8 MiB download completed instead of closing. The kernel's records were
+      counted after each write, and sendfile was asked for the whole file. On
+      loopback one call takes what the socket buffers hold (about 4.6 MiB) plus
+      whatever the reader drains meanwhile, so a ReleaseSafe client (AES-NI) took
+      all 8 MiB in one call: about 513 records under a key allowed 4. A slower
+      Debug client let the socket fill and met the gate, but one key still
+      carried hundreds of records. Fix: the gate (`kernelGate`, KeyUpdate first
+      if due) returns how much the next write may carry (`TlsConn.writeMax`:
+      (limit − records) × 16 KiB − 1, the same upper bound as the record count;
+      a read of 6.18's tls_sw.c confirms it holds with MSG_MORE records left
+      open across sendfile calls). Every kernel write gets it: sendfile and its
+      copy fallback, writev (`sys.iovecsOf`), WebSocket and h2. epoll writes on
+      in a loop with the gate between writes; io_uring carries on from each
+      completion. Our own records under the key before the kernel took over (the
+      NewSessionTicket) count, and a 0-byte write counts none. io_uring's gate is
+      ready/blocked/closed like epoll's. On a kernel without rekey it closes the
+      connection and may release the slot at once; callers had gone on with a
+      freed TlsConn (`endBorrow` assert) or re-armed a released slot
+      (out-of-bounds `releaseSlot`), triggered by one client KeyUpdate after a
+      file (pre-existing since ba72b17). A KeyUpdate that waited for room while
+      input arrived now resumes the connection on `write_ready` (it used to
+      leave the request unanswered); WebSocket/h2 output waiting at the gate has
+      a deadline, and file progress extends it. Proof: std's client checks the
+      records under each key, telling keys apart by the server's secret, for
+      files and bodies around record multiples at limits 1–256, a slow reader,
+      the client's KeyUpdate mid-file and while idle, a WebSocket after a file,
+      and a request while our KeyUpdate waits for room, with and without kTLS;
+      these fail without the fixes on 6.8, 6.12 and 6.18. Found along the way:
+      epoll kept the old request deadline when a pipelined response stalled right
+      after the previous one finished, so a slow but steady reader was closed
+      one request timeout after the first stall (plaintext and kqueue too);
+      `writePending`'s progress now renews the deadline before the next
+      response (test: 120 pipelined 32 KiB responses read at about 1 MB/s with a
+      1 s timeout). Documented: with a receive window shrunk below the MSS,
+      Linux sends only on the zero-window probe timer (about 40 KB/s on
+      loopback), and the request timeout then ends the connection by design.
+      Three review rounds and an adversarial verifier. The suite passes on
+      macOS, Docker epoll/io_uring, the Hetzner box (ReleaseSafe; Debug apart
+      from the leak below) and the 6.12/6.18 VMs (both modes); tls-interop.sh
+      passes. Not done: alerts and close_notify go out ungated (the last record,
+      at most one past the limit)
+- [ ] On x86_64 Debug (Hetzner box), "http3: streamed uploads, a held body
+      resumed from another thread" sometimes ends with io_uring not quiescing at
+      shutdown, so the worker deliberately leaks its buffers (3 of 5 runs on
+      7508bb5 too): an operation the h3 path doesn't cancel at shutdown?
 - [x] **kTLS on Linux** (`TlsOptions.ktls`, on by default): the sending side of
       an HTTP/1.1 connection goes to the kernel (TCP_ULP "tls", TLS_TX with the
       current key, IV split into salt and the rest, and record sequence number)
