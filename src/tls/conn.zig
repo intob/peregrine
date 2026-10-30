@@ -177,8 +177,9 @@ pub const Conn = struct {
     /// and an alert waits in `kernel_alert` for `sys.ktls.sendRecord`.
     kernel_tx: bool = false,
     kernel_alert: ?[2]u8 = null,
-    /// Records the kernel has made under the current key, an upper bound
-    /// (see `kernelWrote`).
+    /// Records made under the current key, ours before the kernel took
+    /// over included, an upper bound (see `kernelWrote`); each write is
+    /// capped to stay within the limit (`kernelWriteMax`).
     kernel_records: u64 = 0,
     /// Our KeyUpdate is due (the client asked, or the record limit was
     /// reached): the event loop sends it before any more data, then
@@ -603,6 +604,10 @@ pub const Conn = struct {
         std.debug.assert(self.kernelTxReady());
         self.kernel_tx = true;
         _ = kernel_tx_count.fetchAdd(1, .monotonic);
+        // The key's records so far (ours, such as a NewSessionTicket)
+        // count towards its limit too.
+        self.kernel_records = self.write.?.seq;
+        if (self.kernel_records >= self.key_update_limit) self.kernel_key_update = true;
         if (self.wire_buf.len > 0) {
             self.pools.out.release(self.wire_buf);
             self.wire_buf = &.{};
@@ -615,6 +620,17 @@ pub const Conn = struct {
     pub fn kernelWrote(self: *Self, n: usize) void {
         self.kernel_records += 1 + n / record.max_plaintext;
         if (self.kernel_records >= self.key_update_limit) self.kernel_key_update = true;
+    }
+
+    /// The most one write through the kernel may carry: the records it can
+    /// make (counted as in `kernelWrote`) stay within the key's limit, so
+    /// the KeyUpdate goes out in time however much the socket takes (a
+    /// sendfile to a fast reader can carry the whole file). Only while no
+    /// KeyUpdate is due.
+    pub fn kernelWriteMax(self: *const Self) usize {
+        std.debug.assert(self.kernel_tx and self.kernel_records < self.key_update_limit);
+        const left = self.key_update_limit - self.kernel_records;
+        return std.math.cast(usize, (left *| record.max_plaintext) - 1) orelse std.math.maxInt(usize);
     }
 
     /// Our KeyUpdate, for `sys.ktls.sendRecord` as a handshake record (22).
@@ -974,6 +990,52 @@ test "kernel TLS: records the kernel seals open with our keys, every suite" {
         conn.deinit();
     }
     if (!used) return error.SkipZigTest;
+}
+
+test "kernel TLS: each write is capped to the records left under the key" {
+    var pools = try Pools.init(testing.allocator, 1);
+    defer pools.deinit();
+    const secret: [32]u8 = @splat(0x5a);
+    const max = record.max_plaintext;
+    var conn: Conn = .{ .pools = &pools, .hs = null, .key_update_limit = 4 };
+    defer conn.deinit();
+    conn.write = .init(.aes_128_gcm_sha256, &secret);
+    conn.write.?.seq = 1; // our NewSessionTicket
+    conn.startKernelTx();
+    // That record counts: three left, so at most 3 * max - 1 bytes
+    // (counted as 1 + 2 records).
+    try testing.expectEqual(1, conn.kernel_records);
+    try testing.expectEqual(3 * max - 1, conn.kernelWriteMax());
+    conn.kernelWrote(conn.kernelWriteMax());
+    try testing.expectEqual(4, conn.kernel_records);
+    try testing.expect(conn.kernel_key_update);
+    conn.kernelNextKey();
+    try testing.expectEqual(4 * max - 1, conn.kernelWriteMax());
+
+    // Writes of any size, each capped and short or not: never more records
+    // than the limit under one key, and the KeyUpdate comes at it.
+    const sizes = [_]usize{ 1, max - 1, max, max + 1, 8 << 20, 100, 3 * max, 1 << 30 };
+    var updates: usize = 0;
+    for (0..64) |i| {
+        const want = sizes[i % sizes.len];
+        var n = @min(want, conn.kernelWriteMax());
+        if (i % 3 == 0) n -= n / 2; // the socket took part of it
+        conn.kernelWrote(n);
+        try testing.expect(conn.kernel_records <= conn.key_update_limit);
+        if (conn.kernel_key_update) {
+            conn.kernelNextKey();
+            updates += 1;
+        }
+    }
+    try testing.expect(updates > 16);
+
+    // Our own records already at the limit: the KeyUpdate goes first.
+    var at_limit: Conn = .{ .pools = &pools, .hs = null, .key_update_limit = 4 };
+    defer at_limit.deinit();
+    at_limit.write = .init(.aes_128_gcm_sha256, &secret);
+    at_limit.write.?.seq = 4;
+    at_limit.startKernelTx();
+    try testing.expect(at_limit.kernel_key_update);
 }
 
 test "handshake and echo with std's TLS client, every suite, group and key type" {

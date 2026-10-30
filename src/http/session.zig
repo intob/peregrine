@@ -14,7 +14,6 @@ const exchange = @import("./exchange.zig");
 const ws_deflate = @import("../ws/deflate.zig");
 const ws_inflate = @import("../ws/inflate.zig");
 const H2Stream = @import("../h2/conn.zig").Stream;
-const iovec_const = std.posix.iovec_const;
 
 /// A bounded stack of things waiting for reuse: BufferPool's buffers, and
 /// tls/conn.zig's connection and handshake states.
@@ -354,23 +353,6 @@ pub const Out = struct {
 
     pub inline fn totalLen(self: *const Out) usize {
         return self.len + self.body.len + self.tail.len;
-    }
-
-    pub fn iovecs(self: *const Out, iov: *[3]iovec_const) []iovec_const {
-        var n: usize = 0;
-        if (self.len > 0) {
-            iov[n] = .{ .base = self.buf.ptr, .len = self.len };
-            n += 1;
-        }
-        if (self.body.len > 0) {
-            iov[n] = .{ .base = self.body.ptr, .len = self.body.len };
-            n += 1;
-        }
-        if (self.tail.len > 0) {
-            iov[n] = .{ .base = self.tail.ptr, .len = self.tail.len };
-            n += 1;
-        }
-        return iov[0..n];
     }
 
     pub inline fn free(self: *const Out) usize {

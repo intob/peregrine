@@ -889,22 +889,18 @@ pub fn Worker(comptime Handler: type) type {
         fn submitWrite(self: *Self, c: *Conn) void {
             if (!self.kernelGate(c)) return;
             var n: usize = 0;
-            const head_rest = c.out.buf[@min(c.sent, c.out.len)..c.out.len];
-            if (head_rest.len > 0) {
-                c.iov[n] = .{ .base = head_rest.ptr, .len = head_rest.len };
+            var skip = c.sent;
+            // Through the kernel's TLS, no more than the key's records allow
+            // (onWrite carries on with the rest).
+            var room = writeMax(c);
+            for ([_][]const u8{ c.out.buf[0..c.out.len], c.out.body, c.out.tail }) |p| {
+                const rest = p[@min(skip, p.len)..];
+                skip -|= p.len;
+                const take = @min(rest.len, room);
+                if (take == 0) continue;
+                c.iov[n] = .{ .base = rest.ptr, .len = take };
                 n += 1;
-            }
-            const body_sent = c.sent -| c.out.len;
-            if (c.out.body.len > body_sent) {
-                const rest = c.out.body[body_sent..];
-                c.iov[n] = .{ .base = rest.ptr, .len = rest.len };
-                n += 1;
-            }
-            const tail_sent = c.sent -| (c.out.len + c.out.body.len);
-            if (c.out.tail.len > tail_sent) {
-                const rest = c.out.tail[tail_sent..];
-                c.iov[n] = .{ .base = rest.ptr, .len = rest.len };
-                n += 1;
+                room -= take;
             }
             const sqe = self.getSqe();
             // send(msg) rather than writev: sockets only, so skip the VFS.
@@ -1383,7 +1379,7 @@ pub fn Worker(comptime Handler: type) type {
             var progressed = false;
             while (f.len > 0) {
                 if (!self.kernelGate(c)) return;
-                const count: usize = @intCast(@min(f.len, 1 << 30));
+                const count: usize = @intCast(@min(f.len, 1 << 30, writeMax(c)));
                 const n = sys.sendfile(c.fd, f.fd, f.offset, count) catch |err| switch (err) {
                     error.WouldBlock => {
                         if (progressed) self.arm(c, .active);
@@ -1425,6 +1421,13 @@ pub fn Worker(comptime Handler: type) type {
         inline fn userTls(c: *const Conn) ?*TlsConn {
             const t = c.tls orelse return null;
             return if (t.kernel_tx) null else t;
+        }
+
+        /// The most one write may carry: no limit, except through the
+        /// kernel's TLS (`TlsConn.kernelWriteMax`). After `kernelGate`.
+        inline fn writeMax(c: *const Conn) usize {
+            const t = c.tls orelse return std.math.maxInt(usize);
+            return if (t.kernel_tx) t.kernelWriteMax() else std.math.maxInt(usize);
         }
 
         /// Counts records the kernel made for `n` bytes written (kTLS).
@@ -1759,7 +1762,7 @@ pub fn Worker(comptime Handler: type) type {
             if (bytes.len > 0) {
                 if (!self.kernelGate(c)) return;
                 const sqe = self.getSqe();
-                sqe.prep_send(c.fd, bytes, linux.MSG.NOSIGNAL);
+                sqe.prep_send(c.fd, bytes[0..@min(bytes.len, writeMax(c))], linux.MSG.NOSIGNAL);
                 sqe.user_data = userData(c.gen, self.slotOf(c), .write);
                 c.write_inflight = true;
                 c.inflight += 1;
@@ -2132,7 +2135,7 @@ pub fn Worker(comptime Handler: type) type {
             if (bytes.len > 0) {
                 if (!self.kernelGate(c)) return;
                 const sqe = self.getSqe();
-                sqe.prep_send(c.fd, bytes, linux.MSG.NOSIGNAL);
+                sqe.prep_send(c.fd, bytes[0..@min(bytes.len, writeMax(c))], linux.MSG.NOSIGNAL);
                 sqe.user_data = userData(c.gen, self.slotOf(c), .write);
                 c.write_inflight = true;
                 c.inflight += 1;

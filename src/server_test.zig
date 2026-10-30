@@ -2236,6 +2236,45 @@ const TlsClient = struct {
         return .{ .status = status, .body_len = body_len, .close = closing };
     }
 
+    /// Reads one response with a body (into `body`) a record at a time,
+    /// as `readResponse` but failing if more than `limit` records came
+    /// under one key: the server's KeyUpdate is due after that many
+    /// (`key_update_limit`). Returns the body's length and the KeyUpdates
+    /// seen.
+    fn readResponseKeyLimit(self: *TlsClient, body: []u8, limit: u64) !struct { body_len: usize, key_updates: usize } {
+        const r = &self.client.reader;
+        const status_line = try r.takeDelimiterInclusive('\n');
+        try testing.expect(std.mem.startsWith(u8, status_line, "HTTP/1.1 200"));
+        var body_len: ?usize = null;
+        while (true) {
+            const line = try r.takeDelimiterInclusive('\n');
+            if (line.len == 2) break;
+            if (std.mem.startsWith(u8, line, "content-length: ")) {
+                body_len = try std.fmt.parseInt(usize, line[16 .. line.len - 2], 10);
+            }
+        }
+        const len = body_len orelse return error.NoContentLength;
+        // std's client opens one record per fill and counts them in
+        // read_seq, which a KeyUpdate resets.
+        var seq = self.client.read_seq;
+        var key_updates: usize = 0;
+        var got: usize = 0;
+        while (true) {
+            if (self.client.read_seq > limit) return error.KeyUpdateMissed;
+            if (self.client.read_seq < seq) key_updates += 1;
+            seq = self.client.read_seq;
+            if (got == len) return .{ .body_len = len, .key_updates = key_updates };
+            if (r.bufferedLen() == 0) {
+                try r.fillMore();
+                continue;
+            }
+            const k = @min(r.bufferedLen(), len - got);
+            @memcpy(body[got..][0..k], r.buffered()[0..k]);
+            r.toss(k);
+            got += k;
+        }
+    }
+
     /// The server's close_notify ends the stream cleanly; a bare FIN would
     /// make std's client report a truncation attack.
     fn expectCleanClose(self: *TlsClient) !void {
@@ -2468,24 +2507,29 @@ fn testKernelTls(backend: Backend) !void {
     try testing.expectEqualSlices(u8, big_body[1000..6000], got[0..res.body_len]);
     // close_notify, sent through the kernel as an alert record.
     try c.expectCleanClose();
-    // Without a tls module (Docker Desktop's kernel) the connection stays
-    // in user space, and the test above is all that runs.
-    if (!kernelTlsAvailable()) return;
-    try testing.expect(tls_conn.kernel_tx_count.load(.monotonic) > before);
+    // Without a tls module (Docker Desktop's kernel) connections stay in
+    // user space.
+    const ktls = kernelTlsAvailable();
+    if (ktls) try testing.expect(tls_conn.kernel_tx_count.load(.monotonic) > before);
 
-    // Our KeyUpdates every 4 records: the kernel switches keys about 128
-    // times in a file through sendfile (TLS 1.3 rekey, Linux 6.14 on), or
-    // the connection closes at the first.
+    // Our KeyUpdates every 4 records: the kernel switches keys at least
+    // 128 times in a file through sendfile (TLS 1.3 rekey, Linux 6.14 on),
+    // or the connection closes at the first; in user space we do. Either
+    // way no key carries more than 4 records, however much one sendfile
+    // could take (a fast reader drains the socket as the kernel fills it:
+    // all 8 MiB in one call).
     tls_conn.test_key_update_limit = 4;
     defer tls_conn.test_key_update_limit = null;
     const c2 = try TlsClient.connect(r.port);
     defer c2.close();
     try c2.send("GET /file HTTP/1.1\r\nHost: x\r\n\r\n");
-    if (c2.readResponse(got)) |res2| {
-        try testing.expect(kernelRekeySupported());
+    if (c2.readResponseKeyLimit(got, 4)) |res2| {
+        try testing.expect(!ktls or kernelRekeySupported());
         try testing.expect(std.mem.eql(u8, &big_body, got[0..res2.body_len]));
-    } else |_| {
-        try testing.expect(!kernelRekeySupported());
+        try testing.expect(res2.key_updates >= big_body_len / (4 * 16384));
+    } else |err| {
+        try testing.expect(err != error.KeyUpdateMissed);
+        try testing.expect(ktls and !kernelRekeySupported());
     }
 }
 
