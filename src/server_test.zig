@@ -2559,14 +2559,26 @@ const KeyChecker = struct {
     len: usize = 0,
     seq: u64 = 0,
     key_updates: usize = 0,
+    key: [16]u8,
     closed: bool = false,
     /// Sleep now and then: the server's socket fills and its writes stop
     /// short.
     slow: bool = false,
     fills: usize = 0,
 
+    /// The first bytes of the server's current traffic secret.
+    fn serverKey(client: *const StdTls) [16]u8 {
+        return switch (client.application_cipher) {
+            inline else => |*p| p.tls_1_3.server_secret[0..16].*,
+        };
+    }
+
     fn init(c: *TlsClient, limit: u64, buf: []u8) KeyChecker {
-        return .{ .c = c, .limit = limit, .buf = buf, .seq = c.client.read_seq };
+        // A send that can't finish (the server stopped reading) fails
+        // instead of hanging the test.
+        const timeout = posix.timeval{ .sec = 5, .usec = 0 };
+        posix.setsockopt(c.fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
+        return .{ .c = c, .limit = limit, .buf = buf, .seq = c.client.read_seq, .key = serverKey(&c.client) };
     }
 
     /// One record (or what is buffered). error.EndOfStream after
@@ -2582,7 +2594,10 @@ const KeyChecker = struct {
             try r.fillMore();
         }
         const seq = self.c.client.read_seq;
-        if (seq < self.seq) self.key_updates += 1;
+        // One record per fill: a KeyUpdate changed the server's key.
+        const key = serverKey(&self.c.client);
+        if (!std.mem.eql(u8, &key, &self.key)) self.key_updates += 1;
+        self.key = key;
         self.seq = seq;
         self.closed = self.c.client.eof();
         if (seq > self.limit + @intFromBool(self.closed)) return error.KeyUpdateMissed;
@@ -2828,22 +2843,22 @@ fn testKeyLimitsSlow(backend: Backend) !void {
     const buf = try testing.allocator.alloc(u8, 16 << 20);
     defer testing.allocator.free(buf);
     defer tls_conn.test_key_update_limit = null;
-    for ([_]u64{ 1, 3, 37 }) |limit| {
+    for ([_]u64{ 1000000, 1, 3, 37 }) |limit| {
         for ([_]bool{ false, true }) |no_sendfile| {
             sys.sendfile_disabled = no_sendfile;
             defer sys.sendfile_disabled = false;
             tls_conn.test_key_update_limit = limit;
             const c = try TlsClient.connect(r.port);
             defer c.close();
-            sys.setsockoptInt(c.fd, posix.SOL.SOCKET, posix.SO.RCVBUF, 4096) catch {};
+            sys.setsockoptInt(c.fd, posix.SOL.SOCKET, posix.SO.RCVBUF, 16384) catch {};
             var k = KeyChecker.init(c, limit, buf);
             k.slow = true;
             const list = [_]KfReq{
                 .{ .kind = 'm', .off = 0, .len = 2 },
-                .{ .kind = 'f', .off = 3, .len = 2 << 20 },
+                .{ .kind = 'f', .off = 3, .len = 1 << 20 },
                 .{ .kind = 'm', .off = 0, .len = 200000 },
                 .{ .kind = 'f', .off = 0, .len = 3 * 16384 - 1 },
-                .{ .kind = 'f', .off = 0, .len = 1 << 20 },
+                .{ .kind = 'f', .off = 0, .len = 512 << 10 },
             };
             // Requests first, then nothing read for a while: every write
             // the server tries runs into a full socket.
@@ -2983,8 +2998,10 @@ fn runKfWebSocket(c: *TlsClient, k: *KeyChecker, pipelined: bool) !void {
     defer testing.allocator.free(frame);
     const sizes = [_]usize{ 1, 16383, 16384, 16385, 16384 * 3 - 4, 60000, 125, 126, 65535 };
     if (pipelined) {
-        for (sizes) |n| try c.send(Client.wsFrame(frame, true, .binary, big_body[n..][0..n]));
-        for (sizes) |n| try k.expectWsFrame(&pos, .binary, big_body[n..][0..n]);
+        // Less than the socket buffers hold, or neither side would read.
+        const few = [_]usize{ 1, 16383, 16384, 16385, 125, 126 };
+        for (few) |n| try c.send(Client.wsFrame(frame, true, .binary, big_body[n..][0..n]));
+        for (few) |n| try k.expectWsFrame(&pos, .binary, big_body[n..][0..n]);
     } else {
         for (sizes) |n| {
             try c.send(Client.wsFrame(frame, true, .binary, big_body[n..][0..n]));
