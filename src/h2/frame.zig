@@ -216,6 +216,14 @@ pub const Reader = struct {
         }
     }
 
+    /// A whole frame is buffered: `next` would return it (or fail on it).
+    pub fn holdsFrame(self: *const Self) bool {
+        const data = self.buf[self.start..self.end];
+        if (data.len < header_len) return false;
+        const len = (@as(usize, data[0]) << 16) | (@as(usize, data[1]) << 8) | data[2];
+        return data.len >= header_len + len;
+    }
+
     pub fn deinit(self: *Self, pool: *BufferPool) void {
         if (self.buf.len > 0) self.releaseBuf(pool);
         self.* = .{};

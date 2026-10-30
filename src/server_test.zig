@@ -2372,6 +2372,137 @@ fn testH2HalfClose(backend: Backend) !void {
     while (try sys.read(c.tcp.fd, &rest) > 0) {}
 }
 
+test "h2c: a half-closed client's requests still being parsed are answered" {
+    try forEachBackend(testH2HalfCloseUnparsed);
+}
+
+/// Large responses first (copied whole, past `out_limit`, so parsing
+/// stops until they drain), then a request whose body comes in a later
+/// frame, then FIN, read slowly: the last request is still parsed and
+/// answered, whatever drained the output (writability, ticks).
+fn testH2HalfCloseUnparsed(backend: Backend) !void {
+    const r = try Running.start(backend, h2Config());
+    defer r.stop();
+    const c = try H2Client.connect(r.port);
+    defer c.close();
+    var replies: [9]H2Client.Reply = undefined;
+    for (&replies) |*x| x.* = .{};
+    defer for (&replies) |*x| x.deinit();
+    var map = std.AutoHashMap(u31, *H2Client.Reply).init(testing.allocator);
+    defer map.deinit();
+    for (&replies, 0..) |*x, i| try map.put(@intCast(2 * i + 1), x);
+    var out: [4096]u8 = undefined;
+    var n = try h2frame.writeWindowUpdate(&out, 0, 1 << 30);
+    n += try h2frame.writeSettings(out[n..], &.{.{ .id = .initial_window_size, .value = big_body_len }});
+    for (0..8) |i| n += (try c.headers(out[n..], @intCast(2 * i + 1), "GET", "/copy-big", true)).len;
+    n += (try c.headers(out[n..], 17, "POST", "/echo", false)).len;
+    n += try h2frame.writeData(out[n..], 17, true, "after");
+    try c.send(out[0..n]);
+    sys.shutdownWrite(c.tcp.fd);
+    c.quiet = true;
+    try slowCollect(c, &map);
+    for (replies[0..8]) |*x| try testing.expectEqual((Config{}).response_body_buffer_size, x.body.items.len);
+    try testing.expectEqualStrings("after", replies[8].body.items);
+}
+
+/// Reads until every reply is done, sleeping between reads (output drains
+/// a piece at a time over a few seconds, across worker ticks).
+fn slowCollect(c: *H2Client, map: *std.AutoHashMap(u31, *H2Client.Reply)) !void {
+    while (true) {
+        var pending: usize = 0;
+        var it = map.valueIterator();
+        while (it.next()) |x| {
+            if (!x.*.done) pending += 1;
+        }
+        if (pending == 0) return;
+        if (try c.readFrames(map)) |_| return error.GoAway;
+        sleepMs(3);
+    }
+}
+
+test "h2c: a connection error with streams in flight releases their exchanges at once" {
+    try forEachBackend(testH2ErrorReleases);
+}
+
+/// Requests answered later (never, here), then a connection error: our
+/// GOAWAY goes out and the connection lingers, but its exchanges go back
+/// and the handler hears of them now, not when the client leaves.
+fn testH2ErrorReleases(backend: Backend) !void {
+    const r = try Running.start(backend, h2Config());
+    defer r.stop();
+    const c = try H2Client.connect(r.port);
+    defer c.close();
+    const aborts = r.srv.handler.aborts.load(.monotonic);
+    const count = 20;
+    for (0..count) |i| try c.request(@intCast(2 * i + 1), "GET", "/hang", null);
+    var waited: usize = 0;
+    while (exchangesActive(r.srv) < count) : (waited += 1) {
+        if (waited == 200) return error.ExchangesNotBound;
+        sleepMs(10);
+    }
+    // A GOAWAY on a stream: a connection error (PROTOCOL_ERROR).
+    var buf: [h2frame.header_len + 8]u8 = undefined;
+    const n = try h2frame.writeGoaway(&buf, 0, .no_error, "");
+    std.mem.writeInt(u32, buf[5..9], 1, .big);
+    try c.send(buf[0..n]);
+    waited = 0;
+    while (exchangesActive(r.srv) > 0) : (waited += 1) {
+        if (waited == 100) return error.ExchangesKept;
+        sleepMs(10);
+    }
+    try testing.expectEqual(aborts + count, r.srv.handler.aborts.load(.monotonic));
+    // Our GOAWAY, then a FIN; the client still holds the connection.
+    var rest: [1024]u8 = undefined;
+    while (try sys.read(c.tcp.fd, &rest) > 0) {}
+}
+
+fn exchangesActive(srv: *Server(TestHandler)) usize {
+    var n: usize = 0;
+    for (srv.workers) |*w| switch (w.*) {
+        .poll => |*p| n += p.exchanges.active_count,
+        .uring => |*u| if (sys.is_linux) {
+            n += u.exchanges.active_count;
+        },
+    };
+    return n;
+}
+
+test "h2c: frames held back for output are parsed when other threads' output drains it" {
+    try forEachBackend(testH2ResumeParses);
+}
+
+/// Requests behind a response past `out_limit` wait unparsed until it
+/// drains. Exchanges answered from other threads and worker ticks drain it
+/// too while the client reads slowly: the requests behind must be parsed
+/// then, whichever drained the output.
+fn testH2ResumeParses(backend: Backend) !void {
+    const r = try Running.start(backend, h2Config());
+    defer r.stop();
+    const c = try H2Client.connect(r.port);
+    defer c.close();
+    var replies: [24]H2Client.Reply = undefined;
+    for (&replies) |*x| x.* = .{};
+    defer for (&replies) |*x| x.deinit();
+    var map = std.AutoHashMap(u31, *H2Client.Reply).init(testing.allocator);
+    defer map.deinit();
+    var out: [8192]u8 = undefined;
+    var n = try h2frame.writeWindowUpdate(&out, 0, 1 << 30);
+    n += try h2frame.writeSettings(out[n..], &.{.{ .id = .initial_window_size, .value = big_body_len }});
+    for (&replies, 0..) |*x, i| {
+        const stream: u31 = @intCast(2 * i + 1);
+        const path = if (i % 3 == 0) "/copy-big" else if (i % 3 == 1) "/later" else "/small";
+        n += (try c.headers(out[n..], stream, "GET", path, true)).len;
+        try map.put(stream, x);
+    }
+    try c.send(out[0..n]);
+    c.quiet = true;
+    try slowCollect(c, &map);
+    for (&replies, 0..) |*x, i| {
+        try testing.expectEqual(@as(u16, if (i % 3 == 1) 202 else 200), x.status);
+        if (i % 3 == 0) try testing.expectEqual((Config{}).response_body_buffer_size, x.body.items.len);
+    }
+}
+
 fn testH2ClientGoaway(backend: Backend) !void {
     const r = try Running.start(backend, h2Config());
     defer r.stop();

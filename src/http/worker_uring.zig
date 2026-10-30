@@ -1052,7 +1052,7 @@ pub fn Worker(comptime Handler: type) type {
                     continue;
                 }
                 const c = &self.conns[e.conn_slot];
-                if (!c.open or c.gen != e.conn_gen or c.closing) continue;
+                if (!c.open or c.gen != e.conn_gen or c.closing or c.lingering) continue;
                 if (c.h2) |conn| {
                     const ctx = self.h2Context(c);
                     conn.onExchangeTimeout(Handler, &ctx, @intCast(slot));
@@ -1385,7 +1385,7 @@ pub fn Worker(comptime Handler: type) type {
             const n = sys.read(c.fd, space) catch |err| switch (err) {
                 error.WouldBlock => {
                     // Not after all: the buffer goes back, and the wait on.
-                    self.releaseIdle(c);
+                    if (c.lingering) c.session.deinit(&self.pool) else self.releaseIdle(c);
                     return self.armRecv(c);
                 },
                 else => return self.closeConn(c),
@@ -1729,7 +1729,7 @@ pub fn Worker(comptime Handler: type) type {
                 return;
             }
             const c = &self.conns[e.conn_slot];
-            if (!c.open or c.gen != e.conn_gen or c.closing) return;
+            if (!c.open or c.gen != e.conn_gen or c.closing or c.lingering) return;
             if (c.h2) |conn| {
                 const ctx = self.h2Context(c);
                 conn.onExchangePosted(Handler, &ctx, slot);
@@ -1960,6 +1960,11 @@ pub fn Worker(comptime Handler: type) type {
             }
             sys.shutdownWrite(c.fd);
             c.lingering = true;
+            // Nothing more is answered: handlers hear of it now, and the
+            // streams and buffers go back (not the input buffer a receive
+            // is writing).
+            const ctx = self.h2Context(c);
+            c.h2.?.abandon(&ctx, &self.pool, plainRecvArmed(c) and c.tls == null);
             self.releaseIdle(c);
             self.arm(c, .active);
             self.armRecv(c);

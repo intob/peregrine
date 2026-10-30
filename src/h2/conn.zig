@@ -2038,6 +2038,31 @@ pub const Conn = struct {
         return self.stream_count;
     }
 
+    /// Frames received and not yet parsed (`process` stopped for output
+    /// to drain first, past `out_limit`).
+    pub fn holdsFrames(self: *const Self) bool {
+        return self.state != .preface and self.reader.holdsFrame();
+    }
+
+    /// The connection is closing (our GOAWAY is written; nothing more is
+    /// read or answered): exchanges are aborted (handleAbort) and released,
+    /// and stream states and buffers go back now rather than at `deinit`,
+    /// which stays safe to call. The input buffer stays if a receive is
+    /// writing into it (`keep_reader`).
+    pub fn abandon(self: *Self, ctx: anytype, pool: *BufferPool, keep_reader: bool) void {
+        self.abortAll(ctx);
+        for (self.streams) |slot| {
+            if (slot) |s| self.releaseStream(s);
+        }
+        self.stream_count = 0;
+        self.blocked_count = 0;
+        if (!keep_reader) self.reader.deinit(pool);
+        self.giveBack(&self.out);
+        self.giveBack(&self.wire);
+        self.wire_pos = 0;
+        self.dropBlock();
+    }
+
     /// Once the client has closed its side: whether what is in flight
     /// can still be answered with nothing more from it. Not if a request
     /// lacks input (a stream open on its side, its head or body arriving

@@ -861,6 +861,8 @@ pub fn Worker(comptime Handler: type) type {
         /// writability would (the edge may already be spent).
         fn h2Resume(self: *Self, c: *Conn) void {
             if (!self.h2Flush(c)) return;
+            // Frames left unparsed while output drained (past `out_limit`).
+            if (!c.h2HasWire() and !self.h2Process(c)) return;
             const tls_buffered = c.tls != null and c.tls.?.hasBufferedInput();
             if ((c.read_ready or tls_buffered) and !c.h2HasWire()) self.h2Readable(c);
         }
@@ -895,6 +897,9 @@ pub fn Worker(comptime Handler: type) type {
         /// from the client (`answerableAlone`).
         fn h2PeerClosed(self: *Self, c: *Conn) void {
             const conn = c.h2.?;
+            // Frames still to parse (they wait for output to drain) come
+            // first: they may complete a request.
+            if (conn.holdsFrames()) return self.h2Timer(c);
             if (!conn.answerableAlone() or (!c.h2HasWire() and conn.activeStreams() == 0)) return self.closeConn(c);
             self.h2Timer(c);
         }
@@ -914,6 +919,11 @@ pub fn Worker(comptime Handler: type) type {
             }
             sys.shutdownWrite(c.fd);
             c.lingering = true;
+            // Nothing more is answered: handlers hear of it now, and the
+            // streams and buffers go back.
+            const ctx = self.h2Context(c);
+            c.h2.?.abandon(&ctx, &self.pool, false);
+            if (c.tls) |t| t.releaseIfIdle();
             self.arm(c, .active);
             self.drainLingering(c);
         }
@@ -968,9 +978,10 @@ pub fn Worker(comptime Handler: type) type {
             while (true) {
                 if (userTls(c)) |t| {
                     const progressed = self.tlsFlush(c, t) orelse return false;
+                    // Progress extends the deadline; a stalled reader times out.
+                    if (progressed) self.arm(c, .active);
                     if (t.hasWire()) {
                         self.h2Timer(c);
-                        _ = progressed;
                         return true;
                     }
                     const bytes = conn.wireBytes();
@@ -1005,6 +1016,7 @@ pub fn Worker(comptime Handler: type) type {
                 };
                 conn.advance(n);
                 if (!self.kernelWrote(c, n)) return false;
+                if (n > 0) self.arm(c, .active);
                 if (n < bytes.len) {
                     self.h2Timer(c);
                     return true;
@@ -1018,7 +1030,7 @@ pub fn Worker(comptime Handler: type) type {
             const ctx = self.h2Context(c);
             conn.pump(Handler, &ctx);
             if (conn.hasWire()) return self.h2Flush(c);
-            if (c.peer_closed and (conn.activeStreams() == 0 or !conn.answerableAlone())) {
+            if (c.peer_closed and !conn.holdsFrames() and (conn.activeStreams() == 0 or !conn.answerableAlone())) {
                 self.closeConn(c);
                 return false;
             }
