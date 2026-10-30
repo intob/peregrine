@@ -1284,7 +1284,7 @@ fn fuzzH3(_: void, smith: *std.testing.Smith) anyerror!void {
                 const p: u8 = if (n > 1) bytes[1] else 0xff;
                 h.path_max = if (p & 0x80 != 0) std.math.maxInt(usize) else 1200 + @as(usize, p & 0x1f) * 10;
                 if (p & 0x40 != 0) h.server.?.onProbeTooBig(h.now_us);
-                if (p & 0x20 != 0) h.server.?.onPathChange(h.now_us);
+                if (p & 0x20 != 0) h.server.?.onPathChange(h.now_us, false, true);
             },
             else => {},
         }

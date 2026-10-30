@@ -364,10 +364,12 @@ pub const Conn = struct {
     /// The maximum datagram size: the PLPMTU (RFC 8899), within the
     /// client's max_udp_payload_size.
     max_datagram: u16,
-    /// PMTU discovery's state (`cfg.max_mtu` nonzero), and the IP
-    /// packet's overhead on this path.
+    /// PMTU discovery's state (`cfg.max_mtu` nonzero), the IP packet's
+    /// overhead on this path, and whether the worker can keep this path's
+    /// datagrams from being fragmented (DF): without it, no discovery.
     pmtu: pmtud.Search,
     ipv6: bool,
+    dont_fragment: bool,
 
     rtt: recovery.Rtt = .{},
     cc: recovery.Congestion,
@@ -456,6 +458,9 @@ pub const Conn = struct {
         /// The client is at an IPv6 address (not IPv4-mapped): 20 more
         /// bytes of IP header in every packet, for PMTU discovery.
         ipv6: bool = false,
+        /// The socket sets DF for the client's address family; PMTU
+        /// discovery needs it (a fragmented probe proves nothing).
+        dont_fragment: bool = true,
     };
 
     pub fn init(allocator: Allocator, cfg: *const Config, opts: InitOptions) !*Self {
@@ -476,6 +481,7 @@ pub const Conn = struct {
             .max_datagram = cfg.max_datagram_size,
             .pmtu = .init(cfg.max_datagram_size, cfg.max_datagram_size),
             .ipv6 = opts.ipv6,
+            .dont_fragment = opts.dont_fragment,
             .cc = .init(cfg.max_datagram_size, cfg.congestion),
             .pacer = .init(cfg.max_datagram_size, cfg.pacing_burst_us),
             .last_activity = opts.now,
@@ -871,12 +877,12 @@ pub const Conn = struct {
     // -- PMTU discovery (RFC 9000 §14, pmtud.zig) --------------------------
 
     fn pmtuEnabled(self: *const Self) bool {
-        return self.cfg.max_mtu != 0;
+        return self.cfg.max_mtu != 0 and self.dont_fragment;
     }
 
     /// MAX_PLPMTU as configured, for this path's IP version.
     fn pmtuCeiling(self: *const Self) u16 {
-        if (!self.pmtuEnabled()) return self.max_datagram;
+        if (!self.pmtuEnabled()) return self.cfg.max_datagram_size;
         const overhead = if (self.ipv6) pmtud.ipv6_overhead else pmtud.ipv4_overhead;
         return @max(self.cfg.max_mtu -| overhead, pmtud.base);
     }
@@ -888,6 +894,16 @@ pub const Conn = struct {
         self.cc.setMss(size);
     }
 
+    /// A packet leaves the flight without being acknowledged and without
+    /// a congestion signal: a lost PMTU probe, or one the interface
+    /// refused.
+    fn retire(self: *Self, space: Space, pn: u64, p: *Sent.Packet) void {
+        const sp = &self.spaces[@backingInt(space)];
+        if (p.in_flight) self.cc.onDiscarded(p.size);
+        if (p.ecn and self.onPath(space, pn)) self.ecn_marked_lost += 1;
+        sp.sent.remove(p);
+    }
+
     /// The probe `send` last returned couldn't be sent: the local
     /// interface refused its size (EMSGSIZE). It leaves the flight, and
     /// the size fails at once.
@@ -895,24 +911,79 @@ pub const Conn = struct {
         const pn = self.pmtu.probe_pn orelse return;
         const sp = &self.spaces[@backingInt(Space.application)];
         if (sp.sent.get(pn)) |p| {
-            if (p.in_flight) self.cc.onDiscarded(p.size);
-            if (p.ecn and self.onPath(.application, pn)) self.ecn_marked_lost += 1;
-            sp.sent.remove(p);
+            self.retire(.application, pn, p);
             sp.sent.compact();
         }
         self.pmtu.onProbeTooBig(now);
         self.setLossTimer(now);
     }
 
+    /// Where the packets of the datagrams `send` returns next begin, per
+    /// packet number space (see `onSendRefused`).
+    pub const SendMark = [3]u64;
+
+    pub fn sendMark(self: *const Self) SendMark {
+        var m: SendMark = undefined;
+        for (&self.spaces, &m) |*sp, *x| x.* = sp.sent.nextPn();
+        return m;
+    }
+
+    /// The datagrams `send` returned since `mark` never left: the local
+    /// interface refused a datagram of `size` bytes (EMSGSIZE; with DF the
+    /// interface's MTU is a hard limit). Their packets leave the flight
+    /// without a congestion signal and what they carried is sent again,
+    /// and the maximum datagram size drops to 1200 at once, the ceiling
+    /// below `size` (discovery then finds what the interface takes).
+    /// Returns whether it dropped: the caller's GSO segment size is stale.
+    pub fn onSendRefused(self: *Self, mark: SendMark, size: usize, now: u64) bool {
+        if (self.max_datagram <= pmtud.base) return false;
+        const lower = self.pmtu.onLocalTooBig(@intCast(@min(size, std.math.maxInt(u16))), now) orelse return false;
+        for (&self.spaces, mark, 0..) |*sp, from, i| {
+            const space: Space = @fromBackingInt(@as(u2, @intCast(i)));
+            var pn = from;
+            while (pn < sp.sent.nextPn()) : (pn += 1) {
+                const p = sp.sent.get(pn) orelse continue;
+                for (sp.sent.recordsOf(p)) |rec| switch (rec) {
+                    // The ACK never went: it is still owed.
+                    .ack => {
+                        sp.ack_wanted = true;
+                        sp.ack_deadline = now;
+                    },
+                    else => self.onRecordLost(space, rec),
+                };
+                if (p.ecn) {
+                    sp.ecn_sent -|= 1;
+                    self.ecn_marked -|= 1;
+                }
+                self.bytes_sent -|= p.size;
+                if (p.pmtu_probe and self.pmtu.probe_pn == pn) self.pmtu.probe_pn = null;
+                // Not lost either: it never left.
+                if (p.in_flight) self.cc.onDiscarded(p.size);
+                sp.sent.remove(p);
+            }
+            sp.sent.compact();
+        }
+        self.setMaxDatagram(lower);
+        self.setLossTimer(now);
+        return true;
+    }
+
     /// Writes a PMTU probe if one is due: PING and PADDING to the probed
     /// size (§14.4), in a 1-RTT packet of its own, sent when the window
-    /// has room for it (it is in flight like any packet). Not after two
+    /// and the pacer have room for it (it is in flight like any packet).
+    /// Not after two
     /// probe timeouts in a row (packets aren't arriving; see `send`), and
     /// not into a buffer too small for it.
     fn sendPmtuProbe(self: *Self, out: []u8, now: u64) usize {
         if (!self.pmtuEnabled() or self.pto_count >= 2) return 0;
         const size = self.pmtu.due(now) orelse return 0;
         if (out.len < size or self.cc.in_flight + size > self.cc.window) return 0;
+        if (self.cfg.pacing) {
+            // Paced like data: when the pacer has a datagram's worth (the
+            // probe then takes what it has: one probe a round trip).
+            self.pacer.refill(now, &self.cc, &self.rtt);
+            if (self.pacer.tokens < self.max_datagram) return 0;
+        }
         const sp = &self.spaces[@backingInt(Space.application)];
         if (sp.tx == null) return 0;
         var b: Builder = .{ .out = out[0..size], .ecn = self.sendEcn() == .ect0, .pmtu_probe = true };
@@ -985,13 +1056,16 @@ pub const Conn = struct {
             // §14: within what the client takes; a smaller start than
             // ours resets the congestion window's units before anything
             // is sent (RFC 9002 §7.2).
+            // PMTU discovery's ceiling caps the start too (max_mtu 1300:
+            // 1272 bytes, not 1350).
             const peer_max: u16 = @intCast(@min(c.peer.max_udp_payload_size, std.math.maxInt(u16)));
-            if (peer_max < c.max_datagram) {
-                c.max_datagram = peer_max;
-                c.cc = .init(peer_max, c.cfg.congestion);
-                c.pacer = .init(peer_max, c.cfg.pacing_burst_us);
+            c.pmtu = .init(@min(c.max_datagram, peer_max), @min(c.pmtuCeiling(), peer_max));
+            if (c.pmtu.current < c.max_datagram) {
+                const start = c.pmtu.current;
+                c.max_datagram = start;
+                c.cc = .init(start, c.cfg.congestion);
+                c.pacer = .init(start, c.cfg.pacing_burst_us);
             }
-            c.pmtu = .init(c.max_datagram, @min(c.pmtuCeiling(), peer_max));
             const ours: tp.Params = .{
                 .original_destination_connection_id = c.odcid,
                 .initial_source_connection_id = c.scid,
@@ -1240,11 +1314,17 @@ pub const Conn = struct {
     /// and the RTT are kept (§9.4 would reset them for a migration to a
     /// new path; we ask clients not to migrate and follow rebinding
     /// without path validation).
-    pub fn onPathChange(self: *Self, now: u64) void {
-        if (self.pmtuEnabled()) {
-            const start: u16 = @intCast(@min(self.cfg.max_datagram_size, self.peer.max_udp_payload_size));
-            self.pmtu.restart(start, now);
-            self.setMaxDatagram(start);
+    /// `ipv6` and `dont_fragment` are the new address's, as at `init`.
+    pub fn onPathChange(self: *Self, now: u64, ipv6: bool, dont_fragment: bool) void {
+        self.ipv6 = ipv6;
+        self.dont_fragment = dont_fragment;
+        if (self.cfg.max_mtu != 0) {
+            const peer_max: u16 = @intCast(@min(self.peer.max_udp_payload_size, std.math.maxInt(u16)));
+            const start = @min(self.cfg.max_datagram_size, peer_max);
+            self.pmtu.restart(start, @min(self.pmtuCeiling(), peer_max), now);
+            // (A path whose family has DF where the old one's hadn't.)
+            if (self.handshake_complete and self.pmtuEnabled()) self.pmtu.start(now);
+            self.setMaxDatagram(self.pmtu.current);
         }
         if (!self.cfg.ecn) return;
         self.ecn_retests = 0;
@@ -1333,9 +1413,7 @@ pub const Conn = struct {
                 if (p.pmtu_probe) {
                     // §14.4: a failed probe, not congestion; and not a
                     // loss towards persistent congestion either.
-                    if (p.in_flight) self.cc.onLost(p.size);
-                    if (p.ecn and self.onPath(space, e.pn)) self.ecn_marked_lost += 1;
-                    sp.sent.remove(p);
+                    self.retire(space, e.pn, p);
                     self.pmtu.onProbeLost(e.pn, now);
                     continue;
                 }

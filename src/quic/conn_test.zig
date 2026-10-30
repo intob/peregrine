@@ -106,10 +106,15 @@ const Harness = struct {
     path_max: usize = std.math.maxInt(usize),
     largest_to_client: usize = 0,
     too_big: usize = 0,
-    /// The client is at an IPv6 address.
+    /// The client is at an IPv6 address; the worker's socket sets DF for it.
     ipv6: bool = false,
+    dont_fragment: bool = true,
     /// Until then, every datagram is lost both ways (an outage).
     outage_until: u64 = 0,
+    /// The server's interface: larger datagrams are refused (EMSGSIZE,
+    /// in `runDelayed`), and how many were.
+    iface_max: usize = std.math.maxInt(usize),
+    refused: usize = 0,
 
     fn init(client_opts: test_client.Options, tweak: anytype) !*Harness {
         const a = testing.allocator;
@@ -156,6 +161,7 @@ const Harness = struct {
                 .entropy = &entropy,
                 .now = h.now,
                 .ipv6 = h.ipv6,
+                .dont_fragment = h.dont_fragment,
             });
             h.first_datagram_len = dgram.len;
         }
@@ -258,9 +264,21 @@ const Harness = struct {
                 while (true) {
                     const in_flight = s.cc.in_flight;
                     const ecn = s.sendEcn();
+                    const mark = s.sendMark();
+                    const max = s.max_datagram;
                     const n = s.send(&buf, h.now);
                     if (n == 0) break;
-                    bytes += s.cc.in_flight - in_flight;
+                    if (n > h.iface_max) {
+                        // The interface refuses it, as the endpoint reports.
+                        if (n > max) {
+                            s.onProbeTooBig(h.now);
+                        } else if (!s.onSendRefused(mark, n, h.now)) {
+                            continue;
+                        }
+                        h.refused += 1;
+                        continue;
+                    }
+                    bytes += s.cc.in_flight -| in_flight;
                     try queue.append(h.a, .{ .at = h.now + delay, .to_server = false, .len = n, .buf = buf, .ecn = ecn });
                 }
                 if (bytes > 0) try bursts.append(h.a, .{ .at = h.now, .bytes = bytes, .tokens = tokens, .window = s.cc.window });
@@ -1811,7 +1829,7 @@ test "QUIC ECN: a new peer address is a new path: tested afresh" {
     const marked = s.spaces[2].ecn_sent;
     // NAT rebinding to a path that carries them.
     h.bleach = false;
-    s.onPathChange(h.now);
+    s.onPathChange(h.now, h.ipv6, true);
     try testing.expectEqual(conn_mod.EcnState.testing, s.ecn);
     try download(h, 200_000);
     try testing.expectEqual(conn_mod.EcnState.capable, s.ecn);
@@ -1895,7 +1913,7 @@ test "QUIC ECN: a new path isn't judged by the old one's packets: their loss doe
     const n = try heldWindow(h, "big 300000", &old);
     try testing.expectEqual(old.len, n);
     s.spaces[2].ecn_ce_pending = true;
-    s.onPathChange(h.now);
+    s.onPathChange(h.now, h.ipv6, true);
     try testing.expect(!s.spaces[2].ecn_ce_pending);
     var fresh: [32]Flight = undefined;
     var m: usize = 0;
@@ -1932,7 +1950,7 @@ test "QUIC ECN: a new path isn't validated by the old one's packets: one droppin
     var flights: [64]Flight = undefined;
     const n = try heldWindow(h, "big 300000", &flights);
     try testing.expect(n > conn_mod.ecn_testing_packets);
-    s.onPathChange(h.now);
+    s.onPathChange(h.now, h.ipv6, true);
     // The old mapping still delivers what it carried; the new path drops
     // every marked datagram.
     for (flights[0..n]) |*f| try h.toClient(f.buf[0..f.len], f.ecn);
@@ -2072,7 +2090,7 @@ test "QUIC PMTU: no probe before the handshake is confirmed, nor without room in
     try testing.expect(s.pmtu.probes_sent > 0);
     // A probe due, and a window with less room than it: a probe waits
     // (data that fits in the room still goes).
-    s.onPathChange(h.now);
+    s.onPathChange(h.now, h.ipv6, true);
     try testing.expectEqual(@as(?u16, 1472), s.pmtu.due(h.now));
     const pad = s.cc.window - s.cc.in_flight - 1400;
     s.cc.in_flight += pad;
@@ -2091,7 +2109,7 @@ test "QUIC PMTU: no probe before the handshake is confirmed, nor without room in
     try testing.expect(s.send(&buf, h.now) <= s.max_datagram);
     // Not into a buffer too small for it either (the worker's, when a GSO
     // run has filled most of it): the probe waits for the next.
-    s.onPathChange(h.now);
+    s.onPathChange(h.now, h.ipv6, true);
     try testing.expect(s.send(buf[0..1400], h.now) <= 1350);
     try testing.expectEqual(@as(usize, 1472), s.send(&buf, h.now));
 }
@@ -2143,7 +2161,7 @@ test "QUIC PMTU: a lost probe doesn't stretch a loss into persistent congestion"
     };
     const t0 = h.now;
     _ = try Fake.add(sp, s, a, t0, 1350, false);
-    s.onPathChange(t0);
+    s.onPathChange(t0, false, true);
     const probe = try Fake.add(sp, s, a, t0 + 5 * std.time.us_per_s, 1472, true);
     s.pmtu.onProbeSent(probe);
     const last = try Fake.add(sp, s, a, t0 + 5 * std.time.us_per_s + 50_000, 1350, false);
@@ -2272,7 +2290,7 @@ test "QUIC PMTU: an IPv6 path's ceiling is 20 bytes lower; EMSGSIZE fails a prob
     try testing.expect(s.isEstablished());
     try testing.expectEqual(@as(u16, 1452), s.max_datagram);
     // A new path: back to the start size, searched again.
-    s.onPathChange(h.now);
+    s.onPathChange(h.now, h.ipv6, true);
     try testing.expectEqual(@as(u16, 1350), s.max_datagram);
     try testing.expectEqual(@as(u64, 1350), s.cc.mss);
     var buf: [1500]u8 = undefined;
@@ -2295,6 +2313,21 @@ test "QUIC PMTU: an IPv6 path's ceiling is 20 bytes lower; EMSGSIZE fails a prob
     try testing.expectEqual(@as(u16, 1350), s.max_datagram);
 }
 
+/// The server's interface shrinks once the download is halfway.
+const IfaceChange = struct {
+    id: u64,
+    to: usize,
+    changed: bool = false,
+
+    fn done(c: *IfaceChange, h: *Harness) bool {
+        if (!c.changed and halfway(c.id, h)) {
+            c.changed = true;
+            h.iface_max = c.to;
+        }
+        return finishedAndSearched(c.id, h);
+    }
+};
+
 /// Everything lost both ways for `ms` once the download is halfway.
 const Outage = struct {
     id: u64,
@@ -2309,6 +2342,180 @@ const Outage = struct {
         return finishedAndSearched(c.id, h);
     }
 };
+
+test "QUIC PMTU: an outage that looks like a black hole costs one probe, not the size" {
+    // Outages ending between the first and second probe timeouts: the
+    // second's 1200-byte packets arrive after the full-sized ones were
+    // lost. The size that failed is probed first again, so it comes back.
+    var mistaken: u32 = 0;
+    var ms: u64 = 40;
+    while (ms <= 400) : (ms += 30) {
+        const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20 }, pmtuOn);
+        defer h.deinit();
+        var bursts: std.ArrayList(Burst) = .empty;
+        defer bursts.deinit(h.a);
+        try h.runDelayed(15_000, {}, established, &bursts);
+        const id = try h.client.openBidi();
+        try h.client.write(id, "big 2000000", true);
+        var outage: Outage = .{ .id = id, .ms = ms };
+        try h.runDelayed(15_000, &outage, Outage.done, &bursts);
+        try expectBody(h, id, 2_000_000);
+        const s = h.server.?;
+        mistaken += s.pmtu.black_holes;
+        try testing.expectEqual(@as(u16, 1472), s.max_datagram);
+        try testing.expectEqual(@as(u16, 1472), s.pmtu.ceiling);
+    }
+    std.debug.print("outages taken for black holes: {d} of 13\n", .{mistaken});
+}
+
+test "QUIC PMTU: datagrams the interface refuses go again at 1200, no congestion event, no probe timeout" {
+    // In the handshake: the server's first flight (1350 bytes) refused.
+    {
+        const h = try Harness.init(.{}, pmtuOn);
+        defer h.deinit();
+        var buf: [1500]u8 = undefined;
+        const n0 = try h.client.send(&buf);
+        try h.toServer(buf[0..n0]);
+        const s = h.server.?;
+        const mark = s.sendMark();
+        var refused: usize = 0;
+        while (s.send(&buf, h.now) > 0) refused += 1;
+        try testing.expect(refused > 0);
+        try testing.expect(s.cc.in_flight > 0);
+        try testing.expect(s.onSendRefused(mark, 1350, h.now));
+        try testing.expectEqual(@as(u16, 1200), s.max_datagram);
+        try testing.expectEqual(@as(u64, 0), s.cc.in_flight);
+        try testing.expectEqual(liveInFlight(s), s.cc.in_flight);
+        // Everything again, at 1200, at once: the handshake completes
+        // without a probe timeout.
+        h.path_max = 1300;
+        for (0..10) |_| {
+            while (true) {
+                const n = s.send(&buf, h.now);
+                if (n == 0) break;
+                // (Once established, a probe up to the lowered ceiling.)
+                try testing.expect(n <= 1200 or (s.isEstablished() and n <= 1349));
+                try h.toClient(buf[0..n], .not_ect);
+            }
+            while (true) {
+                const n = try h.client.send(&buf);
+                if (n == 0) break;
+                try h.toServer(buf[0..n]);
+            }
+            h.now += 1000;
+        }
+        try testing.expect(s.isEstablished() and h.client.handshake_complete);
+        try testing.expectEqual(@as(u32, 0), s.pto_count);
+        try testing.expectEqual(@as(u16, 1349), s.pmtu.ceiling);
+    }
+    // Mid-download at 1472: the interface shrinks to 1400.
+    {
+        const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20 }, pmtuOn);
+        defer h.deinit();
+        var bursts: std.ArrayList(Burst) = .empty;
+        defer bursts.deinit(h.a);
+        try h.runDelayed(10_000, {}, established, &bursts);
+        const s = h.server.?;
+        const lost = s.lost_packets;
+        const recovery_start = s.cc.recovery_start;
+        const id = try h.client.openBidi();
+        try h.client.write(id, "big 2000000", true);
+        var change: IfaceChange = .{ .id = id, .to = 1400 };
+        try h.runDelayed(10_000, &change, IfaceChange.done, &bursts);
+        try expectBody(h, id, 2_000_000);
+        try testing.expect(h.refused > 0);
+        // Nothing lost, no congestion event: the refused datagrams went
+        // again at the smaller size.
+        try testing.expectEqual(lost, s.lost_packets);
+        try testing.expectEqual(recovery_start, s.cc.recovery_start);
+        try testing.expectEqual(liveInFlight(s), s.cc.in_flight);
+        try testing.expect(s.max_datagram <= 1400 and 1400 - s.max_datagram < pmtud.min_step);
+        std.debug.print("refused {d} datagrams; then up to {d}\n", .{ h.refused, s.max_datagram });
+        // At 1200 there's nowhere lower: a refusal is a loss like any other.
+        s.max_datagram = 1200;
+        try testing.expect(!s.onSendRefused(s.sendMark(), 1200, h.now));
+    }
+}
+
+test "QUIC PMTU: no discovery where the socket can't set DF; a ceiling under the start lowers the start" {
+    {
+        const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20 }, pmtuOn);
+        defer h.deinit();
+        h.dont_fragment = false;
+        var bursts: std.ArrayList(Burst) = .empty;
+        defer bursts.deinit(h.a);
+        try h.runDelayed(10_000, {}, established, &bursts);
+        const id = try h.client.openBidi();
+        try h.client.write(id, "big 300000", true);
+        try h.runDelayed(10_000, id, finishedStream, &bursts);
+        try testing.expectEqual(@as(usize, 1350), h.largest_to_client);
+        try testing.expectEqual(@as(u32, 0), h.server.?.pmtu.probes_sent);
+        // A new path whose family has DF: discovery starts.
+        h.server.?.onPathChange(h.now, false, true);
+        try testing.expectEqual(@as(?u16, 1472), h.server.?.pmtu.due(h.now));
+    }
+    {
+        // max_mtu 1300 over IPv4: 1272 bytes from the first datagram.
+        const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20 }, struct {
+            fn f(c: *conn_mod.Config) void {
+                pmtuOn(c);
+                c.max_mtu = 1300;
+            }
+        }.f);
+        defer h.deinit();
+        var bursts: std.ArrayList(Burst) = .empty;
+        defer bursts.deinit(h.a);
+        try h.runDelayed(10_000, {}, established, &bursts);
+        const s = h.server.?;
+        try testing.expectEqual(@as(u16, 1272), s.max_datagram);
+        try testing.expectEqual(@as(u64, 1272), s.cc.mss);
+        const id = try h.client.openBidi();
+        try h.client.write(id, "big 300000", true);
+        try h.runDelayed(10_000, id, finishedStream, &bursts);
+        try testing.expectEqual(@as(usize, 1272), h.largest_to_client);
+        // After a black hole the confirmation probe stays under it too.
+        _ = s.pmtu.onBlackHole(h.now);
+        try testing.expectEqual(@as(?u16, 1272), s.pmtu.due(h.now));
+    }
+}
+
+test "QUIC PMTU: a new path's family sets its ceiling, and a refusal on the old route is forgotten" {
+    const h = try Harness.init(.{}, pmtuOn);
+    defer h.deinit();
+    try h.run(20);
+    const s = h.server.?;
+    try testing.expectEqual(@as(u16, 1472), s.max_datagram);
+    s.onPathChange(h.now, false, true);
+    var buf: [1500]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1472), s.send(&buf, h.now));
+    s.onProbeTooBig(h.now);
+    try testing.expectEqual(@as(u16, 1471), s.pmtu.ceiling);
+    // To an IPv6 address: 1452.
+    s.onPathChange(h.now, true, true);
+    try testing.expectEqual(@as(u16, 1452), s.pmtu.ceiling);
+    try testing.expectEqual(@as(usize, 1452), s.send(&buf, h.now));
+    // And back to IPv4: 1472 again, the old refusal forgotten.
+    s.onPathChange(h.now, false, true);
+    try testing.expectEqual(@as(u16, 1472), s.pmtu.ceiling);
+}
+
+test "QUIC PMTU: probes wait for the pacer" {
+    const h = try Harness.init(.{}, pmtuOn);
+    defer h.deinit();
+    try h.run(20);
+    const s = h.server.?;
+    s.onPathChange(h.now, false, true);
+    // An empty bucket: no probe until it has a datagram's worth.
+    s.pacer.refill(h.now, &s.cc, &s.rtt);
+    s.pacer.onSent(s.pacer.tokens);
+    var buf: [1500]u8 = undefined;
+    const sent = s.pmtu.probes_sent;
+    try testing.expect(s.send(&buf, h.now) <= s.max_datagram);
+    try testing.expectEqual(sent, s.pmtu.probes_sent);
+    // Later, it goes.
+    h.now += 50_000;
+    try testing.expectEqual(@as(usize, 1472), s.send(&buf, h.now));
+}
 
 test "QUIC PMTU: an outage isn't a black hole: the size stays" {
     for ([_]u64{ 200, 700, 3000 }) |ms| {

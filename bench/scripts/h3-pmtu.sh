@@ -15,6 +15,12 @@
 #               completes (probe timeouts go at 1200), then a black hole
 #               takes data to 1200 and the search finds 1241-1256
 #   server-1400 the server's interface at 1400: probes refused locally
+#   server-1300 at 1300, under our 1350 start: ordinary datagrams refused
+#               too (EMSGSIZE, or EINVAL for a GSO run); they go again at
+#               1200 at once (curl's 1 MiB in well under the second two
+#               probe timeouts would take), then the search finds 1257-1272
+#   server-1300-off  the same with discovery off (mtu=0): no DF, so the
+#               kernel fragments the 1350-byte datagrams, which arrive
 #   drop-1300   1500, then the client's MTU drops to 1300 2 s into a 6 s
 #               h2load run (a black hole after validation): no request
 #               fails, and the rate after the drop is reported
@@ -45,10 +51,10 @@ fail=0
 check() { # name, condition result, detail
     if [ "$2" = 1 ]; then echo "PASS $1 ($3)"; else echo "FAIL $1 ($3)"; fail=1; fi
 }
-start() { # server MTU
+start() { # server MTU [more bench-server args]
     docker rm -f "$SRV" "$CLI" >/dev/null 2>&1
     docker run -d --name "$SRV" --network "$NET" --cap-add NET_ADMIN --security-opt seccomp="$SECCOMP" -v "$BIN":/b \
-        $IMG sh -c "ip link set eth0 mtu $1 gso_max_segs 1 && exec /b/bench-server 2 $B 8443 h3 $ARGS" >/dev/null || exit 1
+        $IMG sh -c "ip link set eth0 mtu $1 gso_max_segs 1 && exec /b/bench-server 2 $B 8443 h3 $ARGS ${2:-}" >/dev/null || exit 1
     docker run -d --name "$CLI" --network "$NET" --cap-add NET_ADMIN -v "$ROOT/bench/h3":/h3 $IMG sleep 3600 >/dev/null || exit 1
     sleep 1
     IP=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$NET\").IPAddress}}" "$SRV")
@@ -71,16 +77,28 @@ curl1m() { x "timeout 60 curl -sk --http3-only -o /dev/null -w '%{size_download}
 h2l() { x "timeout 120 h2load --alpn-list=h3 -t2 -n $1 -c2 -m2 $U/1m" | awk '/^status codes:/{s=$3} /^finished in/{t=$3} END{print s+0, t}'; }
 
 uptime | sed 's/.*averages*: /load /'
-for c in 1500 client-1400 client-1280 server-1400; do
-    case $c in 1500) start 1500 ;; client-*) start 1500; cmtu "${c#client-}" ;; server-*) start "${c#server-}" ;; esac
+for c in 1500 client-1400 client-1280 server-1400 server-1300 server-1300-off; do
+    case $c in
+    1500) start 1500 ;;
+    client-*) start 1500; cmtu "${c#client-}" ;;
+    server-*-off) m=${c#server-}; start "${m%-off}" mtu=0 ;;
+    server-*) start "${c#server-}" ;;
+    esac
     # The payload limit: the MTU less 28 bytes (plus the veth's slack of 4
     # at the client); the search stops within 16 bytes of it.
-    case $c in 1500) lo=1472 hi=1472 ;; client-1400) lo=1361 hi=1376 ;; server-1400) lo=1357 hi=1372 ;; client-1280) lo=1241 hi=1256 ;; esac
+    case $c in
+    1500) lo=1472 hi=1472 ;; client-1400) lo=1361 hi=1376 ;; server-1400) lo=1357 hi=1372 ;;
+    client-1280) lo=1241 hi=1256 ;; server-1300) lo=1257 hi=1272 ;; server-1300-off) lo=1350 hi=1350 ;;
+    esac
     aio
     check "$c aioquic 2 × 1 MiB, largest datagram $lo-$hi" "$([ "$oks" = 2 ] && [ "${largest:-0}" -ge $lo ] && [ "${largest:-0}" -le $hi ] && echo 1)" \
         "largest ${largest:-none}, ${count:-0} of them, ${secs:-?} s"
     r=$(curl1m)
     check "$c curl 1 MiB" "$([ "${r%% *}" = 1048576 ] && echo 1)" "$r s"
+    if [ $c = server-1300 ]; then
+        # No probe timeouts: a refused datagram goes again at once.
+        check "$c curl 1 MiB without waiting for probe timeouts" "$(awk -v t="${r#* }" 'BEGIN { print (t < 0.5) ? 1 : 0 }')" "$r s"
+    fi
     r=$(h2l 100)
     check "$c h2load 100 × 1 MiB" "$([ "${r%% *}" = 100 ] && echo 1)" "$r"
 done

@@ -5138,7 +5138,9 @@ fn testHttp3Pmtu(backend: Backend) !void {
         try testing.expect(std.mem.eql(u8, &big_body, a.body.items));
         // The probe arrived whole (its own sendmsg, not cut into a GSO
         // run's segments), and the data went at its size: most of 8 MB.
-        const want: usize = if (ipv6) 1452 else 1472;
+        // (On macOS a dual-stack socket can't set DF for IPv4-mapped
+        // peers, so they get no discovery: 1350 throughout.)
+        const want: usize = if (ipv6) 1452 else if (sys.is_linux or !v6) 1472 else 1350;
         try testing.expectEqual(want, cl.c.largest_datagram);
         try testing.expect(cl.c.largest_datagrams > big_body.len / want / 2);
     }

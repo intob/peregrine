@@ -55,6 +55,9 @@ pub const Options = struct {
     retry: RetryMode = .never,
     /// Stateless resets sent per second, at most.
     max_resets_per_second: u32 = 100,
+    /// Which peers' datagrams the socket sends with DF (`udp.setDontFragment`):
+    /// PMTU discovery runs only for those.
+    dont_fragment: udp.DontFragment = .{},
 };
 
 const CidKey = struct {
@@ -262,7 +265,7 @@ pub fn Endpoint(comptime Handler: type) type {
                 // reordered datagram from the old one doesn't count, RFC
                 // 9000 §9.3): answer there, and test ECN on the new path.
                 st.peer = from.*;
-                st.q.?.onPathChange(now_us);
+                st.q.?.onPathChange(now_us, udp.isIpv6(from), self.opts.dont_fragment.covers(from));
             }
             self.markDirty(s);
         }
@@ -309,6 +312,7 @@ pub fn Endpoint(comptime Handler: type) type {
                 .entropy = &entropy,
                 .now = now_us,
                 .ipv6 = udp.isIpv6(from),
+                .dont_fragment = self.opts.dont_fragment.covers(from),
             }) catch {
                 self.free.appendAssumeCapacity(slot);
                 return null;
@@ -437,6 +441,18 @@ pub fn Endpoint(comptime Handler: type) type {
         }
 
         fn flush(self: *Self, slot: u32, now_us: u64) void {
+            // A datagram the interface refused drops the connection's size
+            // (to 1200); what was refused goes again at the new one. It
+            // only shrinks, so twice is enough.
+            for (0..3) |_| {
+                if (!self.flushRun(slot, now_us)) return;
+            }
+        }
+
+        /// Sends what the connection has. True when the interface refused
+        /// a run and the connection's size dropped: the segment size is
+        /// stale, call again.
+        fn flushRun(self: *Self, slot: u32, now_us: u64) bool {
             const st = &self.slots[slot];
             const q = st.q.?;
             const seg: usize = q.max_datagram;
@@ -444,13 +460,16 @@ pub fn Endpoint(comptime Handler: type) type {
             var segments: usize = 0;
             // One GSO send has one ECN codepoint: a change ends the batch.
             var ecn: packet.Ecn = .not_ect;
+            // Where the run in the buffer began, in packet numbers.
+            var mark = q.sendMark();
             while (true) {
                 const next_ecn: packet.Ecn = if (self.tos_refused[udp.tosKind(&st.peer)]) .not_ect else q.sendEcn();
                 if (pos + seg > gso_max_bytes or (pos > 0 and next_ecn != ecn)) {
-                    self.sendOut(st, pos, seg, segments, ecn);
+                    if (self.sendRun(st, pos, seg, segments, ecn, mark, now_us)) return true;
                     pos = 0;
                     segments = 0;
                 }
+                if (pos == 0) mark = q.sendMark();
                 ecn = next_ecn;
                 // The rest of the buffer: datagrams are at most `seg`
                 // bytes, but a PMTU probe is larger, when it fits.
@@ -458,15 +477,16 @@ pub fn Endpoint(comptime Handler: type) type {
                 if (n == 0) break;
                 if (n > seg) {
                     // A probe goes in a sendmsg of its own, after the run
-                    // before it (GSO segments are all `seg` bytes).
-                    self.sendOut(st, pos, seg, segments, ecn);
+                    // before it (GSO segments are all `seg` bytes; a
+                    // refused run takes the probe after it with it).
+                    if (self.sendRun(st, pos, seg, segments, ecn, mark, now_us)) return true;
                     if (self.sendTo(&st.peer, self.send_buf[pos..][0..n], null, ecn) == .too_big) q.onProbeTooBig(now_us);
                     pos = 0;
                     segments = 0;
                     continue;
                 }
                 if (!self.gso) {
-                    _ = self.sendTo(&st.peer, self.send_buf[0..n], null, ecn);
+                    if (self.sendRun(st, n, seg, 1, ecn, mark, now_us)) return true;
                     continue;
                 }
                 pos += n;
@@ -474,17 +494,23 @@ pub fn Endpoint(comptime Handler: type) type {
                 // GSO sends equal segments with a shorter last one: a short
                 // datagram ends the batch.
                 if (n < seg or segments == 64) {
-                    self.sendOut(st, pos, seg, segments, ecn);
+                    if (self.sendRun(st, pos, seg, segments, ecn, mark, now_us)) return true;
                     pos = 0;
                     segments = 0;
                 }
             }
-            if (pos > 0) self.sendOut(st, pos, seg, segments, ecn);
+            return self.sendRun(st, pos, seg, segments, ecn, mark, now_us);
         }
 
-        fn sendOut(self: *Self, st: *Slot, len: usize, seg: usize, segments: usize, ecn: packet.Ecn) void {
-            if (len == 0) return;
-            _ = self.sendTo(&st.peer, self.send_buf[0..len], if (segments > 1) @intCast(seg) else null, ecn);
+        /// Sends the run in send_buf[0..len], whose packets begin at
+        /// `mark`. True when the interface refused it (EMSGSIZE: larger
+        /// than the interface, DF set) and the connection took a smaller
+        /// size, the run's packets to be sent again without a congestion
+        /// signal; otherwise a failed send is a loss like any other.
+        fn sendRun(self: *Self, st: *Slot, len: usize, seg: usize, segments: usize, ecn: packet.Ecn, mark: quic.Conn.SendMark, now_us: u64) bool {
+            if (len == 0) return false;
+            if (self.sendTo(&st.peer, self.send_buf[0..len], if (segments > 1) @intCast(seg) else null, ecn) != .too_big) return false;
+            return st.q.?.onSendRefused(mark, if (segments > 1) seg else len, now_us);
         }
 
         const Sent = enum { sent, failed, too_big };
@@ -496,9 +522,8 @@ pub fn Endpoint(comptime Handler: type) type {
                     return .sent;
                 },
                 // Larger than the interface (DF is set): for a PMTU probe,
-                // the size fails; for other datagrams (the interface
-                // shrank), a loss like any other, until black hole
-                // detection lowers the size.
+                // the size fails; for other datagrams, the connection's
+                // size drops (`onSendRefused`).
                 error.MessageTooBig => return .too_big,
                 // A send that fails is a lost packet to QUIC; recovery
                 // resends.

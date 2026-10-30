@@ -20,10 +20,15 @@
 //! size): full-sized packets (the PLPMTU's size) lost `black_hole_packets`
 //! times in a row over at least a probe timeout, with none of that size
 //! acknowledged since, while smaller ones sent after the first of them
-//! are acknowledged and none of those is lost (an outage loses both). The PLPMTU goes back to BASE_PLPMTU and the search
-//! runs again below the size that failed. (conn.zig sends its probe
-//! timeouts' packets at BASE_PLPMTU after two in a row, so a bulk sender
-//! whose every packet is full-sized still has small ones acknowledged.)
+//! are acknowledged and none of BASE_PLPMTU's size or less is lost (an
+//! outage loses both). The PLPMTU goes back to BASE_PLPMTU at once, and
+//! the search runs again from the size that failed: probed first, as a
+//! confirmation (an outage that looked like a black hole costs one probe,
+//! not 600 s below the size), then bisected below it. (conn.zig sends its
+//! probe timeouts' packets at BASE_PLPMTU after two in a row, so a bulk
+//! sender whose every packet is full-sized still has small ones
+//! acknowledged.) A datagram the local interface refuses (EMSGSIZE) takes
+//! the PLPMTU to BASE_PLPMTU and the ceiling below its size at once.
 const std = @import("std");
 
 /// BASE_PLPMTU and MIN_PLPMTU (RFC 9000 §14.3): QUIC's smallest maximum
@@ -82,10 +87,12 @@ pub const Search = struct {
     probes_lost: u32 = 0,
     black_holes: u32 = 0,
 
-    /// `current` is the size the connection starts with; `ceiling` at or
-    /// below it: nothing to search for (black holes are still detected).
+    /// `current` is the size the connection starts with, no larger than
+    /// `ceiling`; a ceiling at it: nothing to search for (black holes are
+    /// still detected).
     pub fn init(current: u16, ceiling: u16) Self {
-        return .{ .current = current, .ceiling = @max(ceiling, base) };
+        const c = @max(ceiling, base);
+        return .{ .current = @min(current, c), .ceiling = c };
     }
 
     /// The handshake is confirmed: probing may begin.
@@ -193,10 +200,11 @@ pub const Search = struct {
     /// An ack-eliciting packet other than a probe was declared lost.
     pub fn onPacketLost(self: *Self, size: u32, time_sent: u64) void {
         if (size < self.current) {
-            // A smaller packet lost too, sent after the run began: the
-            // path lost everything for a while (an outage), not only what
-            // was too large.
-            if (self.full_lost > 0 and time_sent > self.full_lost_first) self.full_lost = 0;
+            // A packet the fallback size carries, lost too, sent after the
+            // run began: the path lost everything for a while (an outage),
+            // not only what was too large. (Sizes in between say nothing:
+            // the path may have shrunk below them.)
+            if (size <= base and self.full_lost > 0 and time_sent > self.full_lost_first) self.full_lost = 0;
             return;
         }
         // Only full-sized ones sent after the last full-sized one that
@@ -219,27 +227,46 @@ pub const Search = struct {
             self.small_acked > self.full_lost_first;
     }
 
-    /// A black hole: back to BASE_PLPMTU, and the search runs again below
-    /// the size that stopped arriving. Returns the new PLPMTU.
+    /// A black hole: back to BASE_PLPMTU, and the search runs again from
+    /// the size that stopped arriving, probed first (MAX_PROBES losses of
+    /// it confirm the black hole; an outage mistaken for one ends with
+    /// that probe acknowledged). Returns the new PLPMTU.
     pub fn onBlackHole(self: *Self, now: u64) u16 {
-        const failed = self.current;
-        self.current = base;
+        const failed = @min(self.current, self.ceiling);
         self.black_holes += 1;
-        self.full_lost = 0;
-        self.full_acked = 0;
-        self.small_acked = 0;
-        self.search(failed - 1, now);
-        // The size that failed isn't probed first: halve the range.
-        if (self.state == .searching) self.bisect(now);
+        self.fallBack();
+        if (self.state != .disabled) self.search(failed, now);
         return base;
     }
 
-    /// The peer moved to a new address: a new path, searched afresh from
-    /// `current` (what the connection started with).
-    pub fn restart(self: *Self, current: u16, now: u64) void {
-        const started = self.state != .disabled;
-        self.* = .{ .current = current, .ceiling = self.ceiling, .probes_sent = self.probes_sent, .probes_lost = self.probes_lost, .black_holes = self.black_holes };
-        if (started) self.search(self.ceiling, now);
+    /// The local interface refused a datagram of `size` (EMSGSIZE): the
+    /// ceiling goes below it for good and the PLPMTU to BASE_PLPMTU, and
+    /// the search runs again (its probes find the interface's size by
+    /// EMSGSIZE). Returns the new PLPMTU, or null if it can't go lower.
+    pub fn onLocalTooBig(self: *Self, size: u16, now: u64) ?u16 {
+        if (self.current <= base) return null;
+        self.ceiling = @max(@min(self.ceiling, size -| 1), base);
+        self.fallBack();
+        if (self.state != .disabled) self.search(self.ceiling, now);
+        return base;
+    }
+
+    fn fallBack(self: *Self) void {
+        self.current = base;
+        self.full_lost = 0;
+        self.full_acked = 0;
+        self.small_acked = 0;
+    }
+
+    /// The peer moved to a new address: a new path with its own `ceiling`,
+    /// searched afresh from `current` (what the connection started with).
+    pub fn restart(self: *Self, current: u16, ceiling: u16, now: u64) void {
+        const old = self.*;
+        self.* = .init(current, ceiling);
+        self.probes_sent = old.probes_sent;
+        self.probes_lost = old.probes_lost;
+        self.black_holes = old.black_holes;
+        if (old.state != .disabled) self.search(self.ceiling, now);
     }
 };
 
@@ -369,7 +396,8 @@ test "black holes: full-sized losses over a PTO while smaller packets arrive" {
     s.onPacketLost(1472, 40_000);
     s.onPacketLost(1472, 1_000);
     try testing.expect(!s.blackHole(pto));
-    // Smaller packets' losses don't make a run.
+    // Smaller packets' losses don't make a run (nor, over the fallback
+    // size, end one: the path may have shrunk below them).
     for (0..10) |i| s.onPacketLost(1300, 42_000 + i * 100);
     try testing.expect(!s.blackHole(pto));
     for (0..3) |i| s.onPacketLost(1472, 50_000 + i * 20_000);
@@ -379,18 +407,26 @@ test "black holes: full-sized losses over a PTO while smaller packets arrive" {
     var outage = s;
     outage.onPacketLost(1200, 60_000);
     try testing.expect(!outage.blackHole(pto));
-    // (One sent before the run began says nothing.)
+    // (One sent before the run began says nothing, and one between the
+    // fallback size and the full size doesn't end it.)
     outage = s;
     outage.onPacketLost(1200, 49_000);
+    outage.onPacketLost(1300, 60_000);
     try testing.expect(outage.blackHole(pto));
+    var confirmed = s;
     try testing.expectEqual(base, s.onBlackHole(200_000));
     try testing.expectEqual(@as(u16, base), s.current);
-    // The search runs again below the size that failed, from its middle.
-    try testing.expectEqual(@as(u16, 1471), s.high);
-    try testing.expectEqual(@as(?u16, 1200 + (1471 - 1200 + 1) / 2), s.due(200_000));
+    // The size that failed is probed again first: a confirmation.
+    try testing.expectEqual(@as(?u16, 1472), s.due(200_000));
     var now: u64 = 200_000;
     _ = try converge(&s, 1400, &now);
     try testing.expect(s.current <= 1400 and 1400 - s.current < min_step);
+    // An outage taken for a black hole: the first probe of the old size
+    // is acknowledged and the size is back.
+    _ = confirmed.onBlackHole(200_000);
+    confirmed.onProbeSent(99);
+    try testing.expectEqual(@as(?u16, 1472), confirmed.onProbeAcked(99, 1472, 210_000));
+    try testing.expectEqual(State.complete, confirmed.state);
     // At BASE_PLPMTU, nothing is a black hole.
     s = .init(1200, 1200);
     for (0..10) |i| s.onPacketLost(1200, i * 100_000);
@@ -402,12 +438,40 @@ test "a restart (new path) forgets the probe in flight" {
     var s: Search = .init(1350, 1472);
     s.start(0);
     s.onProbeSent(5);
-    s.restart(1350, 10);
-    try testing.expectEqual(@as(?u16, null), s.onProbeAcked(5, 1472, 20));
+    // A refusal on the old route had lowered the ceiling; the new path
+    // has its own (here an IPv6 one).
+    s.onProbeTooBig(5);
+    try testing.expectEqual(@as(u16, 1471), s.ceiling);
+    s.onProbeSent(6);
+    s.restart(1350, 1452, 10);
+    try testing.expectEqual(@as(?u16, null), s.onProbeAcked(6, 1472, 20));
     try testing.expectEqual(@as(u16, 1350), s.current);
-    try testing.expectEqual(@as(?u16, 1472), s.due(20));
+    try testing.expectEqual(@as(?u16, 1452), s.due(20));
+    try testing.expectEqual(@as(u32, 2), s.probes_sent);
     // Before the handshake, a restart doesn't start the search.
     s = .init(1350, 1472);
-    s.restart(1350, 0);
+    s.restart(1350, 1472, 0);
     try testing.expectEqual(@as(?u16, null), s.due(0));
+}
+
+test "the start size is clamped to the ceiling; a local refusal lowers both at once" {
+    // max_mtu 1300 over IPv4: a 1272 ceiling under a 1350 start.
+    var s: Search = .init(1350, 1272);
+    try testing.expectEqual(@as(u16, 1272), s.current);
+    s.start(0);
+    try testing.expectEqual(State.complete, s.state);
+    // After a black hole the confirmation probe stays within the ceiling.
+    _ = s.onBlackHole(0);
+    try testing.expectEqual(@as(?u16, 1272), s.due(0));
+    // An ordinary datagram of 1272 refused by the interface (before the
+    // handshake: no search yet).
+    s = .init(1350, 1472);
+    try testing.expectEqual(@as(?u16, base), s.onLocalTooBig(1350, 0));
+    try testing.expectEqual(@as(u16, 1349), s.ceiling);
+    try testing.expectEqual(@as(?u16, null), s.due(0));
+    s.start(0);
+    try testing.expectEqual(@as(?u16, 1349), s.due(0));
+    // At BASE_PLPMTU there is nowhere lower to go.
+    s = .init(1200, 1472);
+    try testing.expectEqual(@as(?u16, null), s.onLocalTooBig(1200, 0));
 }

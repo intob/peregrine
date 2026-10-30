@@ -475,8 +475,14 @@ pub fn Server(comptime Handler: type) type {
                         var ua = address;
                         ua.setPort(srv.quic_port);
                         udp_fds[i] = try udp.bind(ua, sys.is_linux);
-                        // RFC 9000 §14: DF, where the kernel lets us.
-                        _ = udp.setDontFragment(udp_fds[i], ua == .ip6);
+                        // RFC 9000 §14: DF, where the kernel lets us, with
+                        // PMTU discovery (without it the kernel's default
+                        // stays: on Linux, fragmenting to the path MTU it
+                        // learns, rather than black-holing a path under
+                        // max_datagram_size with no fallback).
+                        if (o.max_mtu != 0) {
+                            if (opts.quic) |*q| q.dont_fragment = udp.setDontFragment(udp_fds[i], ua == .ip6);
+                        }
                         if (o.ecn) udp.enableEcn(udp_fds[i], ua == .ip6);
                         if (i == 0 and srv.quic_port == 0) srv.quic_port = try udp.localPort(udp_fds[0]);
                     }

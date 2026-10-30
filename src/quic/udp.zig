@@ -138,21 +138,32 @@ pub fn attachSteering(fd: fd_t, workers: u32) !void {
 /// up to the interface's and larger ones fail with EMSGSIZE; on an IPv6
 /// socket for both families (IPv4-mapped traffic follows the IP option).
 /// macOS: IP_DONTFRAG or IPV6_DONTFRAG (it refuses IP-level options on an
-/// IPv6 socket, as with ECN). Whether every option took.
-pub fn setDontFragment(fd: fd_t, ipv6: bool) bool {
-    var ok = true;
+/// IPv6 socket, as with ECN, and IPV6_DONTFRAG doesn't cover IPv4-mapped
+/// destinations: those go fragmented). Which peers' datagrams carry DF.
+pub fn setDontFragment(fd: fd_t, ipv6: bool) DontFragment {
     if (sys.is_linux) {
-        if (ipv6) ok = sys.trySetsockoptInt(fd, posix.IPPROTO.IPV6, linux.IPV6.MTU_DISCOVER, linux.IPV6.PMTUDISC_PROBE) and ok;
-        ok = sys.trySetsockoptInt(fd, posix.IPPROTO.IP, linux.IP.MTU_DISCOVER, linux.IP.PMTUDISC_PROBE) and ok;
-        return ok;
+        const v6 = ipv6 and sys.trySetsockoptInt(fd, posix.IPPROTO.IPV6, linux.IPV6.MTU_DISCOVER, linux.IPV6.PMTUDISC_PROBE);
+        const v4 = sys.trySetsockoptInt(fd, posix.IPPROTO.IP, linux.IP.MTU_DISCOVER, linux.IP.PMTUDISC_PROBE);
+        return .{ .v4 = v4, .v6 = v6 };
     }
     if (ipv6) {
-        if (!@hasDecl(posix.IPV6, "DONTFRAG")) return false;
-        return sys.trySetsockoptInt(fd, posix.IPPROTO.IPV6, posix.IPV6.DONTFRAG, 1);
+        if (!@hasDecl(posix.IPV6, "DONTFRAG")) return .{};
+        return .{ .v6 = sys.trySetsockoptInt(fd, posix.IPPROTO.IPV6, posix.IPV6.DONTFRAG, 1) };
     }
-    if (!@hasDecl(posix.IP, "DONTFRAG")) return false;
-    return sys.trySetsockoptInt(fd, posix.IPPROTO.IP, posix.IP.DONTFRAG, 1);
+    if (!@hasDecl(posix.IP, "DONTFRAG")) return .{};
+    return .{ .v4 = sys.trySetsockoptInt(fd, posix.IPPROTO.IP, posix.IP.DONTFRAG, 1) };
 }
+
+/// Whether a socket's datagrams carry DF, by the peer's family: IPv4
+/// (IPv4-mapped included) and IPv6.
+pub const DontFragment = struct {
+    v4: bool = false,
+    v6: bool = false,
+
+    pub fn covers(df: DontFragment, to: *const Addr) bool {
+        return if (isIpv6(to)) df.v6 else df.v4;
+    }
+};
 
 // -- ECN ----------------------------------------------------------------------
 
@@ -330,37 +341,29 @@ fn sendmsg(fd: fd_t, to: *const Addr, data: []const u8, control: []u8) posix.E {
 /// the ECN codepoint `ecn` (no control message for Not-ECT).
 pub fn send(fd: fd_t, to: *const Addr, data: []const u8, segment: ?u16, ecn: Ecn) SendError!void {
     var control: [2 * ecn_cmsg_space]u8 align(@alignOf(sys.cmsghdr)) = @splat(0);
-    var len: usize = 0;
-    if (sys.is_linux) {
-        if (segment) |seg| {
-            if (data.len > seg) len = sys.putCmsg(&control, len, SOL_UDP, UDP_SEGMENT, std.mem.asBytes(&seg));
-        }
-    }
-    // The TOS message last, so it can be dropped.
-    const plain = len;
-    if (ecn != .not_ect) {
-        const v: c_int = @backingInt(ecn);
-        len = switch (tosKind(to)) {
-            0 => sys.putCmsg(&control, len, posix.IPPROTO.IP, posix.IP.TOS, std.mem.asBytes(&v)),
-            1 => sys.putCmsg(&control, len, posix.IPPROTO.IPV6, posix.IPV6.TCLASS, std.mem.asBytes(&v)),
-        };
-    }
     var refused = false;
     var rest = data;
-    // Elsewhere than Linux: datagram by datagram.
-    const seg = if (sys.is_linux) data.len else segment orelse data.len;
+    // GSO on Linux: the whole run in one sendmsg. Elsewhere, or once the
+    // kernel refused the run: datagram by datagram.
+    var gso: ?u16 = if (sys.is_linux and segment != null and data.len > segment.?) segment else null;
+    var seg = if (gso != null or segment == null) data.len else segment.?;
     while (rest.len > 0) {
         const n = @min(rest.len, seg);
-        var e = sendmsg(fd, to, rest[0..n], control[0..len]);
-        if (e == .INVAL and len > plain) {
+        var e = sendmsg(fd, to, rest[0..n], control[0..putControl(&control, to, gso, if (refused) .not_ect else ecn)]);
+        if (e == .INVAL and ecn != .not_ect and !refused) {
             // EINVAL has other causes (a peer at port 0, a GSO segment
             // over the route's MTU): it is the TOS message only if the
             // send goes without it.
-            e = sendmsg(fd, to, rest[0..n], control[0..plain]);
-            if (e == .SUCCESS) {
-                refused = true;
-                len = plain;
-            }
+            e = sendmsg(fd, to, rest[0..n], control[0..putControl(&control, to, gso, .not_ect)]);
+            if (e == .SUCCESS) refused = true;
+        }
+        if (e == .INVAL and gso != null) {
+            // A GSO segment larger than the route takes (udp_send_skb
+            // says EINVAL, not EMSGSIZE): one at a time, where EMSGSIZE
+            // tells (nothing has left: the first datagram is the largest).
+            gso = null;
+            seg = segment.?;
+            continue;
         }
         switch (e) {
             .SUCCESS => {},
@@ -374,6 +377,21 @@ pub fn send(fd: fd_t, to: *const Addr, data: []const u8, segment: ?u16, ecn: Ecn
         rest = rest[n..];
     }
     if (refused) return error.TosRefused;
+}
+
+/// A send's control messages: the GSO segment size, then the codepoint
+/// (none for Not-ECT). Returns their length.
+fn putControl(control: []u8, to: *const Addr, gso: ?u16, ecn: Ecn) usize {
+    var len: usize = 0;
+    if (gso) |g| len = sys.putCmsg(control, len, SOL_UDP, UDP_SEGMENT, std.mem.asBytes(&g));
+    if (ecn != .not_ect) {
+        const v: c_int = @backingInt(ecn);
+        len = switch (tosKind(to)) {
+            0 => sys.putCmsg(control, len, posix.IPPROTO.IP, posix.IP.TOS, std.mem.asBytes(&v)),
+            1 => sys.putCmsg(control, len, posix.IPPROTO.IPV6, posix.IPV6.TCLASS, std.mem.asBytes(&v)),
+        };
+    }
+    return len;
 }
 
 /// Whether the kernel supports UDP_SEGMENT on this socket.
@@ -526,7 +544,7 @@ test "DF: a datagram larger than the interface fails with MessageTooBig instead 
     var addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
     const fd = try bind(addr, false);
     defer sys.close(fd);
-    try testing.expect(setDontFragment(fd, false));
+    try testing.expect(setDontFragment(fd, false).v4);
     addr.setPort(try localPort(fd));
     const self_addr: Addr = .fromIp(addr);
     const big = try testing.allocator.alloc(u8, 16384);
@@ -546,7 +564,7 @@ test "DF: a datagram larger than the interface fails with MessageTooBig instead 
         if (routed) {
             const df = try bind(.{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } }, false);
             defer sys.close(df);
-            try testing.expect(setDontFragment(df, false));
+            try testing.expect(setDontFragment(df, false).v4);
             send(df, &far, big[0..1600], null, .not_ect) catch |err| try testing.expectEqual(error.MessageTooBig, err);
         }
         return;
@@ -563,8 +581,22 @@ test "DF: a datagram larger than the interface fails with MessageTooBig instead 
     a6.ip6.bytes[15] = 1;
     const s6 = bind(a6, false) catch return;
     defer sys.close(s6);
-    try testing.expect(setDontFragment(s6, true));
+    const df6 = setDontFragment(s6, true);
+    try testing.expect(df6.v6);
     a6.setPort(try localPort(s6));
     const to6: Addr = .fromIp(a6);
     try testing.expectError(error.MessageTooBig, send(s6, &to6, big, null, .not_ect));
+    // A dual-stack socket's IPv4-mapped peers aren't covered on macOS:
+    // IPV6_DONTFRAG doesn't apply to them (the datagram is fragmented),
+    // and it says so.
+    var any6: std.Io.net.IpAddress = .{ .ip6 = .{ .bytes = std.mem.zeroes([16]u8), .port = 0 } };
+    const d = try bind(any6, false);
+    defer sys.close(d);
+    const df = setDontFragment(d, true);
+    try testing.expect(df.v6 and !df.v4);
+    any6.setPort(try localPort(d));
+    const mapped: Addr = .fromIp(.{ .ip6 = .{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 }, .port = any6.ip6.port } });
+    try testing.expect(!df.covers(&mapped));
+    try testing.expect(df.covers(&to6));
+    try send(d, &mapped, big, null, .not_ect);
 }
