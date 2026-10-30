@@ -1065,6 +1065,36 @@ test "fuzz: p256 boundary scalars, watched, against std" {
     } });
 }
 
+test "verify: peers with small or extreme coordinates, on and off the curve, as std" {
+    // x in [0, 400) and (p − 400, p): both points when x³ − 3x + b is a
+    // square, and the same x with y off by one (on another curve: an
+    // invalid-curve point, whose equation has another b).
+    const sk = [_]u256{ 0x1234567890abcdef, n - 2, n - 1, 1, (n - 1) / 2 };
+    var found: usize = 0;
+    for (0..800) |i| {
+        const xv: u256 = if (i < 400) i else field.p - (i - 399);
+        const fx = P256.Fe.fromBytes(be(xv), .big) catch unreachable;
+        for ([_]bool{ false, true }) |odd| {
+            const y = P256.recoverY(fx, odd) catch continue;
+            found += 1;
+            var pk: [65]u8 = (P256{ .x = fx, .y = y }).toUncompressedSec1();
+            for (sk) |s| try expectSameAsStd(be(s), &pk);
+            pk[33..65].* = be(std.mem.readInt(u256, pk[33..65], .big) +% 1);
+            try expectSameAsStd(be(sk[0]), &pk);
+            try testing.expectError(error.InvalidEncoding, sharedSecret(be(sk[0]), &pk));
+        }
+        // y = 0 (order 2 on a curve with that b) and small y.
+        for ([_]u256{ 0, 1, 2 }) |yv| {
+            var pk: [65]u8 = undefined;
+            pk[0] = 4;
+            pk[1..33].* = be(xv);
+            pk[33..65].* = be(yv);
+            try expectSameAsStd(be(sk[0]), &pk);
+        }
+    }
+    try testing.expect(found > 300);
+}
+
 test "verify: the point arithmetic meets only the exceptional additions the model predicts" {
     var prng = std.Random.DefaultPrng.init(0x7e57_ad5f);
     const r = prng.random();
