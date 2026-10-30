@@ -3620,3 +3620,71 @@ fn testHttp3(backend: Backend) !void {
     defer e.body.deinit(testing.allocator);
     try testing.expectEqualStrings("an upload body", e.body.items);
 }
+
+test "verify ECN: HTTP/3 on an IPv6 address: IPv6 clients, and IPv4 ones through a dual-stack socket" {
+    try forEachBackend(testHttp3EcnIpv6);
+}
+
+/// A connected UDP socket to the server's QUIC port over IPv6 (::1), or
+/// IPv4 (127.0.0.1).
+fn h3ClientAt(port: u16, v6: bool) !H3Client {
+    if (!v6) return H3Client.connect(port);
+    const nonblock: u32 = if (sys.is_linux) std.os.linux.SOCK.NONBLOCK else 0;
+    const rc = system.socket(posix.AF.INET6, posix.SOCK.DGRAM | nonblock, posix.IPPROTO.UDP);
+    if (posix.errno(rc) != .SUCCESS) return error.SocketFailed;
+    const fd: sys.fd_t = @intCast(rc);
+    var addr = std.mem.zeroes(posix.sockaddr.in6);
+    addr.family = posix.AF.INET6;
+    addr.port = std.mem.nativeToBig(u16, port);
+    addr.addr[15] = 1;
+    if (posix.errno(system.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in6))) != .SUCCESS) return error.ConnectFailed;
+    if (!sys.is_linux) try sys.setNonBlocking(fd);
+    sys.setsockoptInt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, 8 << 20) catch {};
+    var dcid: [8]u8 = undefined;
+    sys.randomBytes(&dcid);
+    const c = try quic_test_client.Client.init(testing.allocator, .{ .dcid = dcid, .max_stream_data = 16 << 20, .max_data = 64 << 20 });
+    errdefer c.deinit();
+    return .{ .fd = fd, .c = c, .batch = try testing.allocator.create(quic_udp.RecvBatch(8, 2048)) };
+}
+
+fn testHttp3EcnIpv6(backend: Backend) !void {
+    // A system without IPv6 loopback (some containers): nothing to test.
+    {
+        var probe: std.Io.net.IpAddress = .{ .ip6 = .{ .bytes = std.mem.zeroes([16]u8), .port = 0 } };
+        probe.ip6.bytes[15] = 1;
+        const fd = quic_udp.bind(probe, false) catch return error.SkipZigTest;
+        sys.close(fd);
+    }
+    var cfg = tlsConfig();
+    cfg.http3 = .{};
+    cfg.backend = backend;
+    cfg.ip = "::";
+    cfg.handle_signals = false;
+    cfg.worker_thread_count = 2;
+    cfg.max_connections_per_worker = 256;
+    cfg.buffer_pool_size = 4;
+    const srv = try Server(TestHandler).init(testing.allocator, 0, cfg);
+    const thread = try std.Thread.spawn(.{}, Running.runServer, .{srv});
+    const r: Running = .{ .srv = srv, .thread = thread, .port = srv.getPort() };
+    defer r.stop();
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    for ([_]bool{ true, false }) |v6| {
+        var cl = try h3ClientAt(r.srv.getQuicPort(), v6);
+        defer cl.close();
+        if (v6) {
+            quic_udp.enableEcn(cl.fd, true);
+            try sys.setsockoptInt(cl.fd, posix.IPPROTO.IPV6, posix.IPV6.TCLASS, @backingInt(quic_packet.Ecn.ect0));
+        } else try cl.enableEcn(.ect0);
+        try cl.start();
+        const id = try cl.request("GET", "/big", "");
+        try cl.waitFinished(&.{id});
+        var a = try cl.response(id);
+        defer a.body.deinit(testing.allocator);
+        try testing.expect(std.mem.eql(u8, &big_body, a.body.items));
+        const got = cl.c.datagrams_ecn;
+        std.debug.print("{s}: datagrams not-ECT/ECT(1)/ECT(0)/CE {any}, server's counts {any}\n", .{ if (v6) "IPv6" else "IPv4-mapped", got, cl.c.spaces[2].peer_ecn });
+        try testing.expect(got[@backingInt(quic_packet.Ecn.ect0)] > big_body.len / 1350 / 2);
+        const counts = cl.c.spaces[2].peer_ecn.?;
+        try testing.expect(counts[0] > 0 and counts[1] == 0 and counts[2] == 0);
+    }
+}

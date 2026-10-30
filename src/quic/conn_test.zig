@@ -1453,3 +1453,276 @@ test "QUIC ECN: off, nothing is marked and no counts are reported" {
     try testing.expectEqual([3]u64{ 0, 0, 0 }, s.spaces[2].ecn_rx);
     try testing.expectEqual(@as(?[3]u64, null), h.client.spaces[2].peer_ecn);
 }
+
+// -- verify ECN: adversarial cases --------------------------------------------
+
+/// A path for the verify ECN tests: a one-way delay plus up to `jitter` µs
+/// more for each datagram (so datagrams overtake each other), `loss`
+/// percent of datagrams dropped each way, and `ce` percent of the server's
+/// marked datagrams turned CE.
+/// `reorder` percent go without the delay (netem's `reorder`).
+const Path = struct {
+    delay: u64,
+    jitter: u64 = 0,
+    loss: u8 = 0,
+    ce: u8 = 0,
+    reorder: u8 = 0,
+
+    fn arrival(p: Path, now: u64, rnd: std.Random) u64 {
+        if (rnd.uintLessThan(u8, 100) < p.reorder) return now + 200;
+        return now + p.delay + rnd.uintAtMost(u64, p.jitter);
+    }
+};
+
+/// Runs both ends over `path` until `done` holds, the clock jumping from
+/// event to event; the client resends what is unacknowledged when the
+/// path goes quiet (its only loss recovery).
+fn runPath(h: *Harness, path: Path, ctx: anytype, comptime done: fn (@TypeOf(ctx), *Harness) bool) !void {
+    var queue: std.ArrayList(Flight) = .empty;
+    defer queue.deinit(h.a);
+    const limit = h.now + 300 * std.time.us_per_s;
+    var buf: [1500]u8 = undefined;
+    while (!done(ctx, h)) {
+        if (h.now > limit) return error.Timeout;
+        const rnd = h.prng.random();
+        while (true) {
+            const n = try h.client.send(&buf);
+            if (n == 0) break;
+            if (rnd.uintLessThan(u8, 100) < path.loss) continue;
+            try queue.append(h.a, .{ .at = path.arrival(h.now, rnd), .to_server = true, .len = n, .buf = buf });
+        }
+        if (h.server) |s| {
+            if (s.isClosed()) return error.Closed;
+            while (true) {
+                var ecn = s.sendEcn();
+                const n = s.send(&buf, h.now);
+                if (n == 0) break;
+                if (rnd.uintLessThan(u8, 100) < path.loss) continue;
+                if (ecn != .not_ect and rnd.uintLessThan(u8, 100) < path.ce) ecn = .ce;
+                try queue.append(h.a, .{ .at = path.arrival(h.now, rnd), .to_server = false, .len = n, .buf = buf, .ecn = ecn });
+            }
+        }
+        var next: ?u64 = null;
+        for (queue.items) |f| next = if (next) |x| @min(x, f.at) else f.at;
+        var timer: ?u64 = null;
+        if (h.server) |s| if (s.deadline()) |d| if (d < h.now + 10 * std.time.us_per_s) {
+            timer = @max(d, h.now);
+            next = if (next) |x| @min(x, timer.?) else timer;
+        };
+        if (next == null) {
+            h.now += 100_000;
+            try h.client.retransmit();
+            continue;
+        }
+        h.now = next.?;
+        // Arrivals in time order.
+        while (true) {
+            var first: ?usize = null;
+            for (queue.items, 0..) |f, i| {
+                if (f.at > h.now) continue;
+                if (first == null or f.at < queue.items[first.?].at) first = i;
+            }
+            const i = first orelse break;
+            const f = queue.orderedRemove(i);
+            if (f.to_server) try h.toServer(@constCast(f.buf[0..f.len])) else try h.toClient(f.buf[0..f.len], f.ecn);
+        }
+        if (timer) |t| if (t <= h.now) {
+            h.server.?.onTimeout(h.now);
+            try EchoApp.run(h.server.?);
+        };
+    }
+}
+
+fn clientReady(_: void, h: *Harness) bool {
+    return h.client.handshake_complete;
+}
+
+fn allFinished(ids: []const u64, h: *Harness) bool {
+    for (ids) |id| if (!h.client.finished(id)) return false;
+    return true;
+}
+
+fn halfway(id: u64, h: *Harness) bool {
+    return h.client.readAll(id).len > 400_000 or h.client.finished(id);
+}
+
+test "verify ECN: an honest client over lossy, reordering paths: validation never fails" {
+    const paths = [_]Path{
+        .{ .delay = 10_000, .jitter = 0, .loss = 5 },
+        .{ .delay = 10_000, .jitter = 8_000 },
+        .{ .delay = 10_000, .jitter = 15_000, .loss = 3 },
+        .{ .delay = 20_000, .jitter = 30_000, .loss = 10, .ce = 2 },
+        .{ .delay = 2_000, .jitter = 5_000, .loss = 1, .ce = 5 },
+        .{ .delay = 5_000, .jitter = 20_000, .loss = 0, .ce = 1 },
+    };
+    var failures: usize = 0;
+    var unknown: usize = 0;
+    for (0..24) |run| {
+        const path = paths[run % paths.len];
+        const h = try Harness.init(.{ .seed = @intCast(run + 1), .max_stream_data = 8 << 20, .max_data = 32 << 20 }, noTweak);
+        defer h.deinit();
+        h.prng = .init(run *% 7919 + 3);
+        try runPath(h, path, {}, established);
+        const s = h.server.?;
+        var ids: [6]u64 = undefined;
+        for (ids[0..5], 0..) |*id, i| {
+            id.* = try h.client.openBidi();
+            var msg: [32]u8 = undefined;
+            try h.client.write(id.*, try std.fmt.bufPrint(&msg, "req {d}", .{i}), true);
+        }
+        ids[5] = try h.client.openBidi();
+        try h.client.write(ids[5], "big 1000000", true);
+        if (run % 2 == 1) {
+            // Marked packets on both sides of a key update.
+            try runPath(h, path, ids[5], halfway);
+            h.client.initiateKeyUpdate();
+            h.client.followKeyUpdate();
+        }
+        try runPath(h, path, @as([]const u64, &ids), allFinished);
+        try testing.expectEqual(@as(usize, 1_000_000), h.client.readAll(ids[5]).len);
+        if (s.ecn != .capable) {
+            std.debug.print("run {d} path {any}: ecn {s}, marked {d} lost {d}, peer counts {any}, sent {d}, lost packets {d}\n", .{ run, path, @tagName(s.ecn), s.ecn_marked, s.ecn_marked_lost, s.spaces[2].ecn_peer, s.spaces[2].ecn_sent, s.lost_packets });
+            if (s.ecn == .failed) failures += 1 else unknown += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), failures);
+    try testing.expectEqual(@as(usize, 0), unknown);
+}
+
+test "verify ECN: testing packets acknowledged only by an ACK that doesn't raise the largest still validate" {
+    const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 32 << 20 }, noPacing);
+    defer h.deinit();
+    var buf: [1500]u8 = undefined;
+    // The handshake, holding back everything the server sends once
+    // established (its first marked datagrams).
+    var held: std.ArrayList(Flight) = .empty;
+    defer held.deinit(testing.allocator);
+    var id: ?u64 = null;
+    for (0..100) |_| {
+        while (true) {
+            const n = try h.client.send(&buf);
+            if (n == 0) break;
+            try h.toServer(buf[0..n]);
+        }
+        if (h.server) |s| while (true) {
+            const ecn = s.sendEcn();
+            const n = s.send(&buf, h.now);
+            if (n == 0) break;
+            if (s.isEstablished()) {
+                try held.append(testing.allocator, .{ .at = h.now, .to_server = false, .len = n, .buf = buf, .ecn = ecn });
+            } else try h.toClient(buf[0..n], ecn);
+        };
+        if (id == null and h.client.handshake_complete) {
+            id = try h.client.openBidi();
+            try h.client.write(id.?, "big 30000", true);
+        }
+        // (A request that went before the server had its keys.)
+        if (held.items.len < 2) try h.client.retransmit();
+        h.now += 1000;
+    }
+    const s = h.server.?;
+    // Ten testing packets, then one unmarked (the window's end).
+    try testing.expect(held.items.len > conn_mod.ecn_testing_packets);
+    try testing.expectEqual(conn_mod.EcnState.unknown, s.ecn);
+    const last = held.items[held.items.len - 1];
+    try testing.expectEqual(packet.Ecn.not_ect, last.ecn);
+    // The last (unmarked) datagram overtakes the rest: its ACK raises the
+    // largest acknowledged, acknowledging nothing marked.
+    try h.toClient(last.buf[0..last.len], last.ecn);
+    var n = try h.client.send(&buf);
+    try h.toServer(buf[0..n]);
+    // Then the marked ones arrive: their ACK has the same largest.
+    for (held.items[0 .. held.items.len - 1]) |*f| try h.toClient(f.buf[0..f.len], f.ecn);
+    n = try h.client.send(&buf);
+    try h.toServer(buf[0..n]);
+    try testing.expectEqual(@as(u64, conn_mod.ecn_testing_packets), h.client.spaces[2].ecn[0]);
+    std.debug.print("after both ACKs: ecn {s}, marked {d}, lost {d} (declared lost by the first ACK's packet threshold)\n", .{ @tagName(s.ecn), s.ecn_marked, s.ecn_marked_lost });
+    try h.run(3000);
+    try testing.expect(h.client.finished(id.?));
+    // An honest client and a clean path: the marks were all counted.
+    try download(h, 200_000);
+    std.debug.print("after the reordered testing period: ecn {s}, marked {d}, peer counts {any}\n", .{ @tagName(s.ecn), s.ecn_marked, s.spaces[2].ecn_peer });
+    try testing.expectEqual(conn_mod.EcnState.capable, s.ecn);
+}
+
+test "verify ECN: a receiver reporting every mark as CE slows us once a round trip, no further" {
+    const h = try Harness.init(.{ .max_stream_data = 16 << 20, .max_data = 32 << 20 }, noTweak);
+    defer h.deinit();
+    var bursts: std.ArrayList(Burst) = .empty;
+    defer bursts.deinit(testing.allocator);
+    const delay = 10_000;
+    try h.runDelayed(delay, {}, established, &bursts);
+    h.client.ecn_mode = .all_ce;
+    const s = h.server.?;
+    const id = try h.client.openBidi();
+    try h.client.write(id, "big 2000000", true);
+    const start = h.now;
+    try h.runDelayed(delay, id, finishedStream, &bursts);
+    try testing.expectEqual(@as(usize, 2_000_000), h.client.readAll(id).len);
+    const rtts = (h.now - start) / (2 * delay);
+    std.debug.print("all-CE receiver: {d} CE events over {d} round trips, window {d}, state {s}\n", .{ s.ecn_ce_events, rtts, s.cc.window, @tagName(s.ecn) });
+    // Valid counts (ECT(0) never falls): ECN stays on, and each round
+    // trip's marks are one event at most.
+    try testing.expectEqual(conn_mod.EcnState.capable, s.ecn);
+    try testing.expect(s.ecn_ce_events > 3);
+    try testing.expect(s.ecn_ce_events <= rtts + 1);
+    try testing.expect(s.cc.window >= 2 * @as(u64, s.max_datagram));
+    try testing.expectEqual(@as(u64, 0), s.lost_packets);
+}
+
+test "verify ECN: undecryptable, foreign and duplicate packets count nothing" {
+    const h = try Harness.init(.{}, noTweak);
+    defer h.deinit();
+    h.client_ecn = .ect0;
+    try h.run(10);
+    const s = h.server.?;
+    const before = s.spaces[2].ecn_rx;
+    var buf: [1500]u8 = undefined;
+    const id = try h.client.openBidi();
+    try h.client.write(id, "x", false);
+    const n = try h.client.send(&buf);
+    const good = buf;
+    h.client_ecn = .ce;
+    // A byte of the payload flipped: authentication fails.
+    buf[n - 3] ^= 1;
+    try h.toServer(buf[0..n]);
+    try testing.expectEqual(before, s.spaces[2].ecn_rx);
+    // Garbage that looks like a short header packet (a stateless reset's
+    // shape): nothing.
+    var junk: [64]u8 = @splat(0x41);
+    junk[0] = 0x40;
+    @memcpy(junk[1..9], &server_cid);
+    try h.toServer(&junk);
+    try testing.expectEqual(before, s.spaces[2].ecn_rx);
+    // The real one counts once, its duplicate not.
+    buf = good;
+    try h.toServer(buf[0..n]);
+    buf = good;
+    try h.toServer(buf[0..n]);
+    try testing.expectEqual(before[2] + 1, s.spaces[2].ecn_rx[2]);
+    try testing.expectEqual(before[0], s.spaces[2].ecn_rx[0]);
+}
+
+test "verify ECN: netem-style reordering (a quarter of datagrams undelayed): how often an honest client loses ECN" {
+    var outcome: [4]usize = @splat(0);
+    const runs = 100;
+    for (0..runs) |run| {
+        const h = try Harness.init(.{ .seed = @intCast(run % 250 + 1), .max_stream_data = 8 << 20, .max_data = 32 << 20 }, noTweak);
+        // Half of them unpaced: the first window leaves in one burst.
+        h.cfg.pacing = run % 2 == 0;
+        defer h.deinit();
+        h.prng = .init(run *% 104729 + 11);
+        const path: Path = .{ .delay = 10_000, .reorder = 25 };
+        // The request goes with the client's Finished, as browsers do: the
+        // server's first window carries HANDSHAKE_DONE and the response.
+        try runPath(h, path, {}, clientReady);
+        const s = h.server.?;
+        var ids: [1]u64 = undefined;
+        ids[0] = try h.client.openBidi();
+        try h.client.write(ids[0], "big 100000", true);
+        try runPath(h, path, @as([]const u64, &ids), allFinished);
+        outcome[@backingInt(s.ecn)] += 1;
+    }
+    std.debug.print("{d} connections: testing {d}, unknown {d}, capable {d}, failed {d}\n", .{ runs, outcome[0], outcome[1], outcome[2], outcome[3] });
+    try testing.expectEqual(@as(usize, runs), outcome[@backingInt(conn_mod.EcnState.capable)]);
+}

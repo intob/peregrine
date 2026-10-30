@@ -408,3 +408,109 @@ test "ECN codepoints set per send come back on loopback (GSO sends too)" {
         try testing.expectEqual(@as(usize, 3), got);
     }
 }
+
+// -- verify ECN: adversarial cases --------------------------------------------
+
+fn addrOf(ip: std.Io.net.IpAddress) Addr {
+    var a: Addr = .{};
+    switch (ip) {
+        .ip4 => |v| {
+            const in: *posix.sockaddr.in = @ptrCast(&a.storage);
+            in.* = std.mem.zeroes(posix.sockaddr.in);
+            in.family = posix.AF.INET;
+            in.port = std.mem.nativeToBig(u16, v.port);
+            in.addr = @bitCast(v.bytes);
+            a.len = @sizeOf(posix.sockaddr.in);
+        },
+        .ip6 => |v| {
+            a.storage.family = posix.AF.INET6;
+            a.storage.port = std.mem.nativeToBig(u16, v.port);
+            a.storage.addr = v.bytes;
+            a.len = @sizeOf(posix.sockaddr.in6);
+        },
+    }
+    if (!sys.is_linux) {
+        // BSD sockaddrs start with their length.
+        std.mem.asBytes(&a.storage)[0] = @intCast(a.len);
+    }
+    return a;
+}
+
+/// Sends `data` from `from_fd` to `to` with each codepoint and checks
+/// what arrives on `to_fd`.
+fn expectCodepoints(from_fd: fd_t, to_fd: fd_t, to: *const Addr, segment: ?u16) !void {
+    const batch = try testing.allocator.create(RecvBatch(8, 2048));
+    defer testing.allocator.destroy(batch);
+    const data: [2000]u8 = @splat(0x5a);
+    for ([_]Ecn{ .ect0, .ce, .not_ect, .ect1, .ect0 }) |ecn| {
+        try send(from_fd, to, &data, segment, ecn);
+        const want: usize = if (segment != null) 2 else 1;
+        var got: usize = 0;
+        var tries: usize = 0;
+        while (got < want and tries < 200_000) : (tries += 1) {
+            const n = batch.recv(to_fd);
+            for (0..n) |i| try testing.expectEqual(ecn, batch.get(i).ecn);
+            got += n;
+        }
+        try testing.expectEqual(want, got);
+    }
+}
+
+test "verify ECN: IPv6 loopback, and IPv4-mapped peers on a dual-stack socket" {
+    // IPv6 both ways.
+    {
+        var a6: std.Io.net.IpAddress = .{ .ip6 = .{ .bytes = std.mem.zeroes([16]u8), .port = 0 } };
+        a6.ip6.bytes[15] = 1;
+        const s = bind(a6, false) catch return error.SkipZigTest; // no IPv6 here
+        defer sys.close(s);
+        enableEcn(s, true);
+        const c = try bind(a6, false);
+        defer sys.close(c);
+        enableEcn(c, true);
+        a6.setPort(try localPort(s));
+        const to = addrOf(a6);
+        try expectCodepoints(c, s, &to, null);
+        try expectCodepoints(c, s, &to, 1000);
+    }
+    // A dual-stack server socket ([::]) and an IPv4 client, both ways:
+    // the server sends to the client's IPv4-mapped address.
+    {
+        var any6: std.Io.net.IpAddress = .{ .ip6 = .{ .bytes = std.mem.zeroes([16]u8), .port = 0 } };
+        const s = try bind(any6, false);
+        defer sys.close(s);
+        // (Dual stack: the default on Linux and macOS.)
+        enableEcn(s, true);
+        any6.setPort(try localPort(s));
+        var a4: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+        const c = try bind(a4, false);
+        defer sys.close(c);
+        enableEcn(c, false);
+        a4.setPort(any6.ip6.port);
+        // Client to server: an IPv4 datagram arrives on the IPv6 socket.
+        const to_server = addrOf(a4);
+        try expectCodepoints(c, s, &to_server, null);
+        // Server to client, at the client's mapped address (the sockaddr
+        // the server's recvmsg reported).
+        const mapped: std.Io.net.IpAddress = .{ .ip6 = .{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 }, .port = try localPort(c) } };
+        const to_client = addrOf(mapped);
+        try expectCodepoints(s, c, &to_client, null);
+        try expectCodepoints(s, c, &to_client, 1000);
+    }
+}
+
+test "verify ECN: a send failing EINVAL for another reason doesn't stop marking" {
+    if (!sys.is_linux) return error.SkipZigTest;
+    defer tos_refused.store(false, .monotonic);
+    var addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    const fd = try bind(addr, false);
+    defer sys.close(fd);
+    enableEcn(fd, false);
+    // A peer at port 0 (a client can send from it, through a raw socket):
+    // Linux's udp_sendmsg refuses the destination with EINVAL, TOS or not.
+    var port0 = addrOf(addr);
+    try testing.expectError(error.Unexpected, send(fd, &port0, "x", null, .ect0));
+    // Every other peer's datagrams still carry their marks.
+    addr.setPort(try localPort(fd));
+    const to = addrOf(addr);
+    try expectCodepoints(fd, fd, &to, null);
+}

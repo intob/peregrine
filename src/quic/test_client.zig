@@ -54,6 +54,9 @@ pub const EcnMode = enum {
     none,
     /// ACK_ECN with the counts as they are now, never raised again.
     frozen,
+    /// Every packet that arrived ECT(0) reported CE: a receiver that
+    /// wants the sender as slow as it will go.
+    all_ce,
 };
 
 const SentFrame = struct { pn: u64, kind: enum { crypto, stream }, id: u64 = 0, offset: u64, len: u64, fin: bool = false };
@@ -264,7 +267,7 @@ pub const Client = struct {
             if (sp.largest_rx == null or pn > sp.largest_rx.?) sp.largest_rx = pn;
             if (!sp.rx_pns.contains(pn) and self.ecn_mode != .frozen) switch (ecn) {
                 .not_ect => {},
-                .ect0 => sp.ecn[0] += 1,
+                .ect0 => sp.ecn[if (self.ecn_mode == .all_ce) 2 else 0] += 1,
                 .ect1 => sp.ecn[1] += 1,
                 .ce => sp.ecn[2] += 1,
             };
