@@ -226,6 +226,47 @@ end-to-end test pipelines 8 MB + 1 MB responses to a slow reader.
       epoll and io_uring; 64 KiB 10-11 µs from memory, 13-14 µs from the
       file (two syscalls instead of one writev), hence the 64 KiB threshold
       in the file servers. Over TLS with kTLS (M4) files use sendfile too
+- [x] **io_uring: nothing releases or moves a buffer that an in-flight receive
+      writes, and a receive that finds no kernel buffer holds none.** With the
+      provided-buffer ring empty (ENOBUFS: a connection burst; the ring starts with
+      16 buffers) a receive went into a pooled buffer (`armRecvPlain`), owned by the
+      kernel until the completion; meanwhile ticks, posts from other threads and
+      write completions drove the connection, and `h2Drive`/`wsDrive`/`drive`
+      released idle input buffers (h2, WebSocket, HTTP/1.1, TLS). The pool handed
+      them out again and the completion committed bytes into an empty reader
+      (Debug: index out of bounds in `frame.Reader.next`; ReleaseFast: segfault; the
+      early io_uring deaths in h2-churn.sh). Found by the per-connection h2 memory
+      work. Now a receive that finds no kernel buffer waits for readability and
+      receives synchronously into a buffer held only while the input lasts
+      (`armRecvWait`); only a connection holding part of a request, record or frame
+      receives the rest into its own buffer, which `releaseIdle` keeps (TLS and h2
+      release input and output separately). Also: a lingering session keeps such a
+      buffer until the receive completes, and lingering input of any protocol is
+      drained through it instead of closing; ENOBUFS with parked input carries on
+      rather than receiving ahead of it, out of order; TLS records sealed while a
+      send is in flight (KeyUpdate answer, alert, ticket; h2 and WebSockets receive
+      while writing) go into another buffer instead of compacting bytes the kernel
+      reads (`wireSending`); a TLS failure during a write sends its alert after that
+      write. Audited: sends, sendmsg iov/msghdr, timespecs, the waker, QUIC and
+      shutdown hold nothing that moves. Proof: an io_uring test with the ring empty
+      (`worker_uring.test_ring_buffers = 0`: h2 idle across ticks, WebSockets posted
+      to while idle, a large response written while the next receive waits, 13 e2e
+      tests) and with two buffers (parked input, then ENOBUFS), which crashes the
+      parent exactly as reported; the verifiers' suites at rings 0, 1 and 2
+      (KeyUpdates and bad records during large TLS sends, TLS lingering, 300 idle
+      connections at shutdown, requests followed by the client's FIN, bounded
+      lingers, shutdown while lingering); idle connections hold no input buffer
+      while the ring is empty; TLS unit tests and a 300-seed random test of records
+      sealed during sends; a 1500-4000-connection burst repro that kills the parent
+      on round 1 runs clean. h2-churn: the server died in round 2 before, never
+      after. Interleaved A/B against main: HTTP/1.1 keep-alive and pipelined on both
+      backends, h2c, WebSocket echo and connection bursts all within noise. Memory
+      after a burst of 3000 idle WebSockets (RSS): 74.5 → 58.7-61.4 MB on io_uring
+      (epoll 25.9); live heap per connection is the same on both backends (a
+      counting allocator: 3000 × 256 B + 3002 × 2 KiB); io_uring's extra ~14 MB live
+      is fixed per worker (rings, pools), the rest of the RSS gap is freed memory
+      SmpAllocator keeps at the burst's high-water mark. Two review rounds and two
+      adversarial verifiers
 - [ ] NUMA-local allocation
 - [ ] UDP fast path for QUIC (M6): `recvmmsg`/`sendmmsg`, `UDP_SEGMENT` (GSO) and
       `UDP_GRO`, io_uring equivalents
@@ -1408,6 +1449,34 @@ which RFC 9113 deprecated).
       epoll 142 → 8.5 KB (after one request 157 → 15.5), io_uring 138 → 5.0 KB
       (154 → 11.4). h2-bench CPU/req unchanged (interleaved A/B, h2c and TLS; e.g.
       h2c 64k 10×10 epoll 9.9-11.1 µs before, 9.8-10.6 after)
+- [x] **HTTP/2 closing, both event loops** (found with the io_uring fix above).
+      After our GOAWAY the connection half-closes and drains input for a while, as
+      after an HTTP/1.1 error response, and lets go of its streams at once
+      (`h2.Conn.abandon`: exchanges aborted and released, stream states and buffers
+      back); closing with input unread made the kernel reset the connection, which
+      could destroy the GOAWAY unread (h2spec 6.8: io_uring 4-8/40 runs, epoll
+      0-2/40 → 0/40 on each). A client that half-closes still gets what it asked for
+      within the request timeout (write progress extends it), unless that needs
+      more from it (a request missing input, or output waiting for a window only it
+      can open): then it closes at once. Over TLS, close_notify then FIN midway
+      through a 1 MiB response still gets all of it. epoll/kqueue: frames that came
+      with the preface (or with the client's Finished over TLS) are processed at once
+      (`h2Attached`; they waited for more input, and main never answered a client
+      that also never acknowledges our SETTINGS); output written from exchange
+      posts, ticks and exchange timeouts parses frames held back past `out_limit`
+      and resumes input that waited for it (`h2Resume`); a hangup reported with the
+      last data (EPOLLRDHUP, EV_EOF) reads on past a short read, which had hidden the
+      client's FIN until the idle timeout (pipelined requests plus FIN failed on main
+      under kqueue). Proof: tests that fail without each fix (requests in the
+      preface's or Finished's write with nothing more sent, h2c and TLS through a
+      small ALPN-capable TLS 1.3 test client, `TlsAlpnClient`; a connection ending
+      with input unread closes with a FIN; a half-closed client gets a later answer
+      and an 8 MiB one; a connection error with 20 async streams releases their
+      exchanges at once); requests behind large copied responses read slowly, with
+      a FIN and with answers from other threads, reach the held-back paths (the
+      stall itself needs a tick or post to drain the socket between room appearing
+      and the writable event, which the tests don't force). h2spec 40x h2c per
+      backend, TLS 146/146, Autobahn 301/301 plain and TLS on both backends
 - [ ] What an idle h2 connection still holds (~14 KB): the two HPACK tables (~5.6 KB
       each; the encoder's could be smaller than the peer's 4096), the slot, order and
       idle-priority arrays (2.5 KB; the last could be allocated lazily), the Conn
@@ -1415,7 +1484,9 @@ which RFC 9113 deprecated).
       window past `request_timeout_s` (RST CANCEL), exchanges time out (INTERNAL_ERROR),
       the WebSocket client gives up after 2.5 s, and the odd GOAWAY ENHANCE_YOUR_CALM on
       a slow reader. Same before and after the changes above; make the harness tell
-      expected slow-reader outcomes from failures so a clean run exits 0
+      expected slow-reader outcomes from failures so a clean run exits 0. (It and
+      autobahn.sh now stop their containers on any exit: a churn server left running
+      after its script died held up every benchmark waiting for job containers)
 - [ ] h3/QUIC stream buffers (`SendStream`/`RecvStream`, up to `stream_buffer` per
       slot) and ws.Conn queues (`shared`, `wire`, `deflated`) keep their capacity while
       the connection lives: same treatment as the h2 output buffers
