@@ -534,7 +534,8 @@ Ed25519, `std.crypto.tls` enums and `hkdfExpandLabel`.
 | `record.zig` | Record protection: AEAD with per-record nonce (IV xor sequence number), record header as AAD, inner content type and padding removal, record size limits |
 | `conn.zig` | `tls.Conn`: one TLS-over-TCP connection. Buffers ciphertext like `Session` does (pooled, held only while unprocessed), drives the handshake, decrypts application data for the HTTP/WebSocket layers and encrypts their output into a wire buffer |
 | `credentials.zig` | PEM/DER loading of the certificate chain and private key; signing CertificateVerify |
-| `p256.zig`, `x25519.zig` | Base-point tables: ECDSA P-256 signing, P-256 ECDHE key pairs, X25519 public keys; X25519's shared secret |
+| `p256.zig`, `x25519.zig` | ECDSA P-256 signing and ECDHE (key pairs, shared secret: Jacobian window over `field_p256`); X25519 public keys and shared secret |
+| `field_p256.zig` | P-256's field: four 64-bit limbs, Montgomery form |
 | `field25519.zig` | X25519's field: four 64-bit limbs |
 | `rsa.zig` | RSA private keys and RSASSA-PSS signing |
 | `ticket.zig` | Session tickets: resumption state sealed with a rotating key |
@@ -741,13 +742,71 @@ Later in M4:
       §4.1.2; a digest of the rest, in order, is kept from ClientHello1);
       before, one that dropped server_name still got ClientHello1's
       certificate and server_name acknowledged
-- [ ] Faster handshakes, next: P-256's variable-base `mul` for ECDHE
-      (P-256 key pair + shared secret ~138 µs), ML-KEM-768 encapsulation
-      (25 µs), P-384 signing (~324 µs) if P-384 certificates matter; the
-      field on x86_64 (correct, speed unmeasured). QUIC: `quic.Conn` still
-      allocates a handshake state and its flight per connection; the pooling
-      in `tls.Pools` (FreeList, release/reinit) could move to a module both
-      share
+- [x] **Faster handshakes**, step 3: P-256 ECDHE. Of the ~138 µs (key
+      pair + shared secret), std's constant-time `mul` was 102 µs (252
+      doublings and 64 additions with complete formulas, 14 multiplications
+      each, over fiat-crypto's field at ~19 ns) and each of the two divstep
+      inversions 9 µs. `src/tls/field_p256.zig`: GF(p) in four 64-bit
+      limbs, Montgomery form, values below p; each reduction step adds
+      q·(2^32 + p3·2^128), four limbs that don't overlap (one product and
+      one carry chain; fiat uses three), CIOS multiplication, a dedicated
+      square, 1/Z² by Fermat (Brian Smith's chain). `p256.zig`: Jacobian
+      points (dbl-2004-hmv, a = −3; add-1998-cmo-2 with the table's Z² and
+      Z³; mixed additions for the base table), a constant-time signed 4-bit
+      window over 1..8 × P for the peer's point, the 65-row base table
+      summed in the new field; `keyShare` makes the key pair and shared
+      secret with one inversion (the handshake uses it). The incomplete
+      formulas are safe for every 256-bit scalar (identity inputs selected;
+      equal inputs only for s = n − 2 at the last variable-base addition,
+      which also doubles and selects; proofs in the comments, what they rest
+      on asserted at comptime, an integer model of both sums checked against
+      instrumented additions on 60M+ boundary scalars). Unlike X25519's
+      ladder the M2 is throughput-bound here: fewer instructions counted,
+      interleaving didn't. Constant time: runtime safety only in Debug,
+      whole-table scans, sign by mask, and every 0/all-ones mask passed
+      through an empty asm barrier. Without it LLVM turned the field's
+      selections into branches on x86_64 baseline and v2 (about a thousand
+      per k × G; dudect |t| 1216 on key pairs, 688 on signatures; v3, v4
+      and aarch64 were clean; found by the adversarial verifier; the barrier
+      costs ~1.5 µs per key share). `bench/scripts/ct-check.sh` builds
+      `bench/ct/dudect.zig` for x86_64 baseline/v2/v3 and aarch64
+      baseline/apple_m2/cortex_a76 (ReleaseFast and ReleaseSafe) and fails
+      on a forward branch in p256/field_p256/x25519/field25519 beyond the
+      inspected public ones (`bench/ct/allowed.txt`; it fails the
+      pre-barrier builds); `ct-check.sh dudect` runs the timing test (max
+      |t| 2.24 on x86_64 baseline, 2.84 on the M2, P-256 and X25519; X25519
+      had no select turned into a branch). Secrets and everything derived
+      from them are zeroed (scalars, digits, selected entries, the shared
+      point, the handshake's X25519/ML-KEM/P-256 shared secrets, sign's key
+      copy). Peer points must be uncompressed and on the curve, with std's
+      errors. Equal to std byte for byte and error for error: NIST CAVS ECDH
+      vectors, Wycheproof's ecdh_secp256r1_ecpoint (330 valid, 24 invalid,
+      1 compressed: rejected; Apache-2.0 licence in testdata), edge scalars,
+      small multiples of G, small and extreme coordinates on and off the
+      curve; a u512 reference over limb patterns, ranges and 5000-op chains
+      (`p256_verify.zig`, also 20x on x86_64 EPYC in ReleaseFast for the
+      baseline CPU, and in Debug with Zig's own x86_64 backend); 40 mutants;
+      fuzz targets `fuzz: field_p256 against std`, `fuzz: p256 shared secret
+      against std` and `fuzz: p256 boundary scalars, watched, against std`
+      (15 min each on a Pi). A correctness review re-derived the proofs.
+      `bench-tls handshake`, Linux, one core of the M2 Pro, interleaved
+      rounds (µs, before → after): P-256 key pair + shared secret
+      129.7-133.3 → 48.7-48.9 (std 198-208), shared secret 38.9-40.3 (std
+      101-104), key pair 13.1 (std 98-106); handshake with a P-256
+      certificate and secp256r1 182.4-184.2 → 80.4-83.0; ECDSA P-256 sign
+      38.7-40.1 → 23.5-24.2, so with X25519 79.2-84.9 → 62.8-63.8 and with
+      X25519MLKEM768 95.0-103.1 → 80.4-84.8. OpenSSL 4's assembly on this
+      Mac: ECDH 36 µs, sign 16 µs. Interop (`tls-interop.sh`, P-256 now
+      among the default groups and recognised by OpenSSL's and curl's names
+      for it): OpenSSL 3.5 and curl 8.23 over HTTP/1.1, h2 and h3, 480 new
+      h2 connections, a HelloRetryRequest to P-256, epoll and io_uring
+- [ ] Faster handshakes, next: ML-KEM-768 encapsulation (24 µs), P-384
+      signing (~306 µs) if P-384 certificates matter; the fields on x86_64
+      (correct and constant-time, speed unmeasured); P-256 leftovers (NEON
+      table scans, a 5-bit base table, ~1-2 µs each). QUIC: `quic.Conn`
+      still allocates a handshake state and its flight per connection; the
+      pooling in `tls.Pools` (FreeList, release/reinit) could move to a
+      module both share
 - [ ] TLS input buffers (BufferPool) keep plaintext ClientHello records and
       in-place-decrypted application data after release, never zeroed:
       zeroing 16 KiB per release is a hot-path cost to measure first
