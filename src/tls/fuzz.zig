@@ -1442,6 +1442,15 @@ const Run = struct {
     conn: Conn,
     result: Result = .{},
     plain_buf_len: usize,
+    /// Non-empty: output is written as the io_uring worker writes it, one
+    /// send in flight while input is processed, each completing with
+    /// this many bytes (cycled).
+    write_sizes: []const u16 = &.{},
+    write_i: usize = 0,
+    /// The send in flight: the wire's bytes where they were when it
+    /// started (the kernel reads them there), and a copy to check them.
+    inflight: ?[]const u8 = null,
+    inflight_copy: std.ArrayList(u8) = .empty,
 
     fn init(pools: *conn_mod.Pools, config: *const conn_mod.Config, plain_buf_len: usize) !Run {
         return .{ .conn = try Conn.init(pools, config, &conn_mod.testEntropy(5)), .plain_buf_len = plain_buf_len };
@@ -1450,6 +1459,38 @@ const Run = struct {
     fn deinit(r: *Run) void {
         r.conn.deinit();
         r.result.deinit();
+        r.inflight_copy.deinit(testing.allocator);
+    }
+
+    /// Completes the send in flight, if any (part of it), then starts
+    /// one of whatever the wire holds. Records sealed while a send is in
+    /// flight (a KeyUpdate answer, an alert, a ticket) must leave the
+    /// bytes it reads in place, and come after them.
+    fn asyncWrite(r: *Run) !void {
+        if (r.inflight) |sent| {
+            if (!std.mem.eql(u8, sent, r.inflight_copy.items)) return error.InflightBytesChanged;
+            if (!std.mem.startsWith(u8, r.conn.wireBytes(), sent)) return error.WireChangedUnderWrite;
+            const k = @min(sent.len, @max(1, r.write_sizes[r.write_i % r.write_sizes.len]));
+            r.write_i += 1;
+            try r.result.wire.appendSlice(testing.allocator, sent[0..k]);
+            r.conn.advance(k);
+            r.inflight = null;
+        }
+        if (r.conn.hasWire()) {
+            const w = r.conn.wireBytes();
+            r.inflight_copy.clearRetainingCapacity();
+            try r.inflight_copy.appendSlice(testing.allocator, w);
+            r.inflight = w;
+            r.conn.wireSending();
+        }
+    }
+
+    /// Lets the sends complete until the wire is empty.
+    fn flushWrites(r: *Run) !void {
+        while (r.inflight != null) {
+            try r.asyncWrite();
+            r.conn.releaseIfIdle();
+        }
     }
 
     fn stopped(r: *const Run) bool {
@@ -1483,9 +1524,13 @@ const Run = struct {
             try r.result.plain.appendSlice(testing.allocator, buf[0..k]);
         }
         if (r.conn.failed and r.conn.hasBufferedInput()) return error.InputAfterFailure;
-        const w = r.conn.wireBytes();
-        try r.result.wire.appendSlice(testing.allocator, w);
-        r.conn.advance(w.len);
+        if (r.write_sizes.len > 0) {
+            try r.asyncWrite();
+        } else {
+            const w = r.conn.wireBytes();
+            try r.result.wire.appendSlice(testing.allocator, w);
+            r.conn.advance(w.len);
+        }
         r.conn.releaseIfIdle();
     }
 
@@ -1689,10 +1734,17 @@ fn fuzzOne(_: void, smith: *Smith) anyerror!void {
     var read_sizes: [8]u16 = undefined;
     const n_sizes = smith.valueRangeAtMost(u8, 1, read_sizes.len);
     for (read_sizes[0..n_sizes]) |*s| s.* = if (smith.boolWeighted(1, 1)) smith.valueRangeAtMost(u16, 1, 32) else smith.valueRangeAtMost(u16, 1, 20000);
+    // In half the runs, output written as io_uring writes it: a send in
+    // flight while the next input is processed.
+    var write_sizes: [4]u16 = undefined;
+    const n_writes = if (smith.boolWeighted(1, 1)) smith.valueRangeAtMost(u8, 1, write_sizes.len) else 0;
+    for (write_sizes[0..n_writes]) |*s| s.* = if (smith.boolWeighted(1, 1)) smith.valueRangeAtMost(u16, 1, 64) else smith.valueRangeAtMost(u16, 1, 60000);
     {
         var run = try Run.init(pools, &configs[1], smith.valueRangeAtMost(u16, 1, record.max_plaintext));
         defer run.deinit();
+        run.write_sizes = write_sizes[0..n_writes];
         try run.feed(script.stream.items, read_sizes[0..n_sizes]);
+        try run.flushWrites();
         var res = run.finish();
         defer res.deinit();
         try ref.expectEqual(&res, "read split");

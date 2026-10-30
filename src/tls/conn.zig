@@ -1787,6 +1787,127 @@ test "a KeyUpdate answered while the wire is being written leaves those bytes in
     try testing.expectEqual(record.overhead + 5, conn.wireBytes().len);
 }
 
+test "sends in flight, partial completions and KeyUpdates in random order" {
+    const td = credentials.testdata;
+    var server: TestServer = undefined;
+    try server.init(td.p256_cert, td.p256_key);
+    defer server.deinit();
+    const a = testing.allocator;
+    const data = try a.alloc(u8, 3 * out_buffer_size);
+    defer a.free(data);
+    for (data, 0..) |*b, i| b.* = @truncate(i *% 7 +% i / 251);
+    for (0..300) |seed| {
+        var prng: std.Random.DefaultPrng = .init(seed);
+        const rand = prng.random();
+        var conn = try Conn.init(&server.pools, &server.config, &testEntropy(5));
+        defer conn.deinit();
+        conn.freeHandshake();
+        const c_secret: [32]u8 = @splat(1);
+        const s_secret: [32]u8 = @splat(2);
+        conn.read = .init(.aes_128_gcm_sha256, &c_secret);
+        conn.write = .init(.aes_128_gcm_sha256, &s_secret);
+        var client_tx: Protection = .init(.aes_128_gcm_sha256, &c_secret);
+        var client_rx: Protection = .init(.aes_128_gcm_sha256, &s_secret);
+
+        // What the server encrypted, what the client received (records),
+        // and the KeyUpdates it asked for.
+        var sent_plain: std.ArrayList(u8) = .empty;
+        defer sent_plain.deinit(a);
+        var received: std.ArrayList(u8) = .empty;
+        defer received.deinit(a);
+        var asked: usize = 0;
+        // The send in flight: the bytes the kernel reads, and a copy.
+        var inflight: ?[]const u8 = null;
+        var copy: std.ArrayList(u8) = .empty;
+        defer copy.deinit(a);
+
+        for (0..60) |_| {
+            switch (rand.uintLessThan(u8, 4)) {
+                // Encrypt a response (only with no send in flight, as
+                // the worker does).
+                0 => if (inflight == null) {
+                    const off = rand.uintLessThan(usize, data.len);
+                    const len = rand.uintAtMost(usize, @min(data.len - off, 2 * out_buffer_size));
+                    const n = try conn.encrypt(&.{data[off..][0..len]});
+                    try sent_plain.appendSlice(a, data[off..][0..n]);
+                },
+                // The client asks for a KeyUpdate (or announces one).
+                1 => {
+                    const requested = rand.boolean();
+                    const space = try conn.readSpace();
+                    const n = client_tx.seal(space, .handshake, &.{ 24, 0, 0, 1, @intFromBool(requested) });
+                    client_tx.update();
+                    conn.commitRead(n);
+                    var buf: [16]u8 = undefined;
+                    try testing.expectEqual(0, conn.readPlain(&buf));
+                    try testing.expect(!conn.failed);
+                    if (requested) asked += 1;
+                },
+                // The send in flight completes, perhaps in part.
+                2 => if (inflight) |bytes| {
+                    try testing.expectEqualSlices(u8, copy.items, bytes);
+                    try testing.expect(std.mem.startsWith(u8, conn.wireBytes(), bytes));
+                    const k = if (rand.boolean()) bytes.len else rand.uintAtMost(usize, bytes.len);
+                    try received.appendSlice(a, bytes[0..k]);
+                    conn.advance(k);
+                    inflight = null;
+                    conn.releaseIfIdle();
+                },
+                // Nothing in flight: start a send of the whole wire.
+                3 => if (inflight == null and conn.hasWire()) {
+                    const bytes = conn.wireBytes();
+                    copy.clearRetainingCapacity();
+                    try copy.appendSlice(a, bytes);
+                    inflight = bytes;
+                    conn.wireSending();
+                },
+                else => unreachable,
+            }
+        }
+        // Everything goes out.
+        while (conn.hasWire()) {
+            if (inflight) |bytes| {
+                try testing.expectEqualSlices(u8, copy.items, bytes);
+                try received.appendSlice(a, bytes);
+                conn.advance(bytes.len);
+                inflight = null;
+            } else {
+                inflight = conn.wireBytes();
+                copy.clearRetainingCapacity();
+                try copy.appendSlice(a, inflight.?);
+                conn.wireSending();
+            }
+        }
+        conn.releaseIfIdle();
+        try testing.expectEqual(0, conn.wire_retired.len);
+
+        // The client reads: the responses in order, a KeyUpdate answer per
+        // request, each switching its key.
+        var got_plain: std.ArrayList(u8) = .empty;
+        defer got_plain.deinit(a);
+        var answers: usize = 0;
+        var pos: usize = 0;
+        const r = received.items;
+        while (pos < r.len) {
+            try testing.expect(r.len - pos >= record.header_len);
+            const len = record.header_len + std.mem.readInt(u16, r[pos + 3 ..][0..2], .big);
+            const opened = try client_rx.open(r[pos..][0..len]);
+            switch (opened.content_type) {
+                .application_data => try got_plain.appendSlice(a, opened.data),
+                .handshake => {
+                    try testing.expectEqualSlices(u8, &.{ 24, 0, 0, 1, 0 }, opened.data);
+                    client_rx.update();
+                    answers += 1;
+                },
+                else => return error.UnexpectedRecord,
+            }
+            pos += len;
+        }
+        try testing.expectEqual(asked, answers);
+        try testing.expectEqualSlices(u8, sent_plain.items, got_plain.items);
+    }
+}
+
 /// Appends a plaintext handshake record holding `msg`.
 fn plainRecord(out: []u8, msg: []const u8) []u8 {
     out[0..5].* = .{ 22, 3, 1, 0, 0 };
