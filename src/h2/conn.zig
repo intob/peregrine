@@ -4933,6 +4933,7 @@ fn mergeData(lines: []const u8) ![]u8 {
 /// Same frames per stream (DATA as runs), same handler logs and the same
 /// DATA bytes.
 fn expectSameRun(a: *Harness, b: *Harness) !void {
+    if (a.conn.failed or b.conn.failed) return expectSameUntilFailure(a, b);
     try testing.expectEqual(a.last, b.last);
     try testing.expectEqual(a.per_stream.count(), b.per_stream.count());
     var ps = a.per_stream.iterator();
@@ -4956,6 +4957,31 @@ fn expectSameRun(a: *Harness, b: *Harness) !void {
     while (it.next()) |e| {
         const other = db.get(e.key_ptr.*) orelse return error.MissingStream;
         try testing.expectEqualSlices(u8, e.value_ptr.items, other.items);
+    }
+}
+
+/// Both runs ended in a connection error. Output still queued for a
+/// stream then (behind other streams, or an exchange's answer not yet
+/// pumped) went out or not depending on where the input was split, as
+/// nothing follows the GOAWAY: the requests must be the same, and each
+/// stream's DATA in one run a prefix of the other's.
+fn expectSameUntilFailure(a: *Harness, b: *Harness) !void {
+    try testing.expect(a.conn.failed and b.conn.failed);
+    try testing.expectEqualStrings(a.handler.log.items, b.handler.log.items);
+    try testing.expectEqualStrings(a.handler.bodies.items, b.handler.bodies.items);
+    try testing.expectEqualStrings(a.handler.ws_log.items, b.handler.ws_log.items);
+    var da = try dataByStream(a);
+    defer freeDataMap(&da);
+    var db = try dataByStream(b);
+    defer freeDataMap(&db);
+    for ([_]*std.AutoHashMap(u32, std.ArrayList(u8)){ &da, &db }, [_]*std.AutoHashMap(u32, std.ArrayList(u8)){ &db, &da }) |x, y| {
+        var it = x.iterator();
+        while (it.next()) |e| {
+            const other = (y.get(e.key_ptr.*) orelse continue).items;
+            const mine = e.value_ptr.items;
+            const n = @min(mine.len, other.len);
+            try testing.expectEqualSlices(u8, mine[0..n], other[0..n]);
+        }
     }
 }
 
@@ -5396,6 +5422,8 @@ test "fuzz: h2 connections sharing a worker's pool" {
         .corpus = &.{
             "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f",
             "\xff\xfe\xfd\x80\x40\x20\x10\x08\x04\x02\x01\x00\x37\x91\xaa\x55\x13\x77\xc4\x02\x99\x10\x00\x01",
+            // Found by the fuzzer.
+            @embedFile("testdata/fuzz/shared-1.bin"),
         },
     });
 }

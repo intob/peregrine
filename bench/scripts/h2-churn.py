@@ -277,6 +277,8 @@ class Client:
                     self.conn.reset_stream(ev.stream_id, 8)
                 except h2.exceptions.StreamClosedError:
                     return  # ended in this read: check it whole
+                except h2.exceptions.ProtocolError:
+                    return  # a GOAWAY earlier in this read closed the connection
                 stats['resets'] += 1
                 if not s.done.done():
                     s.done.set_result('reset')
