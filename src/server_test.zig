@@ -2503,6 +2503,160 @@ fn testH2ResumeParses(backend: Backend) !void {
     }
 }
 
+/// Runs `f` on io_uring with the provided-buffer rings kept empty (every
+/// receive finds no kernel buffer and waits for readability), if
+/// io_uring is there.
+fn withRingClosed(comptime f: fn (Backend) anyerror!void) !void {
+    if (sys.is_linux) {
+        const worker_uring = @import("./http/worker_uring.zig");
+        if (!worker_uring.available()) return;
+        worker_uring.test_ring_closed.store(true, .monotonic);
+        defer worker_uring.test_ring_closed.store(false, .monotonic);
+        try f(.io_uring);
+    }
+}
+
+test "requests arriving with the client's FIN are all answered (HTTP/1.1 and h2c)" {
+    try forEachBackend(testFinWithRequests);
+    try withRingClosed(testFinWithRequests);
+}
+
+/// A batch of pipelined requests, then FIN at once (a hangup reported
+/// with the last data): every request is answered, then the close. Also
+/// after a keep-alive request answered first, and on HTTP/2.
+fn testFinWithRequests(backend: Backend) !void {
+    const r = try Running.start(backend, h2Config());
+    defer r.stop();
+    const req = "GET /a HTTP/1.1\r\nHost: x\r\n\r\n";
+    var head: [4096]u8 = undefined;
+    for ([_]usize{ 1, 7, 40 }) |k| {
+        for (0..2) |keep_alive| {
+            var c = try Client.connect(r.port);
+            defer c.close();
+            if (keep_alive == 1) {
+                try c.send(req);
+                try testing.expectEqual(@as(u16, 200), (try c.readResponse(&head, null)).status);
+                sleepMs(20);
+            }
+            var batch: [40 * req.len]u8 = undefined;
+            for (0..k) |i| @memcpy(batch[i * req.len ..][0..req.len], req);
+            try c.send(batch[0 .. k * req.len]);
+            sys.shutdownWrite(c.fd);
+            for (0..k) |_| try testing.expectEqual(@as(u16, 200), (try c.readResponse(&head, null)).status);
+            try testing.expectEqual(@as(usize, 0), c.len);
+            try testing.expectEqual(@as(usize, 0), try c.fill());
+        }
+        const h = try H2Client.connect(r.port);
+        defer h.close();
+        var replies: [40]H2Client.Reply = @splat(.{});
+        defer for (&replies) |*x| x.deinit();
+        var map = std.AutoHashMap(u31, *H2Client.Reply).init(testing.allocator);
+        defer map.deinit();
+        for (0..k) |i| {
+            const sid: u31 = @intCast(1 + 2 * i);
+            try map.put(sid, &replies[i]);
+            try h.request(sid, "GET", "/a", null);
+        }
+        sys.shutdownWrite(h.tcp.fd);
+        h.quiet = true;
+        try testing.expectEqual(@as(?h2frame.ErrorCode, null), try h.collect(&map));
+        for (replies[0..k]) |*x| try testing.expectEqual(@as(u16, 200), x.status);
+        var rest: [1024]u8 = undefined;
+        while (try sys.read(h.tcp.fd, &rest) > 0) {}
+    }
+}
+
+test "h2c: after our GOAWAY, a client that keeps sending is closed within the linger bounds" {
+    try forEachBackend(testH2LingerBounded);
+    try withRingClosed(testH2LingerBounded);
+}
+
+/// A connection error (our GOAWAY), then PINGs: trickled, the server
+/// drains them until the request timeout; flooded, until the linger byte
+/// limit (long before that timeout). Either way the client's writes then
+/// fail, in bounded time.
+fn testH2LingerBounded(backend: Backend) !void {
+    for (0..2) |flood| {
+        var cfg = h2Config();
+        cfg.request_timeout_s = if (flood == 1) 30 else 1;
+        const r = try Running.start(backend, cfg);
+        defer r.stop();
+        const c = try H2Client.connect(r.port);
+        defer c.close();
+        var first: H2Client.Reply = .{};
+        defer first.deinit();
+        try c.fetch(1, "GET", "/", null, &first);
+        var out: [64 * 1024]u8 = undefined;
+        // DATA on stream 0: a connection error.
+        try c.send(out[0..try h2frame.writeData(&out, 0, false, "zz")]);
+        var n: usize = 0;
+        while (n + h2frame.header_len + 8 <= out.len) n += try h2frame.writePing(out[n..], false, "lingerin");
+        const t0 = sys.monotonicSeconds();
+        var sent: usize = 0;
+        while (sys.monotonicSeconds() - t0 < 8) {
+            sent += sys.write(c.tcp.fd, if (flood == 1) out[0..n] else out[0 .. h2frame.header_len + 8]) catch break;
+            if (flood == 0) sleepMs(50);
+        }
+        try testing.expect(sys.monotonicSeconds() - t0 < 4);
+        if (flood == 1) try testing.expect(sent < 32 << 20);
+    }
+}
+
+test "shutdown with HTTP/2 connections lingering after our GOAWAY, mid-frame and idle" {
+    try forEachBackend(testShutdownLingering);
+    try withRingClosed(testShutdownLingering);
+}
+
+/// HTTP/2 connections lingering after a connection error, holding part
+/// of a frame, or idle, and WebSockets idle or mid-frame, when the server
+/// stops: prompt, and everything freed (the testing allocator checks).
+fn testShutdownLingering(backend: Backend) !void {
+    var cfg = h2Config();
+    cfg.worker_thread_count = 2;
+    const r = try Running.start(backend, cfg);
+    var stopped = false;
+    defer if (!stopped) r.stop();
+    const n = 48;
+    var h2s: [n]*H2Client = undefined;
+    var wsc: [n]Client = undefined;
+    var opened: usize = 0;
+    defer for (0..opened) |i| {
+        h2s[i].close();
+        wsc[i].close();
+    };
+    for (0..n) |i| {
+        h2s[i] = try H2Client.connect(r.port);
+        wsc[i] = Client.connect(r.port) catch |err| {
+            h2s[i].close();
+            return err;
+        };
+        opened += 1;
+        var reply: H2Client.Reply = .{};
+        defer reply.deinit();
+        try h2s[i].fetch(1, "GET", "/b", null, &reply);
+        try wsc[i].send(Client.upgrade_request);
+        try wsc[i].readUpgrade();
+        try wsc[i].wsSend(true, .text, "one");
+        try wsc[i].expectWsText("one");
+    }
+    var out: [256]u8 = undefined;
+    for (h2s, 0..) |c, i| switch (i % 3) {
+        0 => {
+            var k = try h2frame.writeData(&out, 0, false, "zz");
+            for (0..4) |_| k += try h2frame.writePing(out[k..], false, "lingerin");
+            try c.send(out[0..k]);
+        },
+        1 => try c.send(out[0..try h2frame.writePing(&out, false, "partial.")][0..5]),
+        else => {},
+    };
+    for (wsc[0 .. n / 2]) |*w| try w.send(&.{ 0x81, 0x85 });
+    sleepMs(300);
+    const t0 = sys.monotonicSeconds();
+    r.stop();
+    stopped = true;
+    try testing.expect(sys.monotonicSeconds() - t0 <= 2);
+}
+
 fn testH2ClientGoaway(backend: Backend) !void {
     const r = try Running.start(backend, h2Config());
     defer r.stop();
