@@ -4692,6 +4692,11 @@ const H3Client = struct {
     }
 
     fn connectTo(address: std.Io.net.IpAddress) !H3Client {
+        return connectWith(address, null);
+    }
+
+    /// With the client's max_udp_payload_size transport parameter.
+    fn connectWith(address: std.Io.net.IpAddress, max_udp_payload_size: ?u64) !H3Client {
         const nonblock: u32 = if (sys.is_linux) std.os.linux.SOCK.NONBLOCK else 0;
         const family: u32 = if (address == .ip6) posix.AF.INET6 else posix.AF.INET;
         const rc = system.socket(family, posix.SOCK.DGRAM | nonblock, posix.IPPROTO.UDP);
@@ -4704,7 +4709,7 @@ const H3Client = struct {
         sys.setsockoptInt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, 8 << 20) catch {};
         var dcid: [8]u8 = undefined;
         sys.randomBytes(&dcid);
-        const c = try quic_test_client.Client.init(testing.allocator, .{ .dcid = dcid, .max_stream_data = 16 << 20, .max_data = 64 << 20 });
+        const c = try quic_test_client.Client.init(testing.allocator, .{ .dcid = dcid, .max_stream_data = 16 << 20, .max_data = 64 << 20, .max_udp_payload_size = max_udp_payload_size });
         errdefer c.deinit();
         return .{ .fd = fd, .c = c, .batch = try testing.allocator.create(quic_udp.RecvBatch(8, 65536)) };
     }
@@ -5252,6 +5257,36 @@ fn testHttp3RecvSize(backend: Backend) !void {
         var a = try cl.response(id);
         defer a.body.deinit(testing.allocator);
         try testing.expectEqualStrings("200", &a.status);
+    }
+}
+
+test "verify PMTU: GSO runs at segment sizes under the start size (client limits 1200-1349) stay within 65507 bytes" {
+    try forEachBackend(testHttp3GsoSmallSegments);
+}
+
+fn testHttp3GsoSmallSegments(backend: Backend) !void {
+    var cfg = tlsConfig();
+    // Unpaced, so runs fill up. The sizes where 64 KiB of segments would
+    // pass 65507 bytes (1236, 1260, 1285, 1337), where the run's count
+    // changes (1214, 1311), and the ends.
+    cfg.http3 = .{ .pacing = false };
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    for ([_]u64{ 1200, 1213, 1214, 1236, 1260, 1285, 1311, 1337, 1349 }) |limit| {
+        var cl = try H3Client.connectWith(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = r.srv.getQuicPort() } }, limit);
+        defer cl.close();
+        cl.delay_ns = 20 * std.time.ns_per_ms;
+        try cl.start();
+        const began = sys.nanoTimestamp();
+        const id = try cl.request("GET", "/big", "");
+        try cl.waitFinished(&.{id});
+        var a = try cl.response(id);
+        defer a.body.deinit(testing.allocator);
+        try testing.expect(std.mem.eql(u8, &big_body, a.body.items));
+        try testing.expectEqual(@as(usize, @intCast(limit)), cl.c.largest_datagram);
+        // Not probe timeouts (refused runs would be).
+        try testing.expect(sys.nanoTimestamp() - began < 3 * std.time.ns_per_s);
     }
 }
 
