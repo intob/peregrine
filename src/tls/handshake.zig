@@ -929,7 +929,8 @@ const KeyExchange = struct {
         // The public key from a table, the shared secret from our ladder
         // (both equal std's).
         const public = x25519_base.publicKey(seed.*);
-        const shared = x25519_base.sharedSecret(seed.*, client[0..32].*) catch return error.IllegalParameter;
+        var shared = x25519_base.sharedSecret(seed.*, client[0..32].*) catch return error.IllegalParameter;
+        defer std.crypto.secureZero(u8, &shared);
         @memcpy(self.share_buf[self.share_len..][0..32], &public);
         self.share_len += 32;
         @memcpy(self.shared_buf[self.shared_len..][0..32], &shared);
@@ -959,7 +960,8 @@ const KeyExchange = struct {
                 const ek_len = MLKem768.PublicKey.encoded_length;
                 if (share.key_exchange.len != ek_len + X25519.public_length) return error.IllegalParameter;
                 const ek = MLKem768.PublicKey.fromBytes(share.key_exchange[0..ek_len]) catch return error.IllegalParameter;
-                const enc = ek.encapsDeterministic(entropy[96..128]);
+                var enc = ek.encapsDeterministic(entropy[96..128]);
+                defer std.crypto.secureZero(u8, &enc.shared_secret);
                 @memcpy(self.share_buf[0..enc.ciphertext.len], &enc.ciphertext);
                 self.share_len = enc.ciphertext.len;
                 @memcpy(self.shared_buf[0..enc.shared_secret.len], &enc.shared_secret);

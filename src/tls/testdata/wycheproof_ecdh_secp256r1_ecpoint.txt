@@ -1,4 +1,6 @@
-# Project Wycheproof (github.com/C2SP/wycheproof, Apache License 2.0),
+# Project Wycheproof (github.com/C2SP/wycheproof), Copyright the Project
+# Wycheproof authors, under the Apache License 2.0 (wycheproof.LICENSE
+# next to this file); reformatted from
 # testvectors_v1/ecdh_secp256r1_ecpoint_test.json: tcId, result, flags,
 # public key (SEC1), private key (big-endian, 32 bytes), shared secret.
 1 valid Normal 0462d5bd3372af75fe85a040715d0f502428e07046868b0bfdfa61d731afe44f26ac333a93a9e70a81cd5a95b5bf8d13990eb741c8c38872b4a07d275a014e30cf 0612465c89a023ab17855b0a6bcebfd3febb53aef84138647b5352e02c10c346 53020d908b0219328b658b525f26780e3ae12bcd952bb25a93bc0895e1714285

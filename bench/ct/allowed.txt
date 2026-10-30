@@ -1,0 +1,42 @@
+# Forward conditional branches allowed per function in the constant-time
+# code (see branches.py): "function count [mode]", the most seen over
+# bench/scripts/ct-check.sh's targets (x86_64 baseline, v2, v3; aarch64
+# baseline, apple_m2, cortex_a76) in that optimize mode (ReleaseSafe adds
+# safety checks), each inspected and on a public value. Inlining moves
+# code between functions, so a count is per function as compiled, not
+# per source function. 2026-10-30, Zig 0.17. The scan fails on da04c23
+# (before the field's mask barrier) for x86_64 baseline and v2: p256.mulBase
+# 22-24 forward branches (the selects of every addition), p256.mulVar 1.
+# A new forward branch in the scalar multiplications or the field is
+# what a select turned into a branch looks like: inspect it before
+# raising a count.
+
+# Encoding checks on the peer's public key (length, form, x and y below
+# p, on the curve).
+tls.field_p256.Fe.fromBytes 1
+tls.p256.decodePoint 4
+# The identity check on a result (only for a scalar ≡ 0 mod n, as std).
+tls.p256.affineX 1
+tls.p256.publicKey 1
+# decodePoint's error, then the identity checks.
+tls.p256.keyShare 3
+tls.p256.sharedSecret 1
+# std's HMAC-DRBG: the rejection of a candidate ≥ n.
+tls.p256.deterministicScalar 1
+# std's scalar reduction (ReleaseSafe checks), on the message hash and r.
+tls.p256.reduce 0
+tls.p256.reduce 4 ReleaseSafe
+# Errors: r = 0, s = 0, the key's encoding, the identity.
+tls.p256.sign 4
+# The base-point tables: the ready flag, the mutex, the build's loops and
+# checks on constants (inlined when the table is built here).
+tls.p256.mulBase 6
+tls.p256.mulBase 8 ReleaseSafe
+tls.x25519.mulBase 7
+tls.x25519.publicKey 0
+tls.x25519.publicKey 5 ReleaseSafe
+tls.x25519.buildTable 0
+tls.x25519.buildTable 478 ReleaseSafe
+# The all-zero result check, and (ReleaseSafe) the ladder's loop exit.
+tls.x25519.sharedSecret 1
+tls.x25519.sharedSecret 2 ReleaseSafe

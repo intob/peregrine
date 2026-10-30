@@ -49,7 +49,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
 
 /// The group order.
-const n: u256 = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551;
+pub const n: u256 = P256.scalar.field_order;
 
 /// Jacobian coordinates: x = X/Z², y = Y/Z³. Z = 0 is the identity.
 const Point = struct {
@@ -138,7 +138,19 @@ fn addMixed(p: Point, q: Affine) Point {
     return .{ .x = x3, .y = d[0].sub(d[1]), .z = z3 };
 }
 
+/// Signed 4-bit digits: 64 in [-8, 8) and a last one of 0 or 1.
+const window = 4;
 const rows = 65;
+
+// What `mulVar`'s and `mulBase`'s arguments about equal inputs rest on.
+// Another window width, digit range or recoding (or table) invalidates
+// them, the s = n − 2 case included: redo them, and the tests' integer
+// model (`modelVar`, `modelBase`), first.
+comptime {
+    std.debug.assert(n % (1 << window) == 1); // the wrap n + d needs d = −1
+    std.debug.assert(rows == 256 / window + 1);
+    std.debug.assert(9 * (1 << (window * (rows - 2))) < n); // |K ∓ d·16^i| < n below the last row
+}
 
 /// A little-endian scalar as 65 digits in [-8, 8), the last 0 or 1.
 fn recode(s: [32]u8) [rows]i8 {
@@ -196,8 +208,12 @@ fn varTable(p: Affine) [8]Entry {
 fn varStep(q_: Point, t: *const [8]Entry, d: i8, comptime last: bool) Point {
     @setRuntimeSafety(field.safe);
     const q = dbl(dbl(dbl(dbl(q_))));
-    const negative, const abs, const is_zero = digitParts(d);
+    // The digit and the entry it selects would stay on the stack.
+    var parts = digitParts(d);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&parts));
+    const negative, const abs, const is_zero = parts;
     var entry: Entry = .{ .x = F.one, .y = F.one, .z = F.zero, .zz = F.zero, .zzz = F.zero };
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&entry));
     for (t, 1..) |te, j| {
         const c = eqMask(abs, @intCast(j));
         entry.x.cMov(te.x, c);
@@ -210,7 +226,8 @@ fn varStep(q_: Point, t: *const [8]Entry, d: i8, comptime last: bool) Point {
     const sum, const h, const r = add(q, entry);
     var next = sum;
     const q_zero = q.z.isZero();
-    // q = entry (s = n − 2): the doubling. The identity cases below
+    // q = entry (s = n − 2, see `mulVar`; it rests on the window and
+    // recoding checked at `rows`): the doubling. The identity cases below
     // take precedence (H and r mean nothing then).
     if (last) next.cMov(dbl(entry.point()), h.isZero() & r.isZero());
     next.cMov(entry.point(), q_zero);
@@ -316,8 +333,11 @@ fn mulBase(s: [32]u8) Point {
 /// One step of `mulBase`: q + d·16^i·G, with row i of the table.
 fn baseStep(q: Point, row: *const Row, d: i8) Point {
     @setRuntimeSafety(field.safe);
-    const negative, const abs, const is_zero = digitParts(d);
+    var parts = digitParts(d);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&parts));
+    const negative, const abs, const is_zero = parts;
     var a: Affine = .{ .x = F.zero, .y = F.zero };
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&a));
     for (row, 1..) |entry, j| {
         const c = eqMask(abs, @intCast(j));
         a.x.cMov(entry.x, c);
@@ -333,7 +353,19 @@ fn baseStep(q: Point, row: *const Row, d: i8) Point {
 /// Affine x, big-endian; `error.IdentityElement` for the identity.
 fn affineX(p: Point) error{IdentityElement}![32]u8 {
     if (p.z.isZero() == 1) return error.IdentityElement;
-    return p.x.mul(p.z.invSquare()).toBytes();
+    var x = p.x.mul(p.z.invSquare());
+    defer std.crypto.secureZero(u64, &x.l);
+    return x.toBytes();
+}
+
+/// A 32-byte value with its bytes in the other order.
+fn reversed(bytes: [32]u8) [32]u8 {
+    return @bitCast(@byteSwap(@as(u256, @bitCast(bytes))));
+}
+
+/// The secret std's `generateDeterministic` makes from a seed.
+fn secretFromSeed(seed: [32]u8) Scalar {
+    return deterministicScalar(@splat(0), @splat(0x01), seed);
 }
 
 /// Uncompressed SEC1; `error.IdentityElement` for the identity.
@@ -362,10 +394,11 @@ pub const Error = error{ InvalidEncoding, NonCanonical, IdentityElement };
 /// branch.
 pub fn sharedSecret(secret_key: [32]u8, public_key: []const u8) Error![32]u8 {
     const peer = try decodePoint(public_key);
-    var s: [32]u8 = undefined;
-    for (secret_key, 0..) |byte, i| s[31 - i] = byte;
+    var s = reversed(secret_key);
     defer std.crypto.secureZero(u8, &s);
-    return affineX(mulVar(peer, s));
+    var q = mulVar(peer, s);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&q));
+    return affineX(q);
 }
 
 /// An uncompressed SEC1 point on the curve (see `sharedSecret`).
@@ -391,19 +424,26 @@ pub const KeyShare = struct {
 /// (`sharedSecret`), equal to both, with one inversion for both results.
 pub fn keyShare(seed: [32]u8, public_key: []const u8) Error!KeyShare {
     const peer = try decodePoint(public_key);
-    var secret = deterministicScalar(@splat(0), @splat(0x01), seed);
+    var secret = secretFromSeed(seed);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&secret));
     var s = secret.toBytes(.little);
     defer std.crypto.secureZero(u8, &s);
     const g = mulBase(s);
-    const q = mulVar(peer, s);
+    // The shared point and what is derived from it are zeroed (the
+    // public key's values are public).
+    var q = mulVar(peer, s);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&q));
     // The secret is in [1, n − 1]: neither is the identity.
     if ((g.z.isZero() | q.z.isZero()) == 1) return error.IdentityElement;
     // 1/(Zg·Zq), then each inverse from it (Montgomery's trick).
-    const w = g.z.mul(q.z).invert();
-    const inv = F.mulN(2, .{ w, w }, .{ q.z, g.z }); // 1/Zg, 1/Zq
-    const sq = F.sqN(2, inv); // 1/Zg², 1/Zq²
-    const m = F.mulN(3, .{ g.x, q.x, sq[0] }, .{ sq[0], sq[1], inv[0] }); // xg, xq, 1/Zg³
+    var w = g.z.mul(q.z).invert();
+    defer std.crypto.secureZero(u64, &w.l);
+    var inv = F.mulN(2, .{ w, w }, .{ q.z, g.z }); // 1/Zg, 1/Zq
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&inv));
+    var sq = F.sqN(2, inv); // 1/Zg², 1/Zq²
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&sq));
+    var m = F.mulN(3, .{ g.x, q.x, sq[0] }, .{ sq[0], sq[1], inv[0] }); // xg, xq, 1/Zg³
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&m));
     var out: KeyShare = .{ .public_key = undefined, .shared_secret = m[1].toBytes() };
     out.public_key[0] = 4;
     out.public_key[1..33].* = m[0].toBytes();
@@ -455,7 +495,8 @@ pub fn sign(key_pair: Ecdsa.KeyPair, msg: []const u8, noise: [32]u8) !Ecdsa.Sign
     var h: [32]u8 = undefined;
     Sha256.hash(msg, &h, .{});
     const z = reduce(h);
-    const secret = key_pair.secret_key.bytes;
+    var secret = key_pair.secret_key.bytes;
+    defer std.crypto.secureZero(u8, &secret);
     var k = deterministicScalar(h, secret, noise);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&k));
     var kb = k.toBytes(.little);
@@ -476,17 +517,18 @@ pub const KeyPair = struct {
 
 /// The public key (uncompressed SEC1) for a big-endian secret key: the
 /// same as std's `basePoint.mul(secret_key, .big)`, including
-/// `error.IdentityElement` for a multiple of n.
+/// `error.IdentityElement` for a multiple of n. Not used by the server
+/// (`keyShare`): it is the fixed-base entry point for the tests and the
+/// timing harness (bench/ct), which need chosen scalars.
 pub fn publicKey(secret_key: [32]u8) error{IdentityElement}![65]u8 {
-    var s: [32]u8 = undefined;
-    for (secret_key, 0..) |byte, i| s[31 - i] = byte;
+    var s = reversed(secret_key);
     defer std.crypto.secureZero(u8, &s);
     return toUncompressedSec1(mulBase(s));
 }
 
 /// The key pair std's `generateDeterministic` makes from the same seed.
 pub fn keyPair(seed: [32]u8) !KeyPair {
-    var secret = deterministicScalar(@splat(0), @splat(0x01), seed);
+    var secret = secretFromSeed(seed);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&secret));
     var s = secret.toBytes(.little);
     defer std.crypto.secureZero(u8, &s);
@@ -502,14 +544,14 @@ fn hex(comptime s: []const u8) [s.len / 2]u8 {
 }
 
 /// Little-endian bytes of v.
-fn le(v: u256) [32]u8 {
+pub fn le(v: u256) [32]u8 {
     var out: [32]u8 = undefined;
     std.mem.writeInt(u256, &out, v, .little);
     return out;
 }
 
 /// Big-endian bytes of v.
-fn be(v: u256) [32]u8 {
+pub fn be(v: u256) [32]u8 {
     var out: [32]u8 = undefined;
     std.mem.writeInt(u256, &out, v, .big);
     return out;
@@ -622,9 +664,7 @@ test "p256: shared secrets match NIST's ECDH test vectors (CAVS ECC CDH, P-256)"
         var z: [32]u8 = undefined;
         _ = try std.fmt.hexToBytes(&z, v[3]);
         try testing.expectEqualSlices(u8, &z, &try sharedSecret(d, &peer));
-        var dl: [32]u8 = undefined;
-        for (d, 0..) |byte, i| dl[31 - i] = byte;
-        try testing.expectEqualSlices(u8, &ours, &try toUncompressedSec1(mulBase(dl)));
+        try testing.expectEqualSlices(u8, &ours, &try toUncompressedSec1(mulBase(reversed(d))));
     }
 }
 

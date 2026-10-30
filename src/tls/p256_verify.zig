@@ -14,12 +14,12 @@ const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const testing = std.testing;
 
 const p: u256 = field.p;
-const n: u256 = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551;
+const n: u256 = p256.n;
 /// 2^−256 mod p.
 const r_inv: u256 = blk: {
     @setEvalBranchQuota(100_000);
     // p is prime: a^(p − 2) = 1/a, by square and multiply.
-    const pc: comptime_int = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff;
+    const pc: comptime_int = p;
     const base: comptime_int = (1 << 256) % pc;
     var e: comptime_int = pc - 2;
     var b: comptime_int = base;
@@ -223,17 +223,8 @@ test "verify: long chains of field_p256 ops, outputs fed back, vs u512 reference
     }
 }
 
-fn le(v: u256) [32]u8 {
-    var out: [32]u8 = undefined;
-    std.mem.writeInt(u256, &out, v, .little);
-    return out;
-}
-
-fn be(v: u256) [32]u8 {
-    var out: [32]u8 = undefined;
-    std.mem.writeInt(u256, &out, v, .big);
-    return out;
-}
+const le = p256.le;
+const be = p256.be;
 
 /// A peer key on the curve: k × G, or a point whose x is made of limb
 /// patterns (when x³ − 3x + b is a square), or a small multiple of G.

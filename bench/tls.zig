@@ -326,7 +326,7 @@ fn handshakes() !void {
             std.mem.doNotOptimizeAway(point.affineCoordinates().x.toBytes(.big));
             std.mem.doNotOptimizeAway(kp.public_key.toUncompressedSec1());
         }
-        reportOp("P-256 key pair + shared secret (std)", n, sys.nanoTimestamp() - start);
+        reportOp("P-256 key pair + shared secret (std, ct mul)", n, sys.nanoTimestamp() - start);
     }
     {
         const start = sys.nanoTimestamp();

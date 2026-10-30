@@ -9,11 +9,10 @@
 # Usage: tls-interop.sh [epoll|io_uring] (default: both)
 # IMAGE: any image with OpenSSL 3.5+ (X25519MLKEM768) and curl with
 # HTTP/3 (default peregrine-h3load: OpenSSL 3.5, curl 8.23 with ngtcp2).
-# TLS_GROUPS overrides the groups (default "X25519 X25519MLKEM768"; P-256
-# too).
+# TLS_GROUPS overrides the groups (default "X25519 X25519MLKEM768 P-256").
 source "$(dirname "$0")/env.sh"
 IMAGE=${IMAGE:-peregrine-h3load}
-GROUPS_=${TLS_GROUPS:-X25519 X25519MLKEM768}
+GROUPS_=${TLS_GROUPS:-X25519 X25519MLKEM768 P-256}
 backends=${1:-epoll io_uring}
 "$LOCK" share mac-bench "tls-interop ($ROOT)"
 trap '"$LOCK" unshare mac-bench' EXIT
