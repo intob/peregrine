@@ -4003,6 +4003,80 @@ fn testLingerTrickle(backend: Backend) !void {
     }
 }
 
+test "io_uring: shutdown with many idle connections receiving into their own buffers" {
+    if (sys.is_linux) {
+        const worker_uring = @import("./http/worker_uring.zig");
+        if (!worker_uring.available()) return error.SkipZigTest;
+        defer worker_uring.test_ring_buffers = null;
+        inline for (.{ 0, 2 }) |count| {
+            worker_uring.test_ring_buffers = count;
+            try testShutdownManyIdle(.io_uring);
+        }
+    } else return error.SkipZigTest;
+}
+
+/// 300 connections (HTTP/1.1, WebSocket, h2c and TLS) used once and left
+/// idle, each with a receive armed, then the server stops: everything is
+/// cancelled and freed (the testing allocator checks), promptly.
+fn testShutdownManyIdle(backend: Backend) !void {
+    var cfg = h2Config();
+    cfg.worker_thread_count = 2;
+    const r = try Running.start(backend, cfg);
+    var stopped = false;
+    defer if (!stopped) r.stop();
+    const rt = try Running.start(backend, tlsConfig());
+    defer rt.stop();
+    const n = 60;
+    var h1: [n]Client = undefined;
+    var wsc: [n]Client = undefined;
+    var h2s: [n]*H2Client = undefined;
+    var tls1: [n]*TlsAlpnClient = undefined;
+    var tlsw: [n]*TlsAlpnClient = undefined;
+    var head: [4096]u8 = undefined;
+    for (0..n) |i| {
+        h1[i] = try Client.connect(r.port);
+        wsc[i] = try Client.connect(r.port);
+        h2s[i] = try H2Client.connect(r.port);
+        tls1[i] = try TlsAlpnClient.connect(rt.port, null);
+        tlsw[i] = try tlsWsClient(rt.port);
+    }
+    defer for (0..n) |i| {
+        h1[i].close();
+        wsc[i].close();
+        h2s[i].close();
+        tls1[i].close();
+        tlsw[i].close();
+    };
+    // All at once, then the answers.
+    for (0..n) |i| {
+        try h1[i].send("GET /a HTTP/1.1\r\nHost: x\r\n\r\n");
+        try wsc[i].send(Client.upgrade_request);
+        try h2s[i].request(1, "GET", "/b", null);
+        try tls1[i].send("GET /c HTTP/1.1\r\nHost: x\r\n\r\n");
+    }
+    var buf: [4096]u8 = undefined;
+    for (0..n) |i| {
+        const res = try h1[i].readResponse(&head, null);
+        try testing.expectEqual(@as(u16, 200), res.status);
+        try wsc[i].readUpgrade();
+        var reply: H2Client.Reply = .{};
+        defer reply.deinit();
+        var map = std.AutoHashMap(u31, *H2Client.Reply).init(testing.allocator);
+        defer map.deinit();
+        try map.put(1, &reply);
+        _ = try h2s[i].collect(&map);
+        try testing.expectEqualStrings("ok", reply.body.items);
+        _ = try tls1[i].readUntil(&buf, "ok");
+    }
+    // Idle across a tick, then the plain server stops with all of them
+    // open (the TLS one when the test ends).
+    sleepMs(1200);
+    const t0 = sys.monotonicSeconds();
+    r.stop();
+    stopped = true;
+    try testing.expect(sys.monotonicSeconds() - t0 <= 2);
+}
+
 /// HTTP/1.1, HTTP/2 and WebSocket connections used, left idle across two
 /// worker ticks (which drive every HTTP/2 connection), sent to from
 /// another thread while idle (WebSocket), then used again.
