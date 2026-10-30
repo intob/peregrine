@@ -895,8 +895,7 @@ pub const Conn = struct {
     }
 
     /// A packet leaves the flight without being acknowledged and without
-    /// a congestion signal: a lost PMTU probe, or one the interface
-    /// refused.
+    /// a congestion signal: a lost PMTU probe.
     fn retire(self: *Self, space: Space, pn: u64, p: *Sent.Packet) void {
         const sp = &self.spaces[@backingInt(space)];
         if (p.in_flight) self.cc.onDiscarded(p.size);
@@ -905,17 +904,39 @@ pub const Conn = struct {
     }
 
     /// The probe `send` last returned couldn't be sent: the local
-    /// interface refused its size (EMSGSIZE). It leaves the flight, and
-    /// the size fails at once.
+    /// interface refused its size (EMSGSIZE). It never left (no marked
+    /// packet lost, no bytes sent), and the size fails at once.
     pub fn onProbeTooBig(self: *Self, now: u64) void {
         const pn = self.pmtu.probe_pn orelse return;
         const sp = &self.spaces[@backingInt(Space.application)];
         if (sp.sent.get(pn)) |p| {
-            self.retire(.application, pn, p);
+            self.unsend(.application, p, now);
             sp.sent.compact();
         }
         self.pmtu.onProbeTooBig(now);
         self.setLossTimer(now);
+    }
+
+    /// A packet `send` returned never left (the interface refused it):
+    /// it leaves the flight, neither lost nor acknowledged, and what it
+    /// carried is owed again.
+    fn unsend(self: *Self, space: Space, p: *Sent.Packet, now: u64) void {
+        const sp = &self.spaces[@backingInt(space)];
+        for (sp.sent.recordsOf(p)) |rec| switch (rec) {
+            // The ACK never went: it is still owed.
+            .ack => {
+                sp.ack_wanted = true;
+                sp.ack_deadline = now;
+            },
+            else => self.onRecordLost(space, rec),
+        };
+        if (p.ecn) {
+            sp.ecn_sent -|= 1;
+            self.ecn_marked -|= 1;
+        }
+        self.bytes_sent -|= p.size;
+        if (p.in_flight) self.cc.onDiscarded(p.size);
+        sp.sent.remove(p);
     }
 
     /// Where the packets of the datagrams `send` returns next begin, per
@@ -943,23 +964,8 @@ pub const Conn = struct {
             var pn = from;
             while (pn < sp.sent.nextPn()) : (pn += 1) {
                 const p = sp.sent.get(pn) orelse continue;
-                for (sp.sent.recordsOf(p)) |rec| switch (rec) {
-                    // The ACK never went: it is still owed.
-                    .ack => {
-                        sp.ack_wanted = true;
-                        sp.ack_deadline = now;
-                    },
-                    else => self.onRecordLost(space, rec),
-                };
-                if (p.ecn) {
-                    sp.ecn_sent -|= 1;
-                    self.ecn_marked -|= 1;
-                }
-                self.bytes_sent -|= p.size;
                 if (p.pmtu_probe and self.pmtu.probe_pn == pn) self.pmtu.probe_pn = null;
-                // Not lost either: it never left.
-                if (p.in_flight) self.cc.onDiscarded(p.size);
-                sp.sent.remove(p);
+                self.unsend(space, p, now);
             }
             sp.sent.compact();
         }

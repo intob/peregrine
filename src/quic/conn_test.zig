@@ -2320,12 +2320,20 @@ test "QUIC PMTU: an IPv6 path's ceiling is 20 bytes lower; EMSGSIZE fails a prob
     try testing.expectEqual(@as(u64, 1350), s.cc.mss);
     var buf: [1500]u8 = undefined;
     const in_flight = s.cc.in_flight;
+    const bytes_sent = s.bytes_sent;
+    const marked = s.ecn_marked;
     try testing.expectEqual(@as(usize, 1452), s.send(&buf, h.now));
     try testing.expectEqual(in_flight + 1452, s.cc.in_flight);
+    // (An ECN testing packet on the new path.)
+    try testing.expectEqual(marked + 1, s.ecn_marked);
     // The interface refused it: out of the flight, the size failed, the
-    // next probe halves the range at once.
+    // next probe halves the range at once. It never left: not sent, and
+    // not a marked packet lost (which ECN validation would count).
     s.onProbeTooBig(h.now);
     try testing.expectEqual(in_flight, s.cc.in_flight);
+    try testing.expectEqual(bytes_sent, s.bytes_sent);
+    try testing.expectEqual(marked, s.ecn_marked);
+    try testing.expectEqual(@as(u64, 0), s.ecn_marked_lost);
     try testing.expectEqual(liveInFlight(s), s.cc.in_flight);
     try testing.expectEqual(@as(u16, 1451), s.pmtu.ceiling);
     try testing.expectEqual(@as(usize, 1350 + (1451 - 1350 + 1) / 2), s.send(&buf, h.now));
