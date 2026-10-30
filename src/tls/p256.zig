@@ -795,3 +795,279 @@ test "fuzz: p256 shared secret against std" {
         &(be(n - 1) ++ [_]u8{0x84} ++ @as([64]u8, @splat(0xff))),
     } });
 }
+
+// Adversarial checks of the incompleteness argument (`mulVar`, `mulBase`):
+// an integer model of both sums that reports every addition whose inputs
+// are equal or opposite, run over scalars built to sit on the boundaries
+// (around n, 2^256 − n and their multiples, 2^256, digit runs that push the
+// running sum to its limits, sums constructed to meet ±d·16^i or ±d·P); and
+// the real point arithmetic, instrumented to report what its additions see
+// (H = 0), checked against the model, the unwatched code and std.
+
+/// Raise for long runs (the loop counts multiply).
+const verify_scale = 1;
+
+/// What the additions of one multiplication met: equal or opposite
+/// non-identity inputs, and whether that was at the last step.
+const Exceptional = struct {
+    equal: u32 = 0,
+    opposite: u32 = 0,
+    /// The first exceptional step (variable base: digit index; fixed
+    /// base: row), or none.
+    first_step: ?usize = null,
+    last_equal: u32 = 0,
+    last_opposite: u32 = 0,
+
+    fn note(x: *Exceptional, step: usize, last: bool, equal: bool) void {
+        if (x.first_step == null) x.first_step = step;
+        if (equal) {
+            x.equal += 1;
+            if (last) x.last_equal += 1;
+        } else {
+            x.opposite += 1;
+            if (last) x.last_opposite += 1;
+        }
+    }
+};
+
+/// The model of `mulVar`'s sum: before step i (digit d_i), Q = 16·K where
+/// K is the value of the digits above i. Equal inputs when 16·K ≡ d_i,
+/// opposite when 16·K ≡ −d_i (mod n), for 16·K ≢ 0 and d_i ≠ 0.
+fn modelVar(s: u256) Exceptional {
+    const e = recode(le(s));
+    var x: Exceptional = .{};
+    var k: i600 = e[rows - 1];
+    var i: usize = rows - 1;
+    while (i > 0) {
+        i -= 1;
+        const q = @mod(16 * k, n);
+        const d = e[i];
+        if (q != 0 and d != 0) {
+            if (q == @mod(@as(i600, d), n)) x.note(i, i == 0, true);
+            if (q == @mod(-@as(i600, d), n)) x.note(i, i == 0, false);
+        }
+        // K exactly (not reduced): the argument's bounds are on K itself.
+        k = 16 * k + d;
+    }
+    std.debug.assert(k == s);
+    return x;
+}
+
+/// The model of `mulBase`'s sum: before row i, Q = D·G with D the value of
+/// the digits below i; adding d_i·16^i·G meets ±Q when D ≡ ±d_i·16^i.
+fn modelBase(s: u256) Exceptional {
+    const e = recode(le(s));
+    var x: Exceptional = .{};
+    var dsum: i600 = 0;
+    for (e, 0..) |d, i| {
+        const term: i600 = @as(i600, d) << @intCast(4 * i);
+        const qm = @mod(dsum, n);
+        if (qm != 0 and d != 0) {
+            if (qm == @mod(term, n)) x.note(i, i == rows - 1, true);
+            if (qm == @mod(-term, n)) x.note(i, i == rows - 1, false);
+        }
+        dsum += term;
+    }
+    std.debug.assert(dsum == s);
+    return x;
+}
+
+/// The cases the argument allows: equal inputs only at the variable base's
+/// last step for s = n − 2 (the doubling is selected), opposite inputs only
+/// at the last step for s = n (the identity, which the formulas give).
+fn expectModelAllowed(s: u256) !void {
+    const v = modelVar(s);
+    const b = modelBase(s);
+    const v_ok = (v.equal == 0 or (s == n - 2 and v.equal == 1 and v.last_equal == 1)) and
+        (v.opposite == 0 or (s == n and v.opposite == 1 and v.last_opposite == 1));
+    const b_ok = b.equal == 0 and (b.opposite == 0 or (s == n and b.opposite == 1 and b.last_opposite == 1));
+    if (!v_ok or !b_ok) {
+        std.debug.print("scalar {x}: variable base {any}, fixed base {any}\n", .{ s, v, b });
+        return error.UnhandledExceptionalAddition;
+    }
+}
+
+/// `mulVar` with its additions watched: the same result, and what each
+/// addition's inputs were (H = 0 with both inputs non-identity).
+fn mulVarWatched(p: Affine, s: [32]u8, x: *Exceptional) Point {
+    const t = varTable(p);
+    const e = recode(s);
+    var q = Point.identity;
+    q.cMov(t[0].point(), @as(u8, @bitCast(e[rows - 1])));
+    var i: usize = rows - 1;
+    while (i > 0) {
+        i -= 1;
+        const q4 = dbl(dbl(dbl(dbl(q))));
+        const negative, const abs, const is_zero = digitParts(e[i]);
+        if (q4.z.isZero() == 0 and is_zero == 0) {
+            var entry = t[abs - 1];
+            if (negative == 1) entry.y = entry.y.neg();
+            _, const h, const r = add(q4, entry);
+            if (h.isZero() == 1) x.note(i, i == 0, r.isZero() == 1);
+        }
+        q = if (i == 0) varStep(q, &t, e[i], true) else varStep(q, &t, e[i], false);
+    }
+    return q;
+}
+
+/// `mulBase` with its additions watched.
+fn mulBaseWatched(s: [32]u8, x: *Exceptional) Point {
+    const t = baseTable();
+    const e = recode(s);
+    var q = Point.identity;
+    for (e, t, 0..) |d, *row, i| {
+        const negative, const abs, const is_zero = digitParts(d);
+        if (q.z.isZero() == 0 and is_zero == 0) {
+            var a = row[abs - 1];
+            if (negative == 1) a.y = a.y.neg();
+            // H = U2 − X1, r = S2 − Y1 (as in addMixed).
+            const zz = q.z.sq();
+            const h = a.x.mul(zz).sub(q.x);
+            const r = a.y.mul(zz.mul(q.z)).sub(q.y);
+            if (h.isZero() == 1) x.note(i, i == rows - 1, r.isZero() == 1);
+        }
+        q = baseStep(q, row, d);
+    }
+    return q;
+}
+
+/// The real arithmetic on s: what its additions met agrees with the model,
+/// and the results with the unwatched code and (when `full`: it is the
+/// slow part) std.
+fn expectWatched(s: u256, peer: Affine, peer_sec1: *const [65]u8, full: bool) !void {
+    var xv: Exceptional = .{};
+    var xb: Exceptional = .{};
+    const qv = mulVarWatched(peer, le(s), &xv);
+    const qb = mulBaseWatched(le(s), &xb);
+    const mv = modelVar(s);
+    const mb = modelBase(s);
+    if (xv.equal != mv.equal or xv.opposite != mv.opposite or xb.equal != mb.equal or xb.opposite != mb.opposite) {
+        std.debug.print("scalar {x} peer {x}: watched {any} {any}, model {any} {any}\n", .{ s, peer_sec1, xv, xb, mv, mb });
+        return error.ModelMismatch;
+    }
+    try expectModelAllowed(s);
+    try testing.expectEqualDeep(affineX(mulVar(peer, le(s))), affineX(qv));
+    const ours_b = toUncompressedSec1(qb);
+    try testing.expectEqualDeep(toUncompressedSec1(mulBase(le(s))), ours_b);
+    if (!full) return;
+    try expectSameAsStd(be(s), peer_sec1);
+    if (P256.basePoint.mul(le(s), .little)) |theirs| {
+        try testing.expectEqualSlices(u8, &theirs.toUncompressedSec1(), &try ours_b);
+    } else |err| try testing.expectError(err, ours_b);
+}
+
+/// i600 → u256 mod 2^256.
+fn wrap(v: i600) u256 {
+    return @truncate(@as(u600, @bitCast(v)));
+}
+
+/// Scalars on the argument's boundaries, by kind.
+pub fn boundaryScalar(r: std.Random, kind: u8) u256 {
+    const c: u256 = 0 -% n; // 2^256 − n = 16^64 mod n
+    const small = r.uintAtMost(u256, 1 << 20);
+    return switch (kind) {
+        // n − j, n + j, 2^256 − j, j.
+        0 => n -% small,
+        1 => n +% small,
+        2 => 0 -% small,
+        3 => small,
+        // m·c ± j, m·n ± j (wrapping).
+        4 => c *% r.uintAtMost(u256, 17) +% small -% (1 << 19),
+        5 => n *% r.uintAtMost(u256, 3) +% r.uintAtMost(u256, 64) -% 32,
+        // The fixed-base sum at row i at its extremes: every digit below
+        // i equal to −8 or 7 (D = −8/15·(16^i − 1) or 7/15·(16^i − 1)),
+        // any digit at i, the rest random or zero.
+        6 => blk: {
+            const i: usize = r.uintAtMost(u8, 64);
+            const d: i600 = @as(i600, r.uintAtMost(u8, 15)) - 8;
+            const run: i600 = if (r.boolean()) 7 else -8;
+            var v: i600 = 0;
+            for (0..i) |j| v += run << @intCast(4 * j);
+            v += d << @intCast(4 * i);
+            if (r.boolean() and i < 63) v += @as(i600, r.int(u256) >> @intCast(4 * (i + 1))) << @intCast(4 * (i + 1));
+            break :blk wrap(v);
+        },
+        // The variable base's prefixes next to m·n/16: K·16^i with 16·K
+        // near m·n ± d (truncated to 256 bits), plus random low digits.
+        7 => blk: {
+            const i: usize = r.uintAtMost(u8, 4);
+            const m: i600 = @as(i600, r.uintAtMost(u8, 2)) + 1;
+            const d: i600 = @as(i600, r.uintAtMost(u8, 16)) - 8;
+            const k: i600 = @divFloor(m * n + d, 16) + r.uintAtMost(u8, 4) - 2;
+            const low: i600 = r.uintAtMost(u32, (@as(u32, 1) << @intCast(4 * i)) - 1);
+            break :blk wrap((k << @intCast(4 * i)) + low);
+        },
+        // Digit strings: runs of one digit with others mixed in.
+        8 => blk: {
+            const digits = [_]i8{ -8, -7, -1, 0, 1, 7, 4, -4 };
+            const fill = digits[r.uintLessThan(usize, digits.len)];
+            var v: i600 = 0;
+            for (0..64) |j| {
+                const dj: i600 = if (r.uintLessThan(u8, 8) == 0) digits[r.uintLessThan(usize, digits.len)] else fill;
+                v += dj << @intCast(4 * j);
+            }
+            break :blk wrap(v);
+        },
+        // n − d·16^i − e·16^j.
+        9 => blk: {
+            const i: usize = r.uintAtMost(u8, 63);
+            const j: usize = r.uintAtMost(u8, 63);
+            const d: u256 = r.uintAtMost(u8, 15);
+            const e: u256 = r.uintAtMost(u8, 15);
+            break :blk n -% (d << @intCast(4 * i)) -% (e << @intCast(4 * j));
+        },
+        // Bytes of nibble-boundary patterns with a few flipped bits.
+        10 => blk: {
+            const pat = [_]u8{ 0x00, 0xff, 0x88, 0x77, 0x80, 0x7f, 0x08, 0xf8, 0x8f, 0xf7 };
+            var b: [32]u8 = undefined;
+            for (&b) |*x| x.* = pat[r.uintLessThan(usize, pat.len)];
+            for (0..r.uintAtMost(u8, 3)) |_| b[r.uintLessThan(usize, 32)] ^= @as(u8, 1) << r.int(u3);
+            break :blk std.mem.readInt(u256, &b, .little);
+        },
+        else => r.int(u256),
+    };
+}
+
+test "verify: the incompleteness argument's integer model, on boundary scalars" {
+    // The cases it says do happen, do.
+    try testing.expectEqual(@as(u32, 1), modelVar(n - 2).last_equal);
+    try testing.expectEqual(@as(u32, 1), modelVar(n).last_opposite);
+    try testing.expectEqual(@as(u32, 1), modelBase(n).last_opposite);
+    var prng = std.Random.DefaultPrng.init(0x7e57_ad5e);
+    const r = prng.random();
+    for (0..verify_scale * 20_000) |i| try expectModelAllowed(boundaryScalar(r, @intCast(i % 12)));
+    for (edge_scalars) |s| try expectModelAllowed(s);
+    // Every scalar within 2^12 of n, 2^256, m·(2^256 − n) and 2n mod 2^256.
+    for (0..1 << 13) |j| {
+        const d: u256 = @as(u256, j) -% (1 << 12);
+        for ([_]u256{ n, 0, 0 -% n, 2 *% (0 -% n), n *% 2 }) |centre| try expectModelAllowed(centre +% d);
+    }
+}
+
+test "verify: the point arithmetic meets only the exceptional additions the model predicts" {
+    var prng = std.Random.DefaultPrng.init(0x7e57_ad5f);
+    const r = prng.random();
+    // Peers: small multiples of G, −G, random points.
+    var peers: [6][65]u8 = undefined;
+    for (&peers, 0..) |*pk, k| pk.* = switch (k) {
+        0 => stdPublic(1),
+        1 => stdPublic(2),
+        2 => stdPublic(n - 1),
+        3 => stdPublic(7),
+        else => stdPublic(r.uintLessThan(u256, n - 1) + 1),
+    };
+    for (0..verify_scale * 600) |i| {
+        const pk = &peers[i % peers.len];
+        try expectWatched(boundaryScalar(r, @intCast(i % 12)), try decodePoint(pk), pk, i % 4 == 0);
+    }
+    // The predicted cases themselves, on every peer: s = n − 2 meets equal
+    // inputs at the last step (only), s = n opposite ones.
+    for (peers) |pk| {
+        const peer = try decodePoint(&pk);
+        var x: Exceptional = .{};
+        _ = mulVarWatched(peer, le(n - 2), &x);
+        try testing.expectEqual(@as(?usize, 0), x.first_step);
+        try testing.expectEqual(@as(u32, 1), x.last_equal);
+        for ([_]u256{ n - 2, n, n - 1, n + 1, n - 3, 0 -% @as(u256, 1) }) |s| try expectWatched(s, peer, &pk, true);
+    }
+}
