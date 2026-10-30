@@ -4800,9 +4800,55 @@ fn freeDataMap(map: *std.AutoHashMap(u32, std.ArrayList(u8))) void {
     map.deinit();
 }
 
-/// Same frames per stream, same handler logs and the same DATA bytes.
+/// A stream's frames with each run of DATA frames as one line: how DATA is
+/// cut depends on when the windows opened, which depends on how input
+/// was split.
+fn mergeData(lines: []const u8) ![]u8 {
+    const a = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    var run: ?struct { id: u32, len: usize, end: bool } = null;
+    var it = std.mem.splitScalar(u8, lines, '\n');
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "data ")) {
+            var f = std.mem.tokenizeAny(u8, line, " =");
+            _ = f.next();
+            const id = try std.fmt.parseInt(u32, f.next().?, 10);
+            _ = f.next();
+            const len = try std.fmt.parseInt(usize, f.next().?, 10);
+            _ = f.next();
+            const end = std.mem.eql(u8, f.next().?, "true");
+            if (run) |*r| {
+                r.len += len;
+                r.end = end;
+            } else run = .{ .id = id, .len = len, .end = end };
+            continue;
+        }
+        if (run) |r| try out.print(a, "data {d} len={d} end={}\n", .{ r.id, r.len, r.end });
+        run = null;
+        if (line.len > 0) try out.print(a, "{s}\n", .{line});
+    }
+    if (run) |r| try out.print(a, "data {d} len={d} end={}\n", .{ r.id, r.len, r.end });
+    return out.toOwnedSlice(a);
+}
+
+/// Same frames per stream (DATA as runs), same handler logs and the same
+/// DATA bytes.
 fn expectSameRun(a: *Harness, b: *Harness) !void {
-    try expectSameStreams(a, b);
+    try testing.expectEqual(a.last, b.last);
+    try testing.expectEqual(a.per_stream.count(), b.per_stream.count());
+    var ps = a.per_stream.iterator();
+    while (ps.next()) |entry| {
+        const other = b.per_stream.get(entry.key_ptr.*) orelse return error.MissingStream;
+        const x = try mergeData(entry.value_ptr.items);
+        defer testing.allocator.free(x);
+        const y = try mergeData(other.items);
+        defer testing.allocator.free(y);
+        try testing.expectEqualStrings(x, y);
+    }
+    try testing.expectEqualStrings(a.handler.log.items, b.handler.log.items);
+    try testing.expectEqualStrings(a.handler.bodies.items, b.handler.bodies.items);
+    try testing.expectEqualStrings(a.handler.ws_log.items, b.handler.ws_log.items);
     var da = try dataByStream(a);
     defer freeDataMap(&da);
     var db = try dataByStream(b);
@@ -5004,4 +5050,261 @@ test "stream states: exchanges completed after their stream's state went to anot
     try testing.expectEqual(@as(usize, 8), std.mem.count(u8, other.events.items, "end=true"));
     try testing.expectEqual(@as(usize, 0), std.mem.count(u8, other.events.items, "rst"));
     try testing.expectEqual(@as(usize, 0), owner.pool.h2_streams.in_use);
+}
+
+/// Choices from the fuzzer, or from a seeded generator (the same
+/// conversations in an ordinary test run). Inlined, so the fuzzer still
+/// tells each call site apart.
+const Pick = struct {
+    smith: ?*std.testing.Smith = null,
+    rng: ?std.Random = null,
+
+    inline fn range(p: Pick, comptime T: type, lo: T, hi: T) T {
+        if (p.smith) |s| return s.valueRangeAtMost(T, lo, hi);
+        return p.rng.?.intRangeAtMost(T, lo, hi);
+    }
+
+    inline fn flag(p: Pick) bool {
+        if (p.smith) |s| return s.value(bool);
+        return p.rng.?.boolean();
+    }
+
+    inline fn byte(p: Pick) u8 {
+        if (p.smith) |s| return s.value(u8);
+        return p.rng.?.int(u8);
+    }
+
+    inline fn index(p: Pick, n: usize) usize {
+        if (p.smith) |s| return s.index(n);
+        return p.rng.?.uintLessThan(usize, n);
+    }
+
+    inline fn stop(p: Pick) bool {
+        if (p.smith) |s| return s.eos();
+        return p.rng.?.uintLessThan(u8, 16) == 0;
+    }
+
+    inline fn fill(p: Pick, buf: []u8) u32 {
+        if (p.smith) |s| return s.slice(buf);
+        const n = p.rng.?.uintAtMost(usize, buf.len);
+        p.rng.?.bytes(buf[0..n]);
+        return @intCast(n);
+    }
+};
+
+/// One client conversation built from fuzzer choices: requests of every
+/// kind (heads split over CONTINUATIONs, fields added to the table,
+/// bodies up to 60 KB with or without trailers, streamed bodies, deferred
+/// and large responses), window updates, resets, priority updates,
+/// settings, pings, a GOAWAY and raw bytes. The bodies are made here, so
+/// stream states hold more than `state_kept`.
+fn fuzzScript(pick: Pick, a: std.mem.Allocator, enc: *hpack.Encoder) ![]u8 {
+    var s: std.ArrayList(u8) = .empty;
+    errdefer s.deinit(a);
+    try s.appendSlice(a, frame.preface);
+    var buf: [frame.header_len + 16384]u8 = undefined;
+    var n = try frame.writeSettings(&buf, &.{.{ .id = .initial_window_size, .value = if (pick.flag()) 65535 else pick.range(u32, 0, 70000) }});
+    try s.appendSlice(a, buf[0..n]);
+    var block: [8192]u8 = undefined;
+    var next: u31 = 1;
+    var ops: usize = 0;
+    while (!pick.stop() and ops < 40) : (ops += 1) {
+        const recent: u31 = if (next > 1) next - 2 * @as(u31, pick.range(u8, 1, @intCast(@min(8, next / 2)))) else 1;
+        switch (pick.range(u8, 0, 11)) {
+            0...4 => {
+                const kind = pick.range(u8, 0, 6);
+                const paths = [_][]const u8{ "/", "/big", "/later", "/stream", "/echo", "/up", "/empty" };
+                const post = kind == 4 or kind == 5;
+                var bn: usize = 0;
+                bn += try enc.encode(block[bn..], ":method", if (post) "POST" else if (pick.byte() < 20) "HEAD" else "GET", .{});
+                bn += try enc.encode(block[bn..], ":scheme", "https", .{});
+                bn += try enc.encode(block[bn..], ":path", paths[kind], .{});
+                if (pick.flag()) bn += try enc.encode(block[bn..], ":authority", "example.com", .{});
+                var value: [1500]u8 = undefined;
+                const vlen = pick.range(u16, 0, 1500);
+                @memset(value[0..vlen], 'a' + @as(u8, @intCast(next % 26)));
+                var name: [8]u8 = undefined;
+                bn += try enc.encode(block[bn..], try std.fmt.bufPrint(&name, "x-{d}", .{pick.range(u8, 0, 9)}), value[0..vlen], .{
+                    .indexing = if (pick.byte() < 40) .never else .index,
+                    .huffman = if (pick.flag()) .always else .never,
+                });
+                if (pick.flag()) bn += try enc.encode(block[bn..], "priority", "u=2, i", .{});
+                const body_len: usize = if (post) pick.range(u16, 0, 60000) else 0;
+                const trailers = post and pick.flag();
+                const end_stream = !post or (body_len == 0 and !trailers);
+                const flags: u8 = if (end_stream) frame.flag.end_stream else 0;
+                const pieces = pick.range(u8, 1, 4);
+                var pos: usize = 0;
+                for (0..pieces) |p| {
+                    const last = p + 1 == pieces;
+                    const end = if (last) bn else @min(bn, pos + pick.range(u16, 0, @intCast(bn - pos)));
+                    const fl: u8 = if (last) frame.flag.end_headers else 0;
+                    if (p == 0) {
+                        n = try frame.writeHeaders(&buf, next, flags | fl, block[pos..end]);
+                        try s.appendSlice(a, buf[0..n]);
+                    } else {
+                        frame.writeHeader(buf[0..frame.header_len], @intCast(end - pos), .continuation, fl, next);
+                        try s.appendSlice(a, buf[0..frame.header_len]);
+                        try s.appendSlice(a, block[pos..end]);
+                    }
+                    pos = end;
+                }
+                if (post) {
+                    var sent: usize = 0;
+                    while (sent < body_len) {
+                        const k = @min(body_len - sent, pick.range(u16, 1, 16384));
+                        var chunk: [16384]u8 = undefined;
+                        for (chunk[0..k], sent..) |*c, j| c.* = @truncate(j *% 13 +% next);
+                        const last = sent + k == body_len;
+                        n = try frame.writeData(&buf, next, last and !trailers, chunk[0..k]);
+                        try s.appendSlice(a, buf[0..n]);
+                        sent += k;
+                    }
+                    if (trailers) {
+                        bn = try enc.encode(&block, "x-trailer", value[0..@min(vlen, 300)], .{});
+                        n = try frame.writeHeaders(&buf, next, frame.flag.end_headers | frame.flag.end_stream, block[0..bn]);
+                        try s.appendSlice(a, buf[0..n]);
+                    }
+                }
+                next += 2;
+            },
+            5 => {
+                // (A stream not opened yet would be a connection error.)
+                n = try frame.writeWindowUpdate(&buf, if (next == 1 or pick.flag()) 0 else recent, pick.range(u31, 1, 200000));
+                try s.appendSlice(a, buf[0..n]);
+            },
+            6 => if (next > 1) {
+                n = try frame.writeRstStream(&buf, recent, .cancel);
+                try s.appendSlice(a, buf[0..n]);
+            },
+            7 => {
+                const id = if (pick.flag()) recent else next + 2 * @as(u31, pick.range(u8, 0, 3));
+                n = try frame.writePriorityUpdate(&buf, id, if (pick.flag()) "u=0" else "u=6, i");
+                try s.appendSlice(a, buf[0..n]);
+            },
+            8 => {
+                n = try frame.writeSettings(&buf, &.{
+                    .{ .id = .initial_window_size, .value = pick.range(u32, 0, 100000) },
+                    .{ .id = .header_table_size, .value = pick.range(u32, 0, 8192) },
+                });
+                try s.appendSlice(a, buf[0..n]);
+            },
+            9 => {
+                n = try frame.writePing(&buf, false, "pingpong");
+                try s.appendSlice(a, buf[0..n]);
+            },
+            10 => if (pick.byte() < 30) {
+                n = try frame.writeGoaway(&buf, 0, .no_error, "");
+                try s.appendSlice(a, buf[0..n]);
+            },
+            else => if (pick.byte() < 16) {
+                var raw: [64]u8 = undefined;
+                const len = pick.fill(&raw);
+                try s.appendSlice(a, raw[0..len]);
+            },
+        }
+    }
+    // Room for every response.
+    n = try frame.writeWindowUpdate(&buf, 0, 4000000);
+    try s.appendSlice(a, buf[0..n]);
+    var id: u31 = 1;
+    while (id < next) : (id += 2) {
+        n = try frame.writeWindowUpdate(&buf, id, 400000);
+        try s.appendSlice(a, buf[0..n]);
+    }
+    return s.toOwnedSlice(a);
+}
+
+/// After all input: the handler answers its deferred exchanges, in order.
+fn answerExchanges(h: *Harness) !void {
+    for (h.handler.exchanges.items, 0..) |ex, i| {
+        if (i % 2 == 0) {
+            ex.respond(.{}, h.handler.big) catch {};
+        } else {
+            ex.writeBorrowed("partial", null) catch {};
+            ex.finish(&.{.{ .key = "X-Done", .value = "yes" }}) catch {};
+        }
+    }
+    if (h.last == .close) return;
+    try h.drainMailbox();
+    try h.collect();
+    try h.flushAll();
+}
+
+fn fuzzShared(_: void, smith: *std.testing.Smith) anyerror!void {
+    return sharedConversation(.{ .smith = smith });
+}
+
+/// Three conversations, each alone on a pool of its own and then
+/// interleaved on one pool: the same streams, bytes and logs.
+fn sharedConversation(pick: Pick) !void {
+    const a = testing.allocator;
+    var scripts: [3][]u8 = undefined;
+    var made: usize = 0;
+    defer for (scripts[0..made]) |x| a.free(x);
+    while (made < scripts.len) : (made += 1) {
+        var e = try hpack.Encoder.init(a, 4096);
+        defer e.deinit();
+        scripts[made] = try fuzzScript(pick, a, &e);
+    }
+    const opts: Options = .{ .limits = .{ .max_body_size = 50000 }, .max_concurrent_streams = 6, .enable_connect_protocol = true };
+    const big = try testBody(40 * 1024);
+    defer a.free(big);
+    // Each alone, on a pool of its own.
+    var refs: [3]*Harness = undefined;
+    var nrefs: usize = 0;
+    defer for (refs[0..nrefs]) |r| r.deinit();
+    while (nrefs < refs.len) : (nrefs += 1) {
+        refs[nrefs] = try Harness.init(opts);
+        refs[nrefs].handler.big = big;
+        try refs[nrefs].feed(scripts[nrefs]);
+        try answerExchanges(refs[nrefs]);
+    }
+    // Interleaved on one pool, split where the fuzzer says, with ticks.
+    const owner = try Harness.init(opts);
+    defer owner.deinit();
+    var conns: [3]*Harness = undefined;
+    var nconns: usize = 0;
+    defer for (conns[0..nconns]) |c| c.deinit();
+    while (nconns < conns.len) : (nconns += 1) {
+        conns[nconns] = try Harness.share(owner, opts);
+        conns[nconns].handler.big = big;
+    }
+    var rests: [3][]const u8 = .{ scripts[0], scripts[1], scripts[2] };
+    var rounds: usize = 0;
+    while (true) : (rounds += 1) {
+        var live: usize = 0;
+        for (conns, rests) |c, r| {
+            if (r.len > 0 and c.last != .close) live += 1;
+        }
+        if (live == 0) break;
+        const i = if (rounds < 1000) pick.index(conns.len) else rounds % conns.len;
+        const c = conns[i];
+        if (rests[i].len == 0 or c.last == .close) continue;
+        const k = @min(rests[i].len, if (rounds < 1000) @as(usize, pick.range(u16, 0, 65535)) + 1 else rests[i].len);
+        try c.feed(rests[i][0..k]);
+        rests[i] = rests[i][k..];
+        if (rounds < 1000 and pick.byte() < 8) owner.pool.trim();
+        var open: usize = 0;
+        for (conns) |x| open += x.conn.activeStreams();
+        try testing.expectEqual(open, owner.pool.h2_streams.in_use);
+    }
+    for (conns) |c| try answerExchanges(c);
+    for (refs, conns) |r, c| try expectSameRun(r, c);
+}
+
+test "fuzz: h2 connections sharing a worker's pool" {
+    try std.testing.fuzz({}, fuzzShared, .{
+        .corpus = &.{
+            "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f",
+            "\xff\xfe\xfd\x80\x40\x20\x10\x08\x04\x02\x01\x00\x37\x91\xaa\x55\x13\x77\xc4\x02\x99\x10\x00\x01",
+        },
+    });
+}
+
+test "stream states: seeded conversations, alone and interleaved on one pool" {
+    for (0..200) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        try sharedConversation(.{ .rng = prng.random() });
+    }
 }
