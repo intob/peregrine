@@ -1924,9 +1924,21 @@ fn testH2FirstWrite(backend: Backend) !void {
 /// client's Finished too) are answered with nothing more sent, not even
 /// the SETTINGS ACK: the server must not wait for another read.
 fn expectFirstWriteAnswered(port: u16, tls: bool) !void {
+    return expectFirstWriteAnsweredAfter(port, tls, false);
+}
+
+/// The same, over TLS, with the client's Finished sent alone first (so the
+/// connection is HTTP/2 before any of it arrives).
+fn expectFirstWriteAnsweredAfter(port: u16, tls: bool, finished_first: bool) !void {
     const c = try H2Client.open(port, tls);
     defer c.close();
-    if (c.tls) |t| try testing.expectEqualStrings("h2", t.alpn[0..t.alpn_len]);
+    if (c.tls) |t| {
+        try testing.expectEqualStrings("h2", t.alpn[0..t.alpn_len]);
+        if (finished_first) {
+            try t.send("");
+            sleepMs(50);
+        }
+    }
     c.quiet = true;
     var buf: [2048]u8 = undefined;
     var n = h2frame.preface.len;
@@ -3076,6 +3088,17 @@ const TlsAlpnClient = struct {
         }
     }
 
+    /// close_notify: we send nothing more (sent with our Finished if that
+    /// hasn't gone yet).
+    fn closeNotify(self: *TlsAlpnClient) !void {
+        var out: [128]u8 = undefined;
+        var n = self.finished_len;
+        @memcpy(out[0..n], self.finished[0..n]);
+        self.finished_len = 0;
+        n += self.tx.seal(out[n..], 21, &.{ 1, 0 }).len;
+        try self.tcp.send(out[0..n]);
+    }
+
     /// Application data into `buf`; 0 at the server's close_notify.
     fn read(self: *TlsAlpnClient, buf: []u8) !usize {
         while (self.plain.len == 0) {
@@ -3948,8 +3971,10 @@ fn testTlsFinishedWithData(backend: Backend) !void {
     cfg.tls.?.alpn = &.{ "h2", "http/1.1" };
     const r = try Running.start(backend, cfg);
     defer r.stop();
-    // HTTP/2 (ALPN): the preface, SETTINGS and a request.
+    // HTTP/2 (ALPN): the preface, SETTINGS and a request; also after the
+    // Finished on its own. Our SETTINGS are never acknowledged.
     try expectFirstWriteAnswered(r.port, true);
+    try expectFirstWriteAnsweredAfter(r.port, true, true);
     var buf: [4096]u8 = undefined;
     // HTTP/1.1: a request.
     {
@@ -3970,6 +3995,49 @@ fn testTlsFinishedWithData(backend: Backend) !void {
         try t.send(first[0..n]);
         const got = try t.readUntil(&buf, "\x81\x05early");
         try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 101 "));
+    }
+}
+
+test "tls: h2 client sending close_notify and FIN mid-response still gets all of it" {
+    try forEachBackend(testTlsH2HalfClose);
+}
+
+/// The client opens its windows, asks for 1 MiB and, once the first DATA
+/// arrives, sends close_notify and FIN: with nothing more needed from the
+/// client the response is finished, then the server closes (its own
+/// close_notify).
+fn testTlsH2HalfClose(backend: Backend) !void {
+    var cfg = tlsConfig();
+    cfg.tls.?.alpn = &.{ "h2", "http/1.1" };
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    const copy_len = (Config{}).response_body_buffer_size;
+    for (0..3) |_| {
+        const c = try H2Client.open(r.port, true);
+        defer c.close();
+        c.quiet = true;
+        var out: [1024]u8 = undefined;
+        var n = h2frame.preface.len;
+        @memcpy(out[0..n], h2frame.preface);
+        n += try h2frame.writeSettings(out[n..], &.{.{ .id = .initial_window_size, .value = big_body_len }});
+        n += try h2frame.writeWindowUpdate(out[n..], 0, 1 << 30);
+        n += (try c.headers(out[n..], 1, "GET", "/copy-big", true)).len;
+        try c.send(out[0..n]);
+        var reply: H2Client.Reply = .{};
+        defer reply.deinit();
+        var map = std.AutoHashMap(u31, *H2Client.Reply).init(testing.allocator);
+        defer map.deinit();
+        try map.put(1, &reply);
+        while (reply.body.items.len == 0) {
+            if (try c.readFrames(&map)) |_| return error.GoAway;
+        }
+        try c.tls.?.closeNotify();
+        sys.shutdownWrite(c.tcp.fd);
+        try testing.expectEqual(@as(?h2frame.ErrorCode, null), try c.collect(&map));
+        try testing.expectEqual(copy_len, reply.body.items.len);
+        // Then the server's close_notify.
+        var rest: [1024]u8 = undefined;
+        while (try c.tls.?.read(&rest) > 0) {}
     }
 }
 
