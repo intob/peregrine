@@ -1097,6 +1097,11 @@ pub fn Worker(comptime Handler: type) type {
                 if (!self.out.isEmpty()) {
                     if (!self.writeOut(c)) return .gone;
                     if (c.hasPending()) {
+                        // Stalled output gets the request timeout from
+                        // now: a pipelined response after one that just
+                        // finished in `writePending` (its progress) must
+                        // not inherit that one's deadline.
+                        self.arm(c, .active);
                         c.after_flush = switch (action) {
                             .close => .close,
                             .upgrade => .upgrade,

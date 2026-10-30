@@ -361,6 +361,8 @@ const Client = struct {
     fd: sys.fd_t,
     buf: [64 * 1024]u8 = undefined,
     len: usize = 0,
+    /// A pause before each read: a slow reader.
+    pace_ms: u64 = 0,
 
     fn connect(port: u16) !Client {
         const rc = system.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
@@ -388,6 +390,7 @@ const Client = struct {
     }
 
     fn fill(self: *Client) !usize {
+        if (self.pace_ms > 0) sleepMs(self.pace_ms);
         const n = try sys.read(self.fd, self.buf[self.len..]);
         self.len += n;
         return n;
@@ -937,6 +940,61 @@ fn testTimeouts(backend: Backend) !void {
     try slow.expectClosed();
     // Within the 5 s client receive timeout, so the server closed them.
     try testing.expect(sys.nanoTimestamp() - start < 4 * std.time.ns_per_s);
+}
+
+test "a slow reader of pipelined responses: each response's progress renews the request timeout" {
+    try forEachBackend(testSlowPipelinedReader);
+}
+
+fn testSlowPipelinedReader(backend: Backend) !void {
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    const r = try Running.start(backend, .{ .request_timeout_s = 1 });
+    defer r.stop();
+    var c = try Client.connect(r.port);
+    defer c.close();
+    var head: [4096]u8 = undefined;
+    try c.send("GET /km/10 HTTP/1.1\r\nHost: x\r\n\r\n");
+    _ = try c.readResponse(&head, null);
+    // Small socket buffers at both ends (no autotuning to swallow it
+    // all): the server's writes stop short often, and each time the
+    // socket has room again a few responses finish and the next one
+    // stops short.
+    const server_fd = peerSocket(c.fd) orelse return error.NoServerSocket;
+    try sys.setsockoptInt(server_fd, posix.SOL.SOCKET, posix.SO.SNDBUF, 64 * 1024);
+    try sys.setsockoptInt(c.fd, posix.SOL.SOCKET, posix.SO.RCVBUF, 128 * 1024);
+    // 120 responses of 32 KiB read at about 1 MB/s: over 3 s in all,
+    // never long without progress.
+    const n = 120;
+    const len = 32 * 1024;
+    var reqs: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer reqs.deinit();
+    for (0..n) |_| try reqs.writer.print("GET /km/{d} HTTP/1.1\r\nHost: x\r\n\r\n", .{len});
+    try c.send(reqs.written());
+    c.pace_ms = 50;
+    var body: [len]u8 = undefined;
+    for (0..n) |_| {
+        const res = try c.readResponse(&head, &body);
+        try testing.expectEqual(200, res.status);
+        try testing.expectEqual(len, res.body_len);
+        try testing.expectEqualSlices(u8, big_body[0..len], &body);
+    }
+}
+
+/// The server's end of a loopback connection (same process): the socket
+/// whose peer is `fd`'s local address.
+fn peerSocket(fd: sys.fd_t) ?sys.fd_t {
+    var local: posix.sockaddr.in = undefined;
+    var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+    if (posix.errno(system.getsockname(fd, @ptrCast(&local), &len)) != .SUCCESS) return null;
+    var other: sys.fd_t = 3;
+    while (other < 4096) : (other += 1) {
+        if (other == fd) continue;
+        var peer: posix.sockaddr.in = undefined;
+        len = @sizeOf(posix.sockaddr.in);
+        if (posix.errno(system.getpeername(other, @ptrCast(&peer), &len)) != .SUCCESS) continue;
+        if (peer.family == posix.AF.INET and peer.port == local.port and peer.addr == local.addr) return other;
+    }
+    return null;
 }
 
 test "shutdown is prompt with idle workers" {
@@ -2851,6 +2909,12 @@ fn testKeyLimitsSlow(backend: Backend) !void {
             tls_conn.test_key_update_limit = limit;
             const c = try TlsClient.connect(r.port);
             defer c.close();
+            // Not much smaller: a window shrunk well below the MSS (which
+            // Linux keeps at half the largest window seen, ~42 KiB here)
+            // is only sent into on the zero-window probe timer, a window
+            // per ~200 ms. With 4 KiB the server's 2.6 MiB socket buffer
+            // then takes over 10 s to become writable on the arm64 VMs,
+            // and the request timeout rightly ends the connection.
             sys.setsockoptInt(c.fd, posix.SOL.SOCKET, posix.SO.RCVBUF, 16384) catch {};
             var k = KeyChecker.init(c, limit, buf);
             k.slow = true;
