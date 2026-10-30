@@ -3018,3 +3018,315 @@ test "QUIC PMTU: NAT rebinding (a new port) on a host behind a small interface c
         try testing.expectEqual(conn_mod.EcnState.capable, s.ecn);
     }
 }
+
+// -- verify PMTU, round 2 (unsend, probe loss by time only) -------------------
+
+test "verify PMTU r2: netem-style reordering (some datagrams undelayed) doesn't fail a size the path carries" {
+    // netem's `reorder P%`: P% of datagrams go at once, the rest after the
+    // delay. The RTT is bimodal, the smoothed RTT under the delayed one,
+    // so the time threshold (9/8 of it) can come before a delayed
+    // probe's acknowledgment while a later, undelayed packet's arrives.
+    var failed: u32 = 0;
+    var runs: u32 = 0;
+    for ([_]u8{ 5, 10, 25, 50 }) |reorder| {
+        for (0..4) |seed| {
+            const h = try Harness.init(.{ .seed = @intCast(seed + 1), .max_stream_data = 8 << 20, .max_data = 16 << 20 }, pmtuOn);
+            defer h.deinit();
+            h.prng = .init(seed * 31 + reorder);
+            const path: Path = .{ .delay = 10_000, .reorder = reorder };
+            try runPath(h, path, {}, established);
+            const id = try h.client.openBidi();
+            try h.client.write(id, "big 1500000", true);
+            try runPath(h, path, id, finishedAndSearched);
+            try expectBody(h, id, 1_500_000);
+            const s = h.server.?;
+            runs += 1;
+            if (s.pmtu.black_holes > 0 or s.max_datagram != 1472) {
+                failed += 1;
+                std.debug.print("reorder {d}% seed {d}: {d} black holes, max {d}, {d} of {d} probes lost\n", .{ reorder, seed, s.pmtu.black_holes, s.max_datagram, s.pmtu.probes_lost, s.pmtu.probes_sent });
+            }
+        }
+    }
+    if (failed > 0) std.debug.print("reordering failed a size in {d} of {d} runs\n", .{ failed, runs });
+    try testing.expectEqual(@as(u32, 0), failed);
+}
+
+/// The endpoint's flush on Linux with GSO (endpoint.zig flushRun): the
+/// connection's datagrams go in runs of its size (one ECN codepoint, at
+/// most 64 and 65507 bytes, a short one ending the run), a probe alone
+/// after the run before it. A run whose first datagram is over
+/// `h.iface_max` is refused whole (EMSGSIZE): `onSendRefused(mark, seg)`,
+/// and the flush starts again (three times at most); a refused probe:
+/// `onProbeTooBig`. What goes is delivered `delay` µs later, `loss`
+/// percent dropped.
+const GsoPath = struct {
+    delay: u64,
+    loss: u8 = 0,
+    /// Runs refused.
+    runs_refused: usize = 0,
+    /// The most datagrams a run that went carried.
+    largest_run: usize = 0,
+};
+
+fn gsoDeliver(h: *Harness, queue: *std.ArrayList(Flight), gp: *GsoPath, data: []const u8, ecn: packet.Ecn) !void {
+    std.debug.assert(data.len <= 1500);
+    h.datagrams_to_client += 1;
+    if (gp.loss > 0 and h.prng.random().uintLessThan(u8, 100) < gp.loss) return;
+    var f: Flight = .{ .at = h.now + gp.delay, .to_server = false, .len = data.len, .buf = undefined, .ecn = ecn };
+    @memcpy(f.buf[0..data.len], data);
+    try queue.append(h.a, f);
+}
+
+fn gsoSendRun(h: *Harness, queue: *std.ArrayList(Flight), gp: *GsoPath, data: []const u8, seg: usize, segments: usize, ecn: packet.Ecn, mark: Conn.SendMark) !bool {
+    if (data.len == 0) return false;
+    const first = if (segments > 1) seg else data.len;
+    if (first > h.iface_max) {
+        gp.runs_refused += 1;
+        h.refused += segments;
+        // At 1200 there's nowhere lower: the run is lost.
+        return h.server.?.onSendRefused(mark, first, h.now);
+    }
+    gp.largest_run = @max(gp.largest_run, segments);
+    var rest = data;
+    while (rest.len > 0) {
+        const n = @min(rest.len, first);
+        try gsoDeliver(h, queue, gp, rest[0..n], ecn);
+        rest = rest[n..];
+    }
+    return false;
+}
+
+fn gsoFlushRun(h: *Harness, queue: *std.ArrayList(Flight), gp: *GsoPath, buf: []u8) !bool {
+    const s = h.server.?;
+    const seg: usize = s.max_datagram;
+    var pos: usize = 0;
+    var segments: usize = 0;
+    var ecn: packet.Ecn = .not_ect;
+    var mark = s.sendMark();
+    while (true) {
+        const next_ecn = s.sendEcn();
+        if (pos + seg > 65507 or (pos > 0 and next_ecn != ecn)) {
+            if (try gsoSendRun(h, queue, gp, buf[0..pos], seg, segments, ecn, mark)) return true;
+            pos = 0;
+            segments = 0;
+        }
+        if (pos == 0) mark = s.sendMark();
+        ecn = next_ecn;
+        const n = s.send(buf[pos..], h.now);
+        if (n == 0) break;
+        if (n > seg) {
+            if (try gsoSendRun(h, queue, gp, buf[0..pos], seg, segments, ecn, mark)) return true;
+            if (n > h.iface_max) {
+                h.refused += 1;
+                s.onProbeTooBig(h.now);
+            } else try gsoDeliver(h, queue, gp, buf[pos..][0..n], ecn);
+            pos = 0;
+            segments = 0;
+            continue;
+        }
+        pos += n;
+        segments += 1;
+        if (n < seg or segments == 64) {
+            if (try gsoSendRun(h, queue, gp, buf[0..pos], seg, segments, ecn, mark)) return true;
+            pos = 0;
+            segments = 0;
+        }
+    }
+    return gsoSendRun(h, queue, gp, buf[0..pos], seg, segments, ecn, mark);
+}
+
+var gso_buf: [64 * 1024]u8 = undefined;
+
+/// runDelayed with the server's datagrams sent as the endpoint sends them
+/// with GSO (`GsoPath`).
+fn runGso(h: *Harness, gp: *GsoPath, ctx: anytype, comptime done: fn (@TypeOf(ctx), *Harness) bool) !void {
+    var queue: std.ArrayList(Flight) = .empty;
+    defer queue.deinit(h.a);
+    var head: usize = 0;
+    const limit = h.now + 120 * std.time.us_per_s;
+    var buf: [1500]u8 = undefined;
+    while (!done(ctx, h)) {
+        if (h.now > limit) return error.Timeout;
+        while (true) {
+            const n = try h.client.send(&buf);
+            if (n == 0) break;
+            if (gp.loss > 0 and h.prng.random().uintLessThan(u8, 100) < gp.loss) continue;
+            try queue.append(h.a, .{ .at = h.now + gp.delay, .to_server = true, .len = n, .buf = buf });
+        }
+        if (h.server) |s| {
+            if (s.isClosed()) return error.Closed;
+            for (0..3) |_| {
+                if (!try gsoFlushRun(h, &queue, gp, &gso_buf)) break;
+            }
+        }
+        var next: ?u64 = if (head < queue.items.len) queue.items[head].at else null;
+        var timer: ?u64 = null;
+        if (h.server) |s| {
+            if (s.deadline()) |d| if (d < h.now + 10 * std.time.us_per_s) {
+                timer = @max(d, h.now);
+                next = if (next) |x| @min(x, timer.?) else timer;
+            };
+        }
+        if (next == null) {
+            h.now += 100_000;
+            try h.client.retransmit();
+            continue;
+        }
+        h.now = next.?;
+        while (head < queue.items.len and queue.items[head].at <= h.now) : (head += 1) {
+            const f = &queue.items[head];
+            if (f.to_server) try h.toServer(f.buf[0..f.len]) else try h.toClient(f.buf[0..f.len], f.ecn);
+        }
+        if (timer) |t| if (t <= h.now) {
+            h.server.?.onTimeout(h.now);
+            try EchoApp.run(h.server.?);
+        };
+    }
+}
+
+test "verify PMTU r2: an interface below the start size from the beginning, GSO runs: ECN is validated" {
+    var bad: u32 = 0;
+    for ([_]usize{ 1210, 1232, 1250, 1280, 1300, 1340, 1377 }) |iface| {
+        const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 32 << 20 }, pmtuOn);
+        defer h.deinit();
+        h.iface_max = iface;
+        var gp: GsoPath = .{ .delay = 10_000 };
+        try runGso(h, &gp, {}, established);
+        const s = h.server.?;
+        const refused_in_handshake = gp.runs_refused;
+        const id = try h.client.openBidi();
+        try h.client.write(id, "big 300000", true);
+        try runGso(h, &gp, id, finishedAndSearched);
+        try expectBody(h, id, 300_000);
+        if (s.ecn != .capable) {
+            bad += 1;
+            std.debug.print("iface {d}: ECN {s} (marked {d}, marked lost {d}; runs refused {d} in the handshake, {d} after)\n", .{ iface, @tagName(s.ecn), s.ecn_marked, s.ecn_marked_lost, refused_in_handshake, gp.runs_refused - refused_in_handshake });
+        }
+        try testing.expect(s.max_datagram <= iface);
+    }
+    try testing.expectEqual(@as(u32, 0), bad);
+}
+
+test "verify PMTU r2: a refused GSO run of ECN testing packets doesn't end ECN (rebinding under an interface below the start size)" {
+    // The interface takes 1300 bytes. A new path (NAT rebinding) restarts
+    // ECN testing and takes the size back to 1350, whose first run (the
+    // ten testing packets, marked) the interface refuses whole. They never
+    // left: ECN testing has sent nothing yet, and must go on, not end as
+    // "every testing packet lost".
+    for ([_]usize{ 1300, 1250 }) |iface| {
+        const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 32 << 20 }, pmtuOn);
+        defer h.deinit();
+        h.iface_max = iface;
+        var gp: GsoPath = .{ .delay = 10_000 };
+        try runGso(h, &gp, {}, established);
+        const s = h.server.?;
+        var id = try h.client.openBidi();
+        try h.client.write(id, "big 300000", true);
+        try runGso(h, &gp, id, finishedAndSearched);
+        try expectBody(h, id, 300_000);
+        if (s.ecn != .capable) std.debug.print("iface {d}: from the start, ECN is {s} (marked {d}, marked lost {d}, refused runs {d})\n", .{ iface, @tagName(s.ecn), s.ecn_marked, s.ecn_marked_lost, gp.runs_refused });
+        try testing.expectEqual(conn_mod.EcnState.capable, s.ecn);
+        try testing.expect(s.max_datagram <= iface);
+        // Rebinding.
+        s.onPathChange(h.now, false, true, false);
+        try testing.expectEqual(@as(u16, 1350), s.max_datagram);
+        const refused_before = gp.runs_refused;
+        id = try h.client.openBidi();
+        try h.client.write(id, "big 300000", true);
+        try runGso(h, &gp, id, finishedAndSearched);
+        try expectBody(h, id, 300_000);
+        try testing.expect(gp.runs_refused > refused_before);
+        if (s.ecn != .capable) std.debug.print("iface {d}: after a refused run of testing packets ECN is {s} (marked {d}, marked lost {d}, retests {d})\n", .{ iface, @tagName(s.ecn), s.ecn_marked, s.ecn_marked_lost, s.ecn_retests });
+        try testing.expectEqual(conn_mod.EcnState.capable, s.ecn);
+        try testing.expectEqual(liveInFlight(s), s.cc.in_flight);
+    }
+}
+
+/// The server's interface changes at fixed points of a download (each at a
+/// quarter more of the body), with the client's key updates and NAT
+/// rebinding at each step as in `Flapping`.
+const IfaceFlapping = struct {
+    id: u64,
+    up: u64,
+    total: usize,
+    limits: []const usize,
+    step: usize = 0,
+    ku: bool = false,
+    ku_pending: u32 = 0,
+    key_updates: u32 = 0,
+    rebind: bool = false,
+
+    fn done(c: *IfaceFlapping, h: *Harness) bool {
+        const got = h.client.readAll(c.id).len;
+        while (c.step < c.limits.len and got >= c.total * (c.step + 1) / (c.limits.len + 1)) : (c.step += 1) {
+            h.iface_max = c.limits[c.step];
+            if (c.ku) c.ku_pending += 1;
+            if (c.rebind) h.server.?.onPathChange(h.now, h.ipv6, true, false);
+        }
+        const s = h.server.?;
+        if (c.ku_pending > 0 and s.tx_phase == h.client.key_phase and s.tx_phase_acked) {
+            c.ku_pending -= 1;
+            c.key_updates += 1;
+            h.client.initiateKeyUpdate();
+            h.client.followKeyUpdate();
+        }
+        return h.client.finished(c.up) and finishedAndSearched(c.id, h);
+    }
+};
+
+test "verify PMTU r2: an interface flapping under GSO runs, with key updates, rebinding, an upload and loss: completes, accounting holds" {
+    const seqs = [_][]const usize{
+        &.{ 1300, 1500, 1252, 1500, 1232, 1500 },
+        &.{ 1232, 1500, 1232, 1500, 1232 },
+        &.{ 1472, 1471, 1349, 1350, 1300, 1500 },
+    };
+    const up = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(up);
+    var up_sum: u64 = 0;
+    @memcpy(up[0..3], "sum");
+    for (up[3..], 3..) |*b, i| b.* = @truncate(i * 7);
+    for (up) |b| up_sum +%= b;
+    var want_up: [64]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_up, "{d}:{d}", .{ up.len, up_sum });
+    for (seqs) |limits| {
+        for ([_]bool{ false, true }) |ku| {
+            for ([_]bool{ false, true }) |rebind| {
+                for ([_]u8{ 0, 3 }) |loss| {
+                    const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 16 << 20 }, pmtuOn);
+                    defer h.deinit();
+                    h.prng = .init(limits[0] + @as(u64, @intFromBool(ku)) * 2 + @intFromBool(rebind) + loss);
+                    var gp: GsoPath = .{ .delay = 10_000, .loss = loss };
+                    try runGso(h, &gp, {}, established);
+                    const id = try h.client.openBidi();
+                    try h.client.write(id, "big 3000000", true);
+                    const uid = try h.client.openBidi();
+                    try h.client.write(uid, up, true);
+                    var f: IfaceFlapping = .{ .id = id, .up = uid, .total = 3_000_000, .limits = limits, .ku = ku, .rebind = rebind };
+                    const start = h.now;
+                    runGso(h, &gp, &f, IfaceFlapping.done) catch |err| {
+                        const sv = h.server.?;
+                        std.debug.print("limits {any} ku {} rebind {} loss {d}: {s} at step {d}, got {d}; max {d} bh {d} pto {d} refused runs {d} in flight {d} live {d}\n", .{ limits, ku, rebind, loss, @errorName(err), f.step, h.client.readAll(id).len, sv.max_datagram, sv.pmtu.black_holes, sv.pto_count, gp.runs_refused, sv.cc.in_flight, liveInFlight(sv) });
+                        return err;
+                    };
+                    try expectBody(h, id, 3_000_000);
+                    try testing.expectEqualStrings(want, h.client.readAll(uid));
+                    const s = h.server.?;
+                    const last = limits[limits.len - 1];
+                    if (s.max_datagram > @min(last, 1472)) {
+                        std.debug.print("limits {any} ku {} rebind {} loss {d}: max {d} (pmtu current {d} ceiling {d} state {s}), refused {d}\n", .{ limits, ku, rebind, loss, s.max_datagram, s.pmtu.current, s.pmtu.ceiling, @tagName(s.pmtu.state), h.refused });
+                        // Only a rebinding's start size, none of it sent
+                        // since: the next datagram refused takes it down.
+                        try testing.expect(rebind and s.max_datagram == 1350);
+                    }
+                    try testing.expectEqual(@as(u64, s.max_datagram), s.cc.mss);
+                    try testing.expectEqual(liveInFlight(s), s.cc.in_flight);
+                    try testing.expect(gp.runs_refused > 0);
+                    if (h.now - start > 60 * std.time.us_per_s) {
+                        std.debug.print("limits {any} ku {} rebind {} loss {d}: {d} ms\n", .{ limits, ku, rebind, loss, (h.now - start) / 1000 });
+                        return error.TooSlow;
+                    }
+                }
+            }
+        }
+    }
+}

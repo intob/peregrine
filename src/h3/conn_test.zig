@@ -203,6 +203,12 @@ const Harness = struct {
     /// The path's largest datagram towards the client (larger ones are
     /// dropped).
     path_max: usize = std.math.maxInt(usize),
+    /// The server's interface: a run of datagrams (up to `gso_batch`, of
+    /// the connection's size, one codepoint, as the endpoint sends them)
+    /// whose first is larger is refused whole (`onSendRefused`); a larger
+    /// probe, alone (`onProbeTooBig`).
+    iface_max: usize = std.math.maxInt(usize),
+    gso_batch: usize = 1,
 
     fn init() !*Harness {
         const a = testing.allocator;
@@ -318,14 +324,7 @@ const Harness = struct {
             if (h.server) |s| {
                 h.drainMailbox();
                 h.serverProcess();
-                while (true) {
-                    const ecn = s.sendEcn();
-                    const n = s.send(&buf, h.now_us);
-                    if (n == 0) break;
-                    progress = true;
-                    if (n > h.path_max) continue;
-                    try h.client.recvEcn(buf[0..n], if (h.bleach) .not_ect else ecn);
-                }
+                if (try h.sendServer(s)) progress = true;
                 if (s.isClosed()) return;
             }
             h.now_us += 1000;
@@ -339,6 +338,65 @@ const Harness = struct {
                 }
                 try h.client.retransmit();
             }
+        }
+    }
+
+    /// Sends what the server has, in runs as the endpoint does (see
+    /// `iface_max`). Whether anything was sent.
+    fn sendServer(h: *Harness, s: *quic.Conn) !bool {
+        var bufs: [8][1500]u8 = undefined;
+        var lens: [8]usize = undefined;
+        var count: usize = 0;
+        var run_ecn: packet.Ecn = .not_ect;
+        var mark = s.sendMark();
+        var seg: usize = s.max_datagram;
+        var any = false;
+        const batch = @min(@max(h.gso_batch, 1), bufs.len);
+        while (true) {
+            const ecn = s.sendEcn();
+            if (count > 0 and (ecn != run_ecn or count == batch)) {
+                try h.sendRun(s, bufs[0..count], lens[0..count], run_ecn, mark);
+                count = 0;
+            }
+            if (count == 0) {
+                mark = s.sendMark();
+                seg = s.max_datagram;
+                run_ecn = ecn;
+            }
+            const n = s.send(&bufs[count], h.now_us);
+            if (n == 0) break;
+            any = true;
+            if (n > seg) {
+                // A probe: after the run before it, alone.
+                var probe: [1500]u8 = undefined;
+                @memcpy(probe[0..n], bufs[count][0..n]);
+                if (count > 0) try h.sendRun(s, bufs[0..count], lens[0..count], run_ecn, mark);
+                count = 0;
+                if (n > h.iface_max) {
+                    s.onProbeTooBig(h.now_us);
+                } else if (n <= h.path_max) try h.client.recvEcn(probe[0..n], if (h.bleach) .not_ect else ecn);
+                continue;
+            }
+            lens[count] = n;
+            count += 1;
+            if (n < seg) {
+                try h.sendRun(s, bufs[0..count], lens[0..count], run_ecn, mark);
+                count = 0;
+            }
+        }
+        if (count > 0) try h.sendRun(s, bufs[0..count], lens[0..count], run_ecn, mark);
+        return any;
+    }
+
+    fn sendRun(h: *Harness, s: *quic.Conn, bufs: [][1500]u8, lens: []const usize, ecn: packet.Ecn, mark: quic.Conn.SendMark) !void {
+        if (lens[0] > h.iface_max) {
+            // Refused whole; at 1200, lost.
+            _ = s.onSendRefused(mark, lens[0], h.now_us);
+            return;
+        }
+        for (bufs, lens) |*b, n| {
+            if (n > h.path_max) continue;
+            try h.client.recvEcn(b[0..n], if (h.bleach) .not_ect else ecn);
         }
     }
 
@@ -1204,7 +1262,9 @@ test "HTTP/3: GOAWAY finishes requests in flight, then closes" {
 /// path that clears the server's, and the client's counts reported,
 /// withheld, frozen or inflated; and PMTU discovery: the path's datagram
 /// limit (1200-1510 bytes, or none), probes refused by the interface, and
-/// path changes (to another host, or only another port).
+/// path changes (to another host, or only another port); the server's
+/// interface (1150-1528 bytes) refusing its datagrams one by one or in GSO
+/// runs of up to 8 (`onSendRefused`).
 /// Checked: no crash, leak or out-of-bounds access; a connection that
 /// closes does so with a transport or HTTP/3 error code; every response
 /// the client sees parses as HTTP/3 frames.
@@ -1285,6 +1345,11 @@ fn fuzzH3(_: void, smith: *std.testing.Smith) anyerror!void {
                 h.path_max = if (p & 0x80 != 0) std.math.maxInt(usize) else 1200 + @as(usize, p & 0x1f) * 10;
                 if (p & 0x40 != 0) h.server.?.onProbeTooBig(h.now_us);
                 if (p & 0x20 != 0) h.server.?.onPathChange(h.now_us, false, true, op & 0x40 != 0);
+                // The server's interface (1150-1528 bytes, or none), and
+                // GSO runs of up to 8 datagrams refused whole.
+                const q: u8 = if (n > 2) bytes[2] else 0xff;
+                h.iface_max = if (q & 0x80 != 0) std.math.maxInt(usize) else 1150 + @as(usize, q & 0x3f) * 6;
+                h.gso_batch = if (q & 0x40 != 0) 8 else 1;
             },
             else => {},
         }
