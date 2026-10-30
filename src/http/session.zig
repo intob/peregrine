@@ -160,6 +160,8 @@ pub const BufferPool = struct {
     /// for reuse.
     pub const large_cache_count = 32;
     pub const large_cache_bytes = 4 * 1024 * 1024;
+    /// What `h2_enc` keeps: room for an ordinary response head.
+    pub const h2_enc_kept = 4096;
 
     buffer_size: usize,
     free: FreeList([]u8),
@@ -174,9 +176,13 @@ pub const BufferPool = struct {
     /// HTTP/2 stream states: taken when a stream opens and given back
     /// when it closes, so a connection holds only its open streams'.
     h2_streams: Recycling(*H2Stream) = .{},
+    /// HTTP/2 header blocks split over CONTINUATIONs, gathered (sized by
+    /// the first connection).
+    h2_blocks: Recycler = .{},
     /// Scratch for HTTP/2 field blocks, used only inside one call: the
     /// response block being encoded, the field being decoded. Made by
-    /// the first connection (`h2.Conn.init`).
+    /// the first connection (`h2.Conn.init`); the trim takes `h2_enc` back
+    /// to `h2_enc_kept` after a larger block.
     h2_enc: std.ArrayList(u8) = .empty,
     h2_dec: []u8 = &.{},
     /// Output buffers and stream states held or kept, as of the last
@@ -206,6 +212,7 @@ pub const BufferPool = struct {
         self.out_small.deinit(self.allocator);
         self.out_large.deinit(self.allocator);
         self.h2_streams.deinit(self.allocator);
+        self.h2_blocks.deinit(self.allocator);
         self.h2_enc.deinit(self.allocator);
         self.allocator.free(self.h2_dec);
         if (self.ws_deflater) |d| self.allocator.destroy(d);
@@ -246,15 +253,21 @@ pub const BufferPool = struct {
         self.out_small.trim(self.allocator);
         self.out_large.trim(self.allocator);
         self.h2_streams.trim(self.allocator);
+        self.h2_blocks.trim(self.allocator);
+        if (self.h2_enc.capacity > h2_enc_kept) {
+            // Empty outside a call. Failing, encoding grows it again.
+            self.h2_enc.clearAndFree(self.allocator);
+            self.h2_enc.ensureTotalCapacityPrecise(self.allocator, h2_enc_kept) catch {};
+        }
         const held = self.out_small.in_use + self.out_small.free.len + self.out_large.in_use + self.out_large.free.len +
-            self.h2_streams.in_use + self.h2_streams.free.len;
+            self.h2_streams.in_use + self.h2_streams.free.len + self.h2_blocks.in_use + self.h2_blocks.free.len;
         self.output_held.store(held, .release);
     }
 
     /// Output buffers or stream states are held or kept: the worker must
     /// keep ticking.
     pub inline fn holdsOutput(self: *const Self) bool {
-        return self.out_small.holds() or self.out_large.holds() or self.h2_streams.holds();
+        return self.out_small.holds() or self.out_large.holds() or self.h2_streams.holds() or self.h2_blocks.holds();
     }
 
     /// A buffer of at least `min` bytes: the smallest cached one that

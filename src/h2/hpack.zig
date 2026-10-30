@@ -576,6 +576,8 @@ pub const Decoder = struct {
     /// decoding continues so the dynamic table stays in sync, and the
     /// result is `error.HeaderListTooLarge`.
     pub fn decode(self: *Self, block: []const u8, sink: anytype) !void {
+        // A decoder from `initShared` decodes with `decodeWith`.
+        std.debug.assert(self.scratch.len >= scratchLen(self.limits));
         var pos: usize = 0;
         var list_size: u64 = 0;
         var too_large = false;

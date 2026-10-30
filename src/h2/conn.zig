@@ -110,6 +110,7 @@ const out_slack = 16 * 1024;
 pub fn preparePool(pool: *BufferPool, opts: Options) void {
     pool.out_small.size = std.mem.alignForward(usize, frame.header_len + opts.max_frame_size + out_slack, 4096);
     pool.out_large.size = std.mem.alignForward(usize, opts.out_limit + 2 * opts.max_frame_size + out_slack, 4096);
+    pool.h2_blocks.size = opts.limits.max_header_bytes;
 }
 
 const StreamState = enum(u8) {
@@ -356,10 +357,13 @@ pub const Conn = struct {
     /// The block is decoded only to keep HPACK in sync; its stream is
     /// refused or closed with this code (stream error) afterwards.
     hb_discard: ?ErrorCode = null,
-    /// A block split over CONTINUATIONs, gathered, and freed once decoded.
-    /// A block in one frame is decoded where it lies: only a block larger
-    /// than our frame size (16 KiB by default, as large as
-    /// `max_header_bytes` allows) needs CONTINUATIONs.
+    /// The stream closed while its block was arriving (the response ended
+    /// it, or a timeout reset it): the block is still taken whole and
+    /// decoded (§4.3, §6.10), and nothing more is sent for it.
+    hb_closed: bool = false,
+    /// A block split over CONTINUATIONs, gathered in a buffer from the
+    /// worker's pool (`h2_blocks`, `max_header_bytes` each), given back once
+    /// decoded. A block in one frame is decoded where it lies.
     hb_buf: std.ArrayList(u8) = .empty,
     hb_since: u32 = 0,
     /// Flood budgets, per second.
@@ -391,7 +395,7 @@ pub const Conn = struct {
     pub fn init(allocator: std.mem.Allocator, opts: Options, pool: *BufferPool) !Self {
         // The worker's scratch for field blocks (the first connection
         // makes it).
-        try pool.h2_enc.ensureTotalCapacity(pool.allocator, 4096);
+        try pool.h2_enc.ensureTotalCapacity(pool.allocator, BufferPool.h2_enc_kept);
         if (pool.h2_dec.len < hpack.Decoder.scratchLen(opts.hpack)) {
             const scratch = try pool.allocator.alloc(u8, hpack.Decoder.scratchLen(opts.hpack));
             pool.allocator.free(pool.h2_dec);
@@ -419,7 +423,7 @@ pub const Conn = struct {
             .idle_prio = idle_prio,
             .pool = pool,
         };
-        std.debug.assert(pool.out_small.size > 0); // preparePool
+        std.debug.assert(pool.out_small.size > 0 and pool.h2_blocks.size >= opts.limits.max_header_bytes); // preparePool
         errdefer self.giveBack(&self.out);
         // Our preface: SETTINGS, then a larger connection window.
         var buf: [64]u8 = undefined;
@@ -456,7 +460,7 @@ pub const Conn = struct {
         self.encoder.deinit();
         self.giveBack(&self.out);
         self.giveBack(&self.wire);
-        self.hb_buf.deinit(self.allocator);
+        self.dropBlock();
     }
 
     // -- Input buffer -------------------------------------------------------
@@ -647,6 +651,8 @@ pub const Conn = struct {
             if (slot != null) continue;
             // Cleared when it was given back (or new).
             const s = self.pool.h2_streams.acquire(self.pool.allocator) catch return null;
+            std.debug.assert(!s.active and s.exchange == NIL and s.file == null and s.ws == null and
+                s.req.items.len == 0 and s.pending.items.len == 0 and s.hdr_count == 0 and !s.blocked);
             s.active = true;
             s.slot = @intCast(i);
             s.id = id;
@@ -663,6 +669,7 @@ pub const Conn = struct {
     /// buffers keep their capacity). Callers still holding `s` see it
     /// inactive: no stream opens before they are done.
     fn releaseStream(self: *Self, s: *Stream) void {
+        std.debug.assert(self.streams[s.slot] == s);
         if (s.file) |f| f.release();
         self.dropLarge(&s.req);
         self.dropLarge(&s.pending);
@@ -718,8 +725,9 @@ pub const Conn = struct {
             self.output_streams -= 1;
         }
         if (self.hb_target == s) {
-            self.hb_stream = 0;
             self.hb_target = null;
+            self.hb_discard = .stream_closed;
+            self.hb_closed = true;
         }
         self.setBlocked(s, false);
         self.closed_ring[self.closed_pos] = .{ .id = s.id, .how = how };
@@ -1098,6 +1106,7 @@ pub const Conn = struct {
         if (h.fragment.len == 0 and !h.end_headers) self.countControl();
         if (h.stream_id % 2 == 0) return self.fail(.protocol_error);
         self.hb_discard = null;
+        self.hb_closed = false;
         self.hb_trailers = false;
         if (h.stream_id > self.last_stream_id) {
             self.last_stream_id = h.stream_id;
@@ -1140,7 +1149,6 @@ pub const Conn = struct {
         self.hb_stream = h.stream_id;
         self.hb_end_stream = h.end_stream;
         self.hb_since = ctx.now;
-        self.hb_buf.clearRetainingCapacity();
         self.appendFragment(Handler, ctx, h.fragment, h.end_headers);
     }
 
@@ -1155,10 +1163,22 @@ pub const Conn = struct {
         if (self.hb_buf.items.len + fragment.len > self.opts.limits.max_header_bytes) return self.fail(.enhance_your_calm);
         // In one frame: decoded where it lies.
         if (end and self.hb_buf.items.len == 0) return self.onBlock(Handler, ctx, fragment);
-        self.hb_buf.appendSlice(self.allocator, fragment) catch return self.fail(.internal_error);
+        if (self.hb_buf.capacity == 0) {
+            const buf = self.pool.h2_blocks.acquire(self.pool.allocator) catch return self.fail(.internal_error);
+            self.hb_buf = .initBuffer(buf);
+        }
+        // Fits: the check above bounds it by the buffer's size.
+        self.hb_buf.appendSliceAssumeCapacity(fragment);
         if (!end) return;
         self.onBlock(Handler, ctx, self.hb_buf.items);
-        self.hb_buf.clearAndFree(self.allocator);
+        self.dropBlock();
+    }
+
+    /// The gathered block's buffer goes back to the worker.
+    fn dropBlock(self: *Self) void {
+        if (self.hb_buf.capacity == 0) return;
+        self.pool.h2_blocks.release(self.hb_buf.allocatedSlice());
+        self.hb_buf = .empty;
     }
 
     /// A complete field block: a request's head or trailers, or one only
@@ -1177,6 +1197,7 @@ pub const Conn = struct {
                 error.HeaderListTooLarge => {},
                 else => return self.fail(.compression_error),
             };
+            if (self.hb_closed) return;
             if (code == .refused_stream and self.recentlyClosed(stream_id) == null and self.findStream(stream_id) == null) {
                 self.closed_ring[self.closed_pos] = .{ .id = stream_id, .how = .we_reset };
                 self.closed_pos = (self.closed_pos + 1) % self.closed_ring.len;
@@ -1187,13 +1208,13 @@ pub const Conn = struct {
         if (trailers) {
             // Kept after the body (and after a paused body's kept DATA).
             s.trl_off = s.req.items.len;
-            var sink: fields_mod.TrailerStore = .{ .buf = &s.req, .allocator = self.pool.allocator, .refs = s.hdr[s.hdr_count..], .count = &s.trl_count };
+            var sink: TrailerSink = .{ .conn = self, .inner = .{ .buf = &s.req, .allocator = self.pool.allocator, .refs = s.hdr[s.hdr_count..], .count = &s.trl_count } };
             self.decoder.decodeWith(self.pool.h2_dec, block, &sink) catch |err| switch (err) {
                 error.HeaderListTooLarge => {},
                 error.OutOfMemory => return self.fail(.internal_error),
                 else => return self.fail(.compression_error),
             };
-            if (sink.fault) return self.resetStream(ctx, s, .protocol_error);
+            if (sink.inner.fault) return self.resetStream(ctx, s, .protocol_error);
             if (s.content_length) |cl| {
                 if (s.body_received != cl and s.fault == null) return self.resetStream(ctx, s, .protocol_error);
             }
@@ -1206,7 +1227,7 @@ pub const Conn = struct {
             }
             return self.dispatch(Handler, ctx, s);
         }
-        var sink: RequestSink = .{ .stream = s, .allocator = self.pool.allocator, .allow_protocol = self.opts.enable_connect_protocol };
+        var sink: RequestSink = .{ .stream = s, .conn = self, .allow_protocol = self.opts.enable_connect_protocol };
         self.decoder.decodeWith(self.pool.h2_dec, block, &sink) catch |err| switch (err) {
             error.HeaderListTooLarge => s.fault = s.fault orelse .headers_too_large,
             error.OutOfMemory => return self.fail(.internal_error),
@@ -1216,7 +1237,7 @@ pub const Conn = struct {
             // Handlers written for HTTP/1.1 look for Host.
             const auth = s.slice(s.authority.?);
             const off = s.req.items.len;
-            s.req.ensureUnusedCapacity(self.pool.allocator, 4 + auth.len) catch return self.fail(.internal_error);
+            self.ensureRoom(&s.req, 4 + auth.len) catch return self.fail(.internal_error);
             s.req.appendSliceAssumeCapacity("host");
             s.req.appendSliceAssumeCapacity(s.slice(s.authority.?));
             s.hdr[s.hdr_count] = .{ .name_off = @intCast(off), .name_len = 4, .value_len = @intCast(auth.len) };
@@ -1660,11 +1681,13 @@ pub const Conn = struct {
                     if (!self.wantsPump(s)) continue;
                     if (self.unsent() > self.opts.out_limit) return self.holdBack(order[i..]);
                     const before = self.out.items.len;
+                    // Read first: a stream that finishes is cleared.
+                    const id = s.id;
                     self.sendStream(Handler, ctx, s, share_quantum);
                     if (self.failed) return;
                     if (self.out.items.len != before) {
                         progressed = true;
-                        self.rr_last[p.urgency] = s.id;
+                        self.rr_last[p.urgency] = id;
                     }
                 }
                 if (!progressed) break;
@@ -1980,7 +2003,8 @@ fn statusText(status: Status) []const u8 {
 /// Decodes a request's fields into the stream (RFC 9113 §8.2, §8.3).
 const RequestSink = struct {
     stream: *Stream,
-    allocator: std.mem.Allocator,
+    /// Grows `stream.req` (`Conn.ensureRoom`).
+    conn: *Conn,
     /// Accept :protocol (we sent SETTINGS_ENABLE_CONNECT_PROTOCOL);
     /// otherwise it is an unknown pseudo-header field.
     allow_protocol: bool = false,
@@ -2076,10 +2100,21 @@ const RequestSink = struct {
     fn store(self: *RequestSink, name: []const u8, value: []const u8) !HeaderRef {
         const s = self.stream;
         const off = s.req.items.len;
-        try s.req.ensureUnusedCapacity(self.allocator, name.len + value.len);
+        try self.conn.ensureRoom(&s.req, name.len + value.len);
         s.req.appendSliceAssumeCapacity(name);
         s.req.appendSliceAssumeCapacity(value);
         return .{ .name_off = @intCast(off), .name_len = @intCast(name.len), .value_len = @intCast(value.len) };
+    }
+};
+
+/// Trailers into `stream.req`, grown by `Conn.ensureRoom`.
+const TrailerSink = struct {
+    conn: *Conn,
+    inner: fields_mod.TrailerStore,
+
+    pub fn header(self: *TrailerSink, name: []const u8, value: []const u8) !void {
+        try self.conn.ensureRoom(self.inner.buf, name.len + value.len);
+        return self.inner.header(name, value);
     }
 };
 
@@ -3224,6 +3259,45 @@ test "streamed bodies: a pause holds the window back, resume delivers what was k
     try testing.expectEqual(@as(usize, 1), h.handler.aborts);
 }
 
+test "streamed bodies: a stream that ends while its trailers arrive in CONTINUATIONs" {
+    // The response finished from another thread (a timeout reset takes
+    // the same path) between the trailers' HEADERS and their CONTINUATION: the
+    // block is still a stream's, taken whole and decoded (§4.3, §6.10),
+    // not a CONTINUATION without a HEADERS (a connection error).
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    try h.preface();
+    try postTo(h, 1, "/up", false);
+    try h.data(1, "abc", false);
+    // Indexed by the client: a later block refers to it.
+    const block = try h.encodeFields(&.{.{ .name = "x-t", .value = "trailer value" }});
+    defer testing.allocator.free(block);
+    var buf: [256]u8 = undefined;
+    const half = block.len / 2;
+    try h.feed(buf[0..try frame.writeHeaders(&buf, 1, frame.flag.end_stream, block[0..half])]);
+    h.events.clearRetainingCapacity();
+    try h.handler.exchanges.items[0].respond(.{}, "done");
+    try h.drainMailbox();
+    try h.collect();
+    try h.expectEvents("headers 1 end=false [:status=200] [content-length=4] [date]\ndata 1 len=4 end=true\nrst 1 no_error\n");
+    try testing.expectEqual(@as(u32, 0), h.conn.activeStreams());
+    frame.writeHeader(buf[0..frame.header_len], @intCast(block.len - half), .continuation, frame.flag.end_headers, 1);
+    @memcpy(buf[frame.header_len..][0 .. block.len - half], block[half..]);
+    try h.feed(buf[0 .. frame.header_len + block.len - half]);
+    try testing.expect(!h.conn.failed);
+    try h.expectEvents("");
+    // HPACK stayed in sync: the next request's reference to the trailer
+    // field decodes.
+    h.handler.log.clearRetainingCapacity();
+    try h.headers(.{ .stream = 3, .fields = &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "x-t", .value = "trailer value" },
+    } });
+    try h.expectLog("GET / [x-t=trailer value]\n");
+}
+
 test "streamed bodies: a response given in handleBody goes out in the same pass" {
     // Found by the fuzzer: one read with the whole request, then a
     // connection error. The response is sent before the GOAWAY, as it
@@ -3571,6 +3645,26 @@ test "output buffers: an exchange or HEAD with nothing to send holds none; small
     try testing.expectEqual(@as(usize, 0), h.conn.out.capacity + h.conn.wire.capacity);
 }
 
+test "field block scratch: a large response head grows the worker's encoding buffer, the tick takes it back" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    try h.preface();
+    var lines: std.ArrayList(u8) = .empty;
+    defer lines.deinit(testing.allocator);
+    try lines.appendSlice(testing.allocator, "x-big: ");
+    try lines.appendNTimes(testing.allocator, '~', 20000);
+    try lines.appendSlice(testing.allocator, "\r\n");
+    const s = h.conn.openStream(1).?;
+    const c = h.ctx();
+    h.conn.writeHead(&c, s, .ok, lines.items, null, false);
+    try testing.expect(!h.conn.failed);
+    // Written (the harness's client takes small heads only).
+    h.conn.advance(h.conn.wireBytes().len);
+    try testing.expect(h.pool.h2_enc.capacity > 20000);
+    h.pool.trim();
+    try testing.expectEqual(@as(usize, BufferPool.h2_enc_kept), h.pool.h2_enc.capacity);
+}
+
 test "output buffers: a header block goes in whole or not at all" {
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
     const h = try Harness.initWith(.{}, failing.allocator(), 16 * 1024);
@@ -3872,6 +3966,9 @@ test "stream states: from the worker's pool while open; an idle connection holds
     // scheduling scratch.
     const held_new = heldBy(&conn_counting);
     try testing.expect(held_new <= 16 * 1024);
+    // Nothing per request comes from the connection's own allocator (a
+    // head over CONTINUATIONs is gathered in a buffer from the pool).
+    const conn_allocs = conn_counting.allocations + conn_counting.resize_index;
     var warm: usize = 0;
     var next: u31 = 1;
     for (0..8) |round| {
@@ -3904,6 +4001,7 @@ test "stream states: from the worker's pool while open; an idle connection holds
     // Once warm (the states reused have grown what they keep), the same
     // traffic allocates nothing.
     try testing.expectEqual(warm, pool_counting.allocations + pool_counting.resize_index);
+    try testing.expectEqual(conn_allocs, conn_counting.allocations + conn_counting.resize_index);
     // Two quiet ticks: the worker frees them.
     h.pool.trim();
     h.pool.trim();
