@@ -8,8 +8,9 @@ mkdir -p "$OUT"
 TAG=${TAG:-$$}
 LOCK=$ROOT/bench/scripts/lock.sh
 # Containers these scripts start are named with one of these prefixes
-# (linux-test, autobahn, fuzz, ws-bench, h2-bench, h3-interop and h3-ecn, h3-netem).
-JOB_CONTAINERS='^(lt-|ab-|fuzz-|wsb-|h2b-|h3i-|h3n-)'
+# (linux-test, autobahn, fuzz, ws-bench, h2-bench, h3-interop and h3-ecn, h3-netem,
+# tls-bench).
+JOB_CONTAINERS='^(lt-|ab-|fuzz-|wsb-|h2b-|h3i-|h3n-|tlsb-)'
 
 # For benchmarks, after taking mac-bench: wait for other jobs' containers
 # (started before the lock was taken) to finish; after 15 minutes, name
@@ -39,7 +40,7 @@ cgroup_usec() { docker exec "$1" awk '/usage_usec/ {print $2}' /sys/fs/cgroup/cp
 
 # Linux binaries for Docker on the M2 (aarch64 with its AES and SHA).
 build_linux_bins() {
-    (cd "$ROOT" && "$ZIG" build bench-server ws-load -Dtarget=aarch64-linux-musl -Dcpu=apple_m2 -p "$OUT/linux") >&2
+    (cd "$ROOT" && "$ZIG" build bench-server ws-load tls-load -Dtarget=aarch64-linux-musl -Dcpu=apple_m2 -p "$OUT/linux") >&2
 }
 
 # Zig for aarch64 Linux (fuzzing runs in Docker or on the Pis).
