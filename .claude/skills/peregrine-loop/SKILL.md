@@ -64,6 +64,8 @@ You are implementing one Peregrine roadmap item in your own git worktree.
 Item: <quote the PLAN.md item and its context>
 Read first: PLAN.md (goal, architecture rules, the milestone's section),
 the files involved, and bench/scripts/ (shared harnesses and locks).
+The session scratchpad is shared by every agent: keep your temporary
+files in a subdirectory named after your item.
 Rules: pure Zig 0.17 (/Applications/zig-aarch64-macos-0.17.0/zig); I/O-free
 protocol layers; no per-request heap allocation in steady state; match the
 surrounding code and comment style; zig fmt.
