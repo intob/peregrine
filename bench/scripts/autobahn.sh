@@ -12,7 +12,9 @@ EXCL='["12.*", "13.*"]'; [ -n "$X" ] && EXCL='[]'
 scheme=ws; [ "$M" = tls ] && scheme=wss
 A=$OUT/autobahn; mkdir -p "$A"; rm -rf "$A/reports-$N"
 "$LOCK" share mac-bench "autobahn $N ($ROOT)"
-trap '"$LOCK" unshare mac-bench' EXIT
+# Interrupted or not, the containers go with the lock.
+trap 'docker stop -t 1 ab-cli-$N-$TAG ab-srv-$N-$TAG >/dev/null 2>&1; "$LOCK" unshare mac-bench' EXIT
+trap 'exit 1' INT TERM HUP
 cat > "$A/fc-$N.json" <<J
 { "outdir": "/ab/reports-$N", "servers": [{ "agent": "peregrine-$N", "url": "$scheme://127.0.0.1:8080/ws" }],
   "cases": $CASES, "exclude-cases": $EXCL, "exclude-agent-cases": {} }

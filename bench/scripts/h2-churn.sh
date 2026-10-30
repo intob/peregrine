@@ -10,14 +10,21 @@ SECS=${1:-60}; PROCS=${2:-4}; CONNS=${3:-12}; shift 3 2>/dev/null || shift $#
 BACKENDS=${BACKENDS:-epoll io_uring}
 MODES=${MODES:-h2c tls}
 "$LOCK" share mac-bench "h2-churn ($ROOT)"
-trap '"$LOCK" unshare mac-bench' EXIT
+# Interrupted or not, the containers go with the lock: a server left
+# running holds up every benchmark waiting for job containers.
+name=fuzz-churn-$TAG
+cleanup() {
+    docker ps -q -f name="^$name(-c[0-9]+)?\$" | xargs docker stop -t 1 >/dev/null 2>&1
+    "$LOCK" unshare mac-bench
+}
+trap cleanup EXIT
+trap 'exit 1' INT TERM HUP
 if [ "${BUILD:-1}" = 1 ] && [ -z "$BINDIR" ]; then
     (cd "$ROOT" && "$ZIG" build verify-server -Dtarget=aarch64-linux-musl -Dcpu=apple_m2 -p "$OUT/linux") >&2
 fi
 status=0
 for backend in $BACKENDS; do
     for mode in $MODES; do
-        name=fuzz-churn-$TAG
         sysctl=()
         [ -n "$WMEM" ] && sysctl=(--sysctl "net.ipv4.tcp_wmem=$WMEM")
         [ -n "$RMEM" ] && sysctl+=(--sysctl "net.ipv4.tcp_rmem=$RMEM")
@@ -28,7 +35,7 @@ for backend in $BACKENDS; do
         echo "== $backend $mode $*"
         pids=()
         for p in $(seq 1 "$PROCS"); do
-            docker run --rm --network container:"$name" -v "$ROOT/bench/scripts":/s peregrine-ws-interop \
+            docker run --rm --name "$name-c$p" --network container:"$name" -v "$ROOT/bench/scripts":/s peregrine-ws-interop \
                 python3 /s/h2-churn.py 127.0.0.1 8443 "$mode" "$SECS" "$CONNS" > "$OUT/churn-$TAG-$p.log" 2>&1 &
             pids+=($!)
         done
