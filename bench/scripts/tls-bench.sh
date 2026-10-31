@@ -29,22 +29,25 @@
 #   handshake in N per thread, per server worker count ("1:1 6:32": every
 #   one against 1 worker; std's ECDSA verify, about 130 µs, costs more than
 #   peregrine's whole handshake, and against 6 server cores the client
-#   has none to spare)
+#   has none to spare). Sampling catches a server whose signatures are bad
+#   1 time in 1000 but can miss a rarer one (1 in 50000 was missed); the
+#   1-worker runs verify everything
 #   BUILD=0: use the binaries already in $OUT/linux/bin (A/B runs)
 # Checked per run, or the run is FAILED and the script exits 1 at the end:
 # tls-load's exit status (a thread that failed fails it); no connection
 # errors from start to stop, warm-up included (a timeout, an alert, a wrong
 # Finished, signature, ALPN or session id echo, a certificate other than
-# the case's, a non-200 response, no session ticket); TLS 1.3 with
+# the case's, a server key share equal to the one before, a non-200
+# response, no session ticket); TLS 1.3 with
 # TLS_AES_128_GCM_SHA256 (the only suite offered), the case's group (the
 # only one offered), signature scheme (ecdsa_secp256r1_sha256 or
 # rsa_pss_rsae_sha256) and ALPN as the server negotiated them; exactly one
 # ticket per connection (tls-load waits for one, and counts any other that
 # arrives with it); signatures verified (all of them with VERIFY 1, at
 # least half the expected share otherwise); every handshake full, or for
-# -resume over 99% resumed; a
-# server still running at the end; the CPU readings at most 0.5 s late and
-# at least 90% of DUR apart.
+# -resume over 99% resumed; a server that started and still runs at the
+# end (if not, its log is shown and the next run goes on); the CPU
+# readings at most 0.5 s late and at least 90% of DUR apart.
 # Servers, all TLS 1.3 only, same certificate and key, one session ticket
 # per handshake, no access log, the workers pinned one per CPU, kTLS off
 # (Docker's kernel has no tls module; peregrine is given `noktls` so a
@@ -53,13 +56,19 @@
 # bench/competitors/nginx/nginx.conf, with `ssl_conf_command NumTickets 1`:
 # OpenSSL sends two by default); h2o 2.3.0-DEV (comp-h2o23: docker build -t
 # comp-h2o23 bench/competitors/h2o), whose TLS 1.3 is picotls over OpenSSL
-# 3.3's libcrypto, without X25519MLKEM768 (its mlkem cases are skipped).
-# Workers, certificate and tickets are set by editing a copy of each
-# config. Responses: peregrine "Hello, World!" from memory, nginx `return
+# 3.3's libcrypto, without X25519MLKEM768 (its mlkem cases are skipped),
+# with `neverbleed: OFF`: by default h2o signs in a separate process over a
+# socket (1 worker: 7.2-7.3k ECDSA handshakes/s at 136 µs on, 7.6-8.2k at
+# 121-131 µs off; RSA 1340/s at 0.91 cores on, 1530/s at 0.99 off), and
+# peregrine and nginx sign in process. h2o's 6-worker rows don't scale
+# with either setting (resumed, no signature: 225-235 µs at 4.7-4.8
+# cores): they measure that bottleneck, not its handshake cost.
+# Workers, certificate, tickets and neverbleed are set by editing a copy
+# of each config. Responses: peregrine "Hello, World!" from memory, nginx `return
 # 200`, h2o a static file (as in h2-bench.sh).
 source "$(dirname "$0")/env.sh"
 BIN=$OUT/linux/bin
-usage() { sed -n '2,59p' "$0"; exit 1; }
+usage() { sed -n '2,68p' "$0"; exit 1; }
 servers=${*:-peregrine-epoll peregrine-uring nginx h2o}
 CASES=${CASES:-ecdsa-x25519 ecdsa-p256 ecdsa-mlkem ecdsa-x25519-resume rsa-x25519 ecdsa-x25519-h2}
 WORKERS=${WORKERS:-1 6}; ROUNDS=${ROUNDS:-2}; DUR=${DUR:-8}
@@ -81,7 +90,7 @@ server() { # NAME WORKERS CERT -> "IMAGE|CMD"
     peregrine-uring) echo "peregrine-bench|exec /b/bench-server $2 io_uring 8443 tls noktls $rsa" ;;
     nginx) echo "peregrine-h3load|cp /bench/competitors/nginx/nginx.conf /tmp/ && sed -i 's/^worker_processes 6;/worker_processes $2;/; $edit; s/^\( *\)ssl_protocols TLSv1.3;/&\n\1ssl_conf_command NumTickets 1;/' /tmp/nginx.conf && exec nginx -c /tmp/nginx.conf" ;;
     h2o) local cpus=0; [ "$2" = 6 ] && cpus="0, 1, 2, 3, 4, 5"
-        echo "comp-h2o23|cp /bench/competitors/h2o/h2o.conf /tmp/ && sed -i 's/^num-threads: .*/num-threads: [$cpus]/; $edit' /tmp/h2o.conf && exec h2o -c /tmp/h2o.conf" ;;
+        echo "comp-h2o23|cp /bench/competitors/h2o/h2o.conf /tmp/ && sed -i 's/^num-threads: .*/num-threads: [$cpus]/; $edit; s/^\( *\)minimum-version: TLSv1.3/&\n\1neverbleed: OFF/' /tmp/h2o.conf && exec h2o -c /tmp/h2o.conf" ;;
     esac
 }
 supported() { # SERVER CASE
@@ -115,12 +124,21 @@ for round in $(seq "$ROUNDS"); do
       for s in $servers; do
         if ! supported "$s" "$c"; then printf "%-16s %2s %-20s %7s\n" "$s" "$w" "$c" "n/a"; continue; fi
         spec=$(server "$s" "$w" "$cert")
-        docker run -d --name tlsb-srv-$TAG --cpuset-cpus $cpus --ulimit nofile=65536:65536 \
-          --security-opt seccomp="$SECCOMP" -v "$BIN":/b -v "$ROOT/bench":/bench:ro "${spec%%|*}" sh -c "${spec#*|}" >/dev/null || exit 1
+        # A server that doesn't start (or dies before the client can join
+        # its network namespace) fails this run only.
+        if ! err=$(docker run -d --name tlsb-srv-$TAG --cpuset-cpus $cpus --ulimit nofile=65536:65536 \
+          --security-opt seccomp="$SECCOMP" -v "$BIN":/b -v "$ROOT/bench":/bench:ro "${spec%%|*}" sh -c "${spec#*|}" 2>&1 >/dev/null); then
+          echo "$s $w $c: FAILED: server didn't start: $err"; failures=$((failures + 1))
+          docker rm -f tlsb-srv-$TAG >/dev/null 2>&1; continue
+        fi
         sleep 1.5
         # -t: line-buffered output, so the phase markers arrive as they happen.
-        docker run -d -t --name tlsb-cli-$TAG --cpuset-cpus 6-11 --network container:tlsb-srv-$TAG -v "$BIN":/b peregrine-bench:latest \
-          timeout $((DUR + 30)) /b/tls-load 127.0.0.1 8443 6 "$conns" "$DUR" "$group" "$proto" "$mode" 2 "$cert" "$every" >/dev/null || exit 1
+        if ! err=$(docker run -d -t --name tlsb-cli-$TAG --cpuset-cpus 6-11 --network container:tlsb-srv-$TAG -v "$BIN":/b peregrine-bench:latest \
+          timeout $((DUR + 30)) /b/tls-load 127.0.0.1 8443 6 "$conns" "$DUR" "$group" "$proto" "$mode" 2 "$cert" "$every" 2>&1 >/dev/null); then
+          echo "$s $w $c: FAILED: client didn't start ($(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}}' tlsb-srv-$TAG 2>&1)): $err"
+          docker logs --tail 30 tlsb-srv-$TAG 2>&1; failures=$((failures + 1))
+          docker rm -f tlsb-cli-$TAG tlsb-srv-$TAG >/dev/null 2>&1; continue
+        fi
         # "measuring at T" / "measured at T": T is tls-load's wall clock
         # (the VM's, kept in step with the Mac's by Docker).
         t0= t1= w0= w1= m0= m1=

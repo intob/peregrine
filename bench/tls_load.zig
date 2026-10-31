@@ -32,7 +32,9 @@
 //! client can afford it against 6 server cores; N = 1 verifies every one.
 //! The server's Finished is checked in every handshake, resumed ones too
 //! (it proves the key exchange and the transcript), and so are the
-//! legacy_session_id echo, EncryptedExtensions and its ALPN.
+//! legacy_session_id echo, EncryptedExtensions and its ALPN. The server's
+//! key share must differ from the one before on the same thread (a fresh
+//! ephemeral key).
 //!
 //! With `resume`, a thread without a ticket makes a full handshake; then
 //! every connection offers the newest ticket the thread holds (one
@@ -348,6 +350,10 @@ const Worker = struct {
     tickets: std.atomic.Value(u64) = .init(0),
     /// CertificateVerify messages seen, for verifying one in N.
     signatures: u64 = 0,
+    /// The last 32 bytes of the server's previous key share (the X25519
+    /// part of a hybrid one): a server that reuses its ephemeral key,
+    /// skipping key generation it is measured on, sends the same again.
+    last_share: [32]u8 = @splat(0),
     errors: std.atomic.Value(u64) = .init(0),
     /// The thread itself failed (at setup, before any connection).
     died: ?anyerror = null,
@@ -677,6 +683,9 @@ const Worker = struct {
                 c.transcript.update(msg);
                 var shared_buf: [64]u8 = undefined;
                 const server_share = try serverKeyShare(body);
+                if (server_share.len < 32) return error.BadKeyShare;
+                if (std.mem.eql(u8, server_share[server_share.len - 32 ..], &self.last_share)) return error.ReusedKeyShare;
+                self.last_share = server_share[server_share.len - 32 ..][0..32].*;
                 const shared = try self.share.shared(server_share, &shared_buf);
                 const early = if (c.resumed) ks.earlySecretPsk(&c.psk) else ks.earlySecret();
                 c.hs_secret = ks.handshakeSecret(early, shared);
