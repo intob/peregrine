@@ -2177,6 +2177,86 @@ fn testWsPourFair(backend: Backend) !void {
     }
 }
 
+test "websocket: split and malformed input behind stalled output, read once the client reads again (plain, TLS)" {
+    try forEachBackend(testWsSplitBehindStall);
+}
+
+fn testWsSplitBehindStall(backend: Backend) !void {
+    // While a flood fills the socket the worker reads nothing; a ping,
+    // a ping split across writes (TLS records), and an unmasked frame
+    // wait behind it, in the socket or in the TLS layer. Once the client
+    // reads again: the flood, both pongs, then the close for the
+    // violation.
+    for ([_]bool{ false, true }) |tls| {
+        for ([_]usize{ 0, 1024 }) |read_buffer| {
+            var cfg: Config = if (tls) tlsConfig() else .{};
+            if (read_buffer > 0) cfg.read_buffer_size = read_buffer;
+            const r = try Running.start(backend, cfg);
+            defer r.stop();
+            errdefer std.debug.print("{s} {s} read buffer {d}\n", .{ @tagName(backend), if (tls) "tls" else "plain", read_buffer });
+            var plain: Client = undefined;
+            var secure: *TlsClient = undefined;
+            if (tls) secure = try TlsClient.connect(r.port) else plain = try Client.connect(r.port);
+            defer if (tls) secure.close() else plain.close();
+            const Io = struct {
+                fn send(t: bool, pc: *Client, sc: *TlsClient, bytes: []const u8) !void {
+                    if (t) try sc.send(bytes) else try pc.send(bytes);
+                }
+            };
+            try Io.send(tls, &plain, secure, Client.upgrade_request);
+            if (tls) {
+                const head = try secure.client.reader.takeDelimiterInclusive('\n');
+                try testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 101 "));
+                while ((try secure.client.reader.takeDelimiterInclusive('\n')).len != 2) {}
+            } else try plain.readUpgrade();
+            var frame: [64]u8 = undefined;
+            try Io.send(tls, &plain, secure, Client.wsFrame(&frame, true, .text, "flood"));
+            sleepMs(100);
+            try Io.send(tls, &plain, secure, Client.wsFrame(&frame, true, .ping, "a"));
+            sleepMs(30);
+            const split = Client.wsFrame(&frame, true, .ping, "bb");
+            var rest: [64]u8 = undefined;
+            @memcpy(rest[0 .. split.len - 3], split[3..]);
+            const unmasked = [_]u8{ 0x81, 0x02, 'h', 'i' };
+            @memcpy(rest[split.len - 3 ..][0..unmasked.len], &unmasked);
+            try Io.send(tls, &plain, secure, split[0..3]);
+            sleepMs(30);
+            try Io.send(tls, &plain, secure, rest[0 .. split.len - 3 + unmasked.len]);
+            sleepMs(200);
+            const buf = try testing.allocator.alloc(u8, 64 * 1024);
+            defer testing.allocator.free(buf);
+            var floods: usize = 0;
+            var pongs: usize = 0;
+            while (true) {
+                const op: ws.Opcode, const data: []u8 = if (tls) blk: {
+                    const f = try secure.wsRead(buf);
+                    break :blk .{ f.opcode, f.data };
+                } else blk: {
+                    const f = try plain.wsRead(buf);
+                    break :blk .{ f.opcode, f.payload };
+                };
+                switch (op) {
+                    .binary => {
+                        try testing.expectEqual(@as(usize, 0), pongs);
+                        floods += 1;
+                    },
+                    .pong => {
+                        try testing.expectEqualStrings(if (pongs == 0) "a" else "bb", data);
+                        pongs += 1;
+                    },
+                    .close => {
+                        try testing.expectEqual(@as(u16, 1002), std.mem.readInt(u16, data[0..2], .big));
+                        break;
+                    },
+                    else => return error.UnexpectedOpcode,
+                }
+            }
+            try testing.expectEqual(@as(usize, 2), pongs);
+            try testing.expect(floods * 16 * 1024 >= 4 * 1024 * 1024 - 16 * 1024);
+        }
+    }
+}
+
 test "websocket: protocol violations fail with the right close code" {
     try forEachBackend(testWebSocketErrors);
 }
