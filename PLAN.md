@@ -852,11 +852,32 @@ Later in M4:
       still allocates a handshake state and its flight per connection; the
       pooling in `tls.Pools` (FreeList, release/reinit) could move to a
       module both share
-- [ ] Faster RSA-2048 signing: the one handshake peregrine loses (about 1.1 ms
-      of server CPU against 0.67-0.75 ms for nginx and h2o, `tls-bench.sh`).
-      std.crypto.ff's generic constant-time exponentiation; OpenSSL signs in
-      about 0.55 ms on this Mac. CRT halves with a fixed 16-limb (1024-bit)
-      Montgomery multiply and square instead of std.crypto.ff
+- [x] Faster RSA-2048 signing (`src/tls/mont.zig`, `rsa.zig`): the CRT over
+      fixed-size Montgomery arithmetic (n 64-bit limbs sized at compile time:
+      16 for RSA-2048, 24 for 3072, 32 for 4096), a dedicated square, a fixed
+      5-bit window with a masked whole-table scan, masks through the asm
+      barrier; n = p·q checked at load, every signature checked with the
+      public exponent before it goes out; byte for byte the signatures of the
+      std.crypto.ff code (kept as `rsa_verify.Reference`). RSA-2048 signs in
+      470 µs on the M2, was 1040 (OpenSSL: about 550). On the Pis
+      (`bench/scripts/pi-tls-bench.sh`, pi5 serving, pi1 loading, RSA-2048 +
+      X25519, 3 interleaved rounds, every signature verified): 3.58-3.63 ms of
+      server CPU per handshake, was 5.71-5.91 ms (277-279 against 169-175
+      handshakes/s on 1 worker, 1016-1062 against 644-675 on 4); nginx 1.26.3
+      (OpenSSL 3.5) 4.2 ms and h2o 2.3.0-DEV 4.0 ms on the same Pi (one 10 s
+      round each, a smoke run within 3%), so RSA is no longer a handshake
+      peregrine loses. One RSA-2048 private operation takes about 3.2 ms on
+      the Pi's A76. Tests: NIST CAVP SigGenPSS vectors, generated keys of
+      every shape (5500 random keys, odd sizes, unbalanced primes, limb
+      boundaries, e = 3 to 2^32 - 1) against big integers and the ff
+      reference, malformed keys, injected CRT faults; `fuzz: rsa mont` 45 min
+      on the Pis; ct-check's branch scan on 12 builds and dudect on pi5
+      (`ct-check.sh pi`, 8 cases varying the base or dP/dQ, N = 50000 each,
+      max |t| 2.39 against 4.5); interop with 8 RSA certificate shapes and
+      `CERT=rsa tls-interop.sh` on epoll and io_uring. An adversarial verifier
+      could not break it. The old code panicked at load on keys whose q has
+      fewer 63-bit limbs than p. The Mac table in M7 ("RSA-2048, X25519" rows)
+      predates this and is not rerun (no benchmarks on the Mac for now)
 - [ ] TLS input buffers (BufferPool) keep plaintext ClientHello records and
       in-place-decrypted application data after release, never zeroed:
       zeroing 16 KiB per release is a hot-path cost to measure first
@@ -1734,6 +1755,13 @@ Done on the `m6-h3` branch, as I/O-free layers like the rest:
       window-limited bulk transfer probes only when the pipe drains. The
       HTTP/3 CPU/req benchmark (h2-bench.sh h3) hasn't been rerun since the
       pacer learnt to carry debt
+- [ ] macOS 27.2 (Darwin 27.2, after a restart on 2026-10-31): the test "DF: a
+      datagram larger than the interface fails with MessageTooBig instead of
+      being fragmented" (src/quic/udp.zig) fails on main and every branch: a
+      16 KiB send to an IPv4-mapped peer on a dual-stack socket now gets
+      EMSGSIZE, as if macOS set DF on mapped peers. Find out what changed and
+      update the test (and the "IPv4-mapped peers get no DF" note above if
+      discovery now works for them)
 - [ ] Quirk: a duplicate STREAM frame on an already complete receive stream
       raises `stream_readable` again (`onStream` → `markReadable`); h3
       tolerates it
@@ -1907,8 +1935,9 @@ peregrine's 6-worker rows are client-bound (`tls-load` at 5.4-5.7 of its 6 cores
 server at 5.75-5.9): compare CPU per handshake there. h2o's 6-worker ECDSA rows
 measure its own scaling limit (4.8-5.0 cores even resumed, with or without
 neverbleed; likely OpenSSL 3.3 lock contention in a threaded server, untested), not
-its handshake cost. RSA-2048 is the one loss: std.crypto.ff's exponentiation (see
-M4, "Faster RSA-2048 signing"). epoll spends 7-11 µs more per connection than
+its handshake cost. The RSA-2048 rows are from before "Faster RSA-2048 signing"
+(M4), which cut peregrine's cost per handshake by 38% on the Pis and put it below
+nginx's and h2o's there; they have not been rerun on this Mac. epoll spends 7-11 µs more per connection than
 io_uring (see M2). CPU per handshake rises 10-20% from 1 to 6 workers for peregrine
 (nginx about 2%), probably loopback cost in the VM; separate machines would tell.
 nginx with OpenSSL 3.5 spends about 183 µs even on a resumption, with no signature.
