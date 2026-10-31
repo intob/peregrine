@@ -64,6 +64,8 @@ const TestHandler = struct {
     storm_sent: [Storm.n_threads]std.atomic.Value(u32) = @splat(.init(0)),
     storms_done: std.atomic.Value(usize) = .init(0),
     storm_failed: std.atomic.Value(bool) = .init(false),
+    /// "pour" senders, by connection (see Pour).
+    pours: std.AutoHashMapUnmanaged(*ws.Conn, *Pour) = .empty,
 
     const Upload = struct {
         len: u64 = 0,
@@ -80,7 +82,9 @@ const TestHandler = struct {
 
     pub fn deinit(self: *TestHandler) void {
         std.debug.assert(self.storms.count() == 0);
+        std.debug.assert(self.pours.count() == 0);
         self.storms.deinit(self.allocator);
+        self.pours.deinit(self.allocator);
         self.uploads.deinit(self.allocator);
         self.allocator.destroy(self);
     }
@@ -153,7 +157,13 @@ const TestHandler = struct {
         // Storm senders stop before the connection goes.
         self.storm_mutex.lock();
         const st = if (self.storms.fetchRemove(conn)) |kv| kv.value else null;
+        const pour = if (self.pours.fetchRemove(conn)) |kv| kv.value else null;
         self.storm_mutex.unlock();
+        if (pour) |po| {
+            po.stop.store(true, .release);
+            po.thread.join();
+            self.allocator.destroy(po);
+        }
         if (st) |s| {
             s.stop.store(true, .release);
             for (s.threads) |t| t.join();
@@ -203,6 +213,13 @@ const TestHandler = struct {
             self.startStorm(conn, null);
         } else if (std.mem.eql(u8, data, "storm-close")) {
             self.startStorm(conn, 300);
+        } else if (std.mem.eql(u8, data, "pour")) {
+            const po = self.allocator.create(Pour) catch unreachable;
+            po.* = .{ .conn = conn };
+            po.thread = std.Thread.spawn(.{}, Pour.run, .{po}) catch unreachable;
+            self.storm_mutex.lock();
+            self.pours.put(self.allocator, conn, po) catch unreachable;
+            self.storm_mutex.unlock();
         } else if (std.mem.eql(u8, data, "close-me")) {
             conn.close(1000, "bye") catch unreachable;
         } else if (std.mem.eql(u8, data, "async-big")) {
@@ -1937,6 +1954,98 @@ fn testWsStormFair(backend: Backend) !void {
             std.debug.print("{s} {s}: a request waited {d} ms behind the storm ({d} requests)\n", .{ @tagName(backend), @tagName(mode), worst / std.time.ns_per_ms, n });
             return error.WorkerHeldUp;
         }
+    }
+}
+
+/// "pour": one thread sends 64 KiB binary messages until the connection
+/// goes (handleWSDisconn stops it).
+const Pour = struct {
+    conn: *ws.Conn,
+    stop: std.atomic.Value(bool) = .init(false),
+    thread: std.Thread = undefined,
+
+    fn run(self: *Pour) void {
+        const m: [64 * 1024]u8 = @splat('p');
+        while (!self.stop.load(.acquire)) {
+            self.conn.send(&m, true) catch |err| switch (err) {
+                error.SendQueueFull => std.Thread.yield() catch {},
+                else => return,
+            };
+        }
+    }
+};
+
+/// A client of a "pour": reads and drops everything until stopped.
+const PourReader = struct {
+    c: Client,
+    bytes: usize = 0,
+    stop: std.atomic.Value(bool) = .init(false),
+    thread: std.Thread = undefined,
+
+    fn run(self: *PourReader) void {
+        var buf: [256 * 1024]u8 = undefined;
+        while (!self.stop.load(.acquire)) {
+            const n = sys.read(self.c.fd, &buf) catch return;
+            if (n == 0) return;
+            self.bytes += n;
+        }
+    }
+};
+
+test "websocket: many connections each fed from another thread don't hold up the worker's others" {
+    try forEachBackend(testWsPourFair);
+}
+
+fn testWsPourFair(backend: Backend) !void {
+    // The worker writes at most a turn's worth to a connection, then
+    // posts it again; with more connections posted than one batch of the
+    // mailbox takes, the reposts filled every batch and the drain went on
+    // while the senders kept up.
+    for ([_]usize{ 8, 100 }) |conns| {
+        var cfg: Config = .{};
+        cfg.worker_thread_count = 1;
+        const r = try Running.start(backend, cfg);
+        defer r.stop();
+        const readers = try testing.allocator.alloc(PourReader, conns);
+        defer testing.allocator.free(readers);
+        var started: usize = 0;
+        defer for (readers[0..started]) |*pr| {
+            pr.stop.store(true, .release);
+            _ = std.posix.system.shutdown(pr.c.fd, std.posix.SHUT.RDWR);
+            pr.thread.join();
+            pr.c.close();
+        };
+        for (readers) |*pr| {
+            pr.* = .{ .c = try Client.connect(r.port) };
+            errdefer std.debug.print("{s}: connection {d} of {d} not upgraded within 5 s\n", .{ @tagName(backend), started, conns });
+            try pr.c.send(Client.upgrade_request);
+            try pr.c.readUpgrade();
+            try pr.c.wsSend(true, .text, "pour");
+            pr.thread = try std.Thread.spawn(.{}, PourReader.run, .{pr});
+            started += 1;
+        }
+        sleepMs(200);
+        var c = try Client.connect(r.port);
+        defer c.close();
+        var head: [4096]u8 = undefined;
+        var worst: u64 = 0;
+        var n: usize = 0;
+        const start = sys.nanoTimestamp();
+        while (sys.nanoTimestamp() - start < 3 * std.time.ns_per_s) : (n += 1) {
+            const t0 = sys.nanoTimestamp();
+            try c.send("GET /fair HTTP/1.1\r\nHost: x\r\n\r\n");
+            const resp = c.readResponse(&head, null) catch |err| {
+                std.debug.print("{s} {d} connections: request {d}: {s} after {d} ms\n", .{ @tagName(backend), conns, n, @errorName(err), @divTrunc(sys.nanoTimestamp() - t0, std.time.ns_per_ms) });
+                return err;
+            };
+            try testing.expectEqual(@as(u16, 200), resp.status);
+            worst = @max(worst, @as(u64, @intCast(sys.nanoTimestamp() - t0)));
+            sleepMs(20);
+        }
+        var total: usize = 0;
+        for (readers) |*pr| total += pr.bytes;
+        std.debug.print("{s} {d} connections: {d} requests, worst {d} ms, {d} MiB poured\n", .{ @tagName(backend), conns, n, worst / std.time.ns_per_ms, total >> 20 });
+        if (worst > 1500 * std.time.ns_per_ms) return error.WorkerHeldUp;
     }
 }
 
