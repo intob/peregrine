@@ -2288,6 +2288,13 @@ fn testWsTlsBurstCloseFin(backend: Backend) !void {
     try testing.expectError(error.EndOfStream, p.read(buf, &pool, &inflated));
 }
 
+test "websocket: the mailbox's drain pass never comes round to 0, a new connection's mark" {
+    const next = @import("./http/worker.zig").nextDrainPass;
+    try testing.expectEqual(@as(u32, 1), next(0));
+    try testing.expectEqual(@as(u32, 1), next(std.math.maxInt(u32)));
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), next(std.math.maxInt(u32) - 1));
+}
+
 /// "pour": one thread sends 64 KiB binary messages until the connection
 /// goes (handleWSDisconn stops it).
 const Pour = struct {

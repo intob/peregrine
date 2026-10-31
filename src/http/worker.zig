@@ -49,6 +49,13 @@ const ws_turn_bytes = 256 * 1024;
 /// and an echo then queued far more than a turn writes. Less than a turn
 /// writes, so that a client's echoes can't outgrow what the turns take.
 const ws_msg_bytes = ws_turn_bytes / 2;
+/// The next drainMailbox pass: never 0, which a connection that was never
+/// served has as `ws_served` (its entry would be skipped, and with `posted`
+/// left set it would never be posted again).
+pub fn nextDrainPass(pass: u32) u32 {
+    return if (pass == std.math.maxInt(u32)) 1 else pass + 1;
+}
+
 /// TLS record content types (kTLS control records).
 const tls_alert: u8 = 21;
 const tls_handshake: u8 = 22;
@@ -1844,7 +1851,7 @@ pub fn Worker(comptime Handler: type) type {
             // short batch, a storm of sends on 65 connections kept the
             // worker here, its other connections and timers waiting.
             var left = self.mailbox.pending();
-            self.drain_pass +%= 1;
+            self.drain_pass = nextDrainPass(self.drain_pass);
             while (left > 0) {
                 const n = self.mailbox.drain(entries[0..@min(left, entries.len)]);
                 if (n == 0) break;
