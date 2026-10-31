@@ -725,6 +725,20 @@ pub const H2Poll = struct {
     progressed: bool = false,
 };
 
+/// Worker thread, for HTTP/2: whether `h2Poll` would have something to
+/// frame (a head, bytes, the end) or an abort to act on; changes nothing.
+pub fn h2Ready(ex: Exchange) bool {
+    const e = &ex.slab.entries[ex.slot];
+    std.debug.assert(e.active and e.gen == ex.gen);
+    e.mutex.lock();
+    defer e.mutex.unlock();
+    return switch (e.state) {
+        .aborted, .finished => true,
+        .later => false,
+        else => e.head_pending or e.segments.items.len > 0,
+    };
+}
+
 /// Worker thread, for HTTP/2: moves queued output into `dest` (a DATA
 /// frame's payload), copying borrowed bytes too (releasing them once
 /// fully taken). The caller frames it.

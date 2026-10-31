@@ -1733,6 +1733,10 @@ pub fn Worker(comptime Handler: type) type {
             if (c.h2) |conn| {
                 const ctx = self.h2Context(c);
                 conn.onExchangePosted(Handler, &ctx, slot);
+                // As the other loop's flush does: output the post left
+                // waiting behind other streams (a head needs no window)
+                // goes now, not with the client's next frame.
+                conn.pump(Handler, &ctx);
                 return self.h2Drive(c);
             }
             if (c.exchange != slot or c.ws != null or c.lingering) return;

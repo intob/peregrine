@@ -983,10 +983,16 @@ pub const Conn = struct {
 
     fn onWindowUpdate(self: *Self, comptime Handler: type, ctx: *const Context(Handler), w: anytype) void {
         if (w.stream_id == 0) {
+            // Output waits for the connection window only once it is
+            // spent (any of it is taken): while it was open, a pass would
+            // find nothing new, and a flood of small updates must not buy
+            // one per frame.
+            const was_spent = self.send_window <= 0;
             self.send_window += w.increment;
             if (self.send_window > frame.max_window_size) return self.fail(.flow_control_error);
             self.conn_stalled = false;
-            return self.pumpAll(Handler, ctx);
+            if (was_spent) self.pumpAll(Handler, ctx);
+            return;
         }
         if (self.findStream(w.stream_id)) |s| {
             s.send_window += w.increment;
@@ -1801,8 +1807,11 @@ pub const Conn = struct {
     /// WINDOW_UPDATE's).
     fn pumpStream(self: *Self, comptime Handler: type, ctx: *const Context(Handler), s: *Stream) void {
         if (self.failed) return;
-        if (self.blocked_count > 0 and self.mustYield(s)) {
-            if (!s.hasOutput()) return;
+        // A stream with nothing to send now (an exchange or a WebSocket
+        // holding nothing) takes nothing from the others: it goes on, to
+        // return window for what was read or tell the handler it can
+        // write, rather than wait for a pass that would find nothing.
+        if (self.blocked_count > 0 and self.mustYield(s) and sendable(ctx, s)) {
             if (s.ws != null) s.ws_pending = true;
             // Newly waiting: the next pass gets it. One already waiting
             // was in the last pass, and its own window or new output
@@ -1813,6 +1822,14 @@ pub const Conn = struct {
             return self.setBlocked(s, true);
         }
         self.sendStream(Handler, ctx, s, std.math.maxInt(usize));
+    }
+
+    /// A frame to send now: queued bytes, a file, a WebSocket's frames or
+    /// its end, an exchange's head, bytes or end (or its abort to act on).
+    fn sendable(ctx: anytype, s: *Stream) bool {
+        if (s.pending_pos < s.pending.items.len or s.pending_end or s.file != null) return true;
+        if (s.ws) |w| return w.hasOutput() or w.wantsClose() or s.state != .open;
+        return s.exchange != NIL and exchange.h2Ready(ctx.exchanges.handle(s.exchange));
     }
 
     /// Sends up to `budget` DATA bytes of what a stream has queued (its
@@ -4696,6 +4713,33 @@ test "priorities: frames for a stream already waiting behind others don't each b
     try expectDataRuns(h, "1 3 5 7 9 11 13 15 17 19 21 23 25 27 29 31 33 35 37 39 41");
 }
 
+test "flow control: connection WINDOW_UPDATEs while no stream has window don't each buy a pass over every stream" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    try h.preface();
+    // Every stream window shut, the connection's open: twenty answers wait.
+    try h.settings(&.{.{ .id = .initial_window_size, .value = 0 }});
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    var id: u31 = 1;
+    while (id <= 39) : (id += 2) try appendGet(h, &frames, id, "/", null);
+    try h.feed(frames.items);
+    h.events.clearRetainingCapacity();
+    frames.clearRetainingCapacity();
+    const updates = 2000;
+    for (0..updates) |_| {
+        var buf: [frame.header_len + 4]u8 = undefined;
+        try frames.appendSlice(testing.allocator, buf[0..try frame.writeWindowUpdate(&buf, 0, 1)]);
+    }
+    const before = h.conn.passes;
+    try h.feed(frames.items);
+    try h.expectEvents("");
+    try testing.expect(h.conn.passes - before < updates / 10);
+    // The stream windows open: every answer goes.
+    try h.settings(&.{.{ .id = .initial_window_size, .value = 1000 }});
+    try testing.expectEqual(@as(usize, 20), std.mem.count(u8, h.events.items, "len=13 end=true"));
+}
+
 // Any split of the same client bytes gives the same frames per stream.
 fn connectWs(h: *Harness, stream: u31, path: []const u8) !void {
     try h.headers(.{ .stream = stream, .end_stream = false, .fields = &.{
@@ -6195,7 +6239,6 @@ test "split invariance: seeded priority conversations, exact frames" {
     }
 }
 
-
 test "priorities: held output behind a window-blocked urgent stream and a slow reader doesn't stop input" {
     const a = testing.allocator;
     const big = try testBody(200_000);
@@ -6263,7 +6306,6 @@ test "priorities: held output behind a window-blocked urgent stream and a slow r
         }
     }
 }
-
 
 test "priorities: DATA for a tunnel or a streamed body waiting behind others doesn't buy a pass per frame" {
     const big = try testing.allocator.alloc(u8, 100_000);
