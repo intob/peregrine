@@ -291,7 +291,7 @@ pub const Conn = struct {
                     self.close_received = true;
                     // Echo the status code (§5.5.1), then close the TCP
                     // connection ourselves (§7.1.1).
-                    if (!sent_close) self.queueFrame(.close, frame.payload[0..@min(2, frame.payload.len)]) catch {};
+                    if (!sent_close) self.echoClose(frame.payload[0..@min(2, frame.payload.len)]);
                     self.deliver(Handler, handler, &frame);
                     return .close;
                 },
@@ -311,6 +311,26 @@ pub const Conn = struct {
         }
         @memcpy(self.waiting_pong[0..payload.len], payload);
         self.pong_len = @intCast(payload.len);
+    }
+
+    /// The close echo, after the pong still waiting for room if there is
+    /// one (its ping came first), in one go: a close frame queued first
+    /// would end the pong.
+    fn echoClose(self: *Self, payload: []const u8) void {
+        var hdr: [10]u8 = undefined;
+        const h = protocol.encodeHeader(&hdr, true, .close, payload.len);
+        const post = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.close_sent) return;
+            self.queuePongLocked();
+            self.appendLocked(h, payload) catch return;
+            self.close_sent = true;
+            const post = !self.posted;
+            self.posted = true;
+            break :blk post;
+        };
+        if (post) self.mailbox.post(self.post_entry);
     }
 
     /// The waiting pong joins the shared queue, unless a close frame ended
@@ -747,7 +767,25 @@ test "a ping is answered while the send queue is full: the latest ping's pong jo
     try testing.expectEqualStrings("0123", (try takeFrame(&rest)).payload);
     try testing.expectEqualStrings("ddddd", (try takeFrame(&rest)).payload);
     try testing.expectEqualSlices(u8, "", rest);
-    // A waiting pong goes nowhere once a close frame is queued.
+    // The peer's close after a ping still waiting: the pong, then the echo.
+    {
+        const h2 = try Harness.init(.{ .max_send_queue_bytes = 100 });
+        defer h2.deinit();
+        try h2.conn.send(&big, true);
+        try feedOnly(h2, masked(&buf, .ping, "aaaaa"));
+        try feedOnly(h2, masked(&buf, .ping, "fffff"));
+        try feedOnly(h2, masked(&buf, .close, "\x03\xe8"));
+        try h2.flush();
+        var r2: []const u8 = h2.out.items;
+        _ = try takeFrame(&r2);
+        try testing.expectEqualStrings("aaaaa", (try takeFrame(&r2)).payload);
+        try testing.expectEqualStrings("fffff", (try takeFrame(&r2)).payload);
+        const echo = try takeFrame(&r2);
+        try testing.expectEqual(@as(u4, @backingInt(Opcode.close)), echo.op);
+        try testing.expectEqualStrings("\x03\xe8", echo.payload);
+        try testing.expectEqualSlices(u8, "", r2);
+    }
+    // A waiting pong goes nowhere once the handler's close frame is queued.
     try h.conn.send(&big, true);
     try feedOnly(h, masked(&buf, .ping, "aaaaa"));
     try feedOnly(h, masked(&buf, .ping, "eeeee"));
