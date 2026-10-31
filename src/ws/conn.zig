@@ -1421,3 +1421,95 @@ test "verify send queues: a backlog of large messages, then small batches" {
     std.debug.print("buffers for a small message after a 30 MiB backlog: {any}\n", .{sizes});
     try testing.expect(sizes[1] <= 4096);
 }
+
+// Fuzz target: sends of every size around the queue's size classes (with
+// and without compression), pings, a close, partial writes, the pool's
+// trims and whole flushes in any order. Every frame accepted goes out once,
+// whole and in order, nothing after the close, and the pool's books
+// balance: nothing held once written and two ticks pass.
+fn fuzzSendQueues(_: void, smith: *std.testing.Smith) anyerror!void {
+    const S = struct {
+        var src: [300 * 1024]u8 = undefined;
+        var ready = false;
+    };
+    if (!S.ready) {
+        for (&S.src, 0..) |*b, i| b.* = @truncate((i >> 2) *% 13 +% (i & 3));
+        S.ready = true;
+    }
+    const sizes = [_]usize{ 0, 1, 5, 125, 126, 127, 244, 246, 250, 252, 253, 254, 255, 256, 257, 500, 508, 509, 1000, 4096, 65_525, 65_527, 65_535, 65_536, 65_537, 131_062, 131_072, 131_073, 262_134, 262_144 };
+    const compress = smith.value(u8) & 1 == 1;
+    const limit = 1 + @as(usize, smith.value(u16)) * 8;
+    const h = try Harness.init(.{ .max_send_queue_bytes = limit, .deflate = .{ .min_size = 32 } });
+    defer h.deinit();
+    if (compress) h.conn.enableDeflate(.{ .enabled = true });
+    const Sent = struct { op: u4, off: usize, len: usize };
+    var sent: std.ArrayList(Sent) = .empty;
+    defer sent.deinit(testing.allocator);
+    var steps: usize = 0;
+    while (!smith.eos() and steps < 300) : (steps += 1) {
+        switch (smith.value(u8) % 9) {
+            0...2 => {
+                const k = smith.value(u16);
+                const n = if (k & 1 == 0) sizes[(k >> 1) % sizes.len] else @as(usize, k >> 1) * 7 % S.src.len;
+                const off = smith.value(u8) % 64;
+                const m = S.src[off..][0..@min(n, S.src.len - off)];
+                if (h.conn.send(m, true)) {
+                    try sent.append(testing.allocator, .{ .op = 2, .off = off, .len = m.len });
+                } else |err| switch (err) {
+                    error.SendQueueFull, error.Closed => {},
+                    else => return err,
+                }
+            },
+            3 => {
+                const n = smith.value(u8) % 126;
+                if (h.conn.ping(S.src[0..n])) {
+                    try sent.append(testing.allocator, .{ .op = 9, .off = 0, .len = n });
+                } else |err| switch (err) {
+                    error.SendQueueFull, error.Closed => {},
+                    else => return err,
+                }
+            },
+            4 => if (smith.value(u8) % 8 == 0) {
+                if (h.conn.close(1000, "fz")) {
+                    try sent.append(testing.allocator, .{ .op = 8, .off = 0, .len = 0 });
+                } else |err| switch (err) {
+                    error.Closed => {},
+                    else => return err,
+                }
+            },
+            5, 6 => {
+                const w = h.conn.wireBytes();
+                if (w.len > 0) {
+                    const k = 1 + @as(usize, smith.value(u32)) % w.len;
+                    try h.out.appendSlice(testing.allocator, w[0..k]);
+                    h.conn.advance(k);
+                }
+            },
+            7 => h.pool.trim(),
+            else => try h.flush(),
+        }
+    }
+    try h.flush();
+    try testing.expectEqual(@as(usize, 0), h.conn.queued);
+    var got: inflate.Out = .{ .buf = &.{}, .max = 1 << 20, .pool = &h.pool };
+    defer if (got.buf.len > 0) h.pool.releaseLarge(got.buf);
+    var rest: []const u8 = h.out.items;
+    for (sent.items) |s| {
+        const f = try takeFrame(&rest);
+        try testing.expectEqual(s.op, f.op);
+        switch (s.op) {
+            2 => try testing.expectEqualSlices(u8, S.src[s.off..][0..s.len], try messageOf(&h.pool, f, &got)),
+            9 => try testing.expectEqualSlices(u8, S.src[0..s.len], f.payload),
+            else => try testing.expectEqualSlices(u8, "\x03\xe8fz", f.payload),
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), rest.len);
+    try expectHoldsNothing(h);
+}
+
+test "fuzz: ws send queues" {
+    try std.testing.fuzz({}, fuzzSendQueues, .{ .corpus = &.{
+        &[_]u8{ 0x01, 0x00, 0x10, 0x00, 0x2a, 0x00, 0x03, 0x00, 0x30, 0x05, 0x10, 0x00, 0x00, 0x00, 0x01, 0x2b, 0x01, 0x07, 0x00, 0x46, 0x00, 0x08 },
+        &[_]u8{ 0x00, 0xff, 0xff, 0x02, 0x37, 0x00, 0x05, 0x05, 0x00, 0x10, 0x00, 0x00, 0x02, 0x33, 0x00, 0x09, 0x04, 0x00, 0x08 },
+    } });
+}
