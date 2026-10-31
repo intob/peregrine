@@ -56,7 +56,7 @@ Design rules that apply to every layer:
 | M3. WebSockets over HTTP/1.1 | ✅ reworked; benchmarked against uWebSockets (even on small messages, 15-20% less CPU at 16-64 KiB); Autobahn 301/301 strict on every backend, plain and TLS; decoder fuzzed; permessage-deflate (Autobahn 517/517; with compression both ways 18-30% less CPU than uWebSockets' zlib on small messages, 4-7x less at 16-64 KiB) |
 | M4. TLS 1.3 | ✅ HTTP and WebSockets on every backend (epoll, kqueue, io_uring), interop-tested, fuzzed; tables for P-256 and X25519, RSA-PSS, session tickets, kTLS, 0-RTT and SNI certificates done; the rest of "faster handshakes" open |
 | M5. HTTP/2 | ✅ h2 over TLS (ALPN) and h2c on every backend, h2spec 146/146 over TLS, fuzzed, benchmarked; streamed request bodies on every protocol; WebSockets over h2 (RFC 8441); RFC 9218 priorities |
-| M6. HTTP/3 and QUIC | 🟡 HTTP/3 over QUIC v1 on every backend, interop-tested (aioquic, curl/ngtcp2, h2load), benchmarked against nginx and Caddy; WebSockets over h3 (RFC 9220); 0-RTT; pacing; ECN; migration, PMTUD open |
+| M6. HTTP/3 and QUIC | 🟡 HTTP/3 over QUIC v1 on every backend, interop-tested (aioquic, curl/ngtcp2, h2load), benchmarked against nginx and Caddy; WebSockets over h3 (RFC 9220); 0-RTT; pacing; ECN; PMTU discovery; migration open |
 | M7. Verification and benchmarking | 🟡 ongoing for each milestone |
 
 Source layout:
@@ -1623,11 +1623,67 @@ Done on the `m6-h3` branch, as I/O-free layers like the rest:
       grow the window before the congestion event (§A.7; only CE was
       reordered); congestion control and RTT aren't reset on NAT rebinding;
       `TosRefused` and the port-0 drop have no end-to-end test
-- [ ] PMTU discovery (DPLPMTUD); `max_datagram_size` is 1350. Needs DF
-      (IP_MTU_DISCOVER=IP_PMTUDISC_PROBE, IPV6_DONTFRAG, IP_DONTFRAG on
-      macOS), PING+PADDING probes flagged in `sent.zig` so a lost probe isn't
-      congestion, a send path for probes larger than the GSO segment; `cc.mss`
-      and the pacer's floor should follow the negotiated `max_datagram`
+- [x] PMTU discovery (DPLPMTUD, RFC 8899, RFC 9000 §14; `src/quic/pmtud.zig`,
+      `Http3Options.max_mtu`, 1500 by default, 0 off): DF per address family
+      (IP/IPV6_MTU_DISCOVER=PMTUDISC_PROBE on Linux, IP/IPV6_DONTFRAG on
+      macOS; only with discovery on), PING+PADDING probes once the handshake
+      is confirmed, one in flight, flagged `pmtu_probe` in sent.zig: a lost
+      one is no congestion event and no part of persistent congestion, and
+      is lost by the time threshold only (reordering failed sizes that
+      arrive). The ceiling first, then bisection to 16 bytes; MAX_PROBES or
+      EMSGSIZE fail a size; PMTU_RAISE_TIMER 600 s; the client's
+      max_udp_payload_size bounds everything (we advertise 2048). A probe is
+      cut to what the window and the pacer's bucket can send at once (the
+      top of the range tried again once it arrives), goes when the pacer has
+      a datagram's worth and owes it the rest (`Pacer.onSentAhead`), and
+      leaves in a sendmsg of its own; GSO runs stop at 65507 bytes. Black
+      holes (full-sized losses over a PTO while smaller packets arrive, and
+      no larger one: an acknowledged probe counts; after two PTOs packets go
+      at 1200) fall back to 1200 and probe the failed size first. Datagrams
+      the interface refuses (EMSGSIZE, a GSO run whole) never left: out of
+      the flight without a congestion signal, what they carried, an ACK owed
+      and a PATH_RESPONSE sent again at 1200 at once, the PTO budget, pacer
+      and key-phase count given back, ECN testing not ended; the ceiling
+      goes below them and stays for a new port on the same host (NAT
+      rebinding), not for another host. `cc.mss` and the pacer's floor
+      follow the size (`Congestion.setMss`, CUBIC's K moved to keep its
+      curve's value). Also fixed: a lost MAX_STREAM_DATA/RESET_STREAM/
+      STOP_SENDING never re-queued its stream (an upload blocked at its
+      window waited forever; aioquic's 5 × 1 MiB POSTs in h3-interop.sh
+      timed out 1 in 5-100 runs on a loaded host). Tests: pmtud.zig units;
+      in memory (search, probe loss, reordering with jitter and loss, black
+      holes after validation and from the start, outages, a probe
+      acknowledged with black-hole evidence, client limits 1200…2^40 over
+      IPv4/IPv6, EMSGSIZE, refused GSO runs under flapping interfaces, key
+      updates, rebinding, uploads and loss (`runGso`), refused PTO probes,
+      ECN testing packets and PATH_RESPONSE, a 65507 ceiling over the
+      initial window, path changes, a stale probe acknowledged with the
+      current one, 40 random paths); end to end on every backend (1472 and
+      1452, IPv4-mapped, EMSGSIZE, GSO limits, receiving 2048 and dropping
+      larger); `bench/scripts/h3-pmtu.sh` (1500 path 1472; client or server
+      MTU 1400 1365; client 1280 1256; server 1300 1264, 1350 with discovery
+      off; a drop to 1300 mid-run) and `h3-pmtu-stress.sh` (flapping MTUs,
+      key updates, uploads, netem, CE, IPv6 1452, IPv4-mapped 1472, jumbo
+      8966) on epoll and io_uring; h3spec 77/77 on kqueue, epoll and
+      io_uring; h3-interop.sh; `fuzz: h3 connection` (path limits, refused
+      probes and runs, path changes) 15 min on a Pi. Two review rounds and
+      two adversarial verifier rounds (a stale probe hiding the current
+      one's ACK, ECN ended by a refused run, refused PTO probes waiting a
+      PTO). PMTUD on vs off at 1% loss: no difference beyond noise
+      (40 × 1 MiB in 3.1-6.7 s vs 3.5-8.2 s)
+- [ ] PMTU, what's left: IPv4-mapped peers on macOS dual-stack sockets get
+      no DF and so no discovery; DF only with discovery on (RFC 9000 §14 says
+      set it where possible); with discovery off a GSO run larger than the
+      interface costs a failed sendmsg and N single sends every time (the
+      fallback isn't remembered per path); 20% loss finds false black holes
+      (two PTOs whose 1200-byte packets arrive; one confirmation probe each);
+      a probe acknowledged after it was declared lost counts nothing; after
+      rebinding, the old path's in-flight losses count towards the new
+      path's black-hole record; a path that grows waits for the 600 s raise
+      timer; probes need the window's room for their whole size, so a
+      window-limited bulk transfer probes only when the pipe drains. The
+      HTTP/3 CPU/req benchmark (h2-bench.sh h3) hasn't been rerun since the
+      pacer learnt to carry debt
 - [ ] Quirk: a duplicate STREAM frame on an already complete receive stream
       raises `stream_readable` again (`onStream` → `markReadable`); h3
       tolerates it
