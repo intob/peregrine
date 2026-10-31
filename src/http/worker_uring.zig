@@ -1735,8 +1735,9 @@ pub fn Worker(comptime Handler: type) type {
                 conn.onExchangePosted(Handler, &ctx, slot);
                 // As the other loop's flush does: output the post left
                 // waiting behind other streams (a head needs no window)
-                // goes now, not with the client's next frame.
-                conn.pump(Handler, &ctx);
+                // goes now, not with the client's next frame (a write in
+                // flight pumps when it completes).
+                if (!c.write_inflight) conn.pump(Handler, &ctx);
                 return self.h2Drive(c);
             }
             if (c.exchange != slot or c.ws != null or c.lingering) return;
