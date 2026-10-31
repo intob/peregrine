@@ -66,6 +66,12 @@ pub const Conn = struct {
     /// The last batch sizes the next one's buffer up to this many times
     /// the frame that starts it.
     const hint_frames = 16;
+    /// Messages compressed at a time (bytes of them, at least one whole
+    /// message): the rest of a queue taken to compress waits for the
+    /// wire to be written, so that compressing doesn't take the worker
+    /// for as long as a queue full of messages that shrink a thousandfold
+    /// takes.
+    const compress_chunk = 64 * 1024;
 
     /// The socket. Only for identification (logging); never read or write
     /// it directly. Every WebSocket on one HTTP/2 connection shares its
@@ -104,6 +110,14 @@ pub const Conn = struct {
     /// Bytes being written. Owned by the worker.
     wire: Queue = .{},
     wire_pos: usize = 0,
+    /// Worker only: a queue taken from `shared` to compress, the messages
+    /// from `raw_pos` on still to be compressed onto the wire (in order:
+    /// `shared` is taken again only once they are).
+    raw: Queue = .{},
+    raw_pos: usize = 0,
+    /// Worker only: bytes of messages compressed, for the worker's turns
+    /// (`takeCompressed`).
+    compressed: usize = 0,
     /// permessage-deflate, as negotiated. Set before the handler sees the
     /// connection, then only read.
     deflate: deflate.Agreement = .{},
@@ -139,6 +153,7 @@ pub const Conn = struct {
         self.decoder.deinit();
         if (self.shared.buf.len > 0) self.bufferPool().wsRelease(self.shared.buf);
         if (self.wire.buf.len > 0) self.bufferPool().wsRelease(self.wire.buf);
+        if (self.raw.buf.len > 0) self.bufferPool().wsRelease(self.raw.buf);
         self.allocator.destroy(self);
     }
 
@@ -326,21 +341,32 @@ pub const Conn = struct {
     }
 
     /// Bytes to write next, taken from the shared queue when the wire is
-    /// empty (its buffer and all). Empty means nothing is pending.
+    /// empty (its buffer and all; or, with messages to compress, a chunk
+    /// of them compressed). Empty means nothing is pending.
     pub fn wireBytes(self: *Self) []const u8 {
         if (self.wire_pos == self.wire.len) {
             self.releaseWire();
-            self.mutex.lock();
-            self.queuePongLocked();
-            if (self.shared.len > 0) self.batch_hint = self.shared.len;
-            self.wire = self.shared;
-            self.shared = .{};
-            const compress = self.to_compress;
-            self.to_compress = false;
-            self.mutex.unlock();
-            if (compress) self.compressWire();
+            if (self.raw.len == 0) {
+                self.mutex.lock();
+                self.queuePongLocked();
+                if (self.shared.len > 0) self.batch_hint = self.shared.len;
+                const taken = self.shared;
+                self.shared = .{};
+                const compress = self.to_compress;
+                self.to_compress = false;
+                self.mutex.unlock();
+                if (compress) self.raw = taken else self.wire = taken;
+            }
+            if (self.raw.len > 0) self.compressSome();
         }
         return self.wire.bytes()[self.wire_pos..];
+    }
+
+    /// Bytes of messages compressed since the last call (the worker's
+    /// turns count them with the bytes it writes).
+    pub fn takeCompressed(self: *Self) usize {
+        defer self.compressed = 0;
+        return self.compressed;
     }
 
     /// The wire is written: its buffer goes back to the pool.
@@ -350,28 +376,38 @@ pub const Conn = struct {
         self.wire_pos = 0;
     }
 
-    /// Compresses the messages marked in `wire` into a buffer that
-    /// replaces it. One that doesn't shrink, or meets a failure, goes out
-    /// as it is (RSV1 cleared).
-    fn compressWire(self: *Self) void {
-        const src = self.wire.bytes();
+    /// The frame at the start of `src`: its header's and its payload's
+    /// lengths.
+    fn frameAt(src: []const u8) struct { hl: usize, n: usize } {
+        const b1 = src[1] & 0x7f;
+        return switch (b1) {
+            126 => .{ .hl = 4, .n = std.mem.readInt(u16, src[2..4], .big) },
+            127 => .{ .hl = 10, .n = @intCast(std.mem.readInt(u64, src[2..10], .big)) },
+            else => .{ .hl = 2, .n = b1 },
+        };
+    }
+
+    /// Compresses the next chunk of `raw`'s messages, those marked, into
+    /// a buffer that becomes the wire. One that doesn't shrink, or meets a
+    /// failure, goes out as it is (RSV1 cleared). Every frame is a whole
+    /// message, and the server takes no context over (RFC 7692 §7.1.1):
+    /// any frame boundary can end a chunk.
+    fn compressSome(self: *Self) void {
+        const src = self.raw.bytes()[self.raw_pos..];
+        var end: usize = 0;
+        while (end < src.len and (end == 0 or end < compress_chunk)) {
+            const f = frameAt(src[end..]);
+            end += f.hl + f.n;
+        }
         // Frames only shrink, and a frame is compressed after a gap the size
         // of the longest header.
-        var out: Queue = .{ .buf = self.bufferPool().wsAcquire(src.len + 10) catch return self.uncompressWire() };
+        var out: Queue = .{ .buf = self.bufferPool().wsAcquire(end + 10) catch return self.uncompressRaw() };
         const d = self.bufferPool().wsDeflater() catch null;
         var i: usize = 0;
-        while (i < src.len) {
-            const b1 = src[i + 1] & 0x7f;
-            const hl: usize = switch (b1) {
-                126 => 4,
-                127 => 10,
-                else => 2,
-            };
-            const n: usize = switch (b1) {
-                126 => std.mem.readInt(u16, src[i + 2 ..][0..2], .big),
-                127 => @intCast(std.mem.readInt(u64, src[i + 2 ..][0..8], .big)),
-                else => b1,
-            };
+        while (i < end) {
+            const f = frameAt(src[i..]);
+            const hl = f.hl;
+            const n = f.n;
             const frame = src[i..][0 .. hl + n];
             i += frame.len;
             if (frame[0] & 0x40 != 0) {
@@ -394,31 +430,34 @@ pub const Conn = struct {
             out.len += frame.len;
         }
         self.mutex.lock();
-        self.queued = self.queued - src.len + out.len;
+        self.queued = self.queued - end + out.len;
         self.mutex.unlock();
-        self.bufferPool().wsRelease(self.wire.buf);
+        self.compressed += end;
+        self.raw_pos += end;
+        if (self.raw_pos == self.raw.len) self.releaseRaw();
         self.wire = out;
     }
 
-    /// Sends the marked messages uncompressed.
-    fn uncompressWire(self: *Self) void {
-        var i: usize = 0;
-        const w = self.wire.bytes();
+    /// No buffer to compress into: the rest of `raw` goes out as it is,
+    /// as the wire.
+    fn uncompressRaw(self: *Self) void {
+        const w = self.raw.bytes();
+        var i: usize = self.raw_pos;
         while (i < w.len) {
             w[i] &= ~@as(u8, 0x40);
-            const b1 = w[i + 1] & 0x7f;
-            const hl: usize = switch (b1) {
-                126 => 4,
-                127 => 10,
-                else => 2,
-            };
-            const n: usize = switch (b1) {
-                126 => std.mem.readInt(u16, w[i + 2 ..][0..2], .big),
-                127 => @intCast(std.mem.readInt(u64, w[i + 2 ..][0..8], .big)),
-                else => b1,
-            };
-            i += hl + n;
+            const f = frameAt(w[i..]);
+            i += f.hl + f.n;
         }
+        self.wire = self.raw;
+        self.wire_pos = self.raw_pos;
+        self.raw = .{};
+        self.raw_pos = 0;
+    }
+
+    fn releaseRaw(self: *Self) void {
+        if (self.raw.buf.len > 0) self.bufferPool().wsRelease(self.raw.buf);
+        self.raw = .{};
+        self.raw_pos = 0;
     }
 
     /// `n` bytes of `wireBytes` are written (and no longer read: an
@@ -439,7 +478,7 @@ pub const Conn = struct {
 
     /// Whether anything is queued, on the wire or in the shared queue.
     pub fn hasOutput(self: *Self) bool {
-        if (self.hasWire() or self.pong_len != null) return true;
+        if (self.hasWire() or self.raw.len > 0 or self.pong_len != null) return true;
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.shared.len > 0;
@@ -775,6 +814,69 @@ test "permessage-deflate: sends are compressed on the way to the wire" {
         }
         try testing.expectEqual(@as(usize, 0), rest.len);
     }
+}
+
+test "permessage-deflate: a long queue is compressed a chunk at a time, as the wire is written, its messages whole and in order" {
+    const h = try Harness.init(.{ .max_send_queue_bytes = 64 << 20, .deflate = .{ .min_size = 32 } });
+    defer h.deinit();
+    h.conn.enableDeflate(.{ .enabled = true });
+    const big = try testing.allocator.alloc(u8, 200 * 1024);
+    defer testing.allocator.free(big);
+    // 64 messages of 40 KiB, one of 200 KiB (larger than a chunk), a ping
+    // and a short one in between: each compresses a thousandfold.
+    for (0..64) |i| {
+        @memset(big[0 .. 40 * 1024], letter(i));
+        try h.conn.send(big[0 .. 40 * 1024], true);
+        if (i == 10) {
+            @memset(big, 'Z');
+            try h.conn.send(big, true);
+            try h.conn.ping("p");
+            try h.conn.send("short", false);
+        }
+    }
+    var got: inflate.Out = .{ .buf = &.{}, .max = 1 << 20, .pool = &h.pool };
+    defer if (got.buf.len > 0) h.pool.releaseLarge(got.buf);
+    var chunks: usize = 0;
+    var seen: usize = 0;
+    while (true) {
+        const bytes = h.conn.wireBytes();
+        const taken = h.conn.takeCompressed();
+        if (bytes.len == 0) break;
+        chunks += 1;
+        // Under a chunk's worth, but for the message that crosses the line.
+        try testing.expect(taken < Conn.compress_chunk + big.len + 10);
+        var rest = bytes;
+        while (rest.len > 0) {
+            const f = try takeFrame(&rest);
+            const i = seen;
+            seen += 1;
+            if (i == 11) {
+                try testing.expect(f.rsv1);
+                const m = try messageOf(&h.pool, f, &got);
+                try testing.expectEqual(big.len, m.len);
+                try testing.expect(std.mem.allEqual(u8, m, 'Z'));
+            } else if (i == 12) {
+                try testing.expectEqual(@as(u4, @backingInt(Opcode.ping)), f.op);
+            } else if (i == 13) {
+                try testing.expectEqualStrings("short", f.payload);
+            } else {
+                const k = if (i < 11) i else i - 3;
+                try testing.expect(f.rsv1);
+                const m = try messageOf(&h.pool, f, &got);
+                try testing.expectEqual(@as(usize, 40 * 1024), m.len);
+                try testing.expect(std.mem.allEqual(u8, m, letter(k)));
+            }
+        }
+        h.conn.advance(bytes.len);
+    }
+    try testing.expectEqual(@as(usize, 67), seen);
+    try testing.expect(chunks >= 30);
+    try testing.expectEqual(@as(usize, 0), h.conn.queued);
+    try testing.expect(!h.conn.hasOutput());
+}
+
+fn letter(i: usize) u8 {
+    return @as(u8, 'a') + @as(u8, @intCast(i % 26));
 }
 
 test "partial writes resume where they stopped" {

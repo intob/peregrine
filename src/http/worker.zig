@@ -35,8 +35,9 @@ fn isH2(alpn: ?[]const u8) bool {
 }
 /// Connections accepted per listener event, to stay fair to existing ones.
 const ACCEPT_BATCH = 64;
-/// WebSocket bytes moved per turn of a connection (read, written or
-/// encrypted, over all of one event's or one post's reads and writes):
+/// WebSocket bytes moved per turn of a connection (read, written,
+/// encrypted or compressed, over all of one event's or one post's reads
+/// and writes):
 /// the rest waits for the next pass of the loop, after the others' events
 /// and the timers. Measured with a storm over TLS on one connection and requests on
 /// another (worst wait, Debug / ReleaseSafe): 128 KiB 30 / 12 ms, 256 KiB
@@ -1707,6 +1708,7 @@ pub fn Worker(comptime Handler: type) type {
                     }
                     if (self.ws_turn == 0) return self.wsTurnOver(c, progress);
                     const bytes = w.wireBytes();
+                    self.spendTurn(w.takeCompressed());
                     if (bytes.len == 0) break;
                     const n = t.encrypt(&.{bytes}) catch {
                         self.closeConn(c);
@@ -1718,6 +1720,7 @@ pub fn Worker(comptime Handler: type) type {
                 }
                 if (self.ws_turn == 0) return self.wsTurnOver(c, progress);
                 const wire = w.wireBytes();
+                self.spendTurn(w.takeCompressed());
                 if (wire.len == 0) break;
                 const max = switch (self.kernelGate(c)) {
                     .ready => |max| max,
