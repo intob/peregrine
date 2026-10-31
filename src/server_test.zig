@@ -2563,7 +2563,10 @@ fn testWsPourPingClose(backend: Backend) !void {
                 }
                 const f = try p.read(buf, &pool, &inflated);
                 switch (f.op) {
-                    .binary => try testing.expect(!pong),
+                    // The sender may get a message in between the pong
+                    // and the close echo (RFC 6455 allows data until our
+                    // close frame).
+                    .binary => {},
                     .pong => {
                         try testing.expectEqualStrings("pp", f.data);
                         pong = true;
