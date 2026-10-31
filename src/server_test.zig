@@ -2044,6 +2044,61 @@ fn testWsEchoFloodFair(backend: Backend) !void {
     }
 }
 
+test "websocket: the client's close and FIN behind a turn's worth of output: the output, the close echo, then the socket closes (plain, TLS)" {
+    try forEachBackend(testWsHalfCloseBehindTurn);
+}
+
+fn testWsHalfCloseBehindTurn(backend: Backend) !void {
+    // Reading goes on after a turn ends with output left; the FIN read
+    // then closed the connection at once, the queue unwritten and the
+    // close echo with it. (A sender that never stops would keep a slower
+    // client's socket full, and backpressure would leave the close unread.)
+    for ([_]bool{ false, true }) |tls| {
+        errdefer std.debug.print("{s} {s}\n", .{ @tagName(backend), if (tls) "tls" else "plain" });
+        var cfg: Config = if (tls) tlsConfig() else .{};
+        cfg.worker_thread_count = 1;
+        const r = try Running.start(backend, cfg);
+        defer r.stop();
+        var p = try WsPeer.open(r.port, tls, false);
+        defer p.close();
+        const buf = try testing.allocator.alloc(u8, 1 << 20);
+        defer testing.allocator.free(buf);
+        var pool = try BufferPool.init(testing.allocator, 1024, 1);
+        defer pool.deinit();
+        var inflated: ws.inflate.Out = .{ .buf = &.{}, .max = 4 << 20, .pool = &pool };
+        defer if (inflated.buf.len > 0) pool.releaseLarge(inflated.buf);
+        // The handler fills the queue (4 MiB) at once; it waits on us.
+        try p.send(.text, "flood");
+        sleepMs(200);
+        // The close and the FIN in one go, read once a turn ends with the
+        // socket taking more.
+        try p.send(.close, "\x03\xe8");
+        const fd = switch (p) {
+            .plain => |c| c.fd,
+            .tls => |t| t.fd,
+        };
+        _ = std.posix.system.shutdown(fd, std.posix.SHUT.WR);
+        var messages: usize = 0;
+        while (true) : (messages += 1) {
+            const f = p.read(buf, &pool, &inflated) catch |err| {
+                std.debug.print("{s} after {d} messages: no close echo\n", .{ @errorName(err), messages });
+                return error.CloseNeverEchoed;
+            };
+            switch (f.op) {
+                .binary => {},
+                .close => {
+                    try testing.expectEqualStrings("\x03\xe8", f.data);
+                    break;
+                },
+                else => return error.UnexpectedOpcode,
+            }
+        }
+        // Nothing after the echo: the server closes the socket.
+        try testing.expectError(error.EndOfStream, p.read(buf, &pool, &inflated));
+        std.debug.print("{s} {s}: {d} messages, then the close echo and EOF\n", .{ @tagName(backend), if (tls) "tls" else "plain", messages });
+    }
+}
+
 /// "pour": one thread sends 64 KiB binary messages until the connection
 /// goes (handleWSDisconn stops it).
 const Pour = struct {

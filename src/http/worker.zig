@@ -1690,7 +1690,14 @@ pub fn Worker(comptime Handler: type) type {
                     if (!self.tlsDecrypt(c, t)) return;
                 }
                 if (!self.wsProcess(c)) return;
-                if (c.peer_closed) return self.closeConn(c);
+                if (c.peer_closed) {
+                    // The peer's FIN (or close_notify): what is queued still
+                    // goes out (the close echo among it), then wsFlush
+                    // closes the socket. Closing now dropped it all when a
+                    // turn had left output.
+                    if (!wsHasWire(c) and !c.ws.?.hasOutput()) return self.closeConn(c);
+                    return;
+                }
             }
         }
 
@@ -1762,7 +1769,9 @@ pub fn Worker(comptime Handler: type) type {
                 // Socket buffer full: wait for writability.
                 if (n < bytes.len) return self.wsBlocked(c, true);
             }
-            if (w.wantsClose()) {
+            // Everything is written: the close handshake is over, or the
+            // peer has closed its side.
+            if (w.wantsClose() or c.peer_closed) {
                 self.closeConn(c);
                 return false;
             }
