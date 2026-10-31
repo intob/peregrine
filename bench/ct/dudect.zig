@@ -102,6 +102,32 @@ const cases = [_]Case{
     .{ .name = "rsa2048 privateOp fixed vs random", .kind = .rsa, .fixed = 0x3c1f7a92d0e5b8146a2f9c3e7d5b1a08f6e4c2a0193b5d7f8e6c4a2b0d9f7e5c },
 };
 
+/// dP and dQ patterns for the exponent cases.
+const ExpPattern = enum { zeros, ones, runs, top_only, random };
+
+const exp_cases = [_]struct { name: []const u8, a: ExpPattern, b: ExpPattern }{
+    .{ .name = "rsa2048 privateOp dP,dQ=0 vs random", .a = .zeros, .b = .random },
+    .{ .name = "rsa2048 privateOp dP,dQ=0xff.. vs random", .a = .ones, .b = .random },
+    .{ .name = "rsa2048 privateOp dP,dQ runs of 64 zero/one bytes vs random", .a = .runs, .b = .random },
+    .{ .name = "rsa2048 privateOp dP,dQ=0x80 00.. vs random", .a = .top_only, .b = .random },
+    .{ .name = "rsa2048 privateOp dP,dQ=0 vs 0xff..", .a = .zeros, .b = .ones },
+};
+
+fn fillExp(e: []u8, pat: ExpPattern, r: std.Random) void {
+    switch (pat) {
+        .zeros => @memset(e, 0),
+        .ones => @memset(e, 0xff),
+        .runs => for (e, 0..) |*b, i| {
+            b.* = if ((i / 64) % 2 == 0) 0 else 0xff;
+        },
+        .top_only => {
+            @memset(e, 0);
+            e[0] = 0x80;
+        },
+        .random => r.bytes(e),
+    }
+}
+
 fn lessThan(_: void, a: u64, b: u64) bool {
     return a < b;
 }
@@ -187,6 +213,54 @@ pub fn main(init: std.process.Init) !void {
             const t0 = ticks();
             run(cs.kind, in, m, &peers);
             t.* = ticks() - t0;
+        }
+        @memcpy(sorted[0..samples], times[0..samples]);
+        std.mem.sort(u64, sorted[0..samples], {}, lessThan);
+        const pcts = [_]f64{ 1.0, 0.99, 0.95, 0.9, 0.75, 0.5, 0.25, 0.1 };
+        var worst: f64 = 0;
+        var line: [512]u8 = undefined;
+        var w = std.Io.Writer.fixed(&line);
+        for (pcts) |pc| {
+            const idx = @min(samples - 1, @as(usize, @intFromFloat(pc * @as(f64, @floatFromInt(samples - 1)))));
+            const cut = sorted[idx];
+            var welch: Welch = .{};
+            for (class[0..samples], times[0..samples]) |c, t| {
+                if (t <= cut) welch.push(c, @floatFromInt(t));
+            }
+            const t = welch.t();
+            if (@abs(t) > @abs(worst)) worst = t;
+            try w.print(" p{d:.0}:{d:.2}", .{ pc * 100, t });
+        }
+        worst_all = @max(worst_all, @abs(worst));
+        std.debug.print("{s}: N={} median={} ticks, max|t|={d:.2} [{s}]\n", .{ cs.name, samples, sorted[samples / 2], @abs(worst), w.buffered() });
+    }
+    // RSA with the exponents varying (the base fixed): dP and dQ of each
+    // class written into the key before every sample (outside the timed
+    // part), so long runs of zero or one bits, a lone top bit and all
+    // zeros (every window selects table entry 0) meet random exponents.
+    for (exp_cases) |cs| {
+        if (args.len > 2) {
+            var want = false;
+            for (args[2..]) |a| {
+                if (std.mem.indexOf(u8, cs.name, a) != null) want = true;
+            }
+            if (!want) continue;
+        }
+        const samples = ms.len;
+        var key = peers.rsa;
+        var m: [256]u8 = undefined;
+        r.bytes(&m);
+        m[0] = 0;
+        for (class[0..samples]) |*c| c.* = r.int(u1);
+        for (0..@min(20, samples)) |_| key.privateOp(&m, &ms[0]) catch unreachable;
+        for (class[0..samples], times[0..samples]) |c, *t| {
+            fillExp(key.dp[0..key.p_len], if (c == 0) cs.a else cs.b, r);
+            fillExp(key.dq[0..key.q_len], if (c == 0) cs.a else cs.b, r);
+            var s: [256]u8 = undefined;
+            const t0 = ticks();
+            key.privateOp(&m, &s) catch unreachable;
+            t.* = ticks() - t0;
+            std.mem.doNotOptimizeAway(&s);
         }
         @memcpy(sorted[0..samples], times[0..samples]);
         std.mem.sort(u64, sorted[0..samples], {}, lessThan);

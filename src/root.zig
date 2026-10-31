@@ -70,6 +70,7 @@ test {
     _ = @import("./tls/mont.zig");
     _ = @import("./tls/rsa.zig");
     _ = @import("./tls/rsa_verify.zig");
+    _ = @import("./tls/rsa_stress.zig");
     _ = @import("./tls/ticket.zig");
     _ = @import("./tls/handshake.zig");
     _ = @import("./tls/conn.zig");
