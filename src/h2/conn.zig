@@ -6263,3 +6263,53 @@ test "priorities: held output behind a window-blocked urgent stream and a slow r
         }
     }
 }
+
+
+test "priorities: DATA for a tunnel or a streamed body waiting behind others doesn't buy a pass per frame" {
+    const big = try testing.allocator.alloc(u8, 100_000);
+    defer testing.allocator.free(big);
+    @memset(big, 'b');
+    for ([_]bool{ false, true }) |tunnel| {
+        const h = try Harness.init(.{ .enable_connect_protocol = true });
+        defer h.deinit();
+        h.handler.big = big;
+        try h.preface();
+        try h.settings(&.{.{ .id = .initial_window_size, .value = 1 << 20 }});
+        // Stream 1 (u=0) waits for the connection window, twenty u=7
+        // answers behind it.
+        var frames: std.ArrayList(u8) = .empty;
+        defer frames.deinit(testing.allocator);
+        try appendGet(h, &frames, 1, "/big", "u=0");
+        var id: u31 = 3;
+        while (id <= 41) : (id += 2) try appendGet(h, &frames, id, "/big", "u=7");
+        try h.feed(frames.items);
+        // Stream 43 at u=7: a WebSocket (with the head of a message far
+        // larger than what follows), or an upload whose handler holds its
+        // exchange. It has nothing to send.
+        if (tunnel) {
+            try h.headers(.{ .stream = 43, .end_stream = false, .fields = &.{
+                .{ .name = ":method", .value = "CONNECT" },
+                .{ .name = ":protocol", .value = "websocket" },
+                .{ .name = ":scheme", .value = "https" },
+                .{ .name = ":path", .value = "/ws" },
+                .{ .name = ":authority", .value = "example.com" },
+                .{ .name = "priority", .value = "u=7" },
+            } });
+            try h.data(43, &.{ 0x82, 0xfe, 0xea, 0x60, 1, 2, 3, 4 }, false);
+        } else {
+            frames.clearRetainingCapacity();
+            try appendRequest(h, &frames, 43, "POST", "/up", "u=7", false);
+            try h.feed(frames.items);
+        }
+        h.events.clearRetainingCapacity();
+        // Its DATA, a byte at a time.
+        frames.clearRetainingCapacity();
+        const n = 2000;
+        for (0..n) |_| try appendData(&frames, 43, "x", false);
+        const before = h.conn.passes;
+        try h.feed(frames.items);
+        const passes = h.conn.passes - before;
+        if (passes >= n / 10) std.debug.print("{s}: {d} passes over every stream for {d} DATA frames\n", .{ if (tunnel) "tunnel" else "body", passes, n });
+        try testing.expect(passes < n / 10);
+    }
+}
