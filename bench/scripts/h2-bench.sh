@@ -6,7 +6,9 @@
 # each round. CPU per request is the server cgroup's CPU time over h2load's
 # main phase (after a 2 s warm-up on the same connections) per request.
 # Usage: h2-bench.sh h2c|tls|h3 [SERVER...]
-#   SERVER: peregrine-epoll peregrine-uring nginx h2o (default: all four)
+#   SERVER: peregrine-epoll peregrine-uring nginx h2o (default: all four);
+#   peregrine-epoll-alt and peregrine-uring-alt run the bench-server in
+#   ALT_BIN instead (an A/B against another build, interleaved)
 #   ROUNDS (2), DUR seconds per run (10), CASES (default "hello-10x100
 #   hello-256x1 64k-10x10"): NAME-CONNSxSTREAMS, NAME hello, 64k (peregrine
 #   from memory) or 64kfile (peregrine preads its file per response, as
@@ -14,28 +16,32 @@
 #   NGINX_KEEPALIVE=default: nginx's keepalive_requests 1000 (see nginx.conf)
 #   BUILD=0: use the peregrine binaries already in $OUT/linux/bin (A/B runs)
 #   SERVER_ARGS: more bench-server arguments (e.g. nopace, noecn)
+#   PRIORITY: a `priority` header (RFC 9218) on every request, e.g. "u=3, i"
 # TLS and h3 runs pin TLS_AES_128_GCM_SHA256 and X25519 and check them.
 # Images: peregrine-h3load (h2load 1.70 with HTTP/3, nginx 1.30), comp-h2o23
 # (docker build -t comp-h2o23 bench/competitors/h2o), peregrine-bench.
 source "$(dirname "$0")/env.sh"
 BIN=$OUT/linux/bin
-usage() { sed -n '2,19p' "$0"; exit 1; }
+usage() { sed -n '2,22p' "$0"; exit 1; }
 proto=$1; shift
 case $proto in h2c) port=8080 mode=plain ;; tls) port=8443 mode=tls ;; h3) port=8443 mode=h3 ;; *) usage ;; esac
 servers=${*:-peregrine-epoll peregrine-uring nginx h2o}
 ROUNDS=${ROUNDS:-2}; DUR=${DUR:-10}
 CASES=${CASES:-hello-10x100 hello-256x1 64k-10x10}
-for s in $servers; do case $s in peregrine-epoll | peregrine-uring | nginx | h2o) ;; *) echo "unknown server $s"; usage ;; esac; done
+for s in $servers; do case $s in peregrine-epoll | peregrine-uring | nginx | h2o) ;;
+    peregrine-epoll-alt | peregrine-uring-alt) [ -x "${ALT_BIN:-}/bench-server" ] || { echo "$s needs ALT_BIN"; usage; } ;;
+    *) echo "unknown server $s"; usage ;; esac; done
 for c in $CASES; do [[ $c =~ ^(hello|64k|64kfile)-[1-9][0-9]*x[1-9][0-9]*$ ]] || { echo "bad case $c"; usage; }; done
 [ "$proto" = h2c ] && url=http://127.0.0.1:$port || url=https://127.0.0.1:$port
 tlsargs=(); [ "$proto" != h2c ] && tlsargs=(--tls13-ciphers=TLS_AES_128_GCM_SHA256 --groups=X25519)
 [ "$proto" = h3 ] && tlsargs+=(--alpn-list=h3)
 want_alpn=h2; [ "$proto" = h3 ] && want_alpn=h3
+loadargs=(); [ -n "${PRIORITY:-}" ] && loadargs=(-H "priority: $PRIORITY")
 
 server() { # NAME -> "IMAGE|CMD"
     case $1 in
-    peregrine-epoll) echo "peregrine-bench|exec /b/bench-server 6 epoll $port $mode ${SERVER_ARGS:-}" ;;
-    peregrine-uring) echo "peregrine-bench|exec /b/bench-server 6 io_uring $port $mode ${SERVER_ARGS:-}" ;;
+    peregrine-epoll | peregrine-epoll-alt) echo "peregrine-bench|exec /b/bench-server 6 epoll $port $mode ${SERVER_ARGS:-}" ;;
+    peregrine-uring | peregrine-uring-alt) echo "peregrine-bench|exec /b/bench-server 6 io_uring $port $mode ${SERVER_ARGS:-}" ;;
     nginx) local sed="true"
         [ "${NGINX_KEEPALIVE:-}" = default ] && sed="sed -i 's/^ *keepalive_requests/#&/' /tmp/nginx.conf"
         echo "peregrine-h3load|mkdir -p /tmp/www && head -c 65536 /dev/zero | tr '\\0' x > /tmp/www/64k && cp /bench/competitors/nginx/nginx.conf /tmp/ && $sed && exec nginx -c /tmp/nginx.conf" ;;
@@ -63,13 +69,14 @@ for round in $(seq "$ROUNDS"); do
     name=${c%%-*}; cs=${c#*-}; conns=${cs%x*}; streams=${cs#*x}
     for s in $servers; do
       spec=$(server "$s"); path=$(path_of "$s" "$name")
+      bin=$BIN; [ "${s%-alt}" != "$s" ] && bin=$ALT_BIN
       docker run -d --name h2b-srv-$TAG --cpuset-cpus 0-5 --ulimit nofile=65536:65536 \
-        --security-opt seccomp="$SECCOMP" -v "$BIN":/b -v "$ROOT/bench":/bench:ro "${spec%%|*}" sh -c "${spec#*|}" >/dev/null || exit 1
+        --security-opt seccomp="$SECCOMP" -v "$bin":/b -v "$ROOT/bench":/bench:ro "${spec%%|*}" sh -c "${spec#*|}" >/dev/null || exit 1
       sleep 1.5
       # -t: on a tty h2load's output is line-buffered, so its phase markers
       # arrive as they happen.
       docker run -d -t --name h2b-cli-$TAG --cpuset-cpus 6-11 --network container:h2b-srv-$TAG peregrine-h3load:latest \
-        h2load "${tlsargs[@]}" -t6 -c"$conns" -m"$streams" --warm-up-time=2 -D"$DUR" "$url$path" >/dev/null || exit 1
+        h2load "${tlsargs[@]}" "${loadargs[@]}" -t6 -c"$conns" -m"$streams" --warm-up-time=2 -D"$DUR" "$url$path" >/dev/null || exit 1
       # The main phase, from h2load's own markers (the first thread's).
       t0= t1= w0= w1=
       while IFS= read -r line; do

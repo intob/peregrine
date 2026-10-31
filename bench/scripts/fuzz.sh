@@ -8,7 +8,8 @@
 # Usage: fuzz.sh "fuzz: ws inflate" MINUTES JOBS [HOST]
 source "$(dirname "$0")/env.sh"
 T=$1; MIN=${2:-15}; JOBS=${3:-2}; HOST=${4:-local}
-name=$(echo "$T" | tr -c 'a-zA-Z0-9\n' '-')
+[[ -n $T && $MIN =~ ^[1-9][0-9]*$ && $JOBS =~ ^[1-9][0-9]*$ && $HOST =~ ^[a-z0-9-]+$ ]] || { sed -n 8p "$0"; exit 1; }
+name=$(printf '%s' "$T" | tr -c 'a-zA-Z0-9' '-')
 # The filter goes in single quotes below, each ' in it as '\'' ("fuzz: h2
 # connections sharing a worker's pool").
 q=$(printf '%s' "$T" | sed "s/'/'\\\\''/g")

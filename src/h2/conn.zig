@@ -390,6 +390,14 @@ pub const Conn = struct {
 
     /// Streams with `blocked` set.
     blocked_count: u32 = 0,
+    /// A stream's output yielded to more urgent streams waiting for room
+    /// or for the connection window. The next pass over every stream runs
+    /// before the next frame is read, not at the end of the read, so what
+    /// goes out depends on the frames and not on where reads end (a
+    /// stream the next frame resets or ends gets the same output however
+    /// the input was split). Output stopped for room in `out` waits for the
+    /// worker's pump once written, as before.
+    held: bool = false,
     /// Scratch for `pumpAll`: stream slots in sending order.
     order: []u32,
     /// Per urgency: the incremental stream served last, so the next pass
@@ -802,6 +810,11 @@ pub const Conn = struct {
             // not read, however it was split.
             if (self.wantsClose()) return .close;
             if (self.unsent() > self.opts.out_limit) return .flush;
+            if (self.held) {
+                self.pumpAll(Handler, ctx);
+                if (self.wantsClose()) return .close;
+                if (self.unsent() > self.opts.out_limit) return .flush;
+            }
             if (self.state == .preface) {
                 const data = self.reader.buf[self.reader.start..self.reader.end];
                 if (data.len < frame.preface.len) {
@@ -1506,6 +1519,7 @@ pub const Conn = struct {
             self.appendTo(&s.pending, resp.body[sent..]) catch return self.fail(.internal_error);
             s.pending_end = true;
             self.output_streams += 1;
+            if (yield) self.held = true;
             self.setBlocked(s, yield or s.send_window > 0);
             return;
         }
@@ -1674,6 +1688,9 @@ pub const Conn = struct {
     /// Sends for every stream with output, in priority order (RFC 9218
     /// §10), until `out` is full.
     fn pumpAll(self: *Self, comptime Handler: type, ctx: *const Context(Handler)) void {
+        // Only a new yield holds output again: a pass that sends nothing
+        // doesn't run again before the next frame.
+        self.held = false;
         if (self.output_streams == 0 or self.failed) return;
         var n: usize = 0;
         for (self.streams, 0..) |entry, slot| {
@@ -1772,13 +1789,15 @@ pub const Conn = struct {
     }
 
     /// Sends what a stream has queued, unless more urgent streams are
-    /// waiting for room: then it waits too, for the next `pumpAll` (the
-    /// worker's once `out` drains, or a WINDOW_UPDATE's).
+    /// waiting for room: then it waits too, for the next `pumpAll` (before
+    /// the next frame, the worker's once `out` drains, or a
+    /// WINDOW_UPDATE's).
     fn pumpStream(self: *Self, comptime Handler: type, ctx: *const Context(Handler), s: *Stream) void {
         if (self.failed) return;
         if (self.blocked_count > 0 and self.mustYield(s)) {
             if (!s.hasOutput()) return;
             if (s.ws != null) s.ws_pending = true;
+            self.held = true;
             return self.setBlocked(s, true);
         }
         self.sendStream(Handler, ctx, s, std.math.maxInt(usize));
@@ -2056,6 +2075,7 @@ pub const Conn = struct {
         }
         self.stream_count = 0;
         self.blocked_count = 0;
+        self.held = false;
         if (!keep_reader) self.reader.deinit(pool);
         self.giveBack(&self.out);
         self.giveBack(&self.wire);
@@ -2391,10 +2411,15 @@ const Harness = struct {
     per_stream: std.AutoHashMap(u32, std.ArrayList(u8)),
     /// The most a "write" takes (a slow reader below the maximum).
     write_max: usize = std.math.maxInt(usize),
+    /// Bytes were "written" since the last pump (see `run`).
+    wrote: bool = false,
     /// When set, every stream's DATA must be this body, in order: how far
     /// each stream got.
     check_body: ?[]const u8 = null,
     body_pos: std.AutoHashMapUnmanaged(u32, usize) = .empty,
+    /// Streams the client reset, and how much of `out` the server had
+    /// written when it read the RST_STREAM (see `feedNotingResets`).
+    reset_read: std.AutoHashMapUnmanaged(u32, usize) = .empty,
     /// Another harness's pool, when connections share a worker's (see
     /// `share`); `pool` is then unused.
     shared: ?*BufferPool = null,
@@ -2484,6 +2509,7 @@ const Harness = struct {
         while (it.next()) |l| l.deinit(a);
         h.per_stream.deinit();
         h.body_pos.deinit(a);
+        h.reset_read.deinit(a);
         a.destroy(h);
     }
 
@@ -2510,6 +2536,7 @@ const Harness = struct {
         const all = h.conn.wireBytes();
         const bytes = all[0..@min(all.len, h.write_max)];
         try h.out.appendSlice(a, bytes);
+        if (bytes.len > 0) h.wrote = true;
         var rest = bytes;
         while (rest.len > 0) {
             const space = try h.creader.readSpace(&h.cpool, .{ .max_frame_size = frame.max_max_frame_size });
@@ -2617,6 +2644,13 @@ const Harness = struct {
             try h.collect();
             try h.drainMailbox();
             try h.collect();
+            // Both event loops pump once what they wrote has drained:
+            // streams stopped for room in `out` continue.
+            while (h.wrote and h.conn.unsent() == 0 and h.last != .close) {
+                h.wrote = false;
+                h.conn.pump(TestHandler, &c);
+                try h.collect();
+            }
             if (h.last != .flush) break;
         }
         h.conn.releaseIfIdle(h.bp());
@@ -4419,6 +4453,9 @@ test "priorities: urgency orders streams waiting for room in out_limit" {
     try h.settings(&.{.{ .id = .initial_window_size, .value = 1 << 20 }});
     try h.window(0, 1 << 20);
     h.events.clearRetainingCapacity();
+    // A slow reader (less than out_limit per write): the requests arrive
+    // while streams wait for room.
+    h.write_max = 1000;
     var frames: std.ArrayList(u8) = .empty;
     defer frames.deinit(testing.allocator);
     try appendGet(h, &frames, 1, "/big", "u=7");
@@ -4524,47 +4561,100 @@ test "priorities: an exchange waiting behind other streams doesn't time out" {
     try h.expectEvents("rst 3 internal_error\n");
 }
 
-test "priorities: an answer waiting behind other streams goes out when the read ends, unless the client resets it first" {
-    // So how much of a stream the client resets went out depends on where
-    // reads end, as it would over a socket; the fuzz targets' comparisons
-    // allow for it.
-    for ([_]bool{ false, true }) |same_read| {
+// An answer that waits behind a more urgent stream goes out before the next
+// frame is read, so what the next frame finds (and what the client gets)
+// doesn't depend on where reads end. Before, it went at the end of the read.
+
+/// A request HEADERS frame with a `priority` header.
+fn appendRequest(h: *Harness, out: *std.ArrayList(u8), stream: u31, method: []const u8, path: []const u8, priority: []const u8, end_stream: bool) !void {
+    const block = try h.encodeFields(&.{
+        .{ .name = ":method", .value = method },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = path },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = "priority", .value = priority },
+    });
+    defer testing.allocator.free(block);
+    var buf: [256]u8 = undefined;
+    const flags = frame.flag.end_headers | @as(u8, if (end_stream) frame.flag.end_stream else 0);
+    const n = try frame.writeHeaders(&buf, stream, flags, block);
+    try out.appendSlice(testing.allocator, buf[0..n]);
+}
+
+fn appendData(out: *std.ArrayList(u8), stream: u31, bytes: []const u8, end: bool) !void {
+    var buf: [frame.header_len + 64]u8 = undefined;
+    try out.appendSlice(testing.allocator, buf[0..try frame.writeData(&buf, stream, end, bytes)]);
+}
+
+/// `script` (client frames, and where to cut them) after stream 1 (u=0)
+/// has taken the connection window and waits for more: the same events
+/// fed as one read and as two.
+fn expectSameInOneReadOrTwo(script: *const fn (*Harness, *std.ArrayList(u8)) anyerror!usize, expected: []const u8) !void {
+    const big = try testing.allocator.alloc(u8, 100_000);
+    defer testing.allocator.free(big);
+    @memset(big, 'b');
+    for ([_]bool{ false, true }) |two_reads| {
         const h = try Harness.init(.{});
         defer h.deinit();
-        const big = try testing.allocator.alloc(u8, 100_000);
-        defer testing.allocator.free(big);
-        @memset(big, 'b');
         h.handler.big = big;
         try h.preface();
         try h.settings(&.{.{ .id = .initial_window_size, .value = 1 << 20 }});
         var frames: std.ArrayList(u8) = .empty;
         defer frames.deinit(testing.allocator);
         try appendGet(h, &frames, 1, "/big", "u=0");
-        try appendGet(h, &frames, 3, "/later", "u=7");
         try h.feed(frames.items);
-        // Stream 1 waits for the connection window; 3's answer waits behind it.
-        try h.handler.exchanges.items[0].respond(.{}, "late");
-        try h.drainMailbox();
-        try h.collect();
         h.events.clearRetainingCapacity();
         frames.clearRetainingCapacity();
-        var buf: [frame.header_len + 8]u8 = undefined;
-        try frames.appendSlice(testing.allocator, buf[0..try frame.writePing(&buf, false, "pingpong")]);
-        const ping_len = frames.items.len;
-        try frames.appendSlice(testing.allocator, buf[0..try frame.writeRstStream(&buf, 3, .cancel)]);
-        if (same_read) {
-            try h.feed(frames.items);
-            try h.expectEvents("ping ack=true pingpong\n");
+        const cut = try script(h, &frames);
+        if (two_reads) {
+            try h.feed(frames.items[0..cut]);
+            try h.feed(frames.items[cut..]);
         } else {
-            try h.feed(frames.items[0..ping_len]);
-            try h.feed(frames.items[ping_len..]);
-            // The head went out (DATA waits for the connection window), then nothing.
-            try h.expectEvents("ping ack=true pingpong\nheaders 3 end=false [:status=200] [content-length=4] [date]\n");
+            try h.feed(frames.items);
         }
-        try testing.expectEqual(@as(u32, 1), h.conn.activeStreams());
-        try h.window(0, 1 << 20);
-        try expectDataRuns(h, "1");
+        try h.expectEvents(expected);
     }
+}
+
+test "priorities: a held answer goes out before the client's RST_STREAM is read, however reads end" {
+    try expectSameInOneReadOrTwo(struct {
+        fn script(h: *Harness, out: *std.ArrayList(u8)) !usize {
+            // Streamed: handleBody answers on END_STREAM, behind stream 1.
+            try appendRequest(h, out, 3, "POST", "/up", "u=7", false);
+            try appendData(out, 3, "body", true);
+            const cut = out.items.len;
+            var buf: [frame.header_len + 4]u8 = undefined;
+            try out.appendSlice(testing.allocator, buf[0..try frame.writeRstStream(&buf, 3, .cancel)]);
+            return cut;
+        }
+    }.script, "headers 3 end=false [:status=200] [content-length=5] [date]\n");
+}
+
+test "priorities: a held answer goes out before DATA after END_STREAM resets its stream, however reads end" {
+    try expectSameInOneReadOrTwo(struct {
+        fn script(h: *Harness, out: *std.ArrayList(u8)) !usize {
+            try appendRequest(h, out, 3, "POST", "/up", "u=7", false);
+            try appendData(out, 3, "body", true);
+            const cut = out.items.len;
+            // Half-closed (remote) and still answering: a stream error.
+            try appendData(out, 3, "more", false);
+            return cut;
+        }
+    }.script, "headers 3 end=false [:status=200] [content-length=5] [date]\nrst 3 stream_closed\n");
+}
+
+test "priorities: a held answer that ends its stream does so before the next frame, however reads end" {
+    try expectSameInOneReadOrTwo(struct {
+        fn script(h: *Harness, out: *std.ArrayList(u8)) !usize {
+            // HEAD needs no window: the answer ends the stream once sent.
+            try appendRequest(h, out, 3, "HEAD", "/up", "u=7", true);
+            const cut = out.items.len;
+            // Closed after END_STREAM both ways: a connection error, not
+            // a stream error as when the answer was still held.
+            try appendData(out, 3, "late", false);
+            return cut;
+        }
+    }.script, "headers 3 end=false [:status=200] [content-length=5] [date]\ndata 3 len=0 end=true\ngoaway last=3 stream_closed\n");
 }
 
 // Any split of the same client bytes gives the same frames per stream.
@@ -5147,17 +5237,20 @@ fn mergeData(lines: []const u8) ![]u8 {
 }
 
 /// Same frames per stream (DATA as runs), same handler logs and the same
-/// DATA bytes. Streams the client reset (`reset`) are the exception: a
-/// response that yields to a more urgent stream waits for the next pass
-/// over every stream, which comes at the end of a read, so how much of it
-/// went out before the RST_STREAM depends on where the reads ended, as it
-/// would over a socket. Their frames and bytes in one run need only be the
-/// start of the other's.
-fn expectSameRun(a: *Harness, b: *Harness, reset: []const u32) !void {
+/// DATA bytes.
+fn expectSameRun(a: *Harness, b: *Harness) !void {
     if (a.conn.failed or b.conn.failed) return expectSameUntilFailure(a, b);
     try testing.expectEqual(a.last, b.last);
-    try expectStreamsIn(a, b, reset);
-    try expectStreamsIn(b, a, reset);
+    try testing.expectEqual(a.per_stream.count(), b.per_stream.count());
+    var ps = a.per_stream.iterator();
+    while (ps.next()) |entry| {
+        const other = b.per_stream.get(entry.key_ptr.*) orelse return error.MissingStream;
+        const x = try mergeData(entry.value_ptr.items);
+        defer testing.allocator.free(x);
+        const y = try mergeData(other.items);
+        defer testing.allocator.free(y);
+        try testing.expectEqualStrings(x, y);
+    }
     try testing.expectEqualStrings(a.handler.log.items, b.handler.log.items);
     try testing.expectEqualStrings(a.handler.bodies.items, b.handler.bodies.items);
     try testing.expectEqualStrings(a.handler.ws_log.items, b.handler.ws_log.items);
@@ -5165,60 +5258,88 @@ fn expectSameRun(a: *Harness, b: *Harness, reset: []const u32) !void {
     defer freeDataMap(&da);
     var db = try dataByStream(b);
     defer freeDataMap(&db);
-    try expectDataIn(&da, &db, reset);
-    try expectDataIn(&db, &da, reset);
-}
-
-/// Each of `a`'s streams in `b`, with the same frames (DATA as runs); for
-/// one in `reset`, frames that agree as far as the shorter goes, or none
-/// in one run.
-fn expectStreamsIn(a: *Harness, b: *Harness, reset: []const u32) !void {
-    var ps = a.per_stream.iterator();
-    while (ps.next()) |entry| {
-        const was_reset = std.mem.indexOfScalar(u32, reset, entry.key_ptr.*) != null;
-        const other = b.per_stream.get(entry.key_ptr.*) orelse {
-            if (was_reset) continue;
-            return error.MissingStream;
-        };
-        const x = try mergeData(entry.value_ptr.items);
-        defer testing.allocator.free(x);
-        const y = try mergeData(other.items);
-        defer testing.allocator.free(y);
-        if (was_reset) try expectLinesAgree(x, y) else try testing.expectEqualStrings(x, y);
-    }
-}
-
-/// Each of `a`'s DATA in `b`, the same bytes; for a stream in `reset`,
-/// one the start of the other.
-fn expectDataIn(a: *const std.AutoHashMap(u32, std.ArrayList(u8)), b: *const std.AutoHashMap(u32, std.ArrayList(u8)), reset: []const u32) !void {
-    var it = a.iterator();
+    try testing.expectEqual(da.count(), db.count());
+    var it = da.iterator();
     while (it.next()) |e| {
-        const was_reset = std.mem.indexOfScalar(u32, reset, e.key_ptr.*) != null;
-        const other = (b.get(e.key_ptr.*) orelse {
-            if (was_reset) continue;
-            return error.MissingStream;
-        }).items;
-        const mine = e.value_ptr.items;
-        const n = if (was_reset) @min(mine.len, other.len) else mine.len;
-        try testing.expectEqualSlices(u8, mine[0..n], other[0..n]);
-        if (!was_reset) try testing.expectEqual(mine.len, other.len);
+        const other = db.get(e.key_ptr.*) orelse return error.MissingStream;
+        try testing.expectEqualSlices(u8, e.value_ptr.items, other.items);
     }
 }
 
-/// The streams a client's script resets, read frame by frame by their
+/// An RST_STREAM in a client's script: its stream, and where in the
+/// script the frame starts and ends.
+const ResetAt = struct { id: u32, start: usize, end: usize };
+
+/// The RST_STREAMs in a client's script, read frame by frame by their
 /// lengths after the preface, as the server reads them.
-fn clientResets(script: []const u8) !std.ArrayList(u32) {
-    var ids: std.ArrayList(u32) = .empty;
-    errdefer ids.deinit(testing.allocator);
-    var rest = script[frame.preface.len..];
-    while (rest.len >= frame.header_len) {
+fn clientResets(script: []const u8) !std.ArrayList(ResetAt) {
+    var found: std.ArrayList(ResetAt) = .empty;
+    errdefer found.deinit(testing.allocator);
+    var at: usize = frame.preface.len;
+    while (script.len - at >= frame.header_len) {
+        const rest = script[at..];
         const len = std.mem.readInt(u24, rest[0..3], .big);
-        if (rest[3] == @backingInt(frame.FrameType.rst_stream))
-            try ids.append(testing.allocator, std.mem.readInt(u32, rest[5..9], .big) & 0x7fff_ffff);
         if (rest.len < frame.header_len + len) break;
-        rest = rest[frame.header_len + len ..];
+        if (rest[3] == @backingInt(frame.FrameType.rst_stream)) try found.append(testing.allocator, .{
+            .id = std.mem.readInt(u32, rest[5..9], .big) & 0x7fff_ffff,
+            .start = at,
+            .end = at + frame.header_len + len,
+        });
+        at += frame.header_len + len;
     }
-    return ids;
+    return found;
+}
+
+/// Feeds `bytes`, from `pos` in the client's script, noting for each
+/// stream reset how much the server had written before it read the
+/// first RST_STREAM in `resets`: exactly, when `split` makes each one a
+/// read of its own, or else at the end of the read that took it in.
+fn feedNotingResets(h: *Harness, bytes: []const u8, pos: usize, resets: []const ResetAt, split: bool) !void {
+    var at = pos;
+    var rest = bytes;
+    while (rest.len > 0) {
+        var cut = rest.len;
+        if (split) {
+            for (resets) |r| {
+                if (r.start > at) cut = @min(cut, r.start - at);
+                if (r.end > at) cut = @min(cut, r.end - at);
+            }
+            for (resets) |r| {
+                if (r.start != at) continue;
+                const gop = try h.reset_read.getOrPut(testing.allocator, r.id);
+                if (!gop.found_existing) gop.value_ptr.* = h.out.items.len;
+            }
+        }
+        try h.feed(rest[0..cut]);
+        at += cut;
+        rest = rest[cut..];
+        if (h.last == .close) return;
+        if (split) continue;
+        for (resets) |r| {
+            if (r.end > at or r.end <= at - cut) continue;
+            const gop = try h.reset_read.getOrPut(testing.allocator, r.id);
+            if (!gop.found_existing) gop.value_ptr.* = h.out.items.len;
+        }
+    }
+}
+
+/// Once the server has read a client's RST_STREAM it sends nothing more
+/// on that stream (RFC 9113 §6.4) but an RST_STREAM answering a frame
+/// the client sent on it after all (§5.1, "closed"): whatever was split
+/// where, whoever shared the pool.
+fn expectQuietAfterResets(h: *Harness) !void {
+    var at: usize = 0;
+    while (h.out.items.len - at >= frame.header_len) {
+        const hdr = h.out.items[at..][0..frame.header_len];
+        const id = std.mem.readInt(u32, hdr[5..9], .big) & 0x7fff_ffff;
+        if (h.reset_read.get(id)) |read_at| {
+            if (at >= read_at and hdr[3] != @backingInt(frame.FrameType.rst_stream)) {
+                std.debug.print("frame type {d} on stream {d} after its RST_STREAM was read\n", .{ hdr[3], id });
+                return error.FrameAfterReset;
+            }
+        }
+        at += frame.header_len + std.mem.readInt(u24, hdr[0..3], .big);
+    }
 }
 
 /// Both runs ended in a connection error. Output still queued for a
@@ -5355,7 +5476,7 @@ test "stream states: large bodies, pending responses and moving tables are split
             // The worker's tick, now and then, while streams are open.
             if (random.uintLessThan(u8, 50) == 0) h.pool.trim();
         }
-        try expectSameRun(ref, h, &.{});
+        try expectSameRun(ref, h);
         // Nothing held: every state is back, none keeps a large buffer.
         try testing.expectEqual(@as(usize, 0), h.pool.h2_streams.in_use);
         for (h.pool.h2_streams.free.slice()) |st| {
@@ -5410,7 +5531,7 @@ test "stream states: connections on one worker interleaved, sharing its pool and
             for (conns) |x| open += x.conn.activeStreams();
             try testing.expectEqual(open, owner.pool.h2_streams.in_use);
         }
-        for (conns, 0..) |c, i| try expectSameRun(if (i % 2 == 0) big_ref else small_ref, c, &.{});
+        for (conns, 0..) |c, i| try expectSameRun(if (i % 2 == 0) big_ref else small_ref, c);
     }
 }
 
@@ -5684,6 +5805,10 @@ fn sharedConversation(pick: Pick) !void {
     const opts: Options = .{ .limits = .{ .max_body_size = 50000 }, .max_concurrent_streams = 6, .enable_connect_protocol = true };
     const big = try testBody(40 * 1024);
     defer a.free(big);
+    var resets: [3]std.ArrayList(ResetAt) = undefined;
+    var nresets: usize = 0;
+    defer for (resets[0..nresets]) |*x| x.deinit(a);
+    while (nresets < resets.len) : (nresets += 1) resets[nresets] = try clientResets(scripts[nresets]);
     // Each alone, on a pool of its own.
     var refs: [3]*Harness = undefined;
     var nrefs: usize = 0;
@@ -5693,7 +5818,7 @@ fn sharedConversation(pick: Pick) !void {
         refs[nrefs] = r;
         nrefs += 1;
         r.handler.big = big;
-        try r.feed(scripts[nrefs - 1]);
+        try feedNotingResets(r, scripts[nrefs - 1], 0, resets[nrefs - 1].items, true);
         try answerExchanges(r);
     }
     // Interleaved on one pool, split where the fuzzer says, with ticks.
@@ -5719,7 +5844,9 @@ fn sharedConversation(pick: Pick) !void {
         const c = conns[i];
         if (rests[i].len == 0 or c.last == .close) continue;
         const k = @min(rests[i].len, if (rounds < 1000) @as(usize, pick.range(u16, 0, 65535)) + 1 else rests[i].len);
-        try c.feed(rests[i][0..k]);
+        // (Split where the fuzzer says: a read that goes on past an
+        // RST_STREAM is part of what is tested.)
+        try feedNotingResets(c, rests[i][0..k], scripts[i].len - rests[i].len, resets[i].items, false);
         rests[i] = rests[i][k..];
         if (rounds < 1000 and pick.byte() < 8) owner.pool.trim();
         var open: usize = 0;
@@ -5727,10 +5854,10 @@ fn sharedConversation(pick: Pick) !void {
         try testing.expectEqual(open, owner.pool.h2_streams.in_use);
     }
     for (conns) |c| try answerExchanges(c);
-    for (refs, conns, scripts) |r, c, script| {
-        var reset = try clientResets(script);
-        defer reset.deinit(a);
-        try expectSameRun(r, c, reset.items);
+    for (refs, conns) |r, c| {
+        try expectQuietAfterResets(r);
+        try expectQuietAfterResets(c);
+        try expectSameRun(r, c);
     }
 }
 
