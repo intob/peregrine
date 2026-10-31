@@ -1329,14 +1329,16 @@ pub const Conn = struct {
     /// and the RTT are kept (§9.4 would reset them for a migration to a
     /// new path; we ask clients not to migrate and follow rebinding
     /// without path validation).
-    /// `ipv6` and `dont_fragment` are the new address's, as at `init`.
-    pub fn onPathChange(self: *Self, now: u64, ipv6: bool, dont_fragment: bool) void {
+    /// `ipv6` and `dont_fragment` are the new address's, as at `init`;
+    /// `same_host`: only the port changed, so the route, and the limit
+    /// the local interface's refusals (EMSGSIZE) showed, are the same.
+    pub fn onPathChange(self: *Self, now: u64, ipv6: bool, dont_fragment: bool, same_host: bool) void {
         self.ipv6 = ipv6;
         self.dont_fragment = dont_fragment;
         if (self.cfg.max_mtu != 0) {
             const peer_max: u16 = @intCast(@min(self.peer.max_udp_payload_size, std.math.maxInt(u16)));
             const start = @min(self.cfg.max_datagram_size, peer_max);
-            self.pmtu.restart(start, @min(self.pmtuCeiling(), peer_max), now);
+            self.pmtu.restart(start, @min(self.pmtuCeiling(), peer_max), same_host, now);
             // (A path whose family has DF where the old one's hadn't.)
             if (self.handshake_complete and self.pmtuEnabled()) self.pmtu.start(now);
             self.setMaxDatagram(self.pmtu.current);

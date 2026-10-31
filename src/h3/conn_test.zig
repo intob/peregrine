@@ -1204,7 +1204,7 @@ test "HTTP/3: GOAWAY finishes requests in flight, then closes" {
 /// path that clears the server's, and the client's counts reported,
 /// withheld, frozen or inflated; and PMTU discovery: the path's datagram
 /// limit (1200-1510 bytes, or none), probes refused by the interface, and
-/// path changes.
+/// path changes (to another host, or only another port).
 /// Checked: no crash, leak or out-of-bounds access; a connection that
 /// closes does so with a transport or HTTP/3 error code; every response
 /// the client sees parses as HTTP/3 frames.
@@ -1284,7 +1284,7 @@ fn fuzzH3(_: void, smith: *std.testing.Smith) anyerror!void {
                 const p: u8 = if (n > 1) bytes[1] else 0xff;
                 h.path_max = if (p & 0x80 != 0) std.math.maxInt(usize) else 1200 + @as(usize, p & 0x1f) * 10;
                 if (p & 0x40 != 0) h.server.?.onProbeTooBig(h.now_us);
-                if (p & 0x20 != 0) h.server.?.onPathChange(h.now_us, false, true);
+                if (p & 0x20 != 0) h.server.?.onPathChange(h.now_us, false, true, op & 0x40 != 0);
             },
             else => {},
         }

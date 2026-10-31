@@ -264,8 +264,9 @@ pub fn Endpoint(comptime Handler: type) type {
                 // address (NAT rebinding; we ask clients not to migrate; a
                 // reordered datagram from the old one doesn't count, RFC
                 // 9000 §9.3): answer there, and test ECN on the new path.
+                const same_host = udp.sameHost(&st.peer, from);
                 st.peer = from.*;
-                st.q.?.onPathChange(now_us, udp.isIpv6(from), self.opts.dont_fragment.covers(from));
+                st.q.?.onPathChange(now_us, udp.isIpv6(from), self.opts.dont_fragment.covers(from), same_host);
             }
             self.markDirty(s);
         }

@@ -59,6 +59,9 @@ pub const Search = struct {
     /// MAX_PLPMTU: the configured ceiling, the peer's max_udp_payload_size
     /// and what the local interface took.
     ceiling: u16,
+    /// Below the smallest size the local interface refused (EMSGSIZE): our
+    /// route's limit, which a new peer port on the same address keeps.
+    local_max: u16 = std.math.maxInt(u16),
     /// The largest size not known to fail, in this search.
     high: u16 = 0,
     /// PROBED_SIZE: the next probe's size (or the one in flight).
@@ -178,6 +181,7 @@ pub const Search = struct {
         if (self.state != .searching or self.probe_pn == null) return;
         self.probe_pn = null;
         self.probes_lost += 1;
+        self.local_max = @min(self.local_max, self.probe - 1);
         self.ceiling = @max(self.probe - 1, base);
         self.fail(self.probe, now);
     }
@@ -245,6 +249,7 @@ pub const Search = struct {
     /// EMSGSIZE). Returns the new PLPMTU, or null if it can't go lower.
     pub fn onLocalTooBig(self: *Self, size: u16, now: u64) ?u16 {
         if (self.current <= base) return null;
+        self.local_max = @min(self.local_max, size -| 1);
         self.ceiling = @max(@min(self.ceiling, size -| 1), base);
         self.fallBack();
         if (self.state != .disabled) self.search(self.ceiling, now);
@@ -260,9 +265,14 @@ pub const Search = struct {
 
     /// The peer moved to a new address: a new path with its own `ceiling`,
     /// searched afresh from `current` (what the connection started with).
-    pub fn restart(self: *Self, current: u16, ceiling: u16, now: u64) void {
+    /// `same_route`: only its port changed (NAT rebinding), so what the
+    /// local interface refused still holds; otherwise the route may be
+    /// another interface's, and is learnt again.
+    pub fn restart(self: *Self, current: u16, ceiling: u16, same_route: bool, now: u64) void {
         const old = self.*;
-        self.* = .init(current, ceiling);
+        const local_max = if (same_route) old.local_max else std.math.maxInt(u16);
+        self.* = .init(current, @min(ceiling, local_max));
+        self.local_max = local_max;
         self.probes_sent = old.probes_sent;
         self.probes_lost = old.probes_lost;
         self.black_holes = old.black_holes;
@@ -434,7 +444,7 @@ test "black holes: full-sized losses over a PTO while smaller packets arrive" {
     try testing.expect(!s.blackHole(pto));
 }
 
-test "a restart (new path) forgets the probe in flight" {
+test "a restart (new path) forgets the probe in flight; the local interface's refusals only with the route" {
     var s: Search = .init(1350, 1472);
     s.start(0);
     s.onProbeSent(5);
@@ -443,14 +453,33 @@ test "a restart (new path) forgets the probe in flight" {
     s.onProbeTooBig(5);
     try testing.expectEqual(@as(u16, 1471), s.ceiling);
     s.onProbeSent(6);
-    s.restart(1350, 1452, 10);
+    s.restart(1350, 1452, false, 10);
     try testing.expectEqual(@as(?u16, null), s.onProbeAcked(6, 1472, 20));
     try testing.expectEqual(@as(u16, 1350), s.current);
     try testing.expectEqual(@as(?u16, 1452), s.due(20));
     try testing.expectEqual(@as(u32, 2), s.probes_sent);
+    // An interface of 1300 refused a datagram and a probe; the peer's
+    // port changes (the same route): the start and the ceiling stay under
+    // it, and nothing is searched for.
+    s = .init(1350, 1472);
+    try testing.expectEqual(@as(?u16, base), s.onLocalTooBig(1350, 0));
+    s.start(0);
+    while (s.due(0)) |size| {
+        s.onProbeSent(size);
+        if (size > 1300) s.onProbeTooBig(0) else _ = s.onProbeAcked(size, size, 0);
+    }
+    try testing.expect(s.local_max >= 1300 and s.local_max < 1300 + min_step);
+    s.restart(1350, 1472, true, 0);
+    try testing.expectEqual(s.local_max, s.ceiling);
+    try testing.expectEqual(s.local_max, s.current);
+    try testing.expectEqual(State.complete, s.state);
+    // Another address forgets it.
+    s.restart(1350, 1472, false, 0);
+    try testing.expectEqual(@as(u16, 1350), s.current);
+    try testing.expectEqual(@as(?u16, 1472), s.due(0));
     // Before the handshake, a restart doesn't start the search.
     s = .init(1350, 1472);
-    s.restart(1350, 1472, 0);
+    s.restart(1350, 1472, false, 0);
     try testing.expectEqual(@as(?u16, null), s.due(0));
 }
 

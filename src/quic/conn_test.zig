@@ -1920,7 +1920,7 @@ test "QUIC ECN: a new peer address is a new path: tested afresh" {
     const marked = s.spaces[2].ecn_sent;
     // NAT rebinding to a path that carries them.
     h.bleach = false;
-    s.onPathChange(h.now, h.ipv6, true);
+    s.onPathChange(h.now, h.ipv6, true, false);
     try testing.expectEqual(conn_mod.EcnState.testing, s.ecn);
     try download(h, 200_000);
     try testing.expectEqual(conn_mod.EcnState.capable, s.ecn);
@@ -2004,7 +2004,7 @@ test "QUIC ECN: a new path isn't judged by the old one's packets: their loss doe
     const n = try heldWindow(h, "big 300000", &old);
     try testing.expectEqual(old.len, n);
     s.spaces[2].ecn_ce_pending = true;
-    s.onPathChange(h.now, h.ipv6, true);
+    s.onPathChange(h.now, h.ipv6, true, false);
     try testing.expect(!s.spaces[2].ecn_ce_pending);
     var fresh: [32]Flight = undefined;
     var m: usize = 0;
@@ -2041,7 +2041,7 @@ test "QUIC ECN: a new path isn't validated by the old one's packets: one droppin
     var flights: [64]Flight = undefined;
     const n = try heldWindow(h, "big 300000", &flights);
     try testing.expect(n > conn_mod.ecn_testing_packets);
-    s.onPathChange(h.now, h.ipv6, true);
+    s.onPathChange(h.now, h.ipv6, true, false);
     // The old mapping still delivers what it carried; the new path drops
     // every marked datagram.
     for (flights[0..n]) |*f| try h.toClient(f.buf[0..f.len], f.ecn);
@@ -2181,7 +2181,7 @@ test "QUIC PMTU: no probe before the handshake is confirmed, nor without room in
     try testing.expect(s.pmtu.probes_sent > 0);
     // A probe due, and a window with less room than it: a probe waits
     // (data that fits in the room still goes).
-    s.onPathChange(h.now, h.ipv6, true);
+    s.onPathChange(h.now, h.ipv6, true, false);
     try testing.expectEqual(@as(?u16, 1472), s.pmtu.due(h.now));
     const pad = s.cc.window - s.cc.in_flight - 1400;
     s.cc.in_flight += pad;
@@ -2200,7 +2200,7 @@ test "QUIC PMTU: no probe before the handshake is confirmed, nor without room in
     try testing.expect(s.send(&buf, h.now) <= s.max_datagram);
     // Not into a buffer too small for it either (the worker's, when a GSO
     // run has filled most of it): the probe waits for the next.
-    s.onPathChange(h.now, h.ipv6, true);
+    s.onPathChange(h.now, h.ipv6, true, false);
     try testing.expect(s.send(buf[0..1400], h.now) <= 1350);
     try testing.expectEqual(@as(usize, 1472), s.send(&buf, h.now));
 }
@@ -2252,7 +2252,7 @@ test "QUIC PMTU: a lost probe doesn't stretch a loss into persistent congestion"
     };
     const t0 = h.now;
     _ = try Fake.add(sp, s, a, t0, 1350, false);
-    s.onPathChange(t0, false, true);
+    s.onPathChange(t0, false, true, false);
     const probe = try Fake.add(sp, s, a, t0 + 5 * std.time.us_per_s, 1472, true);
     s.pmtu.onProbeSent(probe);
     const last = try Fake.add(sp, s, a, t0 + 5 * std.time.us_per_s + 50_000, 1350, false);
@@ -2381,7 +2381,7 @@ test "QUIC PMTU: an IPv6 path's ceiling is 20 bytes lower; EMSGSIZE fails a prob
     try testing.expect(s.isEstablished());
     try testing.expectEqual(@as(u16, 1452), s.max_datagram);
     // A new path: back to the start size, searched again.
-    s.onPathChange(h.now, h.ipv6, true);
+    s.onPathChange(h.now, h.ipv6, true, false);
     try testing.expectEqual(@as(u16, 1350), s.max_datagram);
     try testing.expectEqual(@as(u64, 1350), s.cc.mss);
     var buf: [1500]u8 = undefined;
@@ -2550,7 +2550,7 @@ test "QUIC PMTU: no discovery where the socket can't set DF; a ceiling under the
         try testing.expectEqual(@as(usize, 1350), h.largest_to_client);
         try testing.expectEqual(@as(u32, 0), h.server.?.pmtu.probes_sent);
         // A new path whose family has DF: discovery starts.
-        h.server.?.onPathChange(h.now, false, true);
+        h.server.?.onPathChange(h.now, false, true, false);
         try testing.expectEqual(@as(?u16, 1472), h.server.?.pmtu.due(h.now));
     }
     {
@@ -2578,23 +2578,28 @@ test "QUIC PMTU: no discovery where the socket can't set DF; a ceiling under the
     }
 }
 
-test "QUIC PMTU: a new path's family sets its ceiling, and a refusal on the old route is forgotten" {
+test "QUIC PMTU: a new path's family sets its ceiling; a refusal holds for a new port on the same host, not for another host" {
     const h = try Harness.init(.{}, pmtuOn);
     defer h.deinit();
     try h.run(20);
     const s = h.server.?;
     try testing.expectEqual(@as(u16, 1472), s.max_datagram);
-    s.onPathChange(h.now, false, true);
+    s.onPathChange(h.now, false, true, false);
     var buf: [1500]u8 = undefined;
     try testing.expectEqual(@as(usize, 1472), s.send(&buf, h.now));
     s.onProbeTooBig(h.now);
     try testing.expectEqual(@as(u16, 1471), s.pmtu.ceiling);
+    // Only the port changes (NAT rebinding): the route, and what its
+    // interface refused, stay.
+    s.onPathChange(h.now, false, true, true);
+    try testing.expectEqual(@as(u16, 1471), s.pmtu.ceiling);
+    try testing.expectEqual(@as(usize, 1471), s.send(&buf, h.now));
     // To an IPv6 address: 1452.
-    s.onPathChange(h.now, true, true);
+    s.onPathChange(h.now, true, true, false);
     try testing.expectEqual(@as(u16, 1452), s.pmtu.ceiling);
     try testing.expectEqual(@as(usize, 1452), s.send(&buf, h.now));
     // And back to IPv4: 1472 again, the old refusal forgotten.
-    s.onPathChange(h.now, false, true);
+    s.onPathChange(h.now, false, true, false);
     try testing.expectEqual(@as(u16, 1472), s.pmtu.ceiling);
 }
 
@@ -2603,7 +2608,7 @@ test "QUIC PMTU: probes wait for the pacer" {
     defer h.deinit();
     try h.run(20);
     const s = h.server.?;
-    s.onPathChange(h.now, false, true);
+    s.onPathChange(h.now, false, true, false);
     // An empty bucket: no probe until it has a datagram's worth.
     s.pacer.refill(h.now, &s.cc, &s.rtt);
     s.pacer.onSent(s.pacer.tokens);
@@ -2708,7 +2713,7 @@ const Flapping = struct {
         while (c.step < c.limits.len and got >= c.total * (c.step + 1) / (c.limits.len + 1)) : (c.step += 1) {
             h.path_max = c.limits[c.step];
             if (c.ku) c.ku_pending += 1;
-            if (c.rebind) h.server.?.onPathChange(h.now, h.ipv6, true);
+            if (c.rebind) h.server.?.onPathChange(h.now, h.ipv6, true, false);
         }
         const s = h.server.?;
         if (c.ku_pending > 0 and s.tx_phase == h.client.key_phase and s.tx_phase_acked) {
@@ -2802,11 +2807,11 @@ test "verify PMTU: a stale probe acknowledged with the current one doesn't hide 
     try testing.expectEqual(@as(u16, 1472), s.max_datagram);
     var p1: [1500]u8 = undefined;
     var p2: [1500]u8 = undefined;
-    s.onPathChange(h.now, h.ipv6, true);
+    s.onPathChange(h.now, h.ipv6, true, false);
     const n1 = s.send(&p1, h.now);
     try testing.expectEqual(@as(usize, 1472), n1);
     h.now += 1000;
-    s.onPathChange(h.now, h.ipv6, true);
+    s.onPathChange(h.now, h.ipv6, true, false);
     const n2 = s.send(&p2, h.now);
     try testing.expectEqual(@as(usize, 1472), n2);
     try h.toClient(p1[0..n1], .not_ect);
@@ -2913,7 +2918,7 @@ test "QUIC PMTU: a GSO run of ECN testing packets the interface refuses leaves E
     }
     try testing.expectEqual(conn_mod.EcnState.capable, s.ecn);
     try testing.expect(s.max_datagram <= 1300);
-    s.onPathChange(h.now, false, true);
+    s.onPathChange(h.now, false, true, false);
     try testing.expectEqual(@as(u16, 1350), s.max_datagram);
     const refused = h.refused;
     const id = try h.client.openBidi();
@@ -2924,4 +2929,29 @@ test "QUIC PMTU: a GSO run of ECN testing packets the interface refuses leaves E
     try testing.expect(h.refused - refused >= conn_mod.ecn_testing_packets);
     try testing.expectEqual(conn_mod.EcnState.capable, s.ecn);
     try testing.expect(s.max_datagram <= 1300);
+}
+
+test "QUIC PMTU: NAT rebinding (a new port) on a host behind a small interface costs no refused datagrams" {
+    // The interface takes 1300 bytes; the search found it by refusals.
+    // A new port on the same address keeps that limit: the start size
+    // goes under it, and neither a GSO run nor a probe is refused again.
+    const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 32 << 20 }, pmtuOn);
+    defer h.deinit();
+    var bursts: std.ArrayList(Burst) = .empty;
+    defer bursts.deinit(h.a);
+    h.iface_max = 1300;
+    h.gso_runs = true;
+    try h.runDelayed(10_000, {}, established, &bursts);
+    const s = h.server.?;
+    for (0..3) |i| {
+        if (i > 0) s.onPathChange(h.now, false, true, true);
+        const refused = h.refused;
+        const id = try h.client.openBidi();
+        try h.client.write(id, "big 300000", true);
+        try h.runDelayed(10_000, id, finishedAndSearched, &bursts);
+        try expectBody(h, id, 300_000);
+        if (i > 0) try testing.expectEqual(refused, h.refused);
+        try testing.expect(s.max_datagram <= 1300 and 1300 - s.max_datagram < pmtud.min_step);
+        try testing.expectEqual(conn_mod.EcnState.capable, s.ecn);
+    }
 }

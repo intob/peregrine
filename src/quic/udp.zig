@@ -311,6 +311,18 @@ fn isMapped(to: *const Addr) bool {
     return std.mem.eql(u8, to.storage.addr[0..12], &[12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff });
 }
 
+/// Whether `a` and `b` are the same host (family and address; ports
+/// aside): a NAT rebinding that changed only the port keeps the route.
+pub fn sameHost(a: *const Addr, b: *const Addr) bool {
+    if (a.storage.family != b.storage.family) return false;
+    if (a.storage.family == posix.AF.INET) {
+        const x: *const posix.sockaddr.in = @ptrCast(&a.storage);
+        const y: *const posix.sockaddr.in = @ptrCast(&b.storage);
+        return x.addr == y.addr;
+    }
+    return std.mem.eql(u8, &a.storage.addr, &b.storage.addr) and a.storage.scope_id == b.storage.scope_id;
+}
+
 /// Whether datagrams to `to` travel in IPv6 packets (not IPv4, nor
 /// IPv4-mapped on a dual-stack socket): 20 more bytes of header each.
 pub fn isIpv6(to: *const Addr) bool {
@@ -601,4 +613,24 @@ test "DF: a datagram larger than the interface fails with MessageTooBig instead 
     try testing.expect(!df.covers(&mapped));
     try testing.expect(df.covers(&to6));
     try send(d, &mapped, big, null, .not_ect);
+}
+
+test "sameHost: the address and family, not the port" {
+    const a: Addr = .fromIp(.{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 4433 } });
+    const a2: Addr = .fromIp(.{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 5000 } });
+    const b: Addr = .fromIp(.{ .ip4 = .{ .bytes = .{ 192, 0, 2, 2 }, .port = 4433 } });
+    try testing.expect(sameHost(&a, &a2));
+    try testing.expect(!sameHost(&a, &b));
+    var v6 = std.mem.zeroes([16]u8);
+    v6[0] = 0x20;
+    v6[15] = 1;
+    const c: Addr = .fromIp(.{ .ip6 = .{ .bytes = v6, .port = 4433 } });
+    const c2: Addr = .fromIp(.{ .ip6 = .{ .bytes = v6, .port = 1 } });
+    v6[15] = 2;
+    const d: Addr = .fromIp(.{ .ip6 = .{ .bytes = v6, .port = 4433 } });
+    try testing.expect(sameHost(&c, &c2));
+    try testing.expect(!sameHost(&c, &d));
+    // An IPv4 address and the same one IPv4-mapped: another family.
+    const mapped: Addr = .fromIp(.{ .ip6 = .{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 1 }, .port = 4433 } });
+    try testing.expect(!sameHost(&a, &mapped));
 }
