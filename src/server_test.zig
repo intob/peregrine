@@ -64,6 +64,8 @@ const TestHandler = struct {
     storm_sent: [Storm.n_threads]std.atomic.Value(u32) = @splat(.init(0)),
     storms_done: std.atomic.Value(usize) = .init(0),
     storm_failed: std.atomic.Value(bool) = .init(false),
+    /// A binary echo found the send queue full.
+    echo_full: std.atomic.Value(bool) = .init(false),
     /// "pour" senders, by connection (see Pour).
     pours: std.AutoHashMapUnmanaged(*ws.Conn, *Pour) = .empty,
 
@@ -193,7 +195,10 @@ const TestHandler = struct {
             },
             .ping, .pong => return,
             .binary => {
-                conn.send(data, true) catch unreachable;
+                conn.send(data, true) catch |err| switch (err) {
+                    error.SendQueueFull => self.echo_full.store(true, .monotonic),
+                    else => unreachable,
+                };
                 return;
             },
             .text => {},
@@ -1970,13 +1975,36 @@ fn testWsStormFair(backend: Backend) !void {
 /// messages, another reads the echoes, until stopped.
 const EchoFlood = struct {
     p: *WsPeer,
+    /// What the writer sends over and over: a 64 KiB binary message.
+    frame: []const u8,
     stop: std.atomic.Value(bool) = .init(false),
     got: std.atomic.Value(usize) = .init(0),
 
+    const m_len = 64 * 1024;
+    const frame_max = m_len + ws.protocol.max_header_len;
+
+    /// 64 KiB of 'e'.
+    fn plainFrame(out: *[frame_max]u8) []const u8 {
+        const m: [m_len]u8 = @splat('e');
+        return Client.wsFrame(out, true, .binary, &m);
+    }
+
+    /// 64 KiB that deflate shrinks some fifteenfold (a 64-byte pattern,
+    /// one byte of each changing), compressed (RSV1).
+    fn deflatedFrame(out: *[frame_max]u8, pool: *BufferPool) ![]const u8 {
+        const pattern = "deflate this, then inflate it; again and again, a pattern of 64.";
+        comptime std.debug.assert(pattern.len == 64);
+        var m: [m_len]u8 = undefined;
+        for (&m, 0..) |*b, i| b.* = if (i % 64 == 0) @truncate(i / 64 *% 7) else pattern[i % 64];
+        var packed_buf: [m_len]u8 = undefined;
+        const n = (try pool.wsDeflater()).compress(&m, &packed_buf, 15) orelse return error.DidNotShrink;
+        const frame = Client.wsFrame(out, true, .binary, packed_buf[0..n]);
+        frame[0] |= 0x40;
+        return frame;
+    }
+
     fn write(self: *EchoFlood) void {
-        const m: [64 * 1024]u8 = @splat('e');
-        var out: [m.len + ws.protocol.max_header_len]u8 = undefined;
-        const frame = Client.wsFrame(&out, true, .binary, &m);
+        const frame = self.frame;
         while (!self.stop.load(.acquire)) {
             switch (self.p.*) {
                 .plain => |*c| c.send(frame) catch return,
@@ -2021,7 +2049,8 @@ fn testWsEchoFloodFair(backend: Backend) !void {
         defer r.stop();
         var p = try stormOpen(r.port, mode, false);
         defer p.close();
-        var flood: EchoFlood = .{ .p = &p };
+        var out: [EchoFlood.frame_max]u8 = undefined;
+        var flood: EchoFlood = .{ .p = &p, .frame = EchoFlood.plainFrame(&out) };
         const writer = try std.Thread.spawn(.{}, EchoFlood.write, .{&flood});
         const reader = try std.Thread.spawn(.{}, EchoFlood.read, .{&flood});
         sleepMs(100);
@@ -2040,6 +2069,51 @@ fn testWsEchoFloodFair(backend: Backend) !void {
             return err;
         };
         if (got == 0) return error.NothingEchoed;
+        if (worst > 1500 * std.time.ns_per_ms) return error.WorkerHeldUp;
+    }
+}
+
+test "websocket: permessage-deflate echoes of messages that inflate fifteenfold, to a client that keeps up: the queue stays within its limit (plain, TLS)" {
+    try forEachBackend(testWsDeflateEchoFlood);
+}
+
+fn testWsDeflateEchoFlood(backend: Backend) !void {
+    // A turn counted socket bytes in and uncompressed bytes out: each read
+    // its 256 KiB, compressed, and queued their echoes, 2.5 MiB inflated,
+    // while writing 256 KiB of them, and the echoes found the queue full
+    // within two turns.
+    var pool = try BufferPool.init(testing.allocator, 1024, 1);
+    defer pool.deinit();
+    var out: [EchoFlood.frame_max]u8 = undefined;
+    const frame = try EchoFlood.deflatedFrame(&out, &pool);
+    try testing.expect(frame.len * 10 < EchoFlood.m_len);
+    for ([_]StormMode{ .plain, .tls }) |mode| {
+        var cfg: Config = if (mode == .tls) tlsConfig() else .{};
+        cfg.worker_thread_count = 1;
+        cfg.websocket_deflate = .{};
+        cfg.websocket_max_send_queue_bytes = 1 << 20;
+        const r = try Running.start(backend, cfg);
+        defer r.stop();
+        var p = try stormOpen(r.port, mode, true);
+        defer p.close();
+        var flood: EchoFlood = .{ .p = &p, .frame = frame };
+        const writer = try std.Thread.spawn(.{}, EchoFlood.write, .{&flood});
+        const reader = try std.Thread.spawn(.{}, EchoFlood.read, .{&flood});
+        sleepMs(100);
+        var worst: u64 = 0;
+        var n: usize = 0;
+        const never: std.atomic.Value(bool) = .init(false);
+        const timed = timeRequests(r.port, mode == .tls, &never, &worst, &n);
+        const got = flood.got.load(.monotonic);
+        flood.stop.store(true, .release);
+        _ = std.posix.system.shutdown(flood.fd(), std.posix.SHUT.RDWR);
+        writer.join();
+        reader.join();
+        const full = r.srv.handler.echo_full.load(.monotonic);
+        std.debug.print("{s} {s} deflate: {d} requests, worst {d} ms; {d} MiB echoed (compressed){s}\n", .{ @tagName(backend), @tagName(mode), n, worst / std.time.ns_per_ms, got >> 20, if (full) "; an echo found the queue full" else "" });
+        try timed;
+        if (got == 0) return error.NothingEchoed;
+        if (full) return error.SendQueueFull;
         if (worst > 1500 * std.time.ns_per_ms) return error.WorkerHeldUp;
     }
 }

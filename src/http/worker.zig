@@ -44,6 +44,11 @@ const ACCEPT_BATCH = 64;
 /// 192 / 21 ms, no turns over 5 s / 1 s; echoes of 20 B to 1 MiB cost the
 /// same with any of them.
 const ws_turn_bytes = 256 * 1024;
+/// Message bytes delivered per turn (payloads, inflated): with
+/// permessage-deflate a turn's socket bytes may inflate tenfold or more,
+/// and an echo then queued far more than a turn writes. Less than a turn
+/// writes, so that a client's echoes can't outgrow what the turns take.
+const ws_msg_bytes = ws_turn_bytes / 2;
 /// TLS record content types (kTLS control records).
 const tls_alert: u8 = 21;
 const tls_handshake: u8 = 22;
@@ -211,6 +216,9 @@ pub fn Worker(comptime Handler: type) type {
         /// upgrade (`wsTurn`).
         ws_out: usize = 0,
         ws_in: usize = 0,
+        /// What is left of the turn's message bytes (`ws_msg_bytes`):
+        /// the payloads delivered, inflated.
+        ws_msg: usize = 0,
         /// Passes of drainMailbox: a connection served in this one is
         /// skipped if it comes up again (`Conn.ws_served`).
         drain_pass: u32 = 0,
@@ -668,7 +676,7 @@ pub fn Worker(comptime Handler: type) type {
             if (@hasDecl(Handler, "handleWSConn")) self.handler.handleWSConn(w);
             self.wsTurn();
             if (!self.wsProcess(c)) return;
-            if (c.read_ready or (c.tls != null and c.tls.?.hasBufferedInput())) self.wsReadable(c);
+            self.wsReadable(c);
         }
 
         fn freePending(self: *Self, c: *Conn) void {
@@ -1654,6 +1662,7 @@ pub fn Worker(comptime Handler: type) type {
         fn wsTurn(self: *Self) void {
             self.ws_out = ws_turn_bytes;
             self.ws_in = ws_turn_bytes;
+            self.ws_msg = ws_msg_bytes;
         }
 
         fn onWsEvent(self: *Self, c: *Conn, ev: Poller.Event) void {
@@ -1676,36 +1685,46 @@ pub fn Worker(comptime Handler: type) type {
         /// limit (a pong and the close echo have room past it), what is
         /// read by the turn.
         fn wsReadable(self: *Self, c: *Conn) void {
+            const w = c.ws.?;
             while (!c.ws_blocked) {
-                const tls_buffered = c.tls != null and c.tls.?.hasBufferedInput();
-                if (!c.read_ready and !tls_buffered) break;
-                if (self.ws_in == 0) {
-                    // A client that keeps the socket readable gets the rest
-                    // on a later pass too (the post brings it back here).
-                    c.ws.?.repost();
-                    break;
-                }
-                if (c.read_ready and !self.readSocket(c)) return;
-                if (c.tls) |t| {
-                    if (!self.tlsDecrypt(c, t)) return;
-                }
-                if (!self.wsProcess(c)) return;
                 if (c.peer_closed) {
                     // The peer's FIN (or close_notify): what is queued still
                     // goes out (the close echo among it), then wsFlush
                     // closes the socket. Closing now dropped it all when a
                     // turn had left output.
-                    if (!wsHasWire(c) and !c.ws.?.hasOutput()) return self.closeConn(c);
+                    if (!wsHasWire(c) and !w.hasOutput()) return self.closeConn(c);
                     return;
                 }
+                const tls_buffered = c.tls != null and c.tls.?.hasBufferedInput();
+                // Frames decoded but not yet processed (the turn's message
+                // bytes ran out) come before more input.
+                const paused = w.input_paused;
+                if (!c.read_ready and !tls_buffered and !paused) break;
+                if (self.ws_in == 0 or self.ws_msg == 0) {
+                    // A client that keeps the socket readable gets the rest
+                    // on a later pass too (the post brings it back here).
+                    w.repost();
+                    break;
+                }
+                if (!paused) {
+                    if (c.read_ready and !self.readSocket(c)) return;
+                    if (c.tls) |t| {
+                        if (!self.tlsDecrypt(c, t)) return;
+                    }
+                }
+                if (!self.wsProcess(c)) return;
             }
         }
 
-        /// Runs the protocol over buffered input and writes its output.
-        /// Returns false if the connection is gone.
+        /// Runs the protocol over buffered input, up to the turn's message
+        /// bytes, and writes its output. Returns false if the connection is
+        /// gone.
         fn wsProcess(self: *Self, c: *Conn) bool {
             const w = c.ws.?;
+            w.input_budget = self.ws_msg;
             _ = w.process(Handler, self.handler);
+            self.ws_msg = w.input_budget;
+            w.input_budget = std.math.maxInt(usize);
             if (!self.wsFlush(c)) return false;
             w.decoder.releaseIfIdle();
             return true;

@@ -126,6 +126,12 @@ pub const Conn = struct {
     to_compress: bool = false,
     /// Worker only: the peer sent a close frame.
     close_received: bool = false,
+    /// Worker only: message bytes (payloads, inflated) process() may
+    /// deliver before it stops; it is spent as they are. Unbounded but for
+    /// the epoll worker's turns.
+    input_budget: usize = std.math.maxInt(usize),
+    /// Worker only: process() stopped for `input_budget` with input left.
+    input_paused: bool = false,
     /// Worker only: the answer to the latest ping, when the send queue had
     /// no room for it (it is full of the handler's messages). It joins the
     /// queue as the worker takes the queue, past the size limit: a ping
@@ -278,12 +284,20 @@ pub const Conn = struct {
     /// Runs the protocol over the buffered input, calling the handler for
     /// each complete message. Pings are answered, close frames are echoed.
     pub fn process(self: *Self, comptime Handler: type, handler: *Handler) Action {
+        self.input_paused = false;
         if (self.wantsClose()) return .close;
         while (true) {
+            if (self.input_budget == 0) {
+                self.input_paused = self.decoder.buffered() > 0;
+                return .ok;
+            }
             var frame = self.decoder.next() catch |err| {
                 self.fail(protocol.closeCodeFor(err));
                 return .close;
             } orelse return .ok;
+            // A frame costs at least a header's worth, so that empty ones
+            // count too.
+            self.input_budget -|= @max(frame.payload.len, 8);
             const sent_close = self.closeSent();
             switch (frame.opcode) {
                 .ping => if (!sent_close) self.answerPing(frame.payload),
