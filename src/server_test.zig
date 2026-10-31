@@ -2003,9 +2003,19 @@ fn testWsPourFair(backend: Backend) !void {
     // posts it again; with more connections posted than one batch of the
     // mailbox takes, the reposts filled every batch and the drain went on
     // while the senders kept up.
-    for ([_]usize{ 8, 100 }) |conns| {
+    // With permessage-deflate a turn's bytes are compressed ones: a
+    // message that compresses well buys many more of them.
+    const cases = [_]struct { conns: usize, deflate: bool }{
+        .{ .conns = 8, .deflate = false },
+        .{ .conns = 100, .deflate = false },
+        .{ .conns = 1, .deflate = true },
+        .{ .conns = 8, .deflate = true },
+    };
+    for (cases) |case| {
+        const conns = case.conns;
         var cfg: Config = .{};
         cfg.worker_thread_count = 1;
+        if (case.deflate) cfg.websocket_deflate = .{};
         const r = try Running.start(backend, cfg);
         defer r.stop();
         const readers = try testing.allocator.alloc(PourReader, conns);
@@ -2020,7 +2030,7 @@ fn testWsPourFair(backend: Backend) !void {
         for (readers) |*pr| {
             pr.* = .{ .c = try Client.connect(r.port) };
             errdefer std.debug.print("{s}: connection {d} of {d} not upgraded within 5 s\n", .{ @tagName(backend), started, conns });
-            try pr.c.send(Client.upgrade_request);
+            try pr.c.send(if (case.deflate) WsPeer.offer else Client.upgrade_request);
             try pr.c.readUpgrade();
             try pr.c.wsSend(true, .text, "pour");
             pr.thread = try std.Thread.spawn(.{}, PourReader.run, .{pr});
@@ -2038,7 +2048,7 @@ fn testWsPourFair(backend: Backend) !void {
             const t0 = sys.nanoTimestamp();
             try c.send("GET /fair HTTP/1.1\r\nHost: x\r\n\r\n");
             const resp = c.readResponse(&head, null) catch |err| {
-                std.debug.print("{s} {d} connections: request {d}: {s} after {d} ms\n", .{ @tagName(backend), conns, n, @errorName(err), @divTrunc(sys.nanoTimestamp() - t0, std.time.ns_per_ms) });
+                std.debug.print("{s} {d} connections{s}: request {d}: {s} after {d} ms\n", .{ @tagName(backend), conns, if (case.deflate) " (deflate)" else "", n, @errorName(err), @divTrunc(sys.nanoTimestamp() - t0, std.time.ns_per_ms) });
                 return err;
             };
             try testing.expectEqual(@as(u16, 200), resp.status);
@@ -2056,7 +2066,7 @@ fn testWsPourFair(backend: Backend) !void {
             least = @min(least, got);
             if (got == 0) starved += 1;
         }
-        std.debug.print("{s} {d} connections: {d} requests, worst {d} ms; {d} MiB poured in 3 s, the least to one connection {d} KiB, {d} given nothing\n", .{ @tagName(backend), conns, n, worst / std.time.ns_per_ms, total >> 20, least >> 10, starved });
+        std.debug.print("{s} {d} connections{s}: {d} requests, worst {d} ms; {d} MiB poured in 3 s, the least to one connection {d} KiB, {d} given nothing\n", .{ @tagName(backend), conns, if (case.deflate) " (deflate)" else "", n, worst / std.time.ns_per_ms, total >> 20, least >> 10, starved });
         if (worst > 1500 * std.time.ns_per_ms) return error.WorkerHeldUp;
         if (starved > 0) return error.ConnectionStarved;
     }
