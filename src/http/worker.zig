@@ -932,7 +932,7 @@ pub fn Worker(comptime Handler: type) type {
             // included (onH2Event).
             if (c.h2HasWire()) return self.h2Timer(c);
             if (!self.h2Process(c)) return;
-            if (c.peer_closed) return self.h2PeerClosed(c);
+            if (c.peer_closed and !tlsInputLeft(c)) return self.h2PeerClosed(c);
             self.h2Readable(c);
         }
 
@@ -987,7 +987,7 @@ pub fn Worker(comptime Handler: type) type {
                     if (!self.tlsDecrypt(c, t)) return;
                 }
                 if (!self.h2Process(c)) return;
-                if (c.peer_closed) return self.h2PeerClosed(c);
+                if (c.peer_closed and !tlsInputLeft(c)) return self.h2PeerClosed(c);
             }
             self.h2Timer(c);
         }
@@ -1075,7 +1075,7 @@ pub fn Worker(comptime Handler: type) type {
             const ctx = self.h2Context(c);
             conn.pump(Handler, &ctx);
             if (conn.hasWire()) return self.h2Flush(c);
-            if (c.peer_closed and !conn.holdsFrames() and (conn.activeStreams() == 0 or !conn.answerableAlone())) {
+            if (c.peer_closed and !conn.holdsFrames() and !tlsInputLeft(c) and (conn.activeStreams() == 0 or !conn.answerableAlone())) {
                 self.closeConn(c);
                 return false;
             }
@@ -1148,8 +1148,11 @@ pub fn Worker(comptime Handler: type) type {
                     .blocked => return self.updateTimer(c),
                     .gone => return,
                 }
-                if (c.peer_closed) return self.closeConn(c);
-                if (!c.read_ready and !(c.tls != null and c.tls.?.hasBufferedInput())) break;
+                // Requests still in records the TLS layer holds are
+                // answered first.
+                const tls_left = tlsInputLeft(c);
+                if (c.peer_closed and !tls_left) return self.closeConn(c);
+                if (!c.read_ready and !tls_left) break;
             }
             c.session.releaseIfIdle(&self.pool);
             if (c.tls) |t| t.releaseIfIdle();
@@ -1428,6 +1431,15 @@ pub fn Worker(comptime Handler: type) type {
             return progressed;
         }
 
+        /// Records the TLS layer still holds: it hands the session, the
+        /// HTTP/2 connection or the WebSocket decoder only what fits their
+        /// buffers, so the read that brings the peer's FIN (or its
+        /// close_notify) can leave some behind. The peer's end waits for
+        /// them. Kernel TLS keeps none in user space.
+        inline fn tlsInputLeft(c: *const Conn) bool {
+            return c.tls != null and c.tls.?.hasBufferedInput();
+        }
+
         /// The connection's TLS, if we still encrypt its output (not once
         /// the kernel does: then writes are plaintext).
         inline fn userTls(c: *const Conn) ?*TlsConn {
@@ -1672,7 +1684,7 @@ pub fn Worker(comptime Handler: type) type {
         /// bytes ran out), or records the TLS layer holds (it hands the
         /// decoder only what fits). The peer's end waits for it.
         fn wsInputLeft(c: *const Conn) bool {
-            return c.ws.?.input_paused or (c.tls != null and c.tls.?.hasBufferedInput());
+            return c.ws.?.input_paused or tlsInputLeft(c);
         }
 
         fn wsTurn(self: *Self) void {

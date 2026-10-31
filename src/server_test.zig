@@ -5259,6 +5259,91 @@ fn testTlsSni(backend: Backend) !void {
     try testing.expectError(error.CertificateHostMismatch, TlsClient.connectHost(r.port, "c.example"));
 }
 
+test "tls: pipelined requests and the client's FIN in one write, read 1 KiB at a time: every request answered, then the close" {
+    try forEachBackend(testTlsPipelinedFin);
+}
+
+/// The TLS layer hands the session only what fits its buffer: the read
+/// that returned 0 set peer_closed with records still held there, and the
+/// connection closed with their requests unanswered.
+fn testTlsPipelinedFin(backend: Backend) !void {
+    var cfg = tlsConfig();
+    cfg.worker_thread_count = 1;
+    cfg.read_buffer_size = 1024;
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    const req = "GET /a HTTP/1.1\r\nHost: x\r\n\r\n";
+    const count = 200;
+    var batch: [count * req.len]u8 = undefined;
+    for (0..count) |i| @memcpy(batch[i * req.len ..][0..req.len], req);
+    const c = try TlsClient.connect(r.port);
+    defer c.close();
+    try c.send(&batch);
+    sys.shutdownWrite(c.fd);
+    var body: [64]u8 = undefined;
+    for (0..count) |i| {
+        const resp = c.readResponse(&body) catch |err| {
+            std.debug.print("{s}: {s} after {d} of {d} responses\n", .{ @tagName(backend), @errorName(err), i, count });
+            return error.RequestsUnanswered;
+        };
+        try testing.expectEqual(@as(u16, 200), resp.status);
+    }
+    try testing.expectError(error.EndOfStream, c.client.reader.takeByte());
+}
+
+test "tls: h2, requests and the client's FIN in one write, read 1 KiB at a time: every request answered" {
+    try forEachBackend(testH2TlsRequestsFin);
+}
+
+/// As testTlsPipelinedFin, over HTTP/2: h2PeerClosed (and h2Flush) closed
+/// with streams still in records the TLS layer held.
+fn testH2TlsRequestsFin(backend: Backend) !void {
+    var cfg = tlsConfig();
+    cfg.tls.?.alpn = &.{ "h2", "http/1.1" };
+    cfg.worker_thread_count = 1;
+    cfg.read_buffer_size = 1024;
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    const c = try H2Client.open(r.port, true);
+    defer c.close();
+    // Uploads of 2000 bytes, 240 KB in all: within the windows, beyond what
+    // the connection's buffer takes at once.
+    const count = 120;
+    const body: [2000]u8 = @splat('u');
+    const all = try testing.allocator.alloc(u8, 256 + count * (128 + h2frame.header_len + body.len));
+    defer testing.allocator.free(all);
+    var n = h2frame.preface.len;
+    @memcpy(all[0..n], h2frame.preface);
+    // Our windows wide open: the echoes don't wait for a WINDOW_UPDATE
+    // the client, done sending, will never send.
+    n += try h2frame.writeSettings(all[n..], &.{ .{ .id = .max_concurrent_streams, .value = 1000 }, .{ .id = .initial_window_size, .value = 0x7fffffff } });
+    n += try h2frame.writeWindowUpdate(all[n..], 0, 0x7fffffff - 65535);
+    for (0..count) |i| {
+        const sid: u31 = @intCast(1 + 2 * i);
+        n += (try c.headers(all[n..], sid, "POST", "/echo", false)).len;
+        n += try h2frame.writeData(all[n..], sid, true, &body);
+    }
+    try c.send(all[0..n]);
+    sys.shutdownWrite(c.tcp.fd);
+    c.quiet = true;
+    var replies: [count]H2Client.Reply = @splat(.{});
+    defer for (&replies) |*x| x.deinit();
+    var map = std.AutoHashMap(u31, *H2Client.Reply).init(testing.allocator);
+    defer map.deinit();
+    for (0..count) |i| try map.put(@intCast(1 + 2 * i), &replies[i]);
+    const err = c.collect(&map) catch |e| {
+        var done: usize = 0;
+        for (replies) |x| done += @intFromBool(x.done);
+        std.debug.print("{s}: {s} after {d} of {d} responses\n", .{ @tagName(backend), @errorName(e), done, count });
+        return error.RequestsUnanswered;
+    };
+    try testing.expectEqual(@as(?h2frame.ErrorCode, null), err);
+    for (replies) |x| {
+        try testing.expectEqual(@as(u16, 200), x.status);
+        try testing.expectEqualSlices(u8, &body, x.body.items);
+    }
+}
+
 test "tls: keep-alive, pipelining, large responses and close_notify" {
     try forEachBackend(testTlsKeepAlive);
 }
