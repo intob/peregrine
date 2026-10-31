@@ -1889,13 +1889,16 @@ fn fuzzTurns(_: void, smith: *std.testing.Smith) anyerror!void {
     var count: usize = 0;
     while (count < 12 and !smith.eos()) : (count += 1) try protocol.fuzzMessage(smith, &input, &expected, client);
 
-    const whole = try Harness.init(.{});
+    // Offered, or the agreement is ignored and RSV1 is a protocol error.
+    const opts: Options = .{ .deflate = if (compressed) .{} else null };
+    const whole = try Harness.init(opts);
     defer whole.deinit();
     if (compressed) whole.conn.enableDeflate(.{ .enabled = true });
+    try testing.expectEqual(compressed, whole.conn.decoder.deflate);
     try whole.feed(input.items);
     try testing.expectEqual(Conn.Action.ok, whole.action);
 
-    const turns = try Harness.init(.{});
+    const turns = try Harness.init(opts);
     defer turns.deinit();
     if (compressed) turns.conn.enableDeflate(.{ .enabled = true });
     var rest: []const u8 = input.items;
@@ -1929,6 +1932,7 @@ test "fuzz: ws process across turns" {
             &[_]u8{ 0x00, 0x01, 0x10, 0x20, 0x30, 0x00, 0x40, 0x01, 0x02, 0x05, 0x00, 0x10, 0x00, 0x03, 0x00, 0x08, 0x00, 0x01, 0x00 },
             // Compressed, fragments with pings between.
             &[_]u8{ 0x01, 0x05, 0x00, 0x01, 0x02, 0xff, 0x07, 0x02, 0x03, 0x00, 0x10, 0x00, 0x20, 0x01, 0x00, 0x04, 0x00, 0x02, 0x00 },
+            @embedFile("testdata/fuzz/turns-1.bin"),
         },
     });
 }

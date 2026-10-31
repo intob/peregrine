@@ -16,7 +16,7 @@ q=$(printf '%s' "$T" | sed "s/'/'\\\\''/g")
 run="../zig/zig build test --fuzz=200 -Doptimize=ReleaseSafe -Dtest-filter='$q' > warmup.log 2>&1;
  rm -f .zig-cache/f/crash; timeout -s INT $((MIN * 60)) ../zig/zig build test --fuzz -j$JOBS -Doptimize=ReleaseSafe -Dtest-filter='$q' > fuzz.log 2>&1;
  echo exit=\$? >> fuzz.log; tr '\r' '\n' < fuzz.log | grep -E 'failed with|panic|error:' | head -5; tail -1 fuzz.log;
- if [ -f .zig-cache/f/crash ]; then echo CRASH; xxd -p .zig-cache/f/crash | tr -d '\n'; echo; else echo clean; fi"
+ if [ -f .zig-cache/f/crash ]; then echo CRASH; od -An -tx1 -v .zig-cache/f/crash | tr -d ' \n'; echo; else echo clean; fi"
 if [ "$HOST" = local ]; then
     "$LOCK" share mac-bench "fuzz $T ($ROOT)"
     trap '"$LOCK" unshare mac-bench' EXIT
