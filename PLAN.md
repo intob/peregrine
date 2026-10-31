@@ -452,6 +452,15 @@ Still open:
       image by digest so the shared arm64 tag isn't replaced): the only Mac-local way to
       catch backend bugs like the one above
 - [ ] Optional idle timeout / server keepalive pings
+- [x] epoll: HTTP/1.1 and HTTP/2 answer requests still in TLS-held records after
+      the client's FIN (`tlsInputLeft`, shared with WebSockets): 200 pipelined
+      requests and a FIN in one write over TLS with a 1 KiB read buffer got 72
+      answers before (every time on kqueue, 2 of 3 on epoll); the HTTP/2 test
+      is a guard (it passes without the fix)
+- [ ] Intermittent io_uring hang in a TCP test in linux-test.sh: the client
+      blocked in readv, the server's socket in FIN_WAIT1. Seen on several
+      branches and main in the 2026-10-31 rounds, not since; which test and
+      a reproduction still to find
 - [ ] io_uring: parse straight out of the provided buffer like the HTTP path does
 - [x] **Autobahn testsuite** (25.10.1, `wstest -m fuzzingclient` against
       `bench-server`'s `/ws` echo, cases 1-10; 12 and 13 are
@@ -516,10 +525,62 @@ Still open:
         kernel's copy into a cold 1 MiB buffer cost 10-15% more than reading
         through the hot read buffer and copying (64 KiB and 256 KiB: 5-15%
         cheaper in place)
-  - [ ] `send` copies the payload into the shared queue, and `shared`/`wire`
-        keep their capacity for the life of the connection (a connection that
-        once sent 1 MiB holds 2 MiB). They are appended from any thread, so
-        the worker's cache can't hold them as it is
+  - [x] **Send queues from the worker's pool; turns.** `shared`, `wire` and
+        `deflated` are buffers from `BufferPool.ws_queues` (power-of-two sizes
+        256 B to 32 MiB, kept as a Recycler keeps its own, freed within two
+        ticks; larger ones allocated exactly and freed at once), so an idle
+        connection holds none (after 1 MiB echoes the server's live memory
+        returns to its baseline; main kept 7.7 MB more). `send` sizes a new
+        buffer from the last batch (at most 16x the frame starting it, plus one
+        frame up to 64 KiB) and grows by at least half past 32 MiB. Buffers are
+        allocated and freed outside the pool's mutex. A ping is answered while
+        the queue is full (the latest one's pong waits, then goes in ahead of the
+        close echo); a pong or close echo that gets no buffer at all fails the
+        connection, which closes once its output is written.
+        epoll: a WebSocket's work comes in turns (`ws_turn_bytes`, 256 KiB each
+        way, set at its event, post or upgrade; input counted in message bytes,
+        inflated, up to half of that; a compressed wire charged once), then it
+        reposts itself. The mailbox is a ring served oldest first, one pass's
+        worth at a time (a u64 pass number that never comes round to 0; a second
+        entry in one drain is skipped). Reading pauses only while the socket is
+        full. The peer's FIN or close_notify waits for frames a turn left and
+        for records the TLS layer holds; the output and close echo go out, then
+        the socket closes. permessage-deflate compresses a taken queue 64 KiB of
+        messages at a time; with `min_size` 0 an empty message goes out
+        uncompressed (it panicked; main too).
+        Proof: unit tests and four verifier rounds (storms of senders, slow
+        readers, 100 fed connections, requests timed behind storms, ping floods
+        inside fragmented messages, frames at 32 MiB and 32 MiB + 1 from two
+        threads, permessage-deflate over h2, plain/TLS/kTLS/deflate, h2/h3);
+        fuzz targets `fuzz: ws send queues` and `fuzz: ws process across turns`
+        15 min each on a Pi; Autobahn 301/301 and with deflate 517/517 on epoll
+        and io_uring, plain and TLS. ws-load on the Pis (pi5 serves 4 workers,
+        pi1 loads; 3 interleaved rounds against main, server CPU per message;
+        the verifier's rerun in brackets): equal at 20 B and 1 MiB; 16 KiB
+        epoll 8% (5%), io_uring 11% (18%); 64 KiB 14-18% (14-17%); 256 KiB
+        epoll 13% (4%), io_uring noisy, 2% (7%) cheaper
+  - [ ] **A sender pouring to a WebSocket over HTTP/2 holds the worker** (main
+        too): after the output drains `h2Flush` pumps and recurses
+        (`if (conn.hasWire()) return self.h2Flush(c)`) until the socket says
+        EAGAIN, and h2's `pumpWebSocket` counts written bytes, not compressed
+        input (HTTP/1.1's turns use `takeCompressed`). With permessage-deflate a
+        64 KiB message of one byte compresses to ~60 bytes, so one pump
+        compresses ~4000 messages: a request on another connection waited 14-30
+        s on epoll (2.7 s io_uring). Without deflate, macOS Debug overflows the
+        worker's stack (Bus error). HTTP/3's pumpWebSocket buffers up to 1 MiB
+        counted in output bytes, likely the same. Tests "verify h2c WebSocket
+        ... pour ..." in server_test.zig, behind `reproduce = false`
+  - [ ] io_uring answers pings late under a send storm: it arms a receive only
+        once its output drains, so while a sender on another thread keeps the
+        queue full a ping (and the client's close) waits; over TLS no pong in
+        5 s. "A ping and the client's close in one write" skips io_uring until
+        fixed (epoll's turns already read during output)
+  - [ ] An endless sender against a slow client never reads the client's close:
+        the close waits behind output that never drains, until the request
+        timeout
+  - [ ] `WsQueues` is one mutex per worker that every sending thread takes to
+        get or give back a buffer: contention with many sender threads is
+        unmeasured
   - [ ] io_uring copies small frames out of the provided buffer (1 KiB text:
         1.45 µs against 1.33 on epoll); see "parse straight out of the
         provided buffer" above
