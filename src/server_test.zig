@@ -2476,22 +2476,20 @@ test "websocket: the mailbox's drain pass never comes round to 0, a new connecti
     try testing.expectEqual(@as(u64, 1 << 32), next(std.math.maxInt(u32)));
 }
 
-test "verify websocket: a connection served a full cycle of drain passes ago gets its next post served (fails: the pass it was served in comes round again)" {
+test "verify websocket: a connection served a full cycle of drain passes ago gets its next post served (at 32 bits the pass it was served in came round again)" {
     try forEachBackend(testWsDrainPassCycle);
 }
 
 fn testWsDrainPassCycle(backend: Backend) !void {
-    // The skip in drainMailbox compares a u32 pass with the one that last
-    // served the connection. 2^32 - 1 passes later (hours on a busy
+    // The skip in drainMailbox compared a u32 pass with the one that last
+    // served the connection: 2^32 - 1 passes later (hours on a busy
     // worker: one per loop iteration) the same number comes up again: a
     // push from another thread to a connection idle that long, landing on
     // it, is skipped with `posted` left set, so no later send posts
     // either. Simulated by moving the worker's counter there.
     if (backend == .io_uring) return;
-    // Off by default: a reproduction of a one-in-2^32 collision; the
-    // condition is forced by writing the worker's counter from here.
-    const reproduce = false;
-    if (!reproduce) return error.SkipZigTest;
+    // The pass number is 64 bits now: it doesn't come round. The counter
+    // is moved from here to where 2^32 - 1 passes take it.
     var cfg: Config = .{};
     cfg.worker_thread_count = 1;
     const r = try Running.start(backend, cfg);
@@ -2506,14 +2504,14 @@ fn testWsDrainPassCycle(backend: Backend) !void {
     sleepMs(100);
     const wk = &r.srv.workers[0].poll;
     var conn: ?*ws.Conn = null;
-    var served: u32 = 0;
+    var served: u64 = 0;
     for (wk.conns) |*k| if (k.open and k.ws != null) {
         conn = k.ws;
         served = k.ws_served;
     };
     try testing.expect(served != 0);
-    // As if 2^32 - 1 passes had gone by since.
-    @atomicStore(u32, &wk.drain_pass, served - 1, .seq_cst);
+    // As if 2^32 - 1 passes had gone by since (at 32 bits: served - 1).
+    @atomicStore(u64, &wk.drain_pass, served + (1 << 32) - 1, .seq_cst);
     try conn.?.send("pushed", false);
     try c.expectWsText("pushed");
 }
