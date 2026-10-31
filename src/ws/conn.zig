@@ -410,6 +410,17 @@ pub const Conn = struct {
         return self.shared.len > 0;
     }
 
+    /// The worker stopped writing with output left (its turn was over):
+    /// an entry in the mailbox brings it back, unless one is there already.
+    /// The worker wakes itself (a post from its own thread doesn't).
+    pub fn repost(self: *Self) void {
+        self.mutex.lock();
+        const post = !self.posted;
+        self.posted = true;
+        self.mutex.unlock();
+        if (post) self.mailbox.post(self.post_entry);
+    }
+
     /// Called by the worker when it drains its mailbox.
     pub fn clearPosted(self: *Self) void {
         self.mutex.lock();

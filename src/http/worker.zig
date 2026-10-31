@@ -35,6 +35,13 @@ fn isH2(alpn: ?[]const u8) bool {
 }
 /// Connections accepted per listener event, to stay fair to existing ones.
 const ACCEPT_BATCH = 64;
+/// WebSocket output written (or encrypted) per turn: the rest waits for
+/// the next pass of the loop, after the others' events and the timers.
+/// Measured with a storm over TLS on one connection and requests on
+/// another (worst wait, Debug / ReleaseSafe): 128 KiB 30 / 12 ms, 256 KiB
+/// 57 / 12 ms, 1 MiB 192 / 21 ms, no turns over 5 s / 1 s; echoes of 20 B
+/// to 1 MiB cost the same with any of them.
+const ws_turn_bytes = 256 * 1024;
 /// TLS record content types (kTLS control records).
 const tls_alert: u8 = 21;
 const tls_handshake: u8 = 22;
@@ -1662,12 +1669,29 @@ pub fn Worker(comptime Handler: type) type {
         /// gone.
         fn wsFlush(self: *Self, c: *Conn) bool {
             const w = c.ws.?;
+            // Any write in this call renews a stalled write's deadline, not
+            // only the last one (which often finds the socket filled by the
+            // writes before it).
+            var progress = false;
+            // Bytes taken from the queue in this call: senders on other
+            // threads can keep it from ever emptying while the client keeps
+            // up, and one flush then held the worker for as long as they
+            // sent (23 s in the storm test), its timers and every other
+            // connection waiting.
+            var moved: usize = 0;
             while (true) {
+                if (moved >= ws_turn_bytes) {
+                    // The rest on a later pass of the loop (drainMailbox
+                    // wakes the worker for it).
+                    self.wsTimer(c, progress);
+                    w.repost();
+                    return true;
+                }
                 if (userTls(c)) |t| {
                     // TLS records first, then encrypt more WebSocket output.
-                    const progressed = self.tlsFlush(c, t) orelse return false;
+                    progress = (self.tlsFlush(c, t) orelse return false) or progress;
                     if (t.hasWire()) {
-                        self.wsTimer(c, progressed);
+                        self.wsTimer(c, progress);
                         return true;
                     }
                     const bytes = w.wireBytes();
@@ -1677,6 +1701,7 @@ pub fn Worker(comptime Handler: type) type {
                         return false;
                     };
                     w.advance(n);
+                    moved += n;
                     continue;
                 }
                 const wire = w.wireBytes();
@@ -1684,7 +1709,7 @@ pub fn Worker(comptime Handler: type) type {
                 const max = switch (self.kernelGate(c)) {
                     .ready => |max| max,
                     .blocked => {
-                        self.wsTimer(c, false);
+                        self.wsTimer(c, progress);
                         return true;
                     },
                     .closed => return false,
@@ -1692,7 +1717,7 @@ pub fn Worker(comptime Handler: type) type {
                 const bytes = wire[0..@min(wire.len, max)];
                 const n = sys.write(c.fd, bytes) catch |err| switch (err) {
                     error.WouldBlock => {
-                        self.wsTimer(c, false);
+                        self.wsTimer(c, progress);
                         return true;
                     },
                     else => {
@@ -1701,6 +1726,8 @@ pub fn Worker(comptime Handler: type) type {
                     },
                 };
                 w.advance(n);
+                moved += n;
+                progress = progress or n > 0;
                 if (!self.kernelWrote(c, n)) return false;
                 if (n < bytes.len) {
                     // Socket buffer full: wait for writability.
@@ -1733,7 +1760,6 @@ pub fn Worker(comptime Handler: type) type {
             var entries: [64]mailbox_mod.Entry = undefined;
             while (true) {
                 const n = self.mailbox.drain(&entries);
-                if (n == 0) break;
                 for (entries[0..n]) |e| switch (e.kind) {
                     .ws => {
                         const c = &self.conns[e.slot];
@@ -1741,7 +1767,16 @@ pub fn Worker(comptime Handler: type) type {
                     },
                     .exchange => self.exchangePosted(e.slot, e.gen),
                 };
+                // A full batch may have left more. What was posted since
+                // waits for the next pass: draining until empty, a storm of
+                // sends (each posting again as soon as its connection was
+                // written) kept the worker here, its other connections and
+                // timers waiting.
+                if (n < entries.len) break;
             }
+            // Posts from other threads woke the worker; its own (a turn cut
+            // short, a handler sending) don't.
+            if (!self.mailbox.isEmpty()) self.waker.wake();
             if (self.mailbox.takeOverflow()) {
                 for (self.exchanges.entries, 0..) |*e, slot| {
                     if (e.active and e.bound and e.conn_slot & quic_endpoint.exchange_slot_flag != 0)

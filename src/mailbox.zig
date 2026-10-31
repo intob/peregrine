@@ -79,6 +79,14 @@ pub const Mailbox = struct {
         return n;
     }
 
+    /// Whether nothing is posted (the owning worker, after its pass: posts
+    /// from its own thread don't wake it).
+    pub fn isEmpty(self: *Self) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.len == 0;
+    }
+
     /// Whether posts were dropped since the last call.
     pub fn takeOverflow(self: *Self) bool {
         self.mutex.lock();

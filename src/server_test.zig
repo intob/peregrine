@@ -1489,13 +1489,14 @@ const Storm = struct {
         4090, 4096, 16384, 65_530, 65_531, 65_535, 65_536, 65_537, 131_066, 131_072, 300_000, 1 << 20, (2 << 20) - 14,
     };
     const max_len = (2 << 20) - 14;
+    const default_limit = 2000;
 
     conn: *ws.Conn,
     close_after: ?u32,
-    /// Each thread stops after this many: with the queue never empty the
-    /// worker doesn't read (backpressure), so a client's close is only
+    /// Each thread stops after this many: while output is stalled the
+    /// worker doesn't read (backpressure), so a client's close may only be
     /// seen once they stop.
-    limit: u32 = 2000,
+    limit: u32 = default_limit,
     stop: std.atomic.Value(bool) = .init(false),
     failed: std.atomic.Value(bool) = .init(false),
     threads: [n_threads]std.Thread = undefined,
@@ -1612,6 +1613,14 @@ fn stormRead(p: *WsPeer, seen: *StormSeen, max: usize, ms: u64, pace: bool, buf:
     }
 }
 
+/// How long a storm is read to its close frame.
+const storm_read_ms = 120_000;
+
+fn stormNoClose(seen: *const StormSeen, err: anyerror) anyerror {
+    std.debug.print("storm: no close after {d} ms: {d} messages, per thread {any}\n", .{ storm_read_ms, seen.messages, seen.next });
+    return err;
+}
+
 fn waitStormDone(h: *TestHandler, before: usize) !void {
     var tries: u32 = 0;
     while (h.storms_done.load(.acquire) <= before) : (tries += 1) {
@@ -1701,8 +1710,12 @@ fn testWsStorm(backend: Backend) !void {
                 try p.send(.close, "\x03\xe8");
                 seen.client_closed = true;
                 stage = "reading after the client's close";
-                try stormRead(&p, &seen, std.math.maxInt(usize), 30_000, false, buf, want, &pool, &inflated);
-                if (seen.close == null) return error.CloseNeverEchoed;
+                // The worker reads the close only once the senders stop
+                // (2000 each, about 250 MB in all): in Debug over TLS that
+                // took over 30 s. A stall still fails within the socket's
+                // 5 s receive timeout.
+                try stormRead(&p, &seen, std.math.maxInt(usize), storm_read_ms, false, buf, want, &pool, &inflated);
+                if (seen.close == null) return stormNoClose(&seen, error.CloseNeverEchoed);
                 try testing.expectEqualSlices(u8, "\x03\xe8", seen.close.?);
                 try waitStormDone(h, before);
                 try expectStormCounts(h, &seen);
@@ -1716,8 +1729,8 @@ fn testWsStorm(backend: Backend) !void {
                 const before = h.storms_done.load(.acquire);
                 try p.send(.text, "storm-close");
                 var seen: StormSeen = .{};
-                try stormRead(&p, &seen, std.math.maxInt(usize), 30_000, false, buf, want, &pool, &inflated);
-                if (seen.close == null) return error.CloseNeverSent;
+                try stormRead(&p, &seen, std.math.maxInt(usize), storm_read_ms, false, buf, want, &pool, &inflated);
+                if (seen.close == null) return stormNoClose(&seen, error.CloseNeverSent);
                 try testing.expectEqualSlices(u8, "\x03\xe8storm", seen.close.?);
                 try testing.expectEqual(@as(u32, 300), seen.next[0]);
                 stage = "storm-close: the client's reply";
@@ -1816,6 +1829,115 @@ fn testWsTlsInputBehindOutput(backend: Backend) !void {
     }
     try testing.expect(r.srv.handler.queue_full.load(.monotonic));
     try testing.expect(floods * 16 * 1024 >= 4 * 1024 * 1024 - 16 * 1024);
+}
+
+test "websocket: a storm on one connection doesn't hold up the worker's others (plain, TLS)" {
+    try forEachBackend(testWsStormFair);
+}
+
+/// Reads the whole storm (every sender's last message), then closes and
+/// reads to the close echo; `done` once the storm is over. On its own
+/// thread: the test's thread meanwhile times requests on another
+/// connection.
+const StormReader = struct {
+    p: *WsPeer,
+    seen: StormSeen = .{},
+    err: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *StormReader) void {
+        defer self.done.store(true, .release);
+        self.go() catch |err| {
+            self.err = err;
+        };
+    }
+
+    fn over(self: *const StormReader) bool {
+        for (self.seen.next) |n| if (n < Storm.default_limit) return false;
+        return true;
+    }
+
+    fn go(self: *StormReader) !void {
+        const buf = try testing.allocator.alloc(u8, 4 << 20);
+        defer testing.allocator.free(buf);
+        const want = try testing.allocator.alloc(u8, Storm.max_len);
+        defer testing.allocator.free(want);
+        var pool = try BufferPool.init(testing.allocator, 1024, 1);
+        defer pool.deinit();
+        var inflated: ws.inflate.Out = .{ .buf = &.{}, .max = 4 << 20, .pool = &pool };
+        defer if (inflated.buf.len > 0) pool.releaseLarge(inflated.buf);
+        while (!self.over()) {
+            try stormRead(self.p, &self.seen, 1, storm_read_ms, false, buf, want, &pool, &inflated);
+            if (self.seen.close != null) return error.UnexpectedClose;
+        }
+        self.done.store(true, .release);
+        try self.p.send(.close, "\x03\xe8");
+        self.seen.client_closed = true;
+        try stormRead(self.p, &self.seen, std.math.maxInt(usize), storm_read_ms, false, buf, want, &pool, &inflated);
+        if (self.seen.close == null) return stormNoClose(&self.seen, error.CloseNeverEchoed);
+    }
+};
+
+/// Requests one at a time while the storm runs (3 s at most): the longest
+/// wait.
+fn timeRequests(port: u16, tls: bool, reader: *const StormReader, worst: *u64, n: *usize) !void {
+    var plain: Client = undefined;
+    var secure: *TlsClient = undefined;
+    if (tls) secure = try TlsClient.connect(port) else plain = try Client.connect(port);
+    defer if (tls) secure.close() else plain.close();
+    var head: [4096]u8 = undefined;
+    const start = sys.nanoTimestamp();
+    while (!reader.done.load(.acquire) and sys.nanoTimestamp() - start < 3 * std.time.ns_per_s) : (n.* += 1) {
+        const t0 = sys.nanoTimestamp();
+        const req = "GET /fair HTTP/1.1\r\nHost: x\r\n\r\n";
+        const status = if (tls) blk: {
+            try secure.send(req);
+            break :blk (try secure.readResponse(null)).status;
+        } else blk: {
+            try plain.send(req);
+            break :blk (try plain.readResponse(&head, null)).status;
+        };
+        try testing.expectEqual(@as(u16, 200), status);
+        worst.* = @max(worst.*, @as(u64, @intCast(sys.nanoTimestamp() - t0)));
+        sleepMs(20);
+    }
+}
+
+fn testWsStormFair(backend: Backend) !void {
+    // On epoll a flush went on while the queue had output and the socket
+    // took it: with senders on other threads and a client keeping up, one
+    // flush held the worker for seconds (23 s in the storm test over TLS),
+    // and requests on its other connections waited as long.
+    for ([_]StormMode{ .plain, .tls }) |mode| {
+        var cfg: Config = if (mode == .tls) tlsConfig() else .{};
+        cfg.worker_thread_count = 1;
+        const r = try Running.start(backend, cfg);
+        defer r.stop();
+        const h = r.srv.handler;
+        var p = try stormOpen(r.port, mode, false);
+        defer p.close();
+        const before = h.storms_done.load(.acquire);
+        try p.send(.text, "storm");
+        var reader: StormReader = .{ .p = &p };
+        const th = try std.Thread.spawn(.{}, StormReader.run, .{&reader});
+        // Requests on another connection of the same worker while it runs
+        // (the reader is joined whatever happens: it uses `p`).
+        var worst: u64 = 0;
+        var n: usize = 0;
+        const timed = timeRequests(r.port, mode == .tls, &reader, &worst, &n);
+        th.join();
+        timed catch |err| {
+            std.debug.print("{s} {s}: request {d} failed: {s}\n", .{ @tagName(backend), @tagName(mode), n, @errorName(err) });
+            return err;
+        };
+        if (reader.err) |err| return err;
+        try waitStormDone(h, before);
+        try expectStormCounts(h, &reader.seen);
+        if (worst > 1500 * std.time.ns_per_ms) {
+            std.debug.print("{s} {s}: a request waited {d} ms behind the storm ({d} requests)\n", .{ @tagName(backend), @tagName(mode), worst / std.time.ns_per_ms, n });
+            return error.WorkerHeldUp;
+        }
+    }
 }
 
 test "websocket: protocol violations fail with the right close code" {
