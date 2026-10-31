@@ -1486,6 +1486,47 @@ which RFC 9113 deprecated).
       stall itself needs a tick or post to drain the socket between room appearing
       and the writable event, which the tests don't force). h2spec 40x h2c per
       backend, TLS 146/146, Autobahn 301/301 plain and TLS on both backends
+- [x] HTTP/2 output no longer depends on where reads end. `fuzz: h2
+      connections sharing a worker's pool` failed on main (16 streams alone,
+      17 interleaved): not state shared through the pool, but an answer that
+      yielded to a more urgent stream waiting for the window, sent at the end
+      of the read, so a client's RST_STREAM, DATA after END_STREAM (a stream
+      error, or a connection error once the answer had ended the stream) or
+      any later frame found it sent or not depending on where reads ended.
+      Now an answer that newly yields goes out before the next frame is read
+      (`held`, one pass per new yield). Only a stream with something to send
+      now yields (`sendable`, `exchange.h2Ready`), one already waiting doesn't
+      hold again, and a connection WINDOW_UPDATE runs a pass only once the
+      window was spent: floods behind a window-blocked urgent stream (stream
+      or connection WINDOW_UPDATEs, tunnel or body DATA) cost a flat 7-42
+      ns/frame in memory instead of a pass over every stream per frame (up to
+      4.5 µs at 250 streams on the first version; the connection
+      WINDOW_UPDATE case was already 1.2-3.6 µs on main). Output stopped for
+      room in `out` still waits for the worker's pump after a write drains,
+      so input keeps being read. Also fixed (on main too): io_uring never
+      sent the head of an answer posted from another thread while it waited
+      behind a window-blocked stream until the client's next frame; it now
+      pumps after a post as epoll and kqueue do. The test harness pumps when
+      the event loops do; `expectSameRun` is strict, plus a check that nothing
+      but RST_STREAM follows a client's RST_STREAM (frames sent after it were
+      invisible to a comparison between runs), and a split-invariance target
+      `fuzz: h2 frames the same however reads end` (one read, a byte at a
+      time, random splits; seeded too). Remaining split differences come from
+      room in `out` and are legitimate: where DATA frames are cut, and the
+      round-robin order of incremental peers under a small `out_limit`.
+      `fuzz.sh` quotes filters (an apostrophe cut them short, and `'; cmd; '`
+      ran the command) and checks MIN, JOBS and HOST; `h2-bench.sh` has
+      `-alt` servers (ALT_BIN) for A/B runs and PRIORITY.
+      Proof: one-read-vs-two tests (client RST, DATA after END_STREAM, a HEAD
+      answer then DATA) that fail on main, flood tests bounding passes per
+      frame, a slow reader behind a window-blocked stream, the io_uring head
+      test; 14 server mutations a verifier planted all caught; the shared-pool
+      and split-invariance targets fuzzed 20 min × 4 on Pis; h2spec unchanged
+      (TLS 146/146, h2c 145/146 with the known 3.5/2); WebSockets over h2
+      (ws_h2.py); h2-bench A/B within noise (h2c and TLS, hello and 64k,
+      RFC 9218 `u=3, i`). A relaxed oracle came first and was dropped after
+      review: it hid a dropped answer on a reset stream. Two review rounds
+      and two adversarial verifiers
 - [ ] What an idle h2 connection still holds (~14 KB): the two HPACK tables (~5.6 KB
       each; the encoder's could be smaller than the peer's 4096), the slot, order and
       idle-priority arrays (2.5 KB; the last could be allocated lazily), the Conn
