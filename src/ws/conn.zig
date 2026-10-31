@@ -115,8 +115,9 @@ pub const Conn = struct {
     /// `shared` is taken again only once they are).
     raw: Queue = .{},
     raw_pos: usize = 0,
-    /// Worker only: bytes of messages compressed, for the worker's turns
-    /// (`takeCompressed`).
+    /// Worker only: bytes of messages the last chunk compressed, for the
+    /// epoll worker's turns (`takeCompressed`, after each `wireBytes`).
+    /// Set, not added to: other backends never take it.
     compressed: usize = 0,
     /// Worker only: the wire was compressed, and its frames counted as
     /// they were (`compressed`): writing it costs a turn nothing more.
@@ -299,9 +300,9 @@ pub const Conn = struct {
                 return .close;
             } orelse return .ok;
             // A frame costs its payload and the longest header a client's
-            // has (14 bytes): echoes of small frames, their headers and all,
-            // stay well within what a turn writes.
-            self.input_budget -|= frame.payload.len + 14;
+            // has: echoes of small frames, their headers and all, stay well
+            // within what a turn writes.
+            self.input_budget -|= frame.payload.len + protocol.max_header_len;
             const sent_close = self.closeSent();
             switch (frame.opcode) {
                 .ping => if (!sent_close) self.answerPing(frame.payload),
@@ -409,8 +410,8 @@ pub const Conn = struct {
         return self.wire.bytes()[self.wire_pos..];
     }
 
-    /// Bytes of messages compressed since the last call (the worker's
-    /// turns count them with the bytes it writes).
+    /// Bytes of messages the last `wireBytes` compressed, 0 once taken
+    /// (the worker's turns count them with the bytes it writes).
     pub fn takeCompressed(self: *Self) usize {
         defer self.compressed = 0;
         return self.compressed;
@@ -480,7 +481,7 @@ pub const Conn = struct {
         self.mutex.lock();
         self.queued = self.queued - end + out.len;
         self.mutex.unlock();
-        self.compressed += end;
+        self.compressed = end;
         self.raw_pos += end;
         if (self.raw_pos == self.raw.len) self.releaseRaw();
         self.wire = out;
@@ -881,6 +882,24 @@ test "permessage-deflate: sends are compressed on the way to the wire" {
         }
         try testing.expectEqual(@as(usize, 0), rest.len);
     }
+}
+
+test "permessage-deflate: the bytes compressed don't pile up where the turns never take them (io_uring, HTTP/2, HTTP/3)" {
+    const h = try Harness.init(.{ .max_send_queue_bytes = 64 << 20, .deflate = .{ .min_size = 32 } });
+    defer h.deinit();
+    h.conn.enableDeflate(.{ .enabled = true });
+    var m: [40 * 1024]u8 = undefined;
+    for (0..64) |i| {
+        @memset(&m, letter(i));
+        try h.conn.send(&m, true);
+    }
+    while (true) {
+        const bytes = h.conn.wireBytes();
+        if (bytes.len == 0) break;
+        h.conn.advance(bytes.len);
+    }
+    // The last chunk's, not the 2.5 MiB of all of them.
+    try testing.expect(h.conn.takeCompressed() <= Conn.compress_chunk + m.len);
 }
 
 test "permessage-deflate: a long queue is compressed a chunk at a time, as the wire is written, its messages whole and in order" {

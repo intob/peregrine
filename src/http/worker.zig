@@ -1715,8 +1715,12 @@ pub fn Worker(comptime Handler: type) type {
         fn wsReadable(self: *Self, c: *Conn) void {
             const w = c.ws.?;
             while (!c.ws_blocked) {
-                const tls_buffered = c.tls != null and c.tls.?.hasBufferedInput();
-                if (c.peer_closed and !wsInputLeft(c)) {
+                const tls_buffered = tlsInputLeft(c);
+                // Frames decoded but not yet processed (the turn's message
+                // bytes ran out) come before more input.
+                const paused = w.input_paused;
+                // wsInputLeft, from what is at hand.
+                if (c.peer_closed and !paused and !tls_buffered) {
                     // The peer's FIN (or close_notify), its frames all
                     // processed: what is queued still goes out (the close
                     // echo among it), then wsFlush closes the socket.
@@ -1724,9 +1728,6 @@ pub fn Worker(comptime Handler: type) type {
                     if (!wsHasWire(c) and !w.hasOutput()) return self.closeConn(c);
                     return;
                 }
-                // Frames decoded but not yet processed (the turn's message
-                // bytes ran out) come before more input.
-                const paused = w.input_paused;
                 if (!c.read_ready and !tls_buffered and !paused) break;
                 if (self.ws_in == 0 or self.ws_msg == 0) {
                     // A client that keeps the socket readable gets the rest
