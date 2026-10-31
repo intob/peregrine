@@ -2323,11 +2323,14 @@ fn testWsTlsBurstCloseFin(backend: Backend) !void {
     try testing.expectError(error.EndOfStream, p.read(buf, &pool, &inflated));
 }
 
-test "websocket: the mailbox's drain pass never comes round to 0, a new connection's mark" {
+test "websocket: the mailbox's drain pass never comes round to 0, a new connection's mark, nor to an old one's" {
     const next = @import("./http/worker.zig").nextDrainPass;
-    try testing.expectEqual(@as(u32, 1), next(0));
-    try testing.expectEqual(@as(u32, 1), next(std.math.maxInt(u32)));
-    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), next(std.math.maxInt(u32) - 1));
+    try testing.expectEqual(@as(u64, 1), next(0));
+    try testing.expectEqual(@as(u64, 1), next(std.math.maxInt(u64)));
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), next(std.math.maxInt(u64) - 1));
+    // A connection keeps its mark for life: at 32 bits, 2^32 passes later
+    // the number came round to it, and its entry was skipped for good.
+    try testing.expectEqual(@as(u64, 1 << 32), next(std.math.maxInt(u32)));
 }
 
 /// "pour": one thread sends 64 KiB binary messages until the connection

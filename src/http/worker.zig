@@ -51,9 +51,11 @@ const ws_turn_bytes = 256 * 1024;
 const ws_msg_bytes = ws_turn_bytes / 2;
 /// The next drainMailbox pass: never 0, which a connection that was never
 /// served has as `ws_served` (its entry would be skipped, and with `posted`
-/// left set it would never be posted again).
-pub fn nextDrainPass(pass: u32) u32 {
-    return if (pass == std.math.maxInt(u32)) 1 else pass + 1;
+/// left set it would never be posted again). 64 bits: a connection keeps
+/// its mark for life, and a pass number that came round to it again (u32:
+/// after 2^32 passes) would skip its entry the same way.
+pub fn nextDrainPass(pass: u64) u64 {
+    return if (pass == std.math.maxInt(u64)) 1 else pass + 1;
 }
 
 /// TLS record content types (kTLS control records).
@@ -122,7 +124,7 @@ pub fn Worker(comptime Handler: type) type {
             /// Not when a turn ended with output left: input is read then.
             ws_blocked: bool = false,
             /// WebSocket: the drainMailbox pass that last served its post.
-            ws_served: u32 = 0,
+            ws_served: u64 = 0,
             /// Draining input after an error response (see Session.linger).
             lingering: bool = false,
             lingered: u32 = 0,
@@ -228,7 +230,7 @@ pub fn Worker(comptime Handler: type) type {
         ws_msg: usize = 0,
         /// Passes of drainMailbox: a connection served in this one is
         /// skipped if it comes up again (`Conn.ws_served`).
-        drain_pass: u32 = 0,
+        drain_pass: u64 = 0,
         /// Connections speaking HTTP/2 (their streams are ticked once a second).
         h2_count: usize = 0,
         thread: ?std.Thread = null,
