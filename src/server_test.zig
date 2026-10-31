@@ -2772,6 +2772,232 @@ fn testWsIdleCpu(backend: Backend) !void {
     }
 }
 
+test "websocket: frames held across turns: a fragmented message with pings between, many messages and empty pings in one write (plain, TLS, permessage-deflate)" {
+    try forEachBackend(testWsHeldFrames);
+}
+
+/// Writes `bytes`, then (if `fin`) shuts the socket's sending side, on
+/// its own thread while the test reads.
+const RawWriter = struct {
+    fd: sys.fd_t,
+    bytes: []const u8,
+    fin: bool = false,
+    err: ?anyerror = null,
+
+    fn run(self: *RawWriter) void {
+        var rest = self.bytes;
+        while (rest.len > 0) rest = rest[sys.write(self.fd, rest) catch |err| {
+            self.err = err;
+            return;
+        } ..];
+        if (self.fin) _ = std.posix.system.shutdown(self.fd, std.posix.SHUT.WR);
+    }
+};
+
+const HeldBatch = struct { fragments: usize, messages: usize, empty_pings: usize };
+
+/// A fragmented binary message (`fragments` of 1000 B, byte i of fragment
+/// k is k + i, a ping "f<k>" after every 37th), `messages` binary messages
+/// of 1000 B (byte value = index), `empty_pings` empty pings, and a ping
+/// "end".
+fn heldBatch(b: HeldBatch) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(testing.allocator);
+    var frame: [1100]u8 = undefined;
+    var payload: [1000]u8 = undefined;
+    for (0..b.fragments) |k| {
+        for (&payload, 0..) |*x, i| x.* = @truncate(k + i);
+        const op: ws.Opcode = if (k == 0) .binary else .continuation;
+        try out.appendSlice(testing.allocator, Client.wsFrame(&frame, k == b.fragments - 1, op, &payload));
+        if (k % 37 == 36) {
+            var name: [16]u8 = undefined;
+            try out.appendSlice(testing.allocator, Client.wsFrame(&frame, true, .ping, try std.fmt.bufPrint(&name, "f{d}", .{k})));
+        }
+    }
+    for (0..b.messages) |m| {
+        @memset(&payload, @truncate(m));
+        try out.appendSlice(testing.allocator, Client.wsFrame(&frame, true, .binary, &payload));
+    }
+    for (0..b.empty_pings) |_| try out.appendSlice(testing.allocator, Client.wsFrame(&frame, true, .ping, ""));
+    try out.appendSlice(testing.allocator, Client.wsFrame(&frame, true, .ping, "end"));
+    return out.toOwnedSlice(testing.allocator);
+}
+
+fn testWsHeldFrames(backend: Backend) !void {
+    // A turn delivers 128 KiB of messages; process() stops between frames
+    // and the rest waits, decoded, for the next turn, with nothing new on
+    // the socket to bring it back.
+    for ([_]bool{ false, true }) |tls| {
+        for ([_]bool{ false, true }) |deflate| {
+            errdefer std.debug.print("{s} {s}{s}\n", .{ @tagName(backend), if (tls) "tls" else "plain", if (deflate) " deflate" else "" });
+            var cfg: Config = if (tls) tlsConfig() else .{};
+            cfg.worker_thread_count = 1;
+            if (deflate) cfg.websocket_deflate = .{};
+            const r = try Running.start(backend, cfg);
+            defer r.stop();
+            // Over TLS the batch is written before reading: small enough
+            // for the socket buffers to hold both ways.
+            const b: HeldBatch = if (tls) .{ .fragments = 200, .messages = 150, .empty_pings = 5000 } else .{ .fragments = 400, .messages = 300, .empty_pings = 20000 };
+            const batch = try heldBatch(b);
+            defer testing.allocator.free(batch);
+            var p = try WsPeer.open(r.port, tls, deflate);
+            defer p.close();
+            var wr: RawWriter = undefined;
+            var th: ?std.Thread = null;
+            defer if (th) |t| t.join();
+            switch (p) {
+                .plain => |*c| {
+                    wr = .{ .fd = c.fd, .bytes = batch };
+                    th = try std.Thread.spawn(.{}, RawWriter.run, .{&wr});
+                },
+                .tls => |t| try t.send(batch),
+            }
+            const buf = try testing.allocator.alloc(u8, 1 << 20);
+            defer testing.allocator.free(buf);
+            var pool = try BufferPool.init(testing.allocator, 1024, 1);
+            defer pool.deinit();
+            var inflated: ws.inflate.Out = .{ .buf = &.{}, .max = 4 << 20, .pool = &pool };
+            defer if (inflated.buf.len > 0) pool.releaseLarge(inflated.buf);
+            // The pings between fragments, in order, then the message.
+            var k: usize = 36;
+            while (k < b.fragments) : (k += 37) {
+                const m = try p.read(buf, &pool, &inflated);
+                try testing.expectEqual(ws.Opcode.pong, m.op);
+                var name: [16]u8 = undefined;
+                try testing.expectEqualStrings(try std.fmt.bufPrint(&name, "f{d}", .{k}), m.data);
+            }
+            const whole = try p.read(buf, &pool, &inflated);
+            try testing.expectEqual(ws.Opcode.binary, whole.op);
+            try testing.expectEqual(b.fragments * 1000, whole.data.len);
+            for (0..b.fragments) |f| {
+                for (whole.data[f * 1000 ..][0..1000], 0..) |x, i| if (x != @as(u8, @truncate(f + i))) return error.FragmentCorrupt;
+            }
+            for (0..b.messages) |m| {
+                const e = try p.read(buf, &pool, &inflated);
+                try testing.expectEqual(ws.Opcode.binary, e.op);
+                try testing.expectEqual(@as(usize, 1000), e.data.len);
+                try testing.expectEqual(@as(u8, @truncate(m)), e.data[0]);
+            }
+            for (0..b.empty_pings) |i| {
+                const e = p.read(buf, &pool, &inflated) catch |err| {
+                    std.debug.print("empty pong {d} of {d}: {s}\n", .{ i, b.empty_pings, @errorName(err) });
+                    return err;
+                };
+                try testing.expectEqual(ws.Opcode.pong, e.op);
+                try testing.expectEqual(@as(usize, 0), e.data.len);
+            }
+            const last = try p.read(buf, &pool, &inflated);
+            try testing.expectEqual(ws.Opcode.pong, last.op);
+            try testing.expectEqualStrings("end", last.data);
+            if (th) |t| {
+                t.join();
+                th = null;
+                if (wr.err) |err| return err;
+            }
+        }
+    }
+}
+
+test "websocket: the client's FIN behind its messages, its close, the server's close, and a FIN from a client that stopped reading" {
+    try forEachBackend(testWsFin);
+}
+
+fn testWsFin(backend: Backend) !void {
+    const big = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*x, i| x.* = @truncate(i);
+    const frame = try testing.allocator.alloc(u8, big.len + 16);
+    defer testing.allocator.free(frame);
+    const one = Client.wsFrame(frame, true, .binary, big);
+    var eight: std.ArrayList(u8) = .empty;
+    defer eight.deinit(testing.allocator);
+    for (0..8) |_| try eight.appendSlice(testing.allocator, one);
+    const buf = try testing.allocator.alloc(u8, 2 << 20);
+    defer testing.allocator.free(buf);
+    var small: [64]u8 = undefined;
+    const close = Client.wsFrame(&small, true, .close, "\x03\xe8");
+    // 1. Eight 1 MiB messages, then FIN: all eight echoes, then the end.
+    {
+        const r = try Running.start(backend, .{ .worker_thread_count = 1 });
+        defer r.stop();
+        var c = try Client.connect(r.port);
+        defer c.close();
+        try c.send(Client.upgrade_request);
+        try c.readUpgrade();
+        var wr: RawWriter = .{ .fd = c.fd, .bytes = eight.items, .fin = true };
+        const th = try std.Thread.spawn(.{}, RawWriter.run, .{&wr});
+        defer th.join();
+        for (0..8) |i| {
+            const f = c.wsRead(buf) catch |err| {
+                std.debug.print("{s} FIN behind messages: echo {d} of 8: {s}\n", .{ @tagName(backend), i, @errorName(err) });
+                return err;
+            };
+            try testing.expectEqual(ws.Opcode.binary, f.opcode);
+            try testing.expectEqualSlices(u8, big, f.payload);
+        }
+        try c.expectClosed();
+    }
+    // 2. A message, the close and FIN in one write: the echo, the close
+    // echo, then the end.
+    {
+        const r = try Running.start(backend, .{ .worker_thread_count = 1 });
+        defer r.stop();
+        var c = try Client.connect(r.port);
+        defer c.close();
+        try c.send(Client.upgrade_request);
+        try c.readUpgrade();
+        var both: std.ArrayList(u8) = .empty;
+        defer both.deinit(testing.allocator);
+        try both.appendSlice(testing.allocator, one);
+        try both.appendSlice(testing.allocator, close);
+        var wr: RawWriter = .{ .fd = c.fd, .bytes = both.items, .fin = true };
+        const th = try std.Thread.spawn(.{}, RawWriter.run, .{&wr});
+        defer th.join();
+        const f = try c.wsRead(buf);
+        try testing.expectEqual(ws.Opcode.binary, f.opcode);
+        try testing.expectEqual(big.len, f.payload.len);
+        try c.expectWsClose(1000);
+        try c.expectClosed();
+    }
+    // 3. The server closes; the client answers with FIN alone.
+    {
+        const r = try Running.start(backend, .{ .worker_thread_count = 1 });
+        defer r.stop();
+        var c = try Client.connect(r.port);
+        defer c.close();
+        try c.send(Client.upgrade_request);
+        try c.readUpgrade();
+        try c.wsSend(true, .text, "close-me");
+        try c.expectWsClose(1000);
+        _ = std.posix.system.shutdown(c.fd, std.posix.SHUT.WR);
+        try c.expectClosed();
+    }
+    // 4. Eight messages and FIN from a client that never reads: the
+    // request timeout ends it.
+    {
+        const r = try Running.start(backend, .{ .worker_thread_count = 1, .request_timeout_s = 1 });
+        defer r.stop();
+        var c = try Client.connect(r.port);
+        defer c.close();
+        try c.send(Client.upgrade_request);
+        try c.readUpgrade();
+        var wr: RawWriter = .{ .fd = c.fd, .bytes = eight.items, .fin = true };
+        const th = try std.Thread.spawn(.{}, RawWriter.run, .{&wr});
+        const start = sys.nanoTimestamp();
+        while (r.srv.handler.ws_disconns.load(.monotonic) == 0) {
+            if (sys.nanoTimestamp() - start > 6 * std.time.ns_per_s) {
+                _ = std.posix.system.shutdown(c.fd, std.posix.SHUT.RDWR);
+                th.join();
+                std.debug.print("{s}: a client that sent FIN and stopped reading still open after 6 s\n", .{@tagName(backend)});
+                return error.FinNeverReaderNotClosed;
+            }
+            sleepMs(20);
+        }
+        _ = std.posix.system.shutdown(c.fd, std.posix.SHUT.RDWR);
+        th.join();
+    }
+}
+
 test "websocket: split and malformed input behind stalled output, read once the client reads again (plain, TLS)" {
     try forEachBackend(testWsSplitBehindStall);
 }
