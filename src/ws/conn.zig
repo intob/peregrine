@@ -917,9 +917,10 @@ test "a send from another thread wakes the owning worker" {
 // -- Send queues: from the worker's pool, held only while they hold bytes ---
 
 /// One frame the server wrote, taken from the front of `rest`.
-const OutFrame = struct { op: u4, rsv1: bool, payload: []const u8 };
+/// A server frame (tests here and in HTTP/2 and HTTP/3).
+pub const OutFrame = struct { op: u4, rsv1: bool, payload: []const u8 };
 
-fn takeFrame(rest: *[]const u8) !OutFrame {
+pub fn takeFrame(rest: *[]const u8) !OutFrame {
     const r = rest.*;
     if (r.len < 2) return error.Truncated;
     if (r[0] & 0x80 == 0 or r[1] & 0x80 != 0) return error.BadFrame;

@@ -979,23 +979,9 @@ fn expectH3Storm(bytes: []const u8, close: ?[]const u8) ![H3Storm.n_threads]u32 
     var rest = bytes;
     var closed = false;
     while (rest.len > 0) {
-        try testing.expect(rest.len >= 2);
-        const b1 = rest[1] & 0x7f;
-        const hl: usize = switch (b1) {
-            126 => 4,
-            127 => 10,
-            else => 2,
-        };
-        try testing.expect(rest.len >= hl);
-        const n: usize = switch (b1) {
-            126 => std.mem.readInt(u16, rest[2..4], .big),
-            127 => @intCast(std.mem.readInt(u64, rest[2..10], .big)),
-            else => b1,
-        };
-        try testing.expect(rest.len >= hl + n);
-        const p = rest[hl..][0..n];
-        const op = rest[0] & 0x0f;
-        rest = rest[hl + n ..];
+        const f = try ws.takeFrame(&rest);
+        const p = f.payload;
+        const op = f.op;
         try testing.expect(!closed);
         if (op == 8) {
             try testing.expectEqualSlices(u8, close.?, p);

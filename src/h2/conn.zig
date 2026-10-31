@@ -4997,23 +4997,9 @@ fn expectStorm(bytes: []const u8, close: ?[]const u8, cut: bool) ![H2Storm.n_thr
     var rest = bytes;
     var closed = false;
     while (rest.len > 0) {
-        if (rest.len < 2) return if (cut) next else error.Truncated;
-        const b1 = rest[1] & 0x7f;
-        const hl: usize = switch (b1) {
-            126 => 4,
-            127 => 10,
-            else => 2,
-        };
-        if (rest.len < hl) return if (cut) next else error.Truncated;
-        const n: usize = switch (b1) {
-            126 => std.mem.readInt(u16, rest[2..4], .big),
-            127 => @intCast(std.mem.readInt(u64, rest[2..10], .big)),
-            else => b1,
-        };
-        if (rest.len < hl + n) return if (cut) next else error.Truncated;
-        const p = rest[hl..][0..n];
-        const op = rest[0] & 0x0f;
-        rest = rest[hl + n ..];
+        const f = ws.takeFrame(&rest) catch |err| return if (cut and err == error.Truncated) next else err;
+        const p = f.payload;
+        const op = f.op;
         try testing.expect(!closed);
         if (op == 8) {
             try testing.expectEqualSlices(u8, close.?, p);
