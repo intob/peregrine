@@ -36,12 +36,14 @@ B=${1:-epoll}; shift
 IMG=peregrine-h3load-netem
 NET=h3i-pmtu-$TAG; SRV=h3i-pmtu-srv-$TAG; CLI=h3i-pmtu-cli-$TAG
 "$LOCK" share mac-bench "h3-pmtu $B ($ROOT)"
+# Interrupted or not, the containers and the network go with the lock.
 cleanup() {
     docker rm -f "$SRV" "$CLI" >/dev/null 2>&1
     docker network rm "$NET" >/dev/null 2>&1
     "$LOCK" unshare mac-bench
 }
 trap cleanup EXIT
+trap 'exit 1' INT TERM HUP
 docker image inspect peregrine-h3load >/dev/null 2>&1 ||
     { echo "no peregrine-h3load image: docker build -t peregrine-h3load $ROOT/bench/h3"; exit 1; }
 docker image inspect $IMG >/dev/null 2>&1 ||

@@ -25,12 +25,17 @@ IMG=peregrine-h3load-netem
 CIMG=peregrine-h3-ecn
 NET=h3i-pmtus-$TAG; SRV=h3i-pmtus-srv-$TAG; CLI=h3i-pmtus-cli-$TAG
 "$LOCK" share mac-bench "h3-pmtu-stress $B ($ROOT)"
+# Interrupted or not, the MTU schedule's subshells, the containers and the
+# network go with the lock.
 cleanup() {
+    local p
+    for p in $(jobs -p); do pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; done
     docker rm -f "$SRV" "$CLI" >/dev/null 2>&1
     docker network rm "$NET" >/dev/null 2>&1
     "$LOCK" unshare mac-bench
 }
 trap cleanup EXIT
+trap 'exit 1' INT TERM HUP
 docker image inspect $IMG >/dev/null 2>&1 ||
     docker build -q -t $IMG -f "$ROOT/bench/h3/Dockerfile.netem" "$ROOT/bench/h3" >/dev/null || exit 1
 docker image inspect $CIMG >/dev/null 2>&1 ||
