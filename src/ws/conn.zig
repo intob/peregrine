@@ -1507,6 +1507,108 @@ fn fuzzSendQueues(_: void, smith: *std.testing.Smith) anyerror!void {
     try expectHoldsNothing(h);
 }
 
+// Six connections sharing one worker's pool, six threads each sending to
+// all of them in turn while the worker writes pieces of random ones and
+// trims: buffers move between connections through the free lists.
+const ManySenders = struct {
+    conns: []const *Conn,
+    count: usize,
+    done: std.atomic.Value(usize) = .init(0),
+    sent: [6][6]u32 = @splat(@splat(0)),
+
+    fn run(self: *ManySenders, t: usize) void {
+        var buf: [72 * 1024]u8 = undefined;
+        var seq: [6]u32 = @splat(0);
+        var k: usize = t;
+        var tries: usize = 0;
+        while (tries < self.count * self.conns.len) : (tries += 1) {
+            k = (k + 1) % self.conns.len;
+            const c = self.conns[k];
+            const m = buf[0..testMsgLen(t, seq[k])];
+            testMsgFill(m, t, seq[k]);
+            m[0] = @intCast(t << 4 | k);
+            c.send(m, true) catch |err| switch (err) {
+                error.SendQueueFull => {
+                    std.Thread.yield() catch {};
+                    continue;
+                },
+                else => unreachable,
+            };
+            seq[k] += 1;
+        }
+        for (seq, 0..) |n, i| self.sent[t][i] = n;
+        _ = self.done.fetchAdd(1, .release);
+    }
+};
+
+test "verify send queues: connections sharing a pool, threads sending to all of them, the worker writing and trimming" {
+    for ([_]bool{ false, true }) |compress| {
+        const h = try Harness.init(.{ .max_send_queue_bytes = 48 * 1024, .deflate = .{ .min_size = 32 } });
+        defer h.deinit();
+        var conns: [6]*Conn = undefined;
+        var outs: [6]std.ArrayList(u8) = @splat(.empty);
+        defer for (&outs) |*o| o.deinit(testing.allocator);
+        conns[0] = h.conn;
+        for (conns[1..], 1..) |*c, i| c.* = try Conn.create(testing.allocator, &h.pool, @intCast(10 + i), .{ .max_send_queue_bytes = 48 * 1024, .deflate = .{ .min_size = 32 } }, &h.mailbox, .{ .kind = .ws, .slot = @intCast(i), .gen = 1 });
+        defer for (conns[1..]) |c| c.destroy();
+        if (compress) for (conns) |c| c.enableDeflate(.{ .enabled = true });
+        var s: ManySenders = .{ .conns = &conns, .count = 300 };
+        var ts: [6]std.Thread = undefined;
+        for (&ts, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, ManySenders.run, .{ &s, i });
+        var prng = std.Random.DefaultPrng.init(@as(u64, @intFromBool(compress)) + 40);
+        const rand = prng.random();
+        while (true) {
+            const finished = s.done.load(.acquire) == ts.len;
+            _ = h.drainMailbox();
+            for (conns) |c| c.clearPosted();
+            if (rand.uintLessThan(u8, 16) == 0) h.pool.trim();
+            var any = false;
+            for (0..conns.len) |_| {
+                const i = rand.uintLessThan(usize, conns.len);
+                const bytes = conns[i].wireBytes();
+                if (bytes.len == 0) continue;
+                any = true;
+                const k = 1 + rand.uintLessThan(usize, @min(bytes.len, 30_000));
+                try outs[i].appendSlice(testing.allocator, bytes[0..k]);
+                conns[i].advance(k);
+            }
+            if (!any) {
+                var pending = false;
+                for (conns) |c| pending = pending or c.hasOutput();
+                if (finished and !pending) break;
+                std.Thread.yield() catch {};
+            }
+        }
+        for (&ts) |t| t.join();
+        var got: inflate.Out = .{ .buf = &.{}, .max = 1 << 20, .pool = &h.pool };
+        defer if (got.buf.len > 0) h.pool.releaseLarge(got.buf);
+        var want: [72 * 1024]u8 = undefined;
+        for (outs, 0..) |o, ci| {
+            var next: [6]u32 = @splat(0);
+            var rest: []const u8 = o.items;
+            while (rest.len > 0) {
+                const f = try takeFrame(&rest);
+                try testing.expectEqual(@as(u4, 2), f.op);
+                const m = try messageOf(&h.pool, f, &got);
+                const t = m[0] >> 4;
+                try testing.expectEqual(ci, m[0] & 15);
+                const seq = std.mem.readInt(u32, m[1..5], .little);
+                try testing.expectEqual(next[t], seq);
+                const w = want[0..testMsgLen(t, seq)];
+                testMsgFill(w, t, seq);
+                w[0] = m[0];
+                try testing.expectEqualSlices(u8, w, m);
+                next[t] += 1;
+            }
+            for (0..6) |t| try testing.expectEqual(s.sent[t][ci], next[t]);
+        }
+        for (conns) |c| try testing.expectEqual(@as(usize, 0), c.shared.buf.len + c.wire.buf.len);
+        h.pool.trim();
+        h.pool.trim();
+        try testing.expectEqual(@as(usize, 0), h.pool.ws_queues.held.load(.monotonic));
+    }
+}
+
 test "fuzz: ws send queues" {
     try std.testing.fuzz({}, fuzzSendQueues, .{ .corpus = &.{
         &[_]u8{ 0x01, 0x00, 0x10, 0x00, 0x2a, 0x00, 0x03, 0x00, 0x30, 0x05, 0x10, 0x00, 0x00, 0x00, 0x01, 0x2b, 0x01, 0x07, 0x00, 0x46, 0x00, 0x08 },
