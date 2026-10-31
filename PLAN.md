@@ -1090,7 +1090,58 @@ Later in M4:
       std's client, which checks the name; OpenSSL 3.5 `-servername` and
       aioquic over HTTP/3 on epoll and io_uring (`bench-server ... sni`).
       Linear in the number of certificates
-- [ ] OCSP stapling
+- [x] **OCSP stapling** (RFC 8446 §4.4.2.1, RFC 6066 §8, RFC 6960;
+      `src/tls/ocsp.zig`, `src/ocsp_watcher.zig`), over TCP and QUIC:
+      `TlsOptions.ocsp_response_path` (and `TlsCertificate`'s) names a DER
+      OCSP response file; a client that sends status_request gets it in the
+      leaf's CertificateEntry, in full handshakes only. A thread of the
+      server's own reads each file every `ocsp_reload_interval_s` (60 s;
+      opened without blocking, regular files only, compared by bytes). A
+      response is stapled when, decided as OpenSSL's `ocsp -verify` (curl
+      --cert-status) would and never stricter (a responder clients accept may
+      sign a revocation we must act on): it is strict DER, successful, basic,
+      has a SHA-1 CertID for the leaf, is signed by the issuer the CertID
+      names or by the first certificate in `certs` the ResponderID names,
+      issued by that issuer with id-kp-OCSPSigning and no critical extension
+      OpenSSL wouldn't know (a delegate answers for its issuer's certificates
+      only; RSA PKCS#1 v1.5/PSS, ECDSA P-256/P-384, Ed25519; PSS with an
+      8k+1-bit key refused rather than handed to std, which asserts), is
+      current (300 s of skew on thisUpdate and producedAt, none on the
+      responder certificate's validity, stapled until the earlier of
+      nextUpdate and its notAfter), says good, and is no older than the
+      newest verified response. `verify` decides what time can't change
+      (once per file content), `evaluate` the rest (each round). A refusal
+      keeps the last good response, except a current, signed revocation,
+      which stops stapling (logged as an error; "unknown" keeps the last good
+      one). Responses are at most 65527 bytes. `ocsp.Staple` hands the
+      prepared bytes to handshakes in two slots (no lock or allocation), let
+      go once the Certificate is copied; pooled flight buffers are kept up to
+      16 KiB by every free handshake state (about 1.6 MiB per worker worst
+      case at 64 states). Fetching is left to a job that writes the file
+      (readme: `openssl ocsp ... -respout`, then rename).
+      Proof: unit, handshake, watcher and end-to-end tests on kqueue, epoll
+      and io_uring (HTTP/1.1, h2, h3, SNI, files replaced while running, 4
+      threads of handshakes against nonstop rewrites); hand-built fixtures
+      checked against `openssl ocsp`, 23 real CA responses (DigiCert,
+      Sectigo, GoDaddy, Entrust, SSL.com, Amazon, QuoVadis, Actalis, Certum,
+      TWCA) and 467 real CA certificates; about 60 mutations caught; fuzz
+      targets `fuzz: ocsp response check` and `fuzz: ocsp status_request in
+      ClientHello…` (15 min each on a Pi); three code reviews and three
+      adversarial verifiers, which found and got fixed: the size limit 4
+      bytes too high (a panic), unverified signatures, future thisUpdate, a
+      FIFO blocking the watcher, coarse timestamps missing rewrites,
+      revocations ignored then undone by an older response, refusals not
+      retried after a clock fix, unparsed fields, lax ECDSA DER, a std assert,
+      SHA-2-only CertIDs that curl can't match. Interop (`tls-interop.sh`,
+      epoll and io_uring, 77 checks): s_client -status over TCP and QUIC,
+      curl --cert-status over HTTP/1.1, h2 and h3, responses replaced while
+      running (unauthorised, unknown, revoked, SHA-256 CertID, new)
+- [ ] OCSP, what's left: names (ResponderID byName, issuer matching) are
+      compared as bytes, not by RFC 5280 §7.1 / X509_NAME_cmp: a responder or
+      issuer whose name is encoded differently is refused (fail safe for
+      stapling, though a revocation signed so wouldn't stop it); fetching
+      responses ourselves; SHA-1/P-521 response signatures (refused);
+      must-staple
 - [x] **kTLS KeyUpdate missed on x86_64.** "tls: kernel TLS … a file with
       sendfile, close_notify" failed on the Hetzner box (Ubuntu 6.8, no kernel
       rekey) in ReleaseSafe and passed in Debug: with `test_key_update_limit = 4`
