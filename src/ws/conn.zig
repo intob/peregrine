@@ -459,7 +459,9 @@ pub const Conn = struct {
             const n = f.n;
             const frame = src[i..][0 .. hl + n];
             i += frame.len;
-            if (frame[0] & 0x40 != 0) {
+            // An empty message can't shrink (with `min_size` 0 it is
+            // marked too): it goes out as it is.
+            if (frame[0] & 0x40 != 0 and n > 0) {
                 if (d) |deflater| {
                     const room = out.buf[out.len..];
                     // Only output smaller than the payload is kept.
@@ -2003,11 +2005,9 @@ test "fuzz: ws send queues" {
 }
 
 test "verify: permessage-deflate with min_size 0 compresses every message: an empty one goes out as it is" {
-    // Fails here and on main: compressSome's `n - 1` overflows for an empty
-    // payload (a panic in safe builds, which ends the whole test run; out
-    // of bounds in ReleaseFast). Set to true to reproduce.
-    const reproduce = false;
-    if (!reproduce) return error.SkipZigTest;
+    // Failed on main and before the fix: compressSome's `n - 1` overflowed
+    // for an empty payload (a panic in safe builds; out of bounds in
+    // ReleaseFast).
     const h = try Harness.init(.{ .deflate = .{ .min_size = 0 } });
     defer h.deinit();
     h.conn.enableDeflate(.{ .enabled = true });
