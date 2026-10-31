@@ -2173,6 +2173,70 @@ fn testWsHalfCloseBehindTurn(backend: Backend) !void {
     }
 }
 
+test "websocket: more messages than a turn takes, then the client's close_notify and FIN: every one is echoed before the socket closes (plain, TLS)" {
+    try forEachBackend(testWsMessagesThenFin);
+}
+
+fn testWsMessagesThenFin(backend: Backend) !void {
+    // A turn stops processing at its message bytes with frames decoded but
+    // left; were the close_notify decrypted with them, closing at the
+    // peer's end must wait for them too. (A guard: each readable event
+    // starts a turn, and this didn't catch the close coming first.)
+    // Payloads past a turn's 128 KiB (1311 messages), and past two.
+    const counts = [_]usize{ 1312, 1400, 2000, 2700 };
+    for ([_]bool{ false, true }) |tls| for (counts) |count| {
+        errdefer std.debug.print("{s} {s}\n", .{ @tagName(backend), if (tls) "tls" else "plain" });
+        var cfg: Config = if (tls) tlsConfig() else .{};
+        cfg.worker_thread_count = 1;
+        const r = try Running.start(backend, cfg);
+        defer r.stop();
+        var p = try WsPeer.open(r.port, tls, false);
+        defer p.close();
+        const all = try testing.allocator.alloc(u8, counts[counts.len - 1] * (100 + 6));
+        defer testing.allocator.free(all);
+        var n: usize = 0;
+        for (0..count) |i| {
+            var m: [100]u8 = @splat(@truncate(i));
+            n += Client.wsFrame(all[n..], true, .binary, &m).len;
+        }
+        // The messages, then the end, in one go.
+        switch (p) {
+            .plain => |*c| {
+                try c.send(all[0..n]);
+                _ = std.posix.system.shutdown(c.fd, std.posix.SHUT.WR);
+            },
+            .tls => |t| {
+                try t.client.writer.writeAll(all[0..n]);
+                try t.client.end();
+                try t.file_writer.interface.flush();
+                _ = std.posix.system.shutdown(t.fd, std.posix.SHUT.WR);
+            },
+        }
+        const buf = try testing.allocator.alloc(u8, 1 << 16);
+        defer testing.allocator.free(buf);
+        var pool = try BufferPool.init(testing.allocator, 1024, 1);
+        defer pool.deinit();
+        var inflated: ws.inflate.Out = .{ .buf = &.{}, .max = 1 << 20, .pool = &pool };
+        defer if (inflated.buf.len > 0) pool.releaseLarge(inflated.buf);
+        var got: usize = 0;
+        while (true) {
+            const f = p.read(buf, &pool, &inflated) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => {
+                    std.debug.print("{s} after {d} echoes\n", .{ @errorName(err), got });
+                    return err;
+                },
+            };
+            try testing.expectEqual(ws.Opcode.binary, f.op);
+            try testing.expectEqual(@as(usize, 100), f.data.len);
+            try testing.expectEqual(@as(u8, @truncate(got)), f.data[0]);
+            got += 1;
+        }
+        if (got != count) std.debug.print("{s} {s}: {d} of {d} echoed, then EOF\n", .{ @tagName(backend), if (tls) "tls" else "plain", got, count });
+        try testing.expectEqual(@as(usize, count), got);
+    };
+}
+
 /// "pour": one thread sends 64 KiB binary messages until the connection
 /// goes (handleWSDisconn stops it).
 const Pour = struct {

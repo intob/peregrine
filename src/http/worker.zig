@@ -1687,11 +1687,11 @@ pub fn Worker(comptime Handler: type) type {
         fn wsReadable(self: *Self, c: *Conn) void {
             const w = c.ws.?;
             while (!c.ws_blocked) {
-                if (c.peer_closed) {
-                    // The peer's FIN (or close_notify): what is queued still
-                    // goes out (the close echo among it), then wsFlush
-                    // closes the socket. Closing now dropped it all when a
-                    // turn had left output.
+                if (c.peer_closed and !w.input_paused) {
+                    // The peer's FIN (or close_notify), its frames all
+                    // processed: what is queued still goes out (the close
+                    // echo among it), then wsFlush closes the socket.
+                    // Closing now dropped it all when a turn had left output.
                     if (!wsHasWire(c) and !w.hasOutput()) return self.closeConn(c);
                     return;
                 }
@@ -1790,7 +1790,7 @@ pub fn Worker(comptime Handler: type) type {
             }
             // Everything is written: the close handshake is over, or the
             // peer has closed its side.
-            if (w.wantsClose() or c.peer_closed) {
+            if (w.wantsClose() or (c.peer_closed and !w.input_paused)) {
                 self.closeConn(c);
                 return false;
             }
