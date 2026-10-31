@@ -35,9 +35,10 @@ fn isH2(alpn: ?[]const u8) bool {
 }
 /// Connections accepted per listener event, to stay fair to existing ones.
 const ACCEPT_BATCH = 64;
-/// WebSocket output written (or encrypted) per turn: the rest waits for
-/// the next pass of the loop, after the others' events and the timers.
-/// Measured with a storm over TLS on one connection and requests on
+/// WebSocket bytes moved per turn of a connection (read, written or
+/// encrypted, over all of one event's or one post's reads and writes):
+/// the rest waits for the next pass of the loop, after the others' events
+/// and the timers. Measured with a storm over TLS on one connection and requests on
 /// another (worst wait, Debug / ReleaseSafe): 128 KiB 30 / 12 ms, 256 KiB
 /// 57 / 12 ms, 1 MiB 192 / 21 ms, no turns over 5 s / 1 s; echoes of 20 B
 /// to 1 MiB cost the same with any of them.
@@ -198,6 +199,9 @@ pub fn Worker(comptime Handler: type) type {
         idle: List,
         active: List,
         open_count: usize = 0,
+        /// What is left of the current WebSocket connection's turn
+        /// (`ws_turn_bytes`), from its event, its post or its upgrade.
+        ws_turn: usize = 0,
         /// Connections speaking HTTP/2 (their streams are ticked once a second).
         h2_count: usize = 0,
         thread: ?std.Thread = null,
@@ -650,6 +654,7 @@ pub fn Worker(comptime Handler: type) type {
             c.session = .{};
             self.unlink(c);
             if (@hasDecl(Handler, "handleWSConn")) self.handler.handleWSConn(w);
+            self.ws_turn = ws_turn_bytes;
             if (!self.wsProcess(c)) return;
             if (c.read_ready or (c.tls != null and c.tls.?.hasBufferedInput())) self.wsReadable(c);
         }
@@ -1151,6 +1156,7 @@ pub fn Worker(comptime Handler: type) type {
                 } else {
                     c.session.commitRead(n);
                 }
+                if (c.ws != null) self.spendTurn(n);
                 // A short read drained the socket; edge triggering reports
                 // any newer data. Saves a read() == EAGAIN.
                 if (n < space.len and !c.hangup) c.read_ready = false;
@@ -1634,6 +1640,7 @@ pub fn Worker(comptime Handler: type) type {
         }
 
         fn onWsEvent(self: *Self, c: *Conn, ev: Poller.Event) void {
+            self.ws_turn = ws_turn_bytes;
             if (Poller.writable(ev) and wsHasWire(c)) {
                 if (!self.wsFlush(c)) return;
             }
@@ -1649,6 +1656,12 @@ pub fn Worker(comptime Handler: type) type {
             while (!wsHasWire(c)) {
                 const tls_buffered = c.tls != null and c.tls.?.hasBufferedInput();
                 if (!c.read_ready and !tls_buffered) break;
+                if (self.ws_turn == 0) {
+                    // A client that keeps the socket readable gets the rest
+                    // on a later pass too (the post brings it back here).
+                    c.ws.?.repost();
+                    break;
+                }
                 if (c.read_ready and !self.readSocket(c)) return;
                 if (c.tls) |t| {
                     if (!self.tlsDecrypt(c, t)) return;
@@ -1677,27 +1690,22 @@ pub fn Worker(comptime Handler: type) type {
             // only the last one (which often finds the socket filled by the
             // writes before it).
             var progress = false;
-            // Bytes taken from the queue in this call: senders on other
-            // threads can keep it from ever emptying while the client keeps
-            // up, and one flush then held the worker for as long as they
-            // sent (23 s in the storm test), its timers and every other
-            // connection waiting.
-            var moved: usize = 0;
+            // The turn (`ws_turn`) bounds what one call moves: senders on
+            // other threads can keep the queue from ever emptying while the
+            // client keeps up, and one flush then held the worker for as
+            // long as they sent (23 s in the storm test), its timers and
+            // every other connection waiting.
             while (true) {
-                if (moved >= ws_turn_bytes) {
-                    // The rest on a later pass of the loop (drainMailbox
-                    // wakes the worker for it).
-                    self.wsTimer(c, progress);
-                    w.repost();
-                    return true;
-                }
                 if (userTls(c)) |t| {
-                    // TLS records first, then encrypt more WebSocket output.
+                    // TLS records first, then encrypt more WebSocket output
+                    // (the turn ends with the records it encrypted written,
+                    // or waiting for the socket).
                     progress = (self.tlsFlush(c, t) orelse return false) or progress;
                     if (t.hasWire()) {
                         self.wsTimer(c, progress);
                         return true;
                     }
+                    if (self.ws_turn == 0) return self.wsTurnOver(c, progress);
                     const bytes = w.wireBytes();
                     if (bytes.len == 0) break;
                     const n = t.encrypt(&.{bytes}) catch {
@@ -1705,9 +1713,10 @@ pub fn Worker(comptime Handler: type) type {
                         return false;
                     };
                     w.advance(n);
-                    moved += n;
+                    self.spendTurn(n);
                     continue;
                 }
+                if (self.ws_turn == 0) return self.wsTurnOver(c, progress);
                 const wire = w.wireBytes();
                 if (wire.len == 0) break;
                 const max = switch (self.kernelGate(c)) {
@@ -1730,7 +1739,7 @@ pub fn Worker(comptime Handler: type) type {
                     },
                 };
                 w.advance(n);
-                moved += n;
+                self.spendTurn(n);
                 progress = progress or n > 0;
                 if (!self.kernelWrote(c, n)) return false;
                 if (n < bytes.len) {
@@ -1744,6 +1753,19 @@ pub fn Worker(comptime Handler: type) type {
                 return false;
             }
             self.wsTimer(c, false);
+            return true;
+        }
+
+        inline fn spendTurn(self: *Self, n: usize) void {
+            self.ws_turn -|= n;
+        }
+
+        /// The connection's turn is over with output left (or input:
+        /// wsReadable stops too): its post brings it back on the next pass
+        /// of the loop.
+        fn wsTurnOver(self: *Self, c: *Conn, progress: bool) bool {
+            self.wsTimer(c, progress);
+            c.ws.?.repost();
             return true;
         }
 
@@ -1806,6 +1828,7 @@ pub fn Worker(comptime Handler: type) type {
         fn wsFlushPosted(self: *Self, c: *Conn) void {
             const w = c.ws orelse return;
             w.clearPosted();
+            self.ws_turn = ws_turn_bytes;
             if (!self.wsFlush(c)) return;
             // Output may have been stalled; reading resumes once it drains.
             self.wsReadable(c);

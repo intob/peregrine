@@ -1897,14 +1897,14 @@ const StormReader = struct {
 
 /// Requests one at a time while the storm runs (3 s at most): the longest
 /// wait.
-fn timeRequests(port: u16, tls: bool, reader: *const StormReader, worst: *u64, n: *usize) !void {
+fn timeRequests(port: u16, tls: bool, done: *const std.atomic.Value(bool), worst: *u64, n: *usize) !void {
     var plain: Client = undefined;
     var secure: *TlsClient = undefined;
     if (tls) secure = try TlsClient.connect(port) else plain = try Client.connect(port);
     defer if (tls) secure.close() else plain.close();
     var head: [4096]u8 = undefined;
     const start = sys.nanoTimestamp();
-    while (!reader.done.load(.acquire) and sys.nanoTimestamp() - start < 3 * std.time.ns_per_s) : (n.* += 1) {
+    while (!done.load(.acquire) and sys.nanoTimestamp() - start < 3 * std.time.ns_per_s) : (n.* += 1) {
         const t0 = sys.nanoTimestamp();
         const req = "GET /fair HTTP/1.1\r\nHost: x\r\n\r\n";
         const status = if (tls) blk: {
@@ -1941,7 +1941,7 @@ fn testWsStormFair(backend: Backend) !void {
         // (the reader is joined whatever happens: it uses `p`).
         var worst: u64 = 0;
         var n: usize = 0;
-        const timed = timeRequests(r.port, mode == .tls, &reader, &worst, &n);
+        const timed = timeRequests(r.port, mode == .tls, &reader.done, &worst, &n);
         th.join();
         timed catch |err| {
             std.debug.print("{s} {s}: request {d} failed: {s}\n", .{ @tagName(backend), @tagName(mode), n, @errorName(err) });
@@ -1954,6 +1954,84 @@ fn testWsStormFair(backend: Backend) !void {
             std.debug.print("{s} {s}: a request waited {d} ms behind the storm ({d} requests)\n", .{ @tagName(backend), @tagName(mode), worst / std.time.ns_per_ms, n });
             return error.WorkerHeldUp;
         }
+    }
+}
+
+/// An echo client that never lets up: one thread sends 64 KiB binary
+/// messages, another reads the echoes, until stopped.
+const EchoFlood = struct {
+    p: *WsPeer,
+    stop: std.atomic.Value(bool) = .init(false),
+    got: std.atomic.Value(usize) = .init(0),
+
+    fn write(self: *EchoFlood) void {
+        const m: [64 * 1024]u8 = @splat('e');
+        var out: [m.len + ws.protocol.max_header_len]u8 = undefined;
+        const frame = Client.wsFrame(&out, true, .binary, &m);
+        while (!self.stop.load(.acquire)) {
+            switch (self.p.*) {
+                .plain => |*c| c.send(frame) catch return,
+                .tls => |t| t.send(frame) catch return,
+            }
+        }
+    }
+
+    fn read(self: *EchoFlood) void {
+        var buf: [256 * 1024]u8 = undefined;
+        while (!self.stop.load(.acquire)) {
+            const n = switch (self.p.*) {
+                .plain => |*c| sys.read(c.fd, &buf) catch return,
+                .tls => |t| t.client.reader.readSliceShort(&buf) catch return,
+            };
+            if (n == 0) return;
+            _ = self.got.fetchAdd(n, .monotonic);
+        }
+    }
+
+    fn fd(self: *const EchoFlood) sys.fd_t {
+        return switch (self.p.*) {
+            .plain => |c| c.fd,
+            .tls => |t| t.fd,
+        };
+    }
+};
+
+test "websocket: a client that keeps its echoes' input coming doesn't hold up the worker's others (plain, TLS)" {
+    try forEachBackend(testWsEchoFloodFair);
+}
+
+fn testWsEchoFloodFair(backend: Backend) !void {
+    // The turn bounded one flush, but the read loop flushed after every
+    // read with a turn of its own: while the client's input kept the
+    // socket readable (over TLS the worker decrypts and encrypts what two
+    // client threads each do half of), the worker read and echoed on.
+    for ([_]StormMode{ .plain, .tls }) |mode| {
+        var cfg: Config = if (mode == .tls) tlsConfig() else .{};
+        cfg.worker_thread_count = 1;
+        const r = try Running.start(backend, cfg);
+        defer r.stop();
+        var p = try stormOpen(r.port, mode, false);
+        defer p.close();
+        var flood: EchoFlood = .{ .p = &p };
+        const writer = try std.Thread.spawn(.{}, EchoFlood.write, .{&flood});
+        const reader = try std.Thread.spawn(.{}, EchoFlood.read, .{&flood});
+        sleepMs(100);
+        var worst: u64 = 0;
+        var n: usize = 0;
+        const never: std.atomic.Value(bool) = .init(false);
+        const timed = timeRequests(r.port, mode == .tls, &never, &worst, &n);
+        const got = flood.got.load(.monotonic);
+        flood.stop.store(true, .release);
+        _ = std.posix.system.shutdown(flood.fd(), std.posix.SHUT.RDWR);
+        writer.join();
+        reader.join();
+        std.debug.print("{s} {s}: {d} requests, worst {d} ms; {d} MiB echoed\n", .{ @tagName(backend), @tagName(mode), n, worst / std.time.ns_per_ms, got >> 20 });
+        timed catch |err| {
+            std.debug.print("{s} {s}: request {d} failed: {s}\n", .{ @tagName(backend), @tagName(mode), n, @errorName(err) });
+            return err;
+        };
+        if (got == 0) return error.NothingEchoed;
+        if (worst > 1500 * std.time.ns_per_ms) return error.WorkerHeldUp;
     }
 }
 
