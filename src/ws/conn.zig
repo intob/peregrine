@@ -1325,11 +1325,11 @@ test "verify send queues: the peer closes while senders race: accepted messages 
 test "verify send queues: messages at the size class boundaries" {
     const max = WsQueues.max_size;
     const sizes = [_]usize{
-        0,        1,              125,      126,            127,      244,
-        246,      250,            252,      253,            254,      255,
-        256,      257,            508,      65_525,         65_527,   65_535,
-        65_536,   65_537,         131_062,  131_072,        16 << 20, (16 << 20) + 1,
-        max - 14, max - 10,       max - 9,  max - 1,        max,      max + 1,
+        0,            1,              125,     126,     127,      244,
+        246,          250,            252,     253,     254,      255,
+        256,          257,            508,     65_525,  65_527,   65_535,
+        65_536,       65_537,         131_062, 131_072, 16 << 20, (16 << 20) + 1,
+        max - 14,     max - 10,       max - 9, max - 1, max,      max + 1,
         max + 65_536, (40 << 20) + 3,
     };
     const big = try testing.allocator.alloc(u8, (40 << 20) + 3 + 64);
