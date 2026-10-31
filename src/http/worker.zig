@@ -1627,9 +1627,13 @@ pub fn Worker(comptime Handler: type) type {
                 if (!self.wsFlush(c)) return;
             }
             // Reading pauses while output is stalled (backpressure).
-            if (c.read_ready and !wsHasWire(c)) self.wsReadable(c);
+            self.wsReadable(c);
         }
 
+        /// Reads and processes input while no output is stalled: from the
+        /// socket while it is readable, and what the TLS layer still holds
+        /// (a pass that stalled output leaves records behind, and the short
+        /// read that took them cleared `read_ready`: no edge brings them).
         fn wsReadable(self: *Self, c: *Conn) void {
             while (!wsHasWire(c)) {
                 const tls_buffered = c.tls != null and c.tls.?.hasBufferedInput();
@@ -1765,7 +1769,7 @@ pub fn Worker(comptime Handler: type) type {
             w.clearPosted();
             if (!self.wsFlush(c)) return;
             // Output may have been stalled; reading resumes once it drains.
-            if (c.read_ready and !wsHasWire(c)) self.wsReadable(c);
+            self.wsReadable(c);
         }
     };
 }

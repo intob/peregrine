@@ -1346,7 +1346,11 @@ const WsPeer = union(enum) {
                 break :blk .{ .op = f.opcode, .data = f.payload, .compressed = f.compressed };
             },
             .tls => |t| blk: {
-                const f = try t.wsRead(buf);
+                const f = t.wsRead(buf) catch |err| {
+                    // ReadFailed alone doesn't say whether TLS or the socket failed.
+                    std.debug.print("tls read: {s} (tls {?}, socket {?})\n", .{ @errorName(err), t.client.read_err, t.file_reader.err });
+                    return err;
+                };
                 break :blk .{ .op = f.opcode, .data = f.data, .compressed = f.compressed };
             },
         };
@@ -1756,6 +1760,62 @@ fn testWsStorm(backend: Backend) !void {
     // handler's deinit asserts none is left) and free everything.
     r.stop();
     for (&peers) |*p| p.close();
+}
+
+test "websocket over TLS: input the TLS layer still holds when output stalls is read once the output drains" {
+    try forEachBackend(testWsTlsInputBehindOutput);
+}
+
+fn testWsTlsInputBehindOutput(backend: Backend) !void {
+    // The decoder takes 1 KiB of plaintext at a time; the rest stays in
+    // the TLS buffer. On epoll, once a short read had drained the socket,
+    // only the socket's readiness resumed reading when output drained, so
+    // the close behind the flood was never read (the storm test hit this
+    // with the client's close behind its pings).
+    var cfg = tlsConfig();
+    cfg.read_buffer_size = 1024;
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    const t = try TlsClient.connect(r.port);
+    defer t.close();
+    try t.send(Client.upgrade_request);
+    const head = try t.client.reader.takeDelimiterInclusive('\n');
+    try testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 101 "));
+    while ((try t.client.reader.takeDelimiterInclusive('\n')).len != 2) {}
+    // One write: "flood" (the server queues until its send queue is full,
+    // more than the socket takes while we don't read), then 20 pings and
+    // the close, 2 KiB more behind it.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    var frame: [256]u8 = undefined;
+    try out.appendSlice(testing.allocator, Client.wsFrame(&frame, true, .text, "flood"));
+    for (0..20) |i| {
+        const payload: [100]u8 = @splat(@intCast('a' + i));
+        try out.appendSlice(testing.allocator, Client.wsFrame(&frame, true, .ping, &payload));
+    }
+    try out.appendSlice(testing.allocator, Client.wsFrame(&frame, true, .close, "\x03\xe8"));
+    try t.send(out.items);
+    sleepMs(200);
+    const buf = try testing.allocator.alloc(u8, 64 * 1024);
+    defer testing.allocator.free(buf);
+    var floods: usize = 0;
+    while (true) {
+        const f = t.wsRead(buf) catch |err| {
+            std.debug.print("{s}: {d} flood messages, then {s} (socket {?})\n", .{ @tagName(backend), floods, @errorName(err), t.file_reader.err });
+            return err;
+        };
+        switch (f.opcode) {
+            .binary => floods += 1,
+            .pong => {},
+            .close => {
+                try testing.expectEqualStrings("\x03\xe8", f.data);
+                break;
+            },
+            else => return error.UnexpectedOpcode,
+        }
+    }
+    try testing.expect(r.srv.handler.queue_full.load(.monotonic));
+    try testing.expect(floods * 16 * 1024 >= 4 * 1024 * 1024 - 16 * 1024);
 }
 
 test "websocket: protocol violations fail with the right close code" {
