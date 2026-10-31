@@ -2898,6 +2898,100 @@ fn testWsHeldFrames(backend: Backend) !void {
     }
 }
 
+test "websocket: compressed messages held across turns: one fragmented with pings between, and many that inflate past a turn (plain, TLS)" {
+    try forEachBackend(testWsHeldDeflate);
+}
+
+fn testWsHeldDeflate(backend: Backend) !void {
+    // A turn delivers 128 KiB of inflated message bytes: a compressed
+    // message's fragments, and messages that each inflate to 64 KiB from
+    // a few KiB, wait decoded for later turns.
+    const pattern = "deflate this, then inflate it; again and again, a pattern of 64.";
+    var pool = try BufferPool.init(testing.allocator, 1024, 1);
+    defer pool.deinit();
+    const big_len = 600_000;
+    const big = try testing.allocator.alloc(u8, big_len);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = if (i % 64 == 0) @truncate(i / 64 *% 7) else pattern[i % 64];
+    const packed_big = try testing.allocator.alloc(u8, big_len);
+    defer testing.allocator.free(packed_big);
+    const nb = (try pool.wsDeflater()).compress(big, packed_big, 15) orelse return error.DidNotShrink;
+    var small: [64 * 1024]u8 = undefined;
+    var packed_small: [64 * 1024]u8 = undefined;
+    var batch: std.ArrayList(u8) = .empty;
+    defer batch.deinit(testing.allocator);
+    var frame: [70 * 1024]u8 = undefined;
+    // The fragmented one: 1000-byte pieces of its compressed form, RSV1 on
+    // the first; a ping after every 7th.
+    var off: usize = 0;
+    var k: usize = 0;
+    while (off < nb) : (k += 1) {
+        const piece = packed_big[off..@min(nb, off + 1000)];
+        off += piece.len;
+        const f = Client.wsFrame(&frame, off == nb, if (k == 0) .binary else .continuation, piece);
+        if (k == 0) f[0] |= 0x40;
+        try batch.appendSlice(testing.allocator, f);
+        if (k % 7 == 6) try batch.appendSlice(testing.allocator, Client.wsFrame(&frame, true, .ping, "p"));
+    }
+    const pings = k / 7;
+    // 40 whole messages of 64 KiB, compressed.
+    const n_small = 40;
+    for (0..n_small) |m| {
+        for (&small, 0..) |*b, i| b.* = if (i % 64 == 0) @truncate(m + i / 64) else pattern[i % 64];
+        const ns = (try pool.wsDeflater()).compress(&small, &packed_small, 15) orelse return error.DidNotShrink;
+        const f = Client.wsFrame(&frame, true, .binary, packed_small[0..ns]);
+        f[0] |= 0x40;
+        try batch.appendSlice(testing.allocator, f);
+    }
+    try batch.appendSlice(testing.allocator, Client.wsFrame(&frame, true, .ping, "end"));
+    for ([_]bool{ false, true }) |tls| {
+        errdefer std.debug.print("{s} {s}\n", .{ @tagName(backend), if (tls) "tls" else "plain" });
+        var cfg: Config = if (tls) tlsConfig() else .{};
+        cfg.worker_thread_count = 1;
+        cfg.websocket_deflate = .{};
+        const r = try Running.start(backend, cfg);
+        defer r.stop();
+        var p = try WsPeer.open(r.port, tls, true);
+        defer p.close();
+        var wr: RawWriter = undefined;
+        var th: ?std.Thread = null;
+        defer if (th) |t| t.join();
+        switch (p) {
+            .plain => |*c| {
+                wr = .{ .fd = c.fd, .bytes = batch.items };
+                th = try std.Thread.spawn(.{}, RawWriter.run, .{&wr});
+            },
+            .tls => |t| try t.send(batch.items),
+        }
+        const buf = try testing.allocator.alloc(u8, 1 << 20);
+        defer testing.allocator.free(buf);
+        var inflated: ws.inflate.Out = .{ .buf = &.{}, .max = 4 << 20, .pool = &pool };
+        defer if (inflated.buf.len > 0) pool.releaseLarge(inflated.buf);
+        for (0..pings) |_| {
+            const m = try p.read(buf, &pool, &inflated);
+            try testing.expectEqual(ws.Opcode.pong, m.op);
+            try testing.expectEqualStrings("p", m.data);
+        }
+        const whole = try p.read(buf, &pool, &inflated);
+        try testing.expectEqual(ws.Opcode.binary, whole.op);
+        try testing.expectEqualSlices(u8, big, whole.data);
+        for (0..n_small) |m| {
+            const e = try p.read(buf, &pool, &inflated);
+            try testing.expectEqual(ws.Opcode.binary, e.op);
+            try testing.expectEqual(small.len, e.data.len);
+            try testing.expectEqual(@as(u8, @truncate(m)), e.data[0]);
+        }
+        const last = try p.read(buf, &pool, &inflated);
+        try testing.expectEqual(ws.Opcode.pong, last.op);
+        try testing.expectEqualStrings("end", last.data);
+        if (th) |t| {
+            t.join();
+            th = null;
+            if (wr.err) |err| return err;
+        }
+    }
+}
+
 test "websocket: the client's FIN behind its messages, its close, the server's close, and a FIN from a client that stopped reading" {
     try forEachBackend(testWsFin);
 }
