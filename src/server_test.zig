@@ -5344,3 +5344,55 @@ fn testHttp3EcnIpv6(backend: Backend) !void {
         try testing.expect(counts[0] > 0 and counts[1] == 0 and counts[2] == 0);
     }
 }
+
+test "h2c: an answer from another thread behind a stream waiting for the connection window gets its head out" {
+    try forEachBackend(testHeldHeadBehindBlocked);
+}
+
+/// Stream 1 (u=0) takes the connection window; stream 3 (u=7) is answered
+/// later from another thread. The client sends nothing more (its window
+/// stays shut, as an application not reading stream 1's body would leave
+/// it): stream 3's HEADERS need no window and should still come.
+fn testHeldHeadBehindBlocked(backend: Backend) !void {
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    const r = try Running.start(backend, h2Config());
+    defer r.stop();
+    const c = try H2Client.connect(r.port);
+    defer c.close();
+    c.quiet = true;
+    var hdr: [1100]u8 = undefined;
+    // Stream windows larger than the connection's: stream 1 waits for
+    // the connection window (with its own open), so stream 3 yields to it.
+    try c.send(hdr[0..try h2frame.writeSettings(&hdr, &.{.{ .id = .initial_window_size, .value = 1 << 20 }})]);
+    for ([_]struct { u31, []const u8, []const u8 }{ .{ 1, "/big", "u=0" }, .{ 3, "/later", "u=7" } }) |q| {
+        var block: [1024]u8 = undefined;
+        var bn: usize = 0;
+        bn += try c.enc.encode(block[bn..], ":method", "GET", .{});
+        bn += try c.enc.encode(block[bn..], ":scheme", "http", .{});
+        bn += try c.enc.encode(block[bn..], ":path", q[1], .{});
+        bn += try c.enc.encode(block[bn..], ":authority", "localhost", .{});
+        bn += try c.enc.encode(block[bn..], "priority", q[2], .{});
+        const n = try h2frame.writeHeaders(&hdr, q[0], h2frame.flag.end_headers | h2frame.flag.end_stream, block[0..bn]);
+        try c.send(hdr[0..n]);
+    }
+    var big: H2Client.Reply = .{};
+    defer big.deinit();
+    var later: H2Client.Reply = .{};
+    defer later.deinit();
+    var map = std.AutoHashMap(u31, *H2Client.Reply).init(testing.allocator);
+    defer map.deinit();
+    try map.put(1, &big);
+    try map.put(3, &later);
+    const start = sys.nanoTimestamp();
+    while (later.status == 0) {
+        if (sys.nanoTimestamp() - start > 3 * std.time.ns_per_s) {
+            std.debug.print("{s}: no HEADERS for stream 3 in 3 s (stream 1 got {d} bytes)\n", .{ @tagName(backend), big.body.items.len });
+            return error.HeadHeld;
+        }
+        _ = c.readFrames(&map) catch |err| {
+            std.debug.print("{s}: {s} waiting for stream 3's HEADERS (stream 1 got {d} bytes)\n", .{ @tagName(backend), @errorName(err), big.body.items.len });
+            return error.HeadHeld;
+        };
+    }
+    try testing.expectEqual(@as(u16, 202), later.status);
+}

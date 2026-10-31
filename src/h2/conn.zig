@@ -5920,3 +5920,346 @@ test "stream states: seeded conversations, alone and interleaved on one pool" {
         try sharedConversation(.{ .rng = prng.random() });
     }
 }
+
+// -- Output however reads end (verification) --------------------------------
+
+/// A conversation built around priorities (RFC 9218): requests of every
+/// urgency, incremental or not, under small windows; window updates of a
+/// few bytes, resets, DATA after END_STREAM, HEAD, trailers, streamed and
+/// deferred answers, WebSockets, PRIORITY_UPDATE, SETTINGS changes, PING
+/// and GOAWAY.
+fn prioScript(pick: Pick, a: std.mem.Allocator, enc: *hpack.Encoder) ![]u8 {
+    var s: std.ArrayList(u8) = .empty;
+    errdefer s.deinit(a);
+    try s.appendSlice(a, frame.preface);
+    var buf: [frame.header_len + 16384]u8 = undefined;
+    var n = try frame.writeSettings(&buf, &.{.{ .id = .initial_window_size, .value = pick.range(u32, 0, 40000) }});
+    try s.appendSlice(a, buf[0..n]);
+    var block: [1024]u8 = undefined;
+    var next: u31 = 1;
+    // Streams opened as WebSockets.
+    var ws_ids: [8]u31 = undefined;
+    var nws: usize = 0;
+    const prios = [_][]const u8{ "u=0", "u=1", "u=3", "u=3, i", "u=5, i", "u=7", "u=7, i", "u=0, i", "i", "u=2" };
+    var ops: usize = 0;
+    while (!pick.stop() and ops < 60) : (ops += 1) {
+        const recent: u31 = if (next > 1) next - 2 * @as(u31, pick.range(u8, 1, @intCast(@min(6, next / 2)))) else 1;
+        switch (pick.range(u8, 0, 15)) {
+            0...4 => {
+                const kind = pick.range(u8, 0, 11);
+                const paths = [_][]const u8{ "/", "/big", "/later", "/stream", "/echo", "/up", "/empty", "/ws", "/big", "/big", "/up", "/up" };
+                const post = kind == 4 or kind == 5 or kind == 10 or kind == 11;
+                const is_ws = kind == 7;
+                var bn: usize = 0;
+                const method = if (is_ws) "CONNECT" else if (post) "POST" else if (pick.byte() < 50) "HEAD" else "GET";
+                bn += try enc.encode(block[bn..], ":method", method, .{});
+                if (is_ws) bn += try enc.encode(block[bn..], ":protocol", "websocket", .{});
+                bn += try enc.encode(block[bn..], ":scheme", "https", .{});
+                bn += try enc.encode(block[bn..], ":path", paths[kind], .{});
+                bn += try enc.encode(block[bn..], ":authority", "example.com", .{});
+                if (pick.byte() < 220) bn += try enc.encode(block[bn..], "priority", prios[pick.index(prios.len)], .{});
+                const body_len: usize = if (post) pick.range(u16, 0, 3000) else 0;
+                const trailers = post and pick.flag();
+                const end_stream = !is_ws and (!post or (body_len == 0 and !trailers));
+                n = try frame.writeHeaders(&buf, next, frame.flag.end_headers | @as(u8, if (end_stream) frame.flag.end_stream else 0), block[0..bn]);
+                try s.appendSlice(a, buf[0..n]);
+                if (post) {
+                    var sent: usize = 0;
+                    while (sent < body_len) {
+                        const k = @min(body_len - sent, pick.range(u16, 1, 1200));
+                        var chunk: [1200]u8 = undefined;
+                        for (chunk[0..k], sent..) |*c, j| c.* = @truncate(j *% 13 +% next);
+                        const last = sent + k == body_len;
+                        n = try frame.writeData(&buf, next, last and !trailers, chunk[0..k]);
+                        try s.appendSlice(a, buf[0..n]);
+                        sent += k;
+                        // Other frames between a body's DATA.
+                        if (!last and pick.byte() < 40) {
+                            n = try frame.writeWindowUpdate(&buf, 0, pick.range(u31, 1, 3000));
+                            try s.appendSlice(a, buf[0..n]);
+                        }
+                    }
+                    if (trailers) {
+                        bn = try enc.encode(&block, "x-trailer", "t", .{});
+                        n = try frame.writeHeaders(&buf, next, frame.flag.end_headers | frame.flag.end_stream, block[0..bn]);
+                        try s.appendSlice(a, buf[0..n]);
+                    }
+                }
+                if (is_ws and nws < ws_ids.len) {
+                    ws_ids[nws] = next;
+                    nws += 1;
+                }
+                next += 2;
+            },
+            5, 6 => {
+                // A few bytes of window, for the connection or a stream.
+                const inc = if (pick.flag()) pick.range(u31, 1, 64) else pick.range(u31, 1, 30000);
+                n = try frame.writeWindowUpdate(&buf, if (next == 1 or pick.flag()) 0 else recent, inc);
+                try s.appendSlice(a, buf[0..n]);
+            },
+            7 => if (next > 1) {
+                n = try frame.writeRstStream(&buf, recent, .cancel);
+                try s.appendSlice(a, buf[0..n]);
+            },
+            8 => {
+                const id = if (pick.flag() and next > 1) recent else next + 2 * @as(u31, pick.range(u8, 0, 2));
+                n = try frame.writePriorityUpdate(&buf, id, prios[pick.index(prios.len)]);
+                try s.appendSlice(a, buf[0..n]);
+            },
+            9 => {
+                if (pick.flag()) {
+                    n = try frame.writeSettings(&buf, &.{.{ .id = .initial_window_size, .value = pick.range(u32, 0, 40000) }});
+                } else {
+                    n = try frame.writeSettings(&buf, &.{.{ .id = .max_frame_size, .value = pick.range(u32, 16384, 40000) }});
+                }
+                try s.appendSlice(a, buf[0..n]);
+            },
+            10 => {
+                n = try frame.writePing(&buf, false, "pingpong");
+                try s.appendSlice(a, buf[0..n]);
+            },
+            11 => if (next > 1) {
+                // DATA on a recent stream: maybe after its END_STREAM, maybe
+                // empty, maybe ending it.
+                const chunk: [64]u8 = @splat('d');
+                n = try frame.writeData(&buf, recent, pick.byte() < 60, chunk[0..pick.range(u8, 0, 64)]);
+                try s.appendSlice(a, buf[0..n]);
+            },
+            12, 13 => if (nws > 0) {
+                const id = ws_ids[pick.index(nws)];
+                var wsbuf: [256]u8 = undefined;
+                const payloads = [_][]const u8{ "hello", "big", "close-me", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" };
+                const p = payloads[pick.index(payloads.len)];
+                const wire = ws_protocol.encodeFrame(&wsbuf, true, if (pick.flag()) .text else .binary, p, .{ 1, 2, 3, 4 });
+                // Sometimes split over two DATA frames.
+                const cut = if (pick.flag()) wire.len else pick.index(wire.len + 1);
+                n = try frame.writeData(&buf, id, false, wire[0..cut]);
+                try s.appendSlice(a, buf[0..n]);
+                if (cut < wire.len) {
+                    n = try frame.writeData(&buf, id, false, wire[cut..]);
+                    try s.appendSlice(a, buf[0..n]);
+                }
+            },
+            14 => if (pick.byte() < 20) {
+                n = try frame.writeGoaway(&buf, 0, .no_error, "");
+                try s.appendSlice(a, buf[0..n]);
+            },
+            else => if (pick.byte() < 10) {
+                var raw: [32]u8 = undefined;
+                const len = pick.fill(&raw);
+                try s.appendSlice(a, raw[0..len]);
+            },
+        }
+    }
+    if (pick.flag()) {
+        // Room for every response, in a few steps.
+        for (0..3) |_| {
+            n = try frame.writeWindowUpdate(&buf, 0, 1000000);
+            try s.appendSlice(a, buf[0..n]);
+            var id: u31 = 1;
+            while (id < next) : (id += 2) {
+                n = try frame.writeWindowUpdate(&buf, id, 100000);
+                try s.appendSlice(a, buf[0..n]);
+            }
+        }
+    }
+    return s.toOwnedSlice(a);
+}
+
+fn prioHarness(opts: Options, big: []const u8) !*Harness {
+    const h = try Harness.init(opts);
+    h.handler.big = big;
+    return h;
+}
+
+/// Exactly the same frames, in the same order, and the same handler logs.
+fn expectExactlySame(a: *Harness, b: *Harness) !void {
+    // How DATA is cut depends on what else `out` held when it was made
+    // (room, the small buffer): consecutive DATA of one stream as one.
+    const x = try mergeAdjacentData(a.events.items);
+    defer testing.allocator.free(x);
+    const y = try mergeAdjacentData(b.events.items);
+    defer testing.allocator.free(y);
+    try testing.expectEqualStrings(x, y);
+    try testing.expectEqual(a.last, b.last);
+    try testing.expectEqualStrings(a.handler.log.items, b.handler.log.items);
+    try testing.expectEqualStrings(a.handler.bodies.items, b.handler.bodies.items);
+    try testing.expectEqualStrings(a.handler.ws_log.items, b.handler.ws_log.items);
+    try testing.expectEqualSlices(u8, a.data_out.items, b.data_out.items);
+}
+
+/// Server frames with consecutive DATA frames of one stream as one line.
+fn mergeAdjacentData(lines: []const u8) ![]u8 {
+    const a = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    var run: ?struct { id: u32, len: usize, end: bool } = null;
+    var it = std.mem.splitScalar(u8, lines, '\n');
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "data ")) {
+            var f = std.mem.tokenizeAny(u8, line, " =");
+            _ = f.next();
+            const id = try std.fmt.parseInt(u32, f.next().?, 10);
+            _ = f.next();
+            const len = try std.fmt.parseInt(usize, f.next().?, 10);
+            _ = f.next();
+            const end = std.mem.eql(u8, f.next().?, "true");
+            if (run) |*r| {
+                if (r.id == id) {
+                    r.len += len;
+                    r.end = end;
+                    continue;
+                }
+                try out.print(a, "data {d} len={d} end={}\n", .{ r.id, r.len, r.end });
+            }
+            run = .{ .id = id, .len = len, .end = end };
+            continue;
+        }
+        if (run) |r| try out.print(a, "data {d} len={d} end={}\n", .{ r.id, r.len, r.end });
+        run = null;
+        if (line.len > 0) try out.print(a, "{s}\n", .{line});
+    }
+    if (run) |r| try out.print(a, "data {d} len={d} end={}\n", .{ r.id, r.len, r.end });
+    return out.toOwnedSlice(a);
+}
+
+/// Feeds a script a byte at a time, or in pieces of up to 2 KiB.
+fn feedSplit(h: *Harness, script: []const u8, pick: ?Pick) !void {
+    var rest = script;
+    while (rest.len > 0 and h.last != .close) {
+        const k = if (pick) |p| @min(rest.len, @as(usize, p.range(u16, 0, 2047)) + 1) else 1;
+        try h.feed(rest[0..k]);
+        rest = rest[k..];
+    }
+}
+
+/// One priority conversation as one read, a byte at a time and split at
+/// random: exactly the same frames.
+fn prioConversation(pick: Pick) !void {
+    const a = testing.allocator;
+    var e = try hpack.Encoder.init(a, 4096);
+    defer e.deinit();
+    const script = try prioScript(pick, a, &e);
+    defer a.free(script);
+    const limits = [_]usize{ 1024, 4096, 20000, 8 << 20, 8 << 20 };
+    const opts: Options = .{
+        .limits = .{ .max_body_size = 50000 },
+        .max_concurrent_streams = 8,
+        .enable_connect_protocol = true,
+        .out_limit = limits[pick.index(limits.len)],
+        .websocket = .{ .max_message_size = 4096, .max_send_queue_bytes = 8192 },
+    };
+    const big = try testBody(pick.range(u32, 1, 100000));
+    defer a.free(big);
+    // Output stopped for room in `out` waits for the worker's pump, which
+    // comes when a write drains, which depends on where reads end: with
+    // room to spare, the frames themselves must be the same; with little,
+    // each stream's.
+    const check = if (opts.out_limit > 1 << 20) &expectExactlySame else &expectSameRun;
+    const whole = try prioHarness(opts, big);
+    defer whole.deinit();
+    try whole.feed(script);
+    try answerExchanges(whole);
+    const bytes = try prioHarness(opts, big);
+    defer bytes.deinit();
+    try feedSplit(bytes, script, null);
+    try answerExchanges(bytes);
+    try check(whole, bytes);
+    const split = try prioHarness(opts, big);
+    defer split.deinit();
+    try feedSplit(split, script, pick);
+    try answerExchanges(split);
+    try check(whole, split);
+}
+
+fn fuzzPrio(_: void, smith: *std.testing.Smith) anyerror!void {
+    return prioConversation(.{ .smith = smith });
+}
+
+test "fuzz: h2 frames the same however reads end" {
+    try std.testing.fuzz({}, fuzzPrio, .{
+        .corpus = &.{
+            "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f",
+            "\xff\xfe\xfd\x80\x40\x20\x10\x08\x04\x02\x01\x00\x37\x91\xaa\x55\x13\x77\xc4\x02\x99\x10\x00\x01",
+        },
+    });
+}
+
+test "split invariance: seeded priority conversations, exact frames" {
+    for (0..300) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        prioConversation(.{ .rng = prng.random() }) catch |err| {
+            std.debug.print("seed {d}\n", .{seed});
+            return err;
+        };
+    }
+}
+
+
+test "priorities: held output behind a window-blocked urgent stream and a slow reader doesn't stop input" {
+    const a = testing.allocator;
+    const big = try testBody(200_000);
+    defer a.free(big);
+    for ([_]usize{ 1, 97, 512, 5000 }) |write_max| {
+        for ([_]bool{ false, true }) |bytewise| {
+            const h = try Harness.init(.{ .out_limit = 4096 });
+            defer h.deinit();
+            h.handler.big = big;
+            try h.preface();
+            try h.settings(&.{.{ .id = .initial_window_size, .value = 1 << 20 }});
+            h.write_max = write_max;
+            var frames: std.ArrayList(u8) = .empty;
+            defer frames.deinit(a);
+            // Stream 1 takes the connection window and waits for more;
+            // the others wait behind it, some with heads to send.
+            try appendRequest(h, &frames, 1, "GET", "/big", "u=0", true);
+            try appendRequest(h, &frames, 3, "GET", "/big", "u=7", true);
+            try appendRequest(h, &frames, 5, "POST", "/up", "u=7", false);
+            try appendData(&frames, 5, "body", true);
+            try appendRequest(h, &frames, 7, "GET", "/big", "u=5, i", true);
+            try appendRequest(h, &frames, 9, "POST", "/up", "u=5, i", false);
+            try appendData(&frames, 9, "body", true);
+            try appendRequest(h, &frames, 11, "HEAD", "/up", "u=7", true);
+            var buf: [64]u8 = undefined;
+            for (0..50) |_| {
+                try frames.appendSlice(a, buf[0..try frame.writeWindowUpdate(&buf, 3, 1)]);
+                try frames.appendSlice(a, buf[0..try frame.writePing(&buf, false, "pingpong")]);
+            }
+            try frames.appendSlice(a, buf[0..try frame.writeSettings(&buf, &.{.{ .id = .initial_window_size, .value = 1 << 19 }})]);
+            try frames.appendSlice(a, buf[0..try frame.writeRstStream(&buf, 7, .cancel)]);
+            try frames.appendSlice(a, buf[0..try frame.writePriorityUpdate(&buf, 3, "u=0")]);
+            try frames.appendSlice(a, buf[0..try frame.writeGoaway(&buf, 11, .no_error, "")]);
+            // Room for everything, a little at a time.
+            for (0..20) |_| try frames.appendSlice(a, buf[0..try frame.writeWindowUpdate(&buf, 0, 40000)]);
+            if (bytewise) {
+                for (0..frames.items.len) |i| try h.feed(frames.items[i..][0..1]);
+            } else try h.feed(frames.items);
+            var rounds: usize = 0;
+            while (h.last != .close) : (rounds += 1) {
+                try testing.expect(rounds < 100_000);
+                try drainSlowly(h);
+                if (h.conn.wantsClose()) h.last = .close else {
+                    // The exchanges' answers, as the handler gives them.
+                    try h.drainMailbox();
+                    try h.collect();
+                    if (!h.conn.hasWire() and h.conn.output_streams == 0 and h.conn.activeStreams() > 0) break;
+                }
+            }
+            h.write_max = std.math.maxInt(usize);
+            while (h.conn.hasWire()) try h.collect();
+            try testing.expectEqual(@as(usize, 50), std.mem.count(u8, h.events.items, "ping ack=true"));
+            try testing.expectEqual(@as(usize, 3), std.mem.count(u8, h.events.items, "settings ack=true"));
+            try testing.expect(std.mem.indexOf(u8, h.events.items, "data 1 len=") != null);
+            try testing.expect(std.mem.indexOf(u8, h.events.items, "headers 5 ") != null);
+            try testing.expect(std.mem.indexOf(u8, h.events.items, "headers 9 ") != null);
+            const d = try dataByStream(h);
+            var dd = d;
+            defer freeDataMap(&dd);
+            try testing.expectEqual(big.len, dd.get(1).?.items.len);
+            try testing.expectEqual(big.len, dd.get(3).?.items.len);
+            try testing.expectEqualStrings("got 4", dd.get(5).?.items);
+            try testing.expectEqualStrings("got 4", dd.get(9).?.items);
+            try testing.expect(h.conn.wantsClose());
+        }
+    }
+}
