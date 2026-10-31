@@ -6,12 +6,16 @@
 # tls-load (bench/tls_load.zig, 6 threads) runs on CPUs 6-11 in its network
 # namespace. A fresh server for every run, servers interleaved within each
 # case, cases within each round; holds mac-bench, prints the load average
-# each round. CPU per handshake is the server cgroup's CPU time over
-# tls-load's main phase (after a 2 s warm-up) per handshake completed in it.
-# Two columns say who set the rate: the server's cores (below about 0.9 per
-# worker it was not saturated, and the row is marked "<") and the client's
-# (its own CPU time over the same phase; near 6.0 the client, not the
-# server, set the rate, and the row is marked "!").
+# each round. tls-load counts handshakes over its main phase (after a 2 s
+# warm-up) and keeps the load on for 1 s after it; the script reads the
+# server cgroup's CPU time when each phase marker arrives (`lag`: how long
+# after tls-load printed it the reading was done, at most 0.5 s or the run
+# fails), so the server's cores are measured under load, and CPU per
+# handshake is the server's cores over tls-load's rate. Two columns say
+# who set the rate: the server's cores (below about 0.9 per worker it was
+# not saturated, and the row is marked "<") and the client's (its own CPU
+# time over the main phase; near 6.0 the client, not the server, set the
+# rate, and the row is marked "!").
 # Usage: tls-bench.sh [SERVER...]
 #   SERVER: peregrine-epoll peregrine-uring nginx h2o (default: all four)
 #   CASES (default "ecdsa-x25519 ecdsa-p256 ecdsa-mlkem ecdsa-x25519-resume
@@ -28,15 +32,19 @@
 #   has none to spare)
 #   BUILD=0: use the binaries already in $OUT/linux/bin (A/B runs)
 # Checked per run, or the run is FAILED and the script exits 1 at the end:
-# tls-load's exit status; no connection errors (a timeout, an alert, a
-# wrong Finished or signature, a certificate other than the case's, a
-# non-200 response); TLS 1.3 with TLS_AES_128_GCM_SHA256 (the only suite
-# offered), the case's group (the only one offered), signature scheme
-# (ecdsa_secp256r1_sha256 or rsa_pss_rsae_sha256) and ALPN as the server
-# negotiated them; signatures verified (all of them with VERIFY 1, at least
-# half the expected share otherwise); every handshake full, or for -resume
-# over 99% resumed; a server still running at the end; the main phase read
-# over at least 90% of DUR.
+# tls-load's exit status (a thread that failed fails it); no connection
+# errors from start to stop, warm-up included (a timeout, an alert, a wrong
+# Finished, signature, ALPN or session id echo, a certificate other than
+# the case's, a non-200 response, no session ticket); TLS 1.3 with
+# TLS_AES_128_GCM_SHA256 (the only suite offered), the case's group (the
+# only one offered), signature scheme (ecdsa_secp256r1_sha256 or
+# rsa_pss_rsae_sha256) and ALPN as the server negotiated them; exactly one
+# ticket per connection (tls-load waits for one, and counts any other that
+# arrives with it); signatures verified (all of them with VERIFY 1, at
+# least half the expected share otherwise); every handshake full, or for
+# -resume over 99% resumed; a
+# server still running at the end; the CPU readings at most 0.5 s late and
+# at least 90% of DUR apart.
 # Servers, all TLS 1.3 only, same certificate and key, one session ticket
 # per handshake, no access log, the workers pinned one per CPU, kTLS off
 # (Docker's kernel has no tls module; peregrine is given `noktls` so a
@@ -51,7 +59,7 @@
 # 200`, h2o a static file (as in h2-bench.sh).
 source "$(dirname "$0")/env.sh"
 BIN=$OUT/linux/bin
-usage() { sed -n '2,51p' "$0"; exit 1; }
+usage() { sed -n '2,59p' "$0"; exit 1; }
 servers=${*:-peregrine-epoll peregrine-uring nginx h2o}
 CASES=${CASES:-ecdsa-x25519 ecdsa-p256 ecdsa-mlkem ecdsa-x25519-resume rsa-x25519 ecdsa-x25519-h2}
 WORKERS=${WORKERS:-1 6}; ROUNDS=${ROUNDS:-2}; DUR=${DUR:-8}
@@ -88,7 +96,7 @@ on_exit() {
 bench_lock "tls-bench ($ROOT)"
 [ "${BUILD:-1}" = 0 ] || build_linux_bins || exit 1
 failures=0
-printf "%-16s %2s %-20s %7s %6s %9s %6s %8s %7s %5s  %s\n" server w case hs/s cores CPU/hs client verified tickets cert negotiated
+printf "%-16s %2s %-20s %7s %6s %9s %6s %8s %7s %5s %4s  %s\n" server w case hs/s cores CPU/hs client verified tickets cert lag negotiated
 for round in $(seq "$ROUNDS"); do
   # The load average counts this benchmark's own VM threads too; the CPU of
   # everything outside Docker is the better sign of a busy Mac.
@@ -113,11 +121,14 @@ for round in $(seq "$ROUNDS"); do
         # -t: line-buffered output, so the phase markers arrive as they happen.
         docker run -d -t --name tlsb-cli-$TAG --cpuset-cpus 6-11 --network container:tlsb-srv-$TAG -v "$BIN":/b peregrine-bench:latest \
           timeout $((DUR + 30)) /b/tls-load 127.0.0.1 8443 6 "$conns" "$DUR" "$group" "$proto" "$mode" 2 "$cert" "$every" >/dev/null || exit 1
-        t0= t1= w0= w1=
+        # "measuring at T" / "measured at T": T is tls-load's wall clock
+        # (the VM's, kept in step with the Mac's by Docker).
+        t0= t1= w0= w1= m0= m1=
         while IFS= read -r line; do
+          line=${line%$'\r'}
           case $line in
-          measuring*) [ -z "$t0" ] && { t0=$(cgroup_usec tlsb-srv-$TAG); w0=$(now); } ;;
-          measured*) [ -z "$t1" ] && { t1=$(cgroup_usec tlsb-srv-$TAG); w1=$(now); } ;;
+          measuring*) [ -z "$t0" ] && { t0=$(cgroup_usec tlsb-srv-$TAG); w0=$(now); m0=${line##* }; } ;;
+          measured*) [ -z "$t1" ] && { t1=$(cgroup_usec tlsb-srv-$TAG); w1=$(now); m1=${line##* }; } ;;
           esac
         done < <(docker logs -f tlsb-cli-$TAG 2>&1)
         rc=$(docker wait tlsb-cli-$TAG); out=$(docker logs tlsb-cli-$TAG 2>&1 | tr -d '\r'); docker rm tlsb-cli-$TAG >/dev/null
@@ -125,14 +136,18 @@ for round in $(seq "$ROUNDS"); do
         # dead one (tlsb-dead-*) with its log for a look.
         state=$(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' tlsb-srv-$TAG 2>&1)
         if [ "${state%% *}" != running ]; then
-          dead=tlsb-dead-$TAG-$s-$w-$c-$round
-          echo "$s $w $c: FAILED: SERVER DIED ($state), kept as $dead"; failures=$((failures + 1))
+          dead=tlsb-dead-$TAG-$s-$w-$c-$round-$(date +%s)
+          echo "$s $w $c: FAILED: SERVER DIED ($state)"; failures=$((failures + 1))
           echo "$out" | tail -6; docker logs --tail 30 tlsb-srv-$TAG 2>&1
-          docker rename tlsb-srv-$TAG "$dead"; continue
+          # The next run needs the name: keep the container under another
+          # one, or remove it.
+          if docker rename tlsb-srv-$TAG "$dead" 2>/dev/null; then echo "kept as $dead"
+          else docker rm -f tlsb-srv-$TAG >/dev/null; fi
+          continue
         fi
         docker stop -t 1 tlsb-srv-$TAG >/dev/null; docker rm tlsb-srv-$TAG >/dev/null
         # N conns, GROUP, PROTO, MODE: N handshakes in S s, R /s, N resumed, N signatures verified, T tickets each, N errors
-        read -r n rate resumed verified tickets errors <<< "$(echo "$out" | sed -n 's/.*: \([0-9]*\) handshakes in [0-9.]* s, \([0-9]*\) \/s, \([0-9]*\) resumed, \([0-9]*\) signatures verified, \([0-9.]*\) tickets each, \([0-9]*\) errors.*/\1 \2 \3 \4 \5 \6/p')"
+        read -r n secs rate resumed verified tickets errors <<< "$(echo "$out" | sed -n 's/.*: \([0-9]*\) handshakes in \([0-9.]*\) s, \([0-9]*\) \/s, \([0-9]*\) resumed, \([0-9]*\) signatures verified, \([0-9.]*\) tickets each, \([0-9]*\) errors.*/\1 \2 \3 \4 \5 \6 \7/p')"
         # negotiated: TLSv1.3 SUITE GROUP SIG alpn ALPN certificate N B full|resumed
         full=$(echo "$out" | sed -n 's/^negotiated: \(.*\) certificate \([0-9]*\) B full$/\1|\2/p' | head -1)
         res=$(echo "$out" | sed -n 's/^negotiated: \(.*\) certificate 0 B resumed$/\1/p' | head -1)
@@ -140,8 +155,14 @@ for round in $(seq "$ROUNDS"); do
         [ "$rc" = 0 ] || bad+=" exit $rc"
         [ -n "$n" ] && [ "$n" != 0 ] || bad+=" no handshakes"
         [ "${errors:-1}" = 0 ] || bad+=" ${errors:-?} errors ($(echo "$out" | sed -n 's/^first error: //p' | head -1))"
-        if [ -z "$t0" ] || [ -z "$t1" ]; then bad+=" no main-phase CPU reading"
-        elif [ "$(echo "($w1 - $w0) < $DUR * 0.9" | bc)" = 1 ]; then bad+=" main phase read over $(echo "$w1 - $w0" | bc) s"; fi
+        lag=
+        if [ -z "$t0" ] || [ -z "$t1" ] || [ -z "$m0" ] || [ -z "$m1" ]; then bad+=" no main-phase CPU reading"
+        else
+          lag=$(echo "a = $w0 - $m0; b = $w1 - $m1; if (b > a) a = b; a" | bc)
+          [ "$(echo "($w1 - $w0) < $DUR * 0.9" | bc)" = 1 ] && bad+=" main phase read over $(echo "$w1 - $w0" | bc) s"
+          [ "$(echo "$lag > 0.5 || $w0 < $m0 || $w1 < $m1" | bc)" = 1 ] && bad+=" CPU read late or clocks apart (at $w0, $w1 for $m0, $m1)"
+        fi
+        [ "$tickets" = 1.00 ] || bad+=" ${tickets:-?} tickets each (want 1.00)"
         want="TLSv1.3 AES_128_GCM_SHA256 $want_group $want_sig alpn $want_alpn"
         [ "${full%|*}" = "$want" ] || bad+=" negotiated: ${full%|*} (want $want)"
         if [ $mode = full ]; then
@@ -153,14 +174,14 @@ for round in $(seq "$ROUNDS"); do
           [ -n "$n" ] && [ "$(echo "${resumed:-0} < $n * 0.99" | bc)" = 0 ] || bad+=" only ${resumed:-0} of $n resumed"
         fi
         if [ -n "$bad" ]; then echo "$s $w $c: FAILED:$bad"; echo "$out" | tail -4; failures=$((failures + 1)); continue; fi
-        cores=$(echo "scale=2; ($t1 - $t0) / (($w1 - $w0) * 1000000)" | bc)
+        cores=$(echo "scale=4; ($t1 - $t0) / (($w1 - $w0) * 1000000)" | bc)
         client=$(echo "$out" | sed -n 's/^client: \([0-9.]*\) cores/\1/p')
         mark=
         [ "$(echo "$cores < 0.9 * $w" | bc)" = 1 ] && mark+="<"
         [ "$(echo "$client > 5.4" | bc)" = 1 ] && mark+="!"
-        printf "%-16s %2s %-20s %7s %6s %6s µs %6s %8s %7s %5s  %s %s\n" "$s" "$w" "$c" "$rate" "$cores" \
-          "$(echo "scale=1; ($t1 - $t0) / $n" | bc)" "$client" "$([ $mode = full ] && echo "$verified" || echo -)" "$tickets" \
-          "${full#*|}" "$want_group $([ $mode = full ] && echo "$want_sig" || echo psk) $want_alpn" "$mark"
+        printf "%-16s %2s %-20s %7s %6.2f %6.1f µs %6s %8s %7s %5s %4.0f  %s %s\n" "$s" "$w" "$c" "$rate" "$cores" \
+          "$(echo "scale=2; $cores * 1000000 * $secs / $n" | bc)" "$client" "$([ $mode = full ] && echo "$verified" || echo -)" "$tickets" \
+          "${full#*|}" "$(echo "$lag * 1000" | bc)" "$want_group $([ $mode = full ] && echo "$want_sig" || echo psk) $want_alpn" "$mark"
       done
     done
   done
