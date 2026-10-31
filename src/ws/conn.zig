@@ -118,6 +118,9 @@ pub const Conn = struct {
     /// Worker only: bytes of messages compressed, for the worker's turns
     /// (`takeCompressed`).
     compressed: usize = 0,
+    /// Worker only: the wire was compressed, and its frames counted as
+    /// they were (`compressed`): writing it costs a turn nothing more.
+    wire_charged: bool = false,
     /// permessage-deflate, as negotiated. Set before the handler sees the
     /// connection, then only read.
     deflate: deflate.Agreement = .{},
@@ -295,9 +298,10 @@ pub const Conn = struct {
                 self.fail(protocol.closeCodeFor(err));
                 return .close;
             } orelse return .ok;
-            // A frame costs at least a header's worth, so that empty ones
-            // count too.
-            self.input_budget -|= @max(frame.payload.len, 8);
+            // A frame costs its payload and the longest header a client's
+            // has (14 bytes): echoes of small frames, their headers and all,
+            // stay well within what a turn writes.
+            self.input_budget -|= frame.payload.len + 14;
             const sent_close = self.closeSent();
             switch (frame.opcode) {
                 .ping => if (!sent_close) self.answerPing(frame.payload),
@@ -408,6 +412,7 @@ pub const Conn = struct {
         if (self.wire.buf.len > 0) self.bufferPool().wsRelease(self.wire.buf);
         self.wire = .{};
         self.wire_pos = 0;
+        self.wire_charged = false;
     }
 
     /// The frame at the start of `src`: its header's and its payload's
@@ -470,6 +475,7 @@ pub const Conn = struct {
         self.raw_pos += end;
         if (self.raw_pos == self.raw.len) self.releaseRaw();
         self.wire = out;
+        self.wire_charged = true;
     }
 
     /// No buffer to compress into: the rest of `raw` goes out as it is,

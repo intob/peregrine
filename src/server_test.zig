@@ -2073,7 +2073,7 @@ fn testWsEchoFloodFair(backend: Backend) !void {
     }
 }
 
-test "websocket: permessage-deflate echoes of messages that inflate fifteenfold, to a client that keeps up: the queue stays within its limit (plain, TLS)" {
+test "websocket: permessage-deflate echoes of messages that inflate fifteenfold or don't shrink, to a client that keeps up: the queue stays within its limit (plain, TLS)" {
     try forEachBackend(testWsDeflateEchoFlood);
 }
 
@@ -2082,16 +2082,45 @@ fn testWsDeflateEchoFlood(backend: Backend) !void {
     // its 256 KiB, compressed, and queued their echoes, 2.5 MiB inflated,
     // while writing 256 KiB of them, and the echoes found the queue full
     // within two turns.
+    // With messages that don't shrink, a turn counted each echo twice, as
+    // compressed and as written, and input only once: 130-byte echoes
+    // gained some 1.5% a turn on the queue.
     var pool = try BufferPool.init(testing.allocator, 1024, 1);
     defer pool.deinit();
     var out: [EchoFlood.frame_max]u8 = undefined;
-    const frame = try EchoFlood.deflatedFrame(&out, &pool);
-    try testing.expect(frame.len * 10 < EchoFlood.m_len);
-    for ([_]StormMode{ .plain, .tls }) |mode| {
+    const deflated = try EchoFlood.deflatedFrame(&out, &pool);
+    try testing.expect(deflated.len * 10 < EchoFlood.m_len);
+    // Random payloads, sent uncompressed: 500 of 130 bytes in one write,
+    // or one of 64 KiB.
+    var prng = std.Random.DefaultPrng.init(42);
+    const small = try testing.allocator.alloc(u8, 500 * (130 + ws.protocol.max_header_len));
+    defer testing.allocator.free(small);
+    var small_len: usize = 0;
+    for (0..500) |_| {
+        var m: [130]u8 = undefined;
+        prng.random().bytes(&m);
+        small_len += Client.wsFrame(small[small_len..], true, .binary, &m).len;
+    }
+    var big_out: [EchoFlood.frame_max]u8 = undefined;
+    const big = blk: {
+        var m: [EchoFlood.m_len]u8 = undefined;
+        prng.random().bytes(&m);
+        break :blk Client.wsFrame(&big_out, true, .binary, &m);
+    };
+    // A turn's 128 KiB of small messages queue some 122 KiB of echoes,
+    // which the turn writes: a 256 KiB queue holds them, but not a backlog
+    // gaining on it.
+    const kinds = [_]struct { name: []const u8, frame: []const u8, limit: usize }{
+        .{ .name = "fifteenfold", .frame = deflated, .limit = 1 << 20 },
+        .{ .name = "random 130 B", .frame = small[0..small_len], .limit = 256 << 10 },
+        .{ .name = "random 64 KiB", .frame = big, .limit = 1 << 20 },
+    };
+    for ([_]StormMode{ .plain, .tls }) |mode| for (kinds) |kind| {
+        const frame = kind.frame;
         var cfg: Config = if (mode == .tls) tlsConfig() else .{};
         cfg.worker_thread_count = 1;
         cfg.websocket_deflate = .{};
-        cfg.websocket_max_send_queue_bytes = 1 << 20;
+        cfg.websocket_max_send_queue_bytes = kind.limit;
         const r = try Running.start(backend, cfg);
         defer r.stop();
         var p = try stormOpen(r.port, mode, true);
@@ -2110,12 +2139,12 @@ fn testWsDeflateEchoFlood(backend: Backend) !void {
         writer.join();
         reader.join();
         const full = r.srv.handler.echoes_refused.load(.monotonic) > 0;
-        std.debug.print("{s} {s} deflate: {d} requests, worst {d} ms; {d} MiB echoed (compressed){s}\n", .{ @tagName(backend), @tagName(mode), n, worst / std.time.ns_per_ms, got >> 20, if (full) "; an echo found the queue full" else "" });
+        std.debug.print("{s} {s} deflate, {s}: {d} requests, worst {d} ms; {d} MiB echoed{s}\n", .{ @tagName(backend), @tagName(mode), kind.name, n, worst / std.time.ns_per_ms, got >> 20, if (full) "; an echo found the queue full" else "" });
         try timed;
         if (got == 0) return error.NothingEchoed;
         if (full) return error.SendQueueFull;
         if (worst > 1500 * std.time.ns_per_ms) return error.WorkerHeldUp;
-    }
+    };
 }
 
 test "websocket: the client's close and FIN behind a turn's worth of output: the output, the close echo, then the socket closes (plain, TLS)" {

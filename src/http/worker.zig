@@ -1770,18 +1770,20 @@ pub fn Worker(comptime Handler: type) type {
                     const bytes = w.wireBytes();
                     self.ws_out -|= w.takeCompressed();
                     if (bytes.len == 0) break;
+                    const charged = w.wire_charged;
                     const n = t.encrypt(&.{bytes}) catch {
                         self.closeConn(c);
                         return false;
                     };
                     w.advance(n);
-                    self.ws_out -|= n;
+                    if (!charged) self.ws_out -|= n;
                     continue;
                 }
                 if (self.ws_out == 0) return self.wsTurnOver(c, progress);
                 const wire = w.wireBytes();
                 self.ws_out -|= w.takeCompressed();
                 if (wire.len == 0) break;
+                const charged = w.wire_charged;
                 const max = switch (self.kernelGate(c)) {
                     .ready => |max| max,
                     .blocked => return self.wsBlocked(c, progress),
@@ -1796,7 +1798,7 @@ pub fn Worker(comptime Handler: type) type {
                     },
                 };
                 w.advance(n);
-                self.ws_out -|= n;
+                if (!charged) self.ws_out -|= n;
                 progress = progress or n > 0;
                 if (!self.kernelWrote(c, n)) return false;
                 // Socket buffer full: wait for writability.
