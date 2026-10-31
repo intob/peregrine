@@ -105,7 +105,7 @@ pub const Reference = struct {
         const k = self.len;
         var em_buf: [max_len]u8 = @splat(0);
         const em = em_buf[0..k];
-        rsa.encodePss(em, self.n.bits() - 1, msg, &salt);
+        rsa.encodePss(em, self.n.bits() - 1, msg, &salt) catch unreachable; // 32 bytes fit 2048 bits
         const s = out[0..k];
         try self.privateOp(em, s);
         // s^e must give the encoded message back.
@@ -173,7 +173,7 @@ const vectors = @embedFile("testdata/rsa_pss_vectors.txt");
 /// std's PSS verifier, for moduli whose length in bits isn't 1 mod 8
 /// (for those the encoded message is a byte shorter than the modulus,
 /// and std's verifier asserts that it isn't: 2049 and 3073 bits here).
-fn verifyWithStd(key: *const rsa.PrivateKey, sig: []const u8, msg: []const u8) !void {
+pub fn verifyWithStd(key: *const rsa.PrivateKey, sig: []const u8, msg: []const u8) !void {
     if (key.bits % 8 == 1) return;
     var e_buf: [4]u8 = undefined;
     const pk = try rsa_std.PublicKey.fromBytes(key.exponent(&e_buf), key.modulus());
@@ -328,8 +328,8 @@ test "rsa: known answers (NIST CAVP SigGenPSS SHA-256, rsa_pss_vectors.py)" {
                 // NIST's 2048-bit vectors have a 20-byte salt: encode, then
                 // the private operation.
                 var em: [max_len]u8 = undefined;
-                rsa.encodePss(em[0..key.len], key.bits - 1, msg, salt);
-                key.privateOp(em[0..key.len], out[0..key.len]);
+                try rsa.encodePss(em[0..key.len], key.bits - 1, msg, salt);
+                try key.privateOp(em[0..key.len], out[0..key.len]);
                 try testing.expectEqualSlices(u8, want, out[0..key.len]);
             }
             sigs += 1;
@@ -424,7 +424,7 @@ test "rsa: the same as the std.crypto.ff implementation, many keys, also with p 
                 }
                 for (inputs[0..n_inputs]) |*in| {
                     var s: [max_len]u8 = undefined;
-                    key.privateOp(in[0..k], s[0..k]);
+                    try key.privateOp(in[0..k], s[0..k]);
                     var back: [max_len]u8 = undefined;
                     try publicOp(der, s[0..k], back[0..k]);
                     try testing.expectEqualSlices(u8, in[0..k], back[0..k]);

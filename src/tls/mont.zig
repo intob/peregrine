@@ -31,12 +31,20 @@ pub const safe = builtin.mode == .debug;
 pub const window = 5;
 
 /// 0 − bit (all ones for 1) for a bit that may be secret, hidden from
-/// the optimizer (see `field_p256.Fe.mask64`).
-inline fn mask(bit: u64) u64 {
-    return asm (""
-        : [r] "=r" (-> u64),
-        : [x] "0" (0 -% bit),
-    );
+/// the optimizer behind an empty asm.
+const mask = @import("./field_p256.zig").Fe.mask64;
+
+/// d = a − b over n limbs; the borrow out.
+inline fn subBorrow(comptime n: usize, a: *const [n]u64, b: *const [n]u64, d: *[n]u64) u1 {
+    @setRuntimeSafety(safe);
+    var borrow: u1 = 0;
+    for (0..n) |i| {
+        const s1 = @subWithOverflow(a[i], b[i]);
+        const s2 = @subWithOverflow(s1[0], borrow);
+        d[i] = s2[0];
+        borrow = s1[1] | s2[1];
+    }
+    return borrow;
 }
 
 /// 1 if a == b, else 0, without a branch.
@@ -84,13 +92,7 @@ pub fn Mont(comptime n: usize) type {
         inline fn reduceOnce(self: *const Self, a: Int, c: u64) Int {
             @setRuntimeSafety(safe);
             var d: Int = undefined;
-            var borrow: u1 = 0;
-            for (0..n) |i| {
-                const s1 = @subWithOverflow(a[i], self.m[i]);
-                const s2 = @subWithOverflow(s1[0], borrow);
-                d[i] = s2[0];
-                borrow = s1[1] | s2[1];
-            }
+            const borrow = subBorrow(n, &a, &self.m, &d);
             // a + c·R < m exactly when there is no carry and a − m borrows.
             const keep = mask(borrow & ~c & 1);
             var r: Int = undefined;
@@ -114,13 +116,7 @@ pub fn Mont(comptime n: usize) type {
         pub fn sub(self: *const Self, a: *const Int, b: *const Int) Int {
             @setRuntimeSafety(safe);
             var d: Int = undefined;
-            var borrow: u1 = 0;
-            for (0..n) |i| {
-                const s1 = @subWithOverflow(a[i], b[i]);
-                const s2 = @subWithOverflow(s1[0], borrow);
-                d[i] = s2[0];
-                borrow = s1[1] | s2[1];
-            }
+            const borrow = subBorrow(n, a, b, &d);
             // A borrow added R: add m back (the sum wraps to a − b + m).
             const add_m = mask(borrow);
             var c: u1 = 0;
@@ -359,16 +355,9 @@ pub fn mulAdd(comptime n: usize, a: *const [n]u64, b: *const [n]u64, c: *const [
 }
 
 /// 1 if a < b, else 0, constant time.
-pub fn lessThan(a: []const u64, b: []const u64) u64 {
-    @setRuntimeSafety(safe);
-    std.debug.assert(a.len == b.len);
-    var borrow: u1 = 0;
-    for (a, b) |x, y| {
-        const s1 = @subWithOverflow(x, y);
-        const s2 = @subWithOverflow(s1[0], borrow);
-        borrow = s1[1] | s2[1];
-    }
-    return borrow;
+pub fn lessThan(comptime n: usize, a: *const [n]u64, b: *const [n]u64) u64 {
+    var d: [n]u64 = undefined;
+    return subBorrow(n, a, b, &d);
 }
 
 // -- Tests ------------------------------------------------------------
@@ -457,9 +446,9 @@ fn checkAgainstInts(comptime n: usize, moduli: []const @Int(.unsigned, 64 * n), 
             const x_add = sample(U, rand, ~@as(U, 0), k + 3);
             const c: M.Int = @bitCast(x_add);
             try testing.expectEqual(@as(W, big) * x_add + x_add, @as(W, @bitCast(mulAdd(n, &@bitCast(big), &c, &c))));
-            try testing.expectEqual(@as(u64, @intFromBool(a_int < b_int)), lessThan(&a, &b));
-            try testing.expectEqual(@as(u64, @intFromBool(x_add < big)), lessThan(&c, &@as(M.Int, @bitCast(big))));
-            try testing.expectEqual(@as(u64, 0), lessThan(&c, &c));
+            try testing.expectEqual(@as(u64, @intFromBool(a_int < b_int)), lessThan(n, &a, &b));
+            try testing.expectEqual(@as(u64, @intFromBool(x_add < big)), lessThan(n, &c, &@as(M.Int, @bitCast(big))));
+            try testing.expectEqual(@as(u64, 0), lessThan(n, &c, &c));
         }
         // pow against square and multiply on integers, for exponents of
         // several byte lengths (window boundaries) and patterns.

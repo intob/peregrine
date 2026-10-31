@@ -96,7 +96,7 @@ const cases = [_]Case{
     .{ .name = "x25519 publicKey sk=0 vs random", .kind = .x_public, .fixed = 0 },
     .{ .name = "x25519 publicKey sk=0x88.. vs random", .kind = .x_public, .fixed = 0x8888888888888888888888888888888888888888888888888888888888888888 },
     // The base m (256 bytes): `fixed` as its last 32 bytes, the rest 0
-    // (so 0 and 1 are themselves), or 2^2040 + fixed; class 1 random below 2^2040.
+    // (so 0 and 1 are themselves), or 2^2032 + fixed; class 1 random below 2^2040.
     .{ .name = "rsa2048 privateOp m=0 vs random", .kind = .rsa, .fixed = 0 },
     .{ .name = "rsa2048 privateOp m=1 vs random", .kind = .rsa, .fixed = 1 },
     .{ .name = "rsa2048 privateOp fixed vs random", .kind = .rsa, .fixed = 0x3c1f7a92d0e5b8146a2f9c3e7d5b1a08f6e4c2a0193b5d7f8e6c4a2b0d9f7e5c },
@@ -124,7 +124,7 @@ inline fn run(kind: Kind, in: [32]u8, m: *const [256]u8, peers: *const Peers) vo
         .x_public => std.mem.doNotOptimizeAway(x25519.publicKey(in)),
         .rsa => {
             var s: [256]u8 = undefined;
-            peers.rsa.privateOp(m, &s);
+            peers.rsa.privateOp(m, &s) catch unreachable;
             std.mem.doNotOptimizeAway(&s);
         },
     }
@@ -133,6 +133,11 @@ inline fn run(kind: Kind, in: [32]u8, m: *const [256]u8, peers: *const Peers) vo
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const count: usize = if (args.len > 1) try std.fmt.parseInt(usize, args[1], 10) else 200_000;
+    // Welch's t needs samples in both classes; RSA takes a tenth of them.
+    if (count < 20) {
+        std.debug.print("dudect: N must be at least 20\n", .{});
+        std.process.exit(2);
+    }
     const gpa = init.gpa;
     var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.awake.now(init.io).nanoseconds))));
     const r = prng.random();
