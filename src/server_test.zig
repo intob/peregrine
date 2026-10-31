@@ -1978,7 +1978,9 @@ const Pour = struct {
 /// A client of a "pour": reads and drops everything until stopped.
 const PourReader = struct {
     c: Client,
-    bytes: usize = 0,
+    bytes: std.atomic.Value(usize) = .init(0),
+    /// `bytes` when the timed requests began.
+    mark: usize = 0,
     stop: std.atomic.Value(bool) = .init(false),
     thread: std.Thread = undefined,
 
@@ -1987,7 +1989,7 @@ const PourReader = struct {
         while (!self.stop.load(.acquire)) {
             const n = sys.read(self.c.fd, &buf) catch return;
             if (n == 0) return;
-            self.bytes += n;
+            _ = self.bytes.fetchAdd(n, .monotonic);
         }
     }
 };
@@ -2030,6 +2032,7 @@ fn testWsPourFair(backend: Backend) !void {
         var head: [4096]u8 = undefined;
         var worst: u64 = 0;
         var n: usize = 0;
+        for (readers) |*pr| pr.mark = pr.bytes.load(.monotonic);
         const start = sys.nanoTimestamp();
         while (sys.nanoTimestamp() - start < 3 * std.time.ns_per_s) : (n += 1) {
             const t0 = sys.nanoTimestamp();
@@ -2042,10 +2045,20 @@ fn testWsPourFair(backend: Backend) !void {
             worst = @max(worst, @as(u64, @intCast(sys.nanoTimestamp() - t0)));
             sleepMs(20);
         }
+        // Every connection was written to while the requests went on (the
+        // mailbox once gave the same 64 connections every turn).
         var total: usize = 0;
-        for (readers) |*pr| total += pr.bytes;
-        std.debug.print("{s} {d} connections: {d} requests, worst {d} ms, {d} MiB poured\n", .{ @tagName(backend), conns, n, worst / std.time.ns_per_ms, total >> 20 });
+        var least: usize = std.math.maxInt(usize);
+        var starved: usize = 0;
+        for (readers) |*pr| {
+            const got = pr.bytes.load(.monotonic) - pr.mark;
+            total += got;
+            least = @min(least, got);
+            if (got == 0) starved += 1;
+        }
+        std.debug.print("{s} {d} connections: {d} requests, worst {d} ms; {d} MiB poured in 3 s, the least to one connection {d} KiB, {d} given nothing\n", .{ @tagName(backend), conns, n, worst / std.time.ns_per_ms, total >> 20, least >> 10, starved });
         if (worst > 1500 * std.time.ns_per_ms) return error.WorkerHeldUp;
+        if (starved > 0) return error.ConnectionStarved;
     }
 }
 
