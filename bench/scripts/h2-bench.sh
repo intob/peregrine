@@ -8,7 +8,7 @@
 # Usage: h2-bench.sh h2c|tls|h3 [SERVER...]
 #   SERVER: peregrine-epoll peregrine-uring nginx h2o (default: all four);
 #   peregrine-epoll-alt and peregrine-uring-alt run the bench-server in
-#   ALT_BIN instead (an A/B against another build, interleaved)
+#   ALT_BIN (absolute) instead (an A/B against another build, interleaved)
 #   ROUNDS (2), DUR seconds per run (10), CASES (default "hello-10x100
 #   hello-256x1 64k-10x10"): NAME-CONNSxSTREAMS, NAME hello, 64k (peregrine
 #   from memory) or 64kfile (peregrine preads its file per response, as
@@ -29,7 +29,7 @@ servers=${*:-peregrine-epoll peregrine-uring nginx h2o}
 ROUNDS=${ROUNDS:-2}; DUR=${DUR:-10}
 CASES=${CASES:-hello-10x100 hello-256x1 64k-10x10}
 for s in $servers; do case $s in peregrine-epoll | peregrine-uring | nginx | h2o) ;;
-    peregrine-epoll-alt | peregrine-uring-alt) [ -x "${ALT_BIN:-}/bench-server" ] || { echo "$s needs ALT_BIN"; usage; } ;;
+    peregrine-epoll-alt | peregrine-uring-alt) [[ ${ALT_BIN:-} == /* && -x $ALT_BIN/bench-server ]] || { echo "$s needs ALT_BIN, an absolute path"; usage; } ;;
     *) echo "unknown server $s"; usage ;; esac; done
 for c in $CASES; do [[ $c =~ ^(hello|64k|64kfile)-[1-9][0-9]*x[1-9][0-9]*$ ]] || { echo "bad case $c"; usage; }; done
 [ "$proto" = h2c ] && url=http://127.0.0.1:$port || url=https://127.0.0.1:$port
@@ -49,7 +49,7 @@ server() { # NAME -> "IMAGE|CMD"
     esac
 }
 path_of() { # SERVER CASE-NAME
-    case $2 in hello) echo / ;; 64k) echo /64k ;; 64kfile) [ "${1%-*}" = peregrine ] && echo /64k-file || echo /64k ;; esac
+    case $2 in hello) echo / ;; 64k) echo /64k ;; 64kfile) [[ $1 == peregrine-* ]] && echo /64k-file || echo /64k ;; esac
 }
 now() { perl -MTime::HiRes=time -e 'printf "%.3f", time'; }
 on_exit() {
@@ -59,7 +59,7 @@ on_exit() {
 
 bench_lock "h2-bench $proto ($ROOT)"
 [ "${BUILD:-1}" = 0 ] || build_linux_bins || exit 1
-printf "%-16s %-5s %-14s %9s %6s %6s %9s %6s  %s\n" server proto case req/s GB/s cores CPU/req hdr/rsp tls
+printf "%-19s %-5s %-14s %9s %6s %6s %9s %6s  %s\n" server proto case req/s GB/s cores CPU/req hdr/rsp tls
 for round in $(seq "$ROUNDS"); do
   # The load average counts this benchmark's own VM threads too; the CPU of
   # everything outside Docker is the better sign of a busy Mac.
@@ -116,7 +116,7 @@ for round in $(seq "$ROUNDS"); do
       [ "$proto" = h2c ] || [ "$tls" = "TLS_AES_128_GCM_SHA256 X25519 $want_alpn" ] || bad+=" negotiated: $tls"
       if [ -n "$bad" ]; then echo "$s $proto $c: FAILED:$bad"; echo "$out" | tail -6; continue; fi
       gbs=-; [ "$name" != hello ] && gbs=$(echo "scale=1; $rate * 65536 / 1000000000" | bc)
-      printf "%-16s %-5s %-14s %9.0f %6s %6s %6s µs %6s  %s\n" "$s" "$proto" "$c" "$rate" "$gbs" \
+      printf "%-19s %-5s %-14s %9.0f %6s %6s %6s µs %6s  %s\n" "$s" "$proto" "$c" "$rate" "$gbs" \
         "$(echo "scale=2; ($t1 - $t0) / (($w1 - $w0) * 1000000)" | bc)" "$(echo "scale=2; ($t1 - $t0) / $ok" | bc)" \
         "$(echo "scale=1; $hdr / $ok" | bc)" "${tls/TLS_AES_128_GCM_SHA256/AES128GCM}"
     done

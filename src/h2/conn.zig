@@ -398,6 +398,8 @@ pub const Conn = struct {
     /// the input was split). Output stopped for room in `out` waits for the
     /// worker's pump once written, as before.
     held: bool = false,
+    /// `pumpAll` passes so far (tests bound the work per frame with it).
+    passes: u32 = 0,
     /// Scratch for `pumpAll`: stream slots in sending order.
     order: []u32,
     /// Per urgency: the incremental stream served last, so the next pass
@@ -805,6 +807,8 @@ pub const Conn = struct {
 
     pub fn process(self: *Self, comptime Handler: type, ctx: *const Context(Handler)) Action {
         self.refreshBudgets(ctx.now);
+        // A pass over every stream ran and no frame came after it.
+        var pumped = false;
         while (true) {
             // After a GOAWAY with no streams left, the rest of the input is
             // not read, however it was split.
@@ -812,6 +816,7 @@ pub const Conn = struct {
             if (self.unsent() > self.opts.out_limit) return .flush;
             if (self.held) {
                 self.pumpAll(Handler, ctx);
+                pumped = true;
                 if (self.wantsClose()) return .close;
                 if (self.unsent() > self.opts.out_limit) return .flush;
             }
@@ -843,8 +848,9 @@ pub const Conn = struct {
                 },
                 .frame => |fr| self.handleFrame(Handler, ctx, fr),
             }
+            pumped = false;
         }
-        self.pumpAll(Handler, ctx);
+        if (!pumped) self.pumpAll(Handler, ctx);
         if (self.failed or self.wantsClose()) return .close;
         return .need_more;
     }
@@ -1691,6 +1697,7 @@ pub const Conn = struct {
         // Only a new yield holds output again: a pass that sends nothing
         // doesn't run again before the next frame.
         self.held = false;
+        self.passes +%= 1;
         if (self.output_streams == 0 or self.failed) return;
         var n: usize = 0;
         for (self.streams, 0..) |entry, slot| {
@@ -1797,7 +1804,12 @@ pub const Conn = struct {
         if (self.blocked_count > 0 and self.mustYield(s)) {
             if (!s.hasOutput()) return;
             if (s.ws != null) s.ws_pending = true;
-            self.held = true;
+            // Newly waiting: the next pass gets it. One already waiting
+            // was in the last pass, and its own window or new output
+            // doesn't change what a pass would do while the streams it
+            // waits for are stuck (a flood of WINDOW_UPDATEs or DATA must
+            // not buy a pass per frame).
+            if (!s.blocked) self.held = true;
             return self.setBlocked(s, true);
         }
         self.sendStream(Handler, ctx, s, std.math.maxInt(usize));
@@ -2645,8 +2657,9 @@ const Harness = struct {
             try h.drainMailbox();
             try h.collect();
             // Both event loops pump once what they wrote has drained:
-            // streams stopped for room in `out` continue.
-            while (h.wrote and h.conn.unsent() == 0 and h.last != .close) {
+            // streams stopped for room in `out` continue (and output a
+            // mailbox post held goes now, not with the next read).
+            while ((h.wrote or h.conn.held) and h.conn.unsent() == 0 and h.last != .close) {
                 h.wrote = false;
                 h.conn.pump(TestHandler, &c);
                 try h.collect();
@@ -4339,8 +4352,13 @@ test "file bodies: DATA frames through the windows, HEAD, a reset closes the own
 
 /// A GET with an optional `priority` header, as frame bytes.
 fn appendGet(h: *Harness, out: *std.ArrayList(u8), stream: u31, path: []const u8, priority: ?[]const u8) !void {
+    return appendRequest(h, out, stream, "GET", path, priority, true);
+}
+
+/// A request HEADERS frame, with a `priority` header if one is given.
+fn appendRequest(h: *Harness, out: *std.ArrayList(u8), stream: u31, method: []const u8, path: []const u8, priority: ?[]const u8, end_stream: bool) !void {
     var fields: [5]hpack.Field = .{
-        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":method", .value = method },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":path", .value = path },
         .{ .name = ":authority", .value = "example.com" },
@@ -4349,7 +4367,8 @@ fn appendGet(h: *Harness, out: *std.ArrayList(u8), stream: u31, path: []const u8
     const block = try h.encodeFields(fields[0..if (priority != null) 5 else 4]);
     defer testing.allocator.free(block);
     var buf: [256]u8 = undefined;
-    const n = try frame.writeHeaders(&buf, stream, frame.flag.end_stream | frame.flag.end_headers, block);
+    const flags = frame.flag.end_headers | @as(u8, if (end_stream) frame.flag.end_stream else 0);
+    const n = try frame.writeHeaders(&buf, stream, flags, block);
     try out.appendSlice(testing.allocator, buf[0..n]);
 }
 
@@ -4565,22 +4584,6 @@ test "priorities: an exchange waiting behind other streams doesn't time out" {
 // frame is read, so what the next frame finds (and what the client gets)
 // doesn't depend on where reads end. Before, it went at the end of the read.
 
-/// A request HEADERS frame with a `priority` header.
-fn appendRequest(h: *Harness, out: *std.ArrayList(u8), stream: u31, method: []const u8, path: []const u8, priority: []const u8, end_stream: bool) !void {
-    const block = try h.encodeFields(&.{
-        .{ .name = ":method", .value = method },
-        .{ .name = ":scheme", .value = "https" },
-        .{ .name = ":path", .value = path },
-        .{ .name = ":authority", .value = "example.com" },
-        .{ .name = "priority", .value = priority },
-    });
-    defer testing.allocator.free(block);
-    var buf: [256]u8 = undefined;
-    const flags = frame.flag.end_headers | @as(u8, if (end_stream) frame.flag.end_stream else 0);
-    const n = try frame.writeHeaders(&buf, stream, flags, block);
-    try out.appendSlice(testing.allocator, buf[0..n]);
-}
-
 fn appendData(out: *std.ArrayList(u8), stream: u31, bytes: []const u8, end: bool) !void {
     var buf: [frame.header_len + 64]u8 = undefined;
     try out.appendSlice(testing.allocator, buf[0..try frame.writeData(&buf, stream, end, bytes)]);
@@ -4655,6 +4658,42 @@ test "priorities: a held answer that ends its stream does so before the next fra
             return cut;
         }
     }.script, "headers 3 end=false [:status=200] [content-length=5] [date]\ndata 3 len=0 end=true\ngoaway last=3 stream_closed\n");
+}
+
+test "priorities: frames for a stream already waiting behind others don't each buy a pass over every stream" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    const big = try testing.allocator.alloc(u8, 100_000);
+    defer testing.allocator.free(big);
+    @memset(big, 'b');
+    h.handler.big = big;
+    try h.preface();
+    try h.settings(&.{.{ .id = .initial_window_size, .value = 1 << 20 }});
+    // Stream 1 (u=0) waits for the connection window, twenty u=7 answers
+    // behind it.
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(testing.allocator);
+    try appendGet(h, &frames, 1, "/big", "u=0");
+    var id: u31 = 3;
+    while (id <= 41) : (id += 2) try appendGet(h, &frames, id, "/big", "u=7");
+    try h.feed(frames.items);
+    h.events.clearRetainingCapacity();
+    // Window for one of them, a byte at a time: it changes nothing a pass
+    // would do (abuse: no output, so no back-pressure either).
+    frames.clearRetainingCapacity();
+    const updates = 2000;
+    for (0..updates) |_| {
+        var buf: [frame.header_len + 4]u8 = undefined;
+        try frames.appendSlice(testing.allocator, buf[0..try frame.writeWindowUpdate(&buf, 3, 1)]);
+    }
+    const before = h.conn.passes;
+    try h.feed(frames.items);
+    try h.expectEvents("");
+    // A pass per read at most, not one per frame.
+    try testing.expect(h.conn.passes - before < updates / 10);
+    // Once the window comes, the order holds.
+    try h.window(0, 1 << 22);
+    try expectDataRuns(h, "1 3 5 7 9 11 13 15 17 19 21 23 25 27 29 31 33 35 37 39 41");
 }
 
 // Any split of the same client bytes gives the same frames per stream.
@@ -5305,9 +5344,7 @@ fn feedNotingResets(h: *Harness, bytes: []const u8, pos: usize, resets: []const 
                 if (r.end > at) cut = @min(cut, r.end - at);
             }
             for (resets) |r| {
-                if (r.start != at) continue;
-                const gop = try h.reset_read.getOrPut(testing.allocator, r.id);
-                if (!gop.found_existing) gop.value_ptr.* = h.out.items.len;
+                if (r.start == at) try noteReset(h, r.id);
             }
         }
         try h.feed(rest[0..cut]);
@@ -5316,11 +5353,15 @@ fn feedNotingResets(h: *Harness, bytes: []const u8, pos: usize, resets: []const 
         if (h.last == .close) return;
         if (split) continue;
         for (resets) |r| {
-            if (r.end > at or r.end <= at - cut) continue;
-            const gop = try h.reset_read.getOrPut(testing.allocator, r.id);
-            if (!gop.found_existing) gop.value_ptr.* = h.out.items.len;
+            if (r.end <= at and r.end > at - cut) try noteReset(h, r.id);
         }
     }
+}
+
+/// The server has read the client's (first) RST_STREAM for `id` by now.
+fn noteReset(h: *Harness, id: u32) !void {
+    const gop = try h.reset_read.getOrPut(testing.allocator, id);
+    if (!gop.found_existing) gop.value_ptr.* = h.out.items.len;
 }
 
 /// Once the server has read a client's RST_STREAM it sends nothing more
