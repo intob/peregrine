@@ -7,8 +7,10 @@
 //!
 //! `connections` is how many are in flight at once, spread over the
 //! threads, each with its own epoll. A connection is done when its
-//! response has arrived; it is then closed with a reset (SO_LINGER 0, so
-//! neither side keeps a TIME_WAIT socket) and replaced by a new one.
+//! response and a session ticket have arrived (every server measured
+//! sends one per handshake; any other ticket in the same read is counted
+//! too); it is then closed with a reset (SO_LINGER 0, so neither side
+//! keeps a TIME_WAIT socket) and replaced by a new one.
 //!
 //! What the server sees is a browser-like ClientHello: a 32-byte
 //! legacy_session_id (middlebox compatibility, so a change_cipher_spec
@@ -29,7 +31,8 @@
 //! handshake for ECDSA) in one full handshake in N per thread, so that a
 //! client can afford it against 6 server cores; N = 1 verifies every one.
 //! The server's Finished is checked in every handshake, resumed ones too
-//! (it proves the key exchange and the transcript).
+//! (it proves the key exchange and the transcript), and so are the
+//! legacy_session_id echo, EncryptedExtensions and its ALPN.
 //!
 //! With `resume`, a thread without a ticket makes a full handshake; then
 //! every connection offers the newest ticket the thread holds (one
@@ -40,17 +43,24 @@
 //! when the Content-Length body has arrived; `h2` sends the preface, an
 //! empty SETTINGS and a GET on stream 1 (with the Finished, in one write),
 //! acknowledges the server's SETTINGS, and is done at the stream's
-//! END_STREAM. Every response must be 200.
+//! END_STREAM. Every response must be 200 (h2: :status 200 as the first
+//! field).
 //!
-//! After the warm-up it prints "measuring" and after `seconds` "measured"
-//! (a caller reads the server's CPU time at each), then the handshakes
-//! completed in between, the rate, how many resumed, how many had their
-//! signature verified, the client's own CPU time in between as cores used,
-//! the parameters the first full and the first resumed connection
-//! negotiated (suite, group, signature algorithm, ALPN, the certificate,
-//! tickets) and the errors.
+//! After the warm-up it prints "measuring at T" and after `seconds`
+//! "measured at T" (T its wall clock: a caller reads the server's CPU time
+//! at each, and can see how late), and keeps the load on for 1 s more, so
+//! that the second reading is still taken under load. Then it prints the
+//! handshakes completed in between, the rate, how many resumed, how many
+//! had their signature verified, tickets per handshake, the errors from
+//! start to stop (warm-up and tail included), the client's own CPU time in
+//! between as cores used, and the parameters the first full and the first
+//! resumed connection negotiated (suite, group, signature algorithm, ALPN,
+//! the certificate's size). It exits with an error when no handshake
+//! completed or a thread failed (at setup: it would leave its share of
+//! connections unopened).
 const std = @import("std");
 const per = @import("peregrine");
+const util = @import("util.zig");
 const sys = per.internal.sys;
 const record = per.internal.tls_record;
 const x25519 = per.internal.tls_x25519;
@@ -63,6 +73,9 @@ const MLKem768 = std.crypto.kem.ml_kem.MLKem768;
 const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const Certificate = std.crypto.Certificate;
 const Rsa = Certificate.rsa;
+const Writer = util.Writer;
+const parseIp = util.parseIp;
+const sleepMs = util.sleepMs;
 const Protection = record.Protection;
 
 const suite: record.Suite = .aes_128_gcm_sha256;
@@ -82,7 +95,14 @@ const Group = enum {
     }
 };
 
-const Proto = enum { http1, h2 };
+const Proto = enum {
+    http1,
+    h2,
+
+    fn alpn(p: Proto) []const u8 {
+        return if (p == .h2) "h2" else "http/1.1";
+    }
+};
 
 const CertKind = enum { ecdsa, rsa };
 
@@ -164,6 +184,10 @@ const Options = struct {
 /// A connection that hasn't finished in this long is counted as an error
 /// and replaced.
 const timeout_ns = 5 * std.time.ns_per_s;
+/// A slot whose connection couldn't be opened tries again after this long.
+const retry_ns = 100 * std.time.ns_per_ms;
+/// How long the load goes on after "measured".
+const tail_ms = 1000;
 
 const mlkem_share_len = MLKem768.PublicKey.encoded_length + 32;
 const mlkem_reply_len = MLKem768.ciphertext_length + 32;
@@ -265,6 +289,9 @@ const Conn = struct {
     resp_len: usize = 0,
     transcript: Sha256 = undefined,
     offered_psk: bool = false,
+    session_id: [32]u8 = undefined,
+    /// EncryptedExtensions has arrived (with the offered ALPN).
+    extensions: bool = false,
     psk: ks.Secret = undefined,
     resumed: bool = false,
     /// Its CertificateVerify signature was verified.
@@ -294,6 +321,7 @@ const Conn = struct {
         c.hs_len = 0;
         c.resp_len = 0;
         c.offered_psk = false;
+        c.extensions = false;
         c.resumed = false;
         c.verified = false;
         c.neg = .{};
@@ -311,13 +339,18 @@ const Worker = struct {
     ticket: Ticket = .{},
     rng: std.Random.DefaultPrng = undefined,
     epfd: i32 = -1,
-    completed: std.atomic.Value(u64) = .init(0),
+    /// Handshakes completed (high 32 bits) and how many of them had their
+    /// signature verified (low 32), in one word so that main reads the two
+    /// at the same instant: it can be descheduled between two reads, and
+    /// "every one verified" is checked exactly.
+    done: std.atomic.Value(u64) = .init(0),
     resumed: std.atomic.Value(u64) = .init(0),
-    verified: std.atomic.Value(u64) = .init(0),
     tickets: std.atomic.Value(u64) = .init(0),
     /// CertificateVerify messages seen, for verifying one in N.
     signatures: u64 = 0,
     errors: std.atomic.Value(u64) = .init(0),
+    /// The thread itself failed (at setup, before any connection).
+    died: ?anyerror = null,
     first_error: ?anyerror = null,
     first_full: ?Negotiated = null,
     first_resumed: ?Negotiated = null,
@@ -325,9 +358,8 @@ const Worker = struct {
 
     fn run(self: *Worker, stop: *std.atomic.Value(bool)) void {
         self.loop(stop) catch |err| {
-            std.debug.print("tls-load: {s}\n", .{@errorName(err)});
-            if (self.first_error == null) self.first_error = err;
-            _ = self.errors.fetchAdd(1, .release);
+            std.debug.print("tls-load: thread failed: {s}\n", .{@errorName(err)});
+            self.died = err;
         };
     }
 
@@ -370,7 +402,10 @@ const Worker = struct {
             if (now - last_scan > 100 * std.time.ns_per_ms) {
                 last_scan = now;
                 for (conns, 0..) |*c, i| {
-                    if (now - c.started_ns > timeout_ns) {
+                    if (c.fd < 0) {
+                        // open() failed (counted already): try again.
+                        if (now - c.started_ns > retry_ns) self.restart(c, i);
+                    } else if (now - c.started_ns > timeout_ns) {
                         self.failed(error.Timeout);
                         self.restart(c, i);
                     }
@@ -388,10 +423,9 @@ const Worker = struct {
     }
 
     fn finish(self: *Worker, c: *Conn) void {
-        _ = self.completed.fetchAdd(1, .release);
         if (c.resumed) _ = self.resumed.fetchAdd(1, .release);
-        if (c.verified) _ = self.verified.fetchAdd(1, .release);
         _ = self.tickets.fetchAdd(c.neg.tickets, .release);
+        _ = self.done.fetchAdd(1 << 32 | @as(u64, @intFromBool(c.verified)), .release);
         const first = if (c.resumed) &self.first_resumed else &self.first_full;
         if (first.* == null) first.* = c.neg;
     }
@@ -406,8 +440,10 @@ const Worker = struct {
         }
         c.reset(c.gen +% 1);
         self.open(c, i) catch |err| {
-            // Counted, and retried by the timeout scan.
+            // Counted once, and retried by the timeout scan.
             self.failed(err);
+            if (c.fd >= 0) sys.close(c.fd);
+            c.fd = -1;
             c.started_ns = sys.nanoTimestamp();
         };
     }
@@ -449,8 +485,8 @@ const Worker = struct {
                     else => return err,
                 };
                 if (n == 0) {
-                    if (c.answered) return true;
-                    return error.ConnectionClosed;
+                    if (c.answered and c.neg.tickets > 0) return true;
+                    return if (c.answered) error.NoTicket else error.ConnectionClosed;
                 }
                 c.in_len += n;
                 if (try self.records(c)) return true;
@@ -480,6 +516,7 @@ const Worker = struct {
         w.bytes(random[0..32]);
         w.int(u8, 32);
         w.bytes(random[32..64]); // legacy_session_id
+        c.session_id = random[32..64].*;
         w.int(u16, 2);
         w.int(u16, @backingInt(suite));
         w.int(u8, 1);
@@ -520,7 +557,7 @@ const Worker = struct {
         w.int(u8, 1);
         w.int(u8, 1); // psk_dhe_ke
         w.int(u16, @backingInt(tls.ExtensionType.application_layer_protocol_negotiation));
-        const alpn: []const u8 = if (self.o.proto == .h2) "h2" else "http/1.1";
+        const alpn = self.o.proto.alpn();
         w.int(u16, @intCast(alpn.len + 3));
         w.int(u16, @intCast(alpn.len + 1));
         w.int(u8, @intCast(alpn.len));
@@ -563,17 +600,19 @@ const Worker = struct {
     }
 
     /// Handles every whole record in the input; returns whether the
-    /// connection is done.
+    /// connection is done: its response and a ticket have arrived (every
+    /// ticket in the same read is counted, so a server sending two at once
+    /// shows as 2 tickets each).
     fn records(self: *Worker, c: *Conn) !bool {
         var pos: usize = 0;
         defer {
             std.mem.copyForwards(u8, c.in[0 .. c.in_len - pos], c.in[pos..c.in_len]);
             c.in_len -= pos;
         }
-        while (c.in_len - pos >= record.header_len) {
+        const closed = while (c.in_len - pos >= record.header_len) {
             const len = std.mem.readInt(u16, c.in[pos + 3 ..][0..2], .big);
             if (len > record.max_ciphertext) return error.RecordOverflow;
-            if (c.in_len - pos < record.header_len + len) break;
+            if (c.in_len - pos < record.header_len + len) break false;
             const rec = c.in[pos..][0 .. record.header_len + len];
             pos += rec.len;
             switch (rec[0]) {
@@ -593,7 +632,7 @@ const Worker = struct {
                             try self.response(c, opened.data);
                         },
                         .alert => {
-                            if (opened.data.len == 2 and opened.data[1] == 0 and c.answered) return true;
+                            if (opened.data.len == 2 and opened.data[1] == 0 and c.answered) break true;
                             return error.AlertReceived;
                         },
                         else => return error.UnexpectedMessage,
@@ -601,9 +640,10 @@ const Worker = struct {
                 },
                 else => return error.UnexpectedMessage,
             }
-            if (c.answered and (!self.o.resume_ or c.neg.tickets > 0 or self.ticket.len > 0)) return true;
-        }
-        return false;
+        } else false;
+        if (c.answered and c.neg.tickets > 0) return true;
+        // After close_notify nothing more comes.
+        return if (closed) error.NoTicket else false;
     }
 
     fn handshakeBytes(self: *Worker, c: *Conn, data: []const u8) !void {
@@ -649,11 +689,12 @@ const Worker = struct {
             },
             .flight => switch (msg[0]) {
                 @backingInt(tls.HandshakeType.encrypted_extensions) => {
-                    try encryptedExtensions(c, body);
+                    if (c.extensions) return error.UnexpectedMessage;
+                    try self.encryptedExtensions(c, body);
                     c.transcript.update(msg);
                 },
                 @backingInt(tls.HandshakeType.certificate) => {
-                    if (c.resumed or c.neg.cert_len != 0) return error.UnexpectedMessage;
+                    if (c.resumed or !c.extensions or c.neg.cert_len != 0) return error.UnexpectedMessage;
                     try self.certificate(body);
                     c.neg.cert_len = msg.len;
                     c.transcript.update(msg);
@@ -664,7 +705,7 @@ const Worker = struct {
                     c.transcript.update(msg);
                 },
                 @backingInt(tls.HandshakeType.finished) => {
-                    if (!c.resumed and c.neg.sig == 0) return error.UnexpectedMessage;
+                    if (!c.extensions or (!c.resumed and c.neg.sig == 0)) return error.UnexpectedMessage;
                     const expected = ks.finishedVerifyData(c.s_hs, &c.transcript.peek());
                     if (body.len != expected.len or !std.mem.eql(u8, body, &expected)) return error.BadFinished;
                     c.transcript.update(msg);
@@ -687,10 +728,10 @@ const Worker = struct {
         if ((try r.int(u16)) != 0x0303) return error.BadServerHello;
         const random = try r.bytes(32);
         if (std.mem.eql(u8, random, &tls.hello_retry_request_sequence)) return error.HelloRetryRequest;
-        _ = try r.bytes(try r.int(u8));
+        if (!std.mem.eql(u8, try r.bytes(try r.int(u8)), &c.session_id)) return error.BadServerHello;
         c.neg.cipher = try r.int(u16);
         if (c.neg.cipher != @backingInt(suite)) return error.BadServerHello;
-        _ = try r.int(u8);
+        if ((try r.int(u8)) != 0) return error.BadServerHello; // legacy_compression_method
         var exts: Reader = .{ .buf = try r.bytes(try r.int(u16)) };
         var version: u16 = 0;
         while (exts.pos < exts.buf.len) {
@@ -750,9 +791,11 @@ const Worker = struct {
         return error.NoKeyShare;
     }
 
-    fn encryptedExtensions(c: *Conn, body: []const u8) !void {
+    /// The ALPN must be the one offered.
+    fn encryptedExtensions(self: *Worker, c: *Conn, body: []const u8) !void {
         var r: Reader = .{ .buf = body };
         var exts: Reader = .{ .buf = try r.bytes(try r.int(u16)) };
+        if (r.pos != body.len) return error.BadExtensions;
         while (exts.pos < exts.buf.len) {
             const ty = try exts.int(u16);
             var ext: Reader = .{ .buf = try exts.bytes(try exts.int(u16)) };
@@ -764,6 +807,8 @@ const Worker = struct {
                 c.neg.alpn_len = proto.len;
             }
         }
+        if (!std.mem.eql(u8, c.neg.alpn[0..c.neg.alpn_len], self.o.proto.alpn())) return error.WrongAlpn;
+        c.extensions = true;
     }
 
     /// After the server's Finished: our change_cipher_spec, Finished and
@@ -843,11 +888,15 @@ const Worker = struct {
                     pos += 9 + len;
                     switch (ty) {
                         1 => if (stream == 1) { // HEADERS
-                            if (flags & 0x8 != 0) payload = payload[1 .. payload.len - payload[0]];
-                            if (flags & 0x20 != 0) payload = payload[5..];
-                            // :status 200 from the static table, or as a literal.
-                            if (!(payload.len > 0 and payload[0] == 0x88) and
-                                std.mem.indexOf(u8, payload, "\x03200") == null) return error.BadStatus;
+                            if (flags & 0x8 != 0) { // PADDED
+                                if (payload.len < 1 or payload[0] >= payload.len) return error.BadFrame;
+                                payload = payload[1 .. payload.len - payload[0]];
+                            }
+                            if (flags & 0x20 != 0) { // PRIORITY
+                                if (payload.len < 5) return error.BadFrame;
+                                payload = payload[5..];
+                            }
+                            if (!statusOk(payload)) return error.BadStatus;
                             c.status_ok = true;
                         },
                         3 => if (stream == 1) return error.StreamReset,
@@ -868,42 +917,39 @@ const Worker = struct {
     }
 };
 
+/// Whether a response's header block starts with :status 200 (pseudo-header
+/// fields come first, RFC 9113 §8.3): indexed (static entry 8), or a
+/// literal with a :status name (static entries 8-14) and the value "200",
+/// raw or Huffman-coded (RFC 7541). Dynamic table size updates may precede
+/// it.
+fn statusOk(block: []const u8) bool {
+    var b = block;
+    while (b.len > 0 and b[0] & 0xe0 == 0x20) { // 001xxxxx: a 5-bit prefix integer
+        const long = b[0] & 0x1f == 0x1f;
+        b = b[1..];
+        if (long) {
+            while (b.len > 0 and b[0] & 0x80 != 0) b = b[1..];
+            if (b.len == 0) return false;
+            b = b[1..];
+        }
+    }
+    if (b.len == 0) return false;
+    if (b[0] == 0x88) return true;
+    const index = switch (b[0] & 0xf0) {
+        0x40, 0x50, 0x60, 0x70 => b[0] & 0x3f, // incremental indexing, 6-bit index
+        0x00, 0x10 => b[0] & 0x0f, // without indexing or never indexed, 4-bit
+        else => return false,
+    };
+    if (index < 8 or index > 14) return false;
+    return std.mem.startsWith(u8, b[1..], "\x03200") or std.mem.startsWith(u8, b[1..], "\x82\x10\x01");
+}
+
 /// The connection preface, an empty SETTINGS and HEADERS for GET / on
 /// stream 1 (END_STREAM, END_HEADERS): :method GET, :scheme https,
 /// :path / from the static table, :authority localhost as a literal.
 const h2_request = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" ++
     "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++
     "\x00\x00\x0e\x01\x05\x00\x00\x00\x01" ++ "\x82\x87\x84\x41\x09localhost";
-
-const Writer = struct {
-    buf: []u8,
-    pos: usize = 0,
-
-    fn bytes(w: *Writer, b: []const u8) void {
-        @memcpy(w.buf[w.pos..][0..b.len], b);
-        w.pos += b.len;
-    }
-
-    fn fill(w: *Writer, n: usize, v: u8) void {
-        @memset(w.buf[w.pos..][0..n], v);
-        w.pos += n;
-    }
-
-    fn int(w: *Writer, comptime T: type, v: T) void {
-        std.mem.writeInt(T, w.buf[w.pos..][0..@divExact(@bitSizeOf(T), 8)], v, .big);
-        w.pos += @divExact(@bitSizeOf(T), 8);
-    }
-
-    fn begin(w: *Writer, comptime T: type) usize {
-        const at = w.pos;
-        w.pos += @divExact(@bitSizeOf(T), 8);
-        return at;
-    }
-
-    fn end(w: *Writer, comptime T: type, at: usize) void {
-        std.mem.writeInt(T, w.buf[at..][0..@divExact(@bitSizeOf(T), 8)], @intCast(w.pos - at - @divExact(@bitSizeOf(T), 8)), .big);
-    }
-};
 
 const Reader = struct {
     buf: []const u8,
@@ -920,17 +966,12 @@ const Reader = struct {
     }
 };
 
-fn parseIp(s: []const u8) ![4]u8 {
-    var out: [4]u8 = undefined;
-    var it = std.mem.splitScalar(u8, s, '.');
-    for (&out) |*b| b.* = try std.fmt.parseInt(u8, it.next() orelse return error.BadIp, 10);
-    if (it.next() != null) return error.BadIp;
-    return out;
-}
-
-fn sleepMs(ms: u64) void {
-    var ts: posix.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
-    _ = linux.nanosleep(&ts, &ts);
+/// Wall-clock time in seconds, for a caller to see how late it read the
+/// phase markers.
+fn realTime() f64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &ts);
+    return @as(f64, @floatFromInt(ts.sec)) + @as(f64, @floatFromInt(ts.nsec)) / std.time.ns_per_s;
 }
 
 fn name(comptime E: type, v: u16) []const u8 {
@@ -944,6 +985,18 @@ fn cpuTime() u64 {
     var ns: u64 = 0;
     for ([_]linux.timeval{ ru.utime, ru.stime }) |t| ns += @as(u64, @intCast(t.sec)) * std.time.ns_per_s + @as(u64, @intCast(t.usec)) * std.time.ns_per_us;
     return ns;
+}
+
+/// Handshakes completed and verified, each worker's pair read at once.
+fn doneCounts(workers: []Worker) struct { completed: u64, verified: u64 } {
+    var completed: u64 = 0;
+    var verified: u64 = 0;
+    for (workers) |*w| {
+        const d = w.done.load(.acquire);
+        completed += d >> 32;
+        verified += d & 0xffff_ffff;
+    }
+    return .{ .completed = completed, .verified = verified };
 }
 
 fn sum(workers: []Worker, comptime field: []const u8) u64 {
@@ -979,26 +1032,31 @@ pub fn main(init: std.process.Init) !void {
         w.thread = try std.Thread.spawn(.{}, Worker.run, .{ w, &stop });
     }
     sleepMs(o.warm_up * 1000);
-    const n0 = sum(workers, "completed");
+    // Resumptions and tickets are read a moment apart from `done`: a few
+    // handshakes' worth either way.
+    const d0 = doneCounts(workers);
     const r0 = sum(workers, "resumed");
-    const v0 = sum(workers, "verified");
     const t0 = sum(workers, "tickets");
-    const e0 = sum(workers, "errors");
     const start = sys.nanoTimestamp();
     const cpu0 = cpuTime();
-    std.debug.print("measuring\n", .{});
+    std.debug.print("measuring at {d:.3}\n", .{realTime()});
     sleepMs(o.seconds * 1000);
-    const n = sum(workers, "completed") - n0;
+    const d1 = doneCounts(workers);
+    const n = d1.completed - d0.completed;
+    const verified = d1.verified - d0.verified;
     const resumed = sum(workers, "resumed") - r0;
-    const verified = sum(workers, "verified") - v0;
     const tickets = sum(workers, "tickets") - t0;
-    const errors = sum(workers, "errors") - e0;
     const elapsed = sys.nanoTimestamp() - start;
     const cpu = cpuTime() - cpu0;
-    std.debug.print("measured\n", .{});
+    std.debug.print("measured at {d:.3}\n", .{realTime()});
+    // The load goes on a while longer, so that a caller reading the
+    // server's CPU time after "measured" still reads it under load.
+    sleepMs(tail_ms);
     stop.store(true, .release);
     for (workers) |*w| w.thread.join();
     const secs = @as(f64, @floatFromInt(elapsed)) / std.time.ns_per_s;
+    // Every error from start to stop, warm-up and tail included.
+    const errors = sum(workers, "errors");
     std.debug.print("{d} conns, {s}, {s}, {s}: {d} handshakes in {d:.2} s, {d:.0} /s, {d} resumed, {d} signatures verified, {d:.2} tickets each, {d} errors\n", .{
         o.connections,                                                                    @tagName(o.group), @tagName(o.proto),
         if (o.resume_) "resume" else "full",                                              n,                 secs,
@@ -1022,6 +1080,12 @@ pub fn main(init: std.process.Init) !void {
         });
     }
     if (first_error) |err| std.debug.print("first error: {s}\n", .{@errorName(err)});
+    var died: usize = 0;
+    for (workers) |*w| died += @intFromBool(w.died != null);
+    if (died > 0) {
+        std.debug.print("{d} of {d} threads failed\n", .{ died, workers.len });
+        return error.ThreadFailed;
+    }
     if (n == 0) return error.NoHandshakes;
 }
 
@@ -1055,4 +1119,26 @@ test "CertificateVerify: the servers' signatures verify, altered ones don't" {
         out[sig.len / 2] ^= 0x10;
         try std.testing.expect(std.meta.isError(expected.verify(sig, &hash)));
     }
+}
+
+test "statusOk: :status 200 as the first field only" {
+    for ([_][]const u8{
+        "\x88", // indexed
+        "\x88\x5f\x0atext/plain",
+        "\x48\x03200", // literal, incremental indexing, name 8
+        "\x0e\x03200", // without indexing, name 14
+        "\x18\x82\x10\x01", // never indexed, Huffman "200"
+        "\x20\x88", // after a size update to 0
+        "\x3f\xe1\x1f\x88", // after a size update to 4096
+    }) |block| try std.testing.expect(statusOk(block));
+    for ([_][]const u8{
+        "",
+        "\x89", // :status 204
+        "\x48\x82\x64\x02", // :status 302, RFC 7541 C.6.1
+        "\x48\x03404",
+        "\x47\x03200", // name 7 (:scheme https)
+        "\x40\x07:status\x03200", // new name
+        "\x5f\x0atext/plain\x88", // not first
+        "\x3f\xe1", // a truncated size update
+    }) |block| try std.testing.expect(!statusOk(block));
 }

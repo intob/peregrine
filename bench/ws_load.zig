@@ -17,6 +17,9 @@
 //! may come back compressed, are checked for opcode and FIN only.
 const std = @import("std");
 const per = @import("peregrine");
+const util = @import("util.zig");
+const parseIp = util.parseIp;
+const sleepMs = util.sleepMs;
 const sys = per.internal.sys;
 const posix = std.posix;
 const linux = std.os.linux;
@@ -280,19 +283,6 @@ const Worker = struct {
         return done;
     }
 };
-
-fn parseIp(s: []const u8) ![4]u8 {
-    var out: [4]u8 = undefined;
-    var it = std.mem.splitScalar(u8, s, '.');
-    for (&out) |*b| b.* = try std.fmt.parseInt(u8, it.next() orelse return error.BadIp, 10);
-    if (it.next() != null) return error.BadIp;
-    return out;
-}
-
-fn sleepMs(ms: u64) void {
-    var ts: posix.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
-    _ = linux.nanosleep(&ts, &ts);
-}
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());

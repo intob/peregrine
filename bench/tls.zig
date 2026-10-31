@@ -7,6 +7,7 @@
 //! AES key schedule and GHASH's powers of H on every call.
 const std = @import("std");
 const per = @import("peregrine");
+const Writer = @import("util.zig").Writer;
 const record = per.internal.tls_record;
 const sys = per.internal.sys;
 const Protection = record.Protection;
@@ -172,36 +173,6 @@ fn clientHello(buf: []u8, group: tls.NamedGroup, share: []const u8) []const u8 {
     w.end(u24, msg);
     return w.buf[0..w.pos];
 }
-
-const Writer = struct {
-    buf: []u8,
-    pos: usize = 0,
-
-    fn bytes(w: *Writer, b: []const u8) void {
-        @memcpy(w.buf[w.pos..][0..b.len], b);
-        w.pos += b.len;
-    }
-
-    fn fill(w: *Writer, n: usize, v: u8) void {
-        @memset(w.buf[w.pos..][0..n], v);
-        w.pos += n;
-    }
-
-    fn int(w: *Writer, comptime T: type, v: T) void {
-        std.mem.writeInt(T, w.buf[w.pos..][0..@divExact(@bitSizeOf(T), 8)], v, .big);
-        w.pos += @divExact(@bitSizeOf(T), 8);
-    }
-
-    fn begin(w: *Writer, comptime T: type) usize {
-        const at = w.pos;
-        w.pos += @divExact(@bitSizeOf(T), 8);
-        return at;
-    }
-
-    fn end(w: *Writer, comptime T: type, at: usize) void {
-        std.mem.writeInt(T, w.buf[at..][0..@divExact(@bitSizeOf(T), 8)], @intCast(w.pos - at - @divExact(@bitSizeOf(T), 8)), .big);
-    }
-};
 
 fn reportOp(name: []const u8, iterations: usize, ns: u64) void {
     const us = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(iterations)) / 1000.0;

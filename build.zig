@@ -132,7 +132,16 @@ pub fn build(b: *std.Build) !void {
     });
     const tls_load_step = b.step("tls-load", "Build the TLS handshake load generator (Linux)");
     tls_load_step.dependOn(&b.addInstallArtifact(tls_load, .{}).step);
-    const tls_load_test = b.addTest(.{ .name = "tls-load-test", .root_module = tls_load.root_module });
+    // Its tests run with runtime safety (the -Doptimize mode, Debug by default).
+    const tls_load_test = b.addTest(.{
+        .name = "tls-load-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/tls_load.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "peregrine", .module = lib }},
+        }),
+    });
     const tls_load_test_step = b.step("test-tls-load", "Test tls-load's CertificateVerify check");
     tls_load_test_step.dependOn(&b.addRunArtifact(tls_load_test).step);
 }
