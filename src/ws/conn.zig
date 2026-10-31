@@ -63,6 +63,9 @@ pub const Conn = struct {
 
     /// A queue's buffer has room for one more frame up to this size.
     const room_for_another = 64 * 1024;
+    /// The last batch sizes the next one's buffer up to this many times
+    /// the frame that starts it.
+    const hint_frames = 16;
 
     /// The socket. Only for identification (logging); never read or write
     /// it directly. Every WebSocket on one HTTP/2 connection shares its
@@ -72,9 +75,6 @@ pub const Conn = struct {
     user: ?*anyopaque = null,
 
     allocator: std.mem.Allocator,
-    /// The owning worker's: input buffers, and the send queues' (the
-    /// part any thread may use, `wsAcquire`).
-    pool: *BufferPool,
     opts: Options,
     decoder: protocol.Decoder,
     mailbox: *Mailbox,
@@ -96,7 +96,9 @@ pub const Conn = struct {
     /// Guarded by `mutex`: how many bytes `shared` held when the wire last
     /// took it, so that the next batch's buffer is taken large enough at
     /// once instead of growing (and copying) through the sizes, which a
-    /// buffer kept for the connection's life did once.
+    /// buffer kept for the connection's life did once. Followed only up
+    /// to `hint_frames` times the frame that starts the batch, so a small
+    /// message after a large one takes a small buffer.
     batch_hint: usize = 0,
 
     /// Bytes being written. Owned by the worker.
@@ -118,7 +120,6 @@ pub const Conn = struct {
         self.* = .{
             .fd = fd,
             .allocator = allocator,
-            .pool = pool,
             .opts = opts,
             .decoder = protocol.Decoder.init(pool, opts.max_message_size),
             .mailbox = mailbox,
@@ -129,9 +130,15 @@ pub const Conn = struct {
 
     pub fn destroy(self: *Self) void {
         self.decoder.deinit();
-        if (self.shared.buf.len > 0) self.pool.wsRelease(self.shared.buf);
-        if (self.wire.buf.len > 0) self.pool.wsRelease(self.wire.buf);
+        if (self.shared.buf.len > 0) self.bufferPool().wsRelease(self.shared.buf);
+        if (self.wire.buf.len > 0) self.bufferPool().wsRelease(self.wire.buf);
         self.allocator.destroy(self);
+    }
+
+    /// The owning worker's: input buffers, and the send queues (the part
+    /// any thread may use, `wsAcquire`).
+    inline fn bufferPool(self: *const Self) *BufferPool {
+        return self.decoder.pool;
     }
 
     /// Applies what the upgrade negotiated, before the handler sees the
@@ -202,14 +209,20 @@ pub const Conn = struct {
             const q = &self.shared;
             if (q.buf.len - q.len < total) {
                 // A larger buffer (the first: an empty queue holds none),
-                // for what the last batch held if that is more, and a
-                // small frame's room for another like it (two of 2^k bytes
-                // and their headers don't fit in 2^(k+1)).
+                // for what the last batch held if that is more, half as
+                // large again as the one it replaces (past the largest
+                // pooled size, growing a frame at a time would copy the
+                // queue on every send), and a small frame's room for
+                // another like it (two of 2^k bytes and their headers
+                // don't fit in 2^(k+1)). If that much can't be had, just
+                // what it must hold: a pong or a close echo isn't lost for
+                // a hint.
                 const want = q.len + total;
-                const room = @max(want, self.batch_hint) + if (total <= room_for_another) total else 0;
-                const buf = try self.pool.wsAcquire(room);
+                const hint = @min(self.batch_hint, hint_frames * total);
+                const room = @max(want, hint, q.buf.len + q.buf.len / 2) + if (total <= room_for_another) total else 0;
+                const buf = self.bufferPool().wsAcquire(room) catch try self.bufferPool().wsAcquire(want);
                 @memcpy(buf[0..q.len], q.bytes());
-                if (q.buf.len > 0) self.pool.wsRelease(q.buf);
+                if (q.buf.len > 0) self.bufferPool().wsRelease(q.buf);
                 q.buf = buf;
             }
             @memcpy(q.buf[q.len..][0..h.len], h);
@@ -297,7 +310,7 @@ pub const Conn = struct {
 
     /// The wire is written: its buffer goes back to the pool.
     fn releaseWire(self: *Self) void {
-        if (self.wire.buf.len > 0) self.pool.wsRelease(self.wire.buf);
+        if (self.wire.buf.len > 0) self.bufferPool().wsRelease(self.wire.buf);
         self.wire = .{};
         self.wire_pos = 0;
     }
@@ -309,8 +322,8 @@ pub const Conn = struct {
         const src = self.wire.bytes();
         // Frames only shrink, and a frame is compressed after a gap the size
         // of the longest header.
-        var out: Queue = .{ .buf = self.pool.wsAcquire(src.len + 10) catch return self.uncompressWire() };
-        const d = self.pool.wsDeflater() catch null;
+        var out: Queue = .{ .buf = self.bufferPool().wsAcquire(src.len + 10) catch return self.uncompressWire() };
+        const d = self.bufferPool().wsDeflater() catch null;
         var i: usize = 0;
         while (i < src.len) {
             const b1 = src[i + 1] & 0x7f;
@@ -348,7 +361,7 @@ pub const Conn = struct {
         self.mutex.lock();
         self.queued = self.queued - src.len + out.len;
         self.mutex.unlock();
-        self.pool.wsRelease(self.wire.buf);
+        self.bufferPool().wsRelease(self.wire.buf);
         self.wire = out;
     }
 
@@ -976,6 +989,114 @@ test "send queues: after the first batch, a batch like it fits the buffer its fi
             }
         }
     }
+}
+
+test "send queues: past the largest pooled size a queue grows geometrically, not a frame at a time" {
+    // Sized for exactly what it held plus one frame, a 33 MiB queue was
+    // copied whole about every second send.
+    const big = try testing.allocator.alloc(u8, WsQueues.max_size + (1 << 20));
+    defer testing.allocator.free(big);
+    @memset(big, 'b');
+    const h = try Harness.init(.{ .max_send_queue_bytes = 64 << 20 });
+    defer h.deinit();
+    try h.conn.send(big, true);
+    var moves: usize = 0;
+    var last = h.conn.shared.buf.ptr;
+    for (0..400) |_| {
+        try h.conn.send(big[0..100], true);
+        if (h.conn.shared.buf.ptr != last) moves += 1;
+        last = h.conn.shared.buf.ptr;
+    }
+    try testing.expect(moves <= 2);
+    try h.flush();
+    var rest: []const u8 = h.out.items;
+    try testing.expectEqual(big.len, (try takeFrame(&rest)).payload.len);
+    for (0..400) |_| try testing.expectEqualSlices(u8, big[0..100], (try takeFrame(&rest)).payload);
+    try testing.expectEqual(@as(usize, 0), rest.len);
+}
+
+test "send queues: a small message after a large batch takes a small buffer" {
+    // The last batch's size was followed whatever came next: after one
+    // 16 MiB message, sending "hi" took a 32 MiB buffer.
+    const big = try testing.allocator.alloc(u8, 16 << 20);
+    defer testing.allocator.free(big);
+    @memset(big, 'b');
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    try h.conn.send(big, true);
+    try h.flush();
+    h.pool.trim();
+    h.pool.trim();
+    try h.conn.send("hi", false);
+    try testing.expectEqual(@as(usize, WsQueues.min_size), h.conn.shared.buf.len);
+    for (0..20) |_| try h.conn.send("hi", false);
+    try testing.expectEqual(@as(usize, WsQueues.min_size), h.conn.shared.buf.len);
+}
+
+/// testing.allocator, failing anything larger than `limit`.
+const LimitAllocator = struct {
+    limit: usize,
+
+    fn allocator(self: *LimitAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *LimitAllocator = @ptrCast(@alignCast(ctx));
+        if (len > self.limit) return null;
+        return testing.allocator.rawAlloc(len, alignment, ra);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *LimitAllocator = @ptrCast(@alignCast(ctx));
+        return new_len <= self.limit and testing.allocator.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *LimitAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > self.limit) return null;
+        return testing.allocator.rawRemap(memory, alignment, new_len, ra);
+    }
+
+    fn free(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        testing.allocator.rawFree(memory, alignment, ra);
+    }
+};
+
+test "send queues: when the room asked for can't be had, a frame takes just what it needs" {
+    // A full 40 MiB queue asks for half as much again; with only 50 MiB
+    // to be had the pong, the close echo and the next message still go
+    // (dropped as OutOfMemory, a pong or close echo was lost for good).
+    const big = try testing.allocator.alloc(u8, 40 << 20);
+    defer testing.allocator.free(big);
+    @memset(big, 'b');
+    var limited: LimitAllocator = .{ .limit = 50 << 20 };
+    const h = try Harness.initWith(.{ .max_send_queue_bytes = 64 << 20 }, limited.allocator());
+    defer h.deinit();
+    // Input processed while the queue is still full (nothing written).
+    const Feed = struct {
+        fn only(hh: *Harness, bytes: []const u8) !Conn.Action {
+            const space = try hh.conn.decoder.readSpace();
+            @memcpy(space[0..bytes.len], bytes);
+            hh.conn.decoder.commitRead(bytes.len);
+            return hh.conn.process(LogHandler, &hh.handler);
+        }
+    };
+    try h.conn.send(big, true);
+    try testing.expectEqual(Conn.Action.ok, try Feed.only(h, &[_]u8{ 0x89, 0x81, 1, 2, 3, 4, 'p' ^ 1 }));
+    try h.conn.send(big[0..10], true);
+    try testing.expectEqual(Conn.Action.close, try Feed.only(h, &[_]u8{ 0x88, 0x82, 1, 2, 3, 4, 0x03 ^ 1, 0xe8 ^ 2 }));
+    try h.flush();
+    var rest: []const u8 = h.out.items;
+    try testing.expectEqual(big.len, (try takeFrame(&rest)).payload.len);
+    const pong = try takeFrame(&rest);
+    try testing.expectEqual(@as(u4, 0xa), pong.op);
+    try testing.expectEqualStrings("p", pong.payload);
+    try testing.expectEqualSlices(u8, big[0..10], (try takeFrame(&rest)).payload);
+    const close = try takeFrame(&rest);
+    try testing.expectEqual(@as(u4, 8), close.op);
+    try testing.expectEqualStrings("\x03\xe8", close.payload);
+    try testing.expectEqual(@as(usize, 0), rest.len);
 }
 
 test "send queues: a connection destroyed with output queued and half written gives its buffers back" {

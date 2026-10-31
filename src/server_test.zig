@@ -42,6 +42,9 @@ const TestHandler = struct {
     queue_full: std.atomic.Value(bool) = .init(false),
     /// The last close code received from a client (0 = none).
     close_code: std.atomic.Value(u16) = .init(0),
+    /// "from-threads": senders finished, and whether a send failed.
+    threads_done: std.atomic.Value(usize) = .init(0),
+    thread_send_failed: std.atomic.Value(bool) = .init(false),
     /// Exchange hooks and state.
     aborts: std.atomic.Value(usize) = .init(0),
     writable_calls: std.atomic.Value(usize) = .init(0),
@@ -183,9 +186,12 @@ const TestHandler = struct {
             // Two threads at once, three messages each (see
             // threadMessageLen): the queue grows under one thread's
             // appends while the other's and the worker's go on.
+            // A failed send is recorded for the test to report; each
+            // thread counts itself done once it no longer uses `conn`.
             for (0..2) |t| {
                 const th = std.Thread.spawn(.{}, struct {
-                    fn run(c: *ws.Conn, tt: u8) void {
+                    fn run(h: *TestHandler, c: *ws.Conn, tt: u8) void {
+                        defer _ = h.threads_done.fetchAdd(1, .release);
                         const msg = std.heap.page_allocator.alloc(u8, threadMessageLen(1, 2)) catch unreachable;
                         defer std.heap.page_allocator.free(msg);
                         for (0..3) |k| {
@@ -193,10 +199,13 @@ const TestHandler = struct {
                             m[0] = tt;
                             m[1] = @intCast(k);
                             @memset(m[2..], 'a' + 3 * tt + @as(u8, @intCast(k)));
-                            c.send(m, true) catch unreachable;
+                            c.send(m, true) catch {
+                                h.thread_send_failed.store(true, .monotonic);
+                                return;
+                            };
                         }
                     }
-                }.run, .{ conn, @as(u8, @intCast(t)) }) catch unreachable;
+                }.run, .{ self, conn, @as(u8, @intCast(t)) }) catch unreachable;
                 th.detach();
             }
         } else if (std.mem.eql(u8, data, "async")) {
@@ -1218,13 +1227,20 @@ const LiveAllocator = struct {
         return self.live.load(.monotonic);
     }
 
-    /// What is live once it has stayed the same for over two of the
-    /// workers' ticks (what they keep for reuse is freed by then).
-    fn settled(self: *const LiveAllocator) !usize {
+    /// What is live once the workers keep no send queues (two ticks after
+    /// the last was given back: the tick that frees them trims the rest of
+    /// what they keep for reuse) and it has then stayed the same for over
+    /// a tick.
+    fn settled(self: *const LiveAllocator, srv: *Server(TestHandler)) !usize {
+        var tries: u32 = 0;
+        while (workersWsHeld(srv) > 0) : (tries += 1) {
+            if (tries == 100) return error.NeverSettled;
+            sleepMs(50);
+        }
         var last = self.get();
         var same: u32 = 0;
-        var tries: u32 = 0;
-        while (same < 25) : (tries += 1) {
+        tries = 0;
+        while (same < 12) : (tries += 1) {
             if (tries == 150) return error.NeverSettled;
             sleepMs(100);
             const now = self.get();
@@ -1313,7 +1329,7 @@ const WsPeer = union(enum) {
 /// Two 1 MiB echoes, six 300 KiB messages from two other threads at once
 /// ("from-threads": queued while the first are written), then a small
 /// echo.
-fn wsQueueTraffic(p: *WsPeer, deflate: bool, big: []const u8, buf: []u8, pool: *BufferPool) !void {
+fn wsQueueTraffic(p: *WsPeer, h: *TestHandler, deflate: bool, big: []const u8, buf: []u8, pool: *BufferPool) !void {
     var inflated: ws.inflate.Out = .{ .buf = &.{}, .max = 2 << 20, .pool = pool };
     defer if (inflated.buf.len > 0) pool.releaseLarge(inflated.buf);
     for (0..2) |k| {
@@ -1323,10 +1339,14 @@ fn wsQueueTraffic(p: *WsPeer, deflate: bool, big: []const u8, buf: []u8, pool: *
         try testing.expectEqual(deflate, m.compressed);
         try testing.expectEqualSlices(u8, big[k..], m.data);
     }
+    const done_before = h.threads_done.load(.acquire);
     try p.send(.text, "from-threads");
     var next: [2]u8 = @splat(0);
     for (0..6) |_| {
-        const m = try p.read(buf, pool, &inflated);
+        const m = p.read(buf, pool, &inflated) catch |err| {
+            if (h.thread_send_failed.load(.monotonic)) return error.ThreadSendFailed;
+            return err;
+        };
         try testing.expectEqual(ws.Opcode.binary, m.op);
         try testing.expectEqual(deflate, m.compressed);
         const t = m.data[0];
@@ -1336,6 +1356,13 @@ fn wsQueueTraffic(p: *WsPeer, deflate: bool, big: []const u8, buf: []u8, pool: *
         for (m.data[2..]) |b| try testing.expectEqual('a' + 3 * t + next[t], b);
         next[t] += 1;
     }
+    // The senders are done with the connection before it goes.
+    var tries: u32 = 0;
+    while (h.threads_done.load(.acquire) < done_before + 2) : (tries += 1) {
+        if (tries == 250) return error.ThreadsNotDone;
+        sleepMs(20);
+    }
+    try testing.expect(!h.thread_send_failed.load(.monotonic));
     try p.send(.text, "again");
     const m = try p.read(buf, pool, &inflated);
     try testing.expectEqualStrings("again", m.data);
@@ -1373,15 +1400,15 @@ fn testWsQueuesFreed(backend: Backend) !void {
         for ([_]bool{ false, true }) |deflate| {
             var p = try WsPeer.open(r.port, tls, deflate);
             defer p.close();
-            try wsQueueTraffic(&p, deflate, big, buf, &pool);
+            try wsQueueTraffic(&p, r.srv.handler, deflate, big, buf, &pool);
         }
         var tries: u32 = 0;
         while (r.srv.handler.ws_disconns.load(.monotonic) < 2) : (tries += 1) {
             if (tries == 100) return error.NotClosed;
             sleepMs(20);
         }
-        const baseline = try live.settled();
-        for (&idle, 0..) |*p, i| try wsQueueTraffic(p, i == 1, big, buf, &pool);
+        const baseline = try live.settled(r.srv);
+        for (&idle, 0..) |*p, i| try wsQueueTraffic(p, r.srv.handler, i == 1, big, buf, &pool);
         // With both connections open and idle, within a few ticks the
         // server holds no more than before (each held 2 MiB or more).
         tries = 0;
