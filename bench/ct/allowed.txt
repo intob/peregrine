@@ -40,3 +40,27 @@ tls.x25519.buildTable 478 ReleaseSafe
 # The all-zero result check, and (ReleaseSafe) the ladder's loop exit.
 tls.x25519.sharedSecret 1
 tls.x25519.sharedSecret 2 ReleaseSafe
+
+# RSA: mont.zig and the private operation (rsa.Parts(N).privateOp). Key
+# loading (Parts.init: DER, n = p·q, Mont.init's R² by doubling) and
+# sign's PSS encoding and public-exponent check aren't scanned: they work
+# on public data or once per key. 2026-10-31: mul, sqr, redc, sub and
+# reduceOnce have no forward branch on any target.
+# pow: the table-building loop (the index's parity), the exponent's
+# length (no windows), the window's byte positions against that length.
+tls.mont.Mont(16).pow 9
+tls.mont.Mont(24).pow 9
+tls.mont.Mont(32).pow 9
+# ReleaseSafe's assert that the modulus is odd (it is: a prime).
+tls.mont.Mont(16).init 1 ReleaseSafe
+tls.mont.Mont(24).init 1 ReleaseSafe
+tls.mont.Mont(32).init 1 ReleaseSafe
+# The public-exponent check's arithmetic (on the signature) and the
+# CRT's recombination: loop bounds.
+tls.mont.Mont(48).mulCios 1
+tls.mont.Mont(64).mulCios 1
+tls.mont.mulAdd 2
+# Loops over the input's and output's byte lengths (fromBytes, toBytes).
+tls.rsa.Parts(16).privateOp 9
+tls.rsa.Parts(24).privateOp 11
+tls.rsa.Parts(32).privateOp 11

@@ -10,18 +10,22 @@
 # IMAGE: any image with OpenSSL 3.5+ (X25519MLKEM768) and curl with
 # HTTP/3 (default peregrine-h3load: OpenSSL 3.5, curl 8.23 with ngtcp2).
 # TLS_GROUPS overrides the groups (default "X25519 X25519MLKEM768 P-256").
+# CERT=rsa: the RSA-2048 certificate (bench/rsa.pem) instead of ECDSA
+# P-256, and s_client must report an rsa_pss_rsae_sha256 signature.
 source "$(dirname "$0")/env.sh"
 IMAGE=${IMAGE:-peregrine-h3load}
 GROUPS_=${TLS_GROUPS:-X25519 X25519MLKEM768 P-256}
+CERT=${CERT:-ecdsa}
+case $CERT in ecdsa) cert_arg= ;; rsa) cert_arg=rsa ;; *) echo "CERT: ecdsa or rsa"; exit 1 ;; esac
 backends=${1:-epoll io_uring}
 "$LOCK" share mac-bench "tls-interop ($ROOT)"
 trap '"$LOCK" unshare mac-bench' EXIT
 build_linux_bins || exit 1
 BIN=$OUT/linux/bin
 
-# Runs in the container: $1 backend, $2 groups.
+# Runs in the container: $1 backend, $2 groups, $3 "rsa" or empty.
 client='
-/b/bench-server 2 "$1" 9443 h3 > /tmp/srv.log 2>&1 &
+/b/bench-server 2 "$1" 9443 h3 $3 > /tmp/srv.log 2>&1 &
 srv=$!
 for i in $(seq 100); do
     curl -sk -o /dev/null https://127.0.0.1:9443/ && break
@@ -38,6 +42,11 @@ for g in $2; do
     st=$(echo "$out" | grep -m1 "^HTTP/1.1")
     echo "$st" | grep -q " 200" && echo "$grp" | grep -qiE "$name" && r=ok || r=bad
     check "openssl s_client $g http/1.1: $grp" $r "$st"
+    if [ "$3" = rsa ]; then
+        sig=$(echo "$out" | grep -iE "^(Peer )?signature type" | head -1)
+        echo "$sig" | grep -qi "rsa_pss_rsae_sha256" && r=ok || r=bad
+        check "openssl s_client $g: $sig" $r "$sig"
+    fi
     for v in --http1.1 --http2 --http3-only; do
         res=$(curl -sk -v --curves $g $v https://127.0.0.1:9443/ -o /dev/null -w "%{http_code} %{http_version}" 2>/tmp/curl.err)
         used=$(grep -o "SSL connection using .*" /tmp/curl.err | head -1 | tr -d "\r")
@@ -75,9 +84,9 @@ exit $fail
 
 status=0
 for b in $backends; do
-    echo "== $b"
+    echo "== $b ($CERT)"
     docker run --rm --name tls-interop-$b-$TAG --security-opt seccomp="$SECCOMP" -v "$BIN":/b "$IMAGE" \
-        sh -c "$client" sh "$b" "$GROUPS_" || status=1
+        sh -c "$client" sh "$b" "$GROUPS_" "$cert_arg" || status=1
 done
 [ $status = 0 ] && echo "all PASS" || echo "some FAIL"
 exit $status

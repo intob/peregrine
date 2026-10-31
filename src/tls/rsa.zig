@@ -3,11 +3,15 @@
 //! (RFC 8446 §9.1). std has only RSA verification.
 //!
 //! The private-key operation uses the CRT (two half-size exponentiations)
-//! with std's constant-time modular arithmetic (`std.crypto.ff`). Every
-//! signature is checked with the public exponent before it is returned, so
-//! a fault in the CRT can't hand out a value that reveals the factors.
+//! over `mont.zig`'s fixed-size constant-time Montgomery arithmetic, sized
+//! at compile time to the primes: 16 limbs for RSA-2048, 24 for RSA-3072,
+//! 32 for RSA-4096 (other sizes take the next one up). Every signature is
+//! checked with the public exponent before it is returned, so a fault in
+//! the CRT can't hand out a value that reveals the factors. Until
+//! 2026-10-31 this used std.crypto.ff (`rsa_verify.zig` keeps that as the
+//! reference): RSA-2048 signing took about 1.1 ms.
 const std = @import("std");
-const ff = std.crypto.ff;
+const mont = @import("./mont.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const min_bits = 2048;
@@ -16,24 +20,17 @@ pub const max_bits = 4096;
 pub const max_len = max_bits / 8;
 pub const salt_len = Sha256.digest_length;
 
-const Modulus = ff.Modulus(max_bits);
-const Half = ff.Modulus(max_bits / 2);
-const Uint = ff.Uint(max_bits);
-
 pub const Error = error{ InvalidKey, UnsupportedKey, SignatureFault };
 
 pub const PrivateKey = struct {
-    n: Modulus,
     /// The modulus length in bytes (the signature length).
     len: usize,
     /// Big-endian, `len` bytes (for matching the certificate).
     n_bytes: [max_len]u8,
+    /// The modulus length in bits.
+    bits: usize,
     e: u32,
-    p: Half,
-    q: Half,
-    /// q as an element mod n (for recombining the halves).
-    q_n: Modulus.Fe,
-    q_inv: Half.Fe,
+    crt: Crt,
     /// d mod (p − 1) and d mod (q − 1), big-endian, padded to the length
     /// of p and q so the exponentiation time doesn't depend on them.
     dp: [max_len / 2]u8,
@@ -56,27 +53,34 @@ pub const PrivateKey = struct {
         const q_inv = try seq.integer();
         if (!seq.atEnd()) return error.UnsupportedKey; // multi-prime
         if (n.len > max_len or e.len == 0 or e.len > 4 or p.len > max_len / 2 or q.len > max_len / 2) return error.InvalidKey;
+        // Odd moduli of at least 3 (Montgomery arithmetic needs them odd).
+        for ([_][]const u8{ n, p, q }) |v| {
+            if (v.len == 0 or v[v.len - 1] & 1 == 0 or (v.len == 1 and v[0] < 3)) return error.InvalidKey;
+        }
 
         var key: PrivateKey = undefined;
-        key.n = Modulus.fromBytes(n, .big) catch return error.InvalidKey;
-        const bits = key.n.bits();
-        if (bits < min_bits or bits > max_bits) return error.UnsupportedKey;
+        key.bits = 8 * n.len - @clz(n[0]);
+        if (key.bits < min_bits or key.bits > max_bits) return error.UnsupportedKey;
         key.len = n.len;
         @memcpy(key.n_bytes[0..n.len], n);
         key.e = 0;
         for (e) |b| key.e = key.e << 8 | b;
         if (key.e < 3 or key.e & 1 == 0) return error.InvalidKey;
-        key.p = Half.fromBytes(p, .big) catch return error.InvalidKey;
-        key.q = Half.fromBytes(q, .big) catch return error.InvalidKey;
         key.p_len = p.len;
         key.q_len = q.len;
-        key.q_n = Modulus.Fe.fromBytes(key.n, q, .big) catch return error.InvalidKey;
-        key.q_inv = Half.Fe.fromBytes(key.p, q_inv, .big) catch return error.InvalidKey;
         if (dp.len > p.len or dq.len > q.len) return error.InvalidKey;
         key.dp = @splat(0);
         key.dq = @splat(0);
         @memcpy(key.dp[p.len - dp.len ..][0..dp.len], dp);
         @memcpy(key.dq[q.len - dq.len ..][0..dq.len], dq);
+        // Limbs per prime, from the longer one.
+        const prime_len = @max(p.len, q.len);
+        key.crt = if (prime_len <= 128)
+            .{ .l16 = try .init(n, p, q, q_inv) }
+        else if (prime_len <= 192)
+            .{ .l24 = try .init(n, p, q, q_inv) }
+        else
+            .{ .l32 = try .init(n, p, q, q_inv) };
         // The parts must make a working key: a signature that verifies.
         var sig: [max_len]u8 = undefined;
         _ = key.sign("key check", @splat(0), &sig) catch return error.InvalidKey;
@@ -100,43 +104,111 @@ pub const PrivateKey = struct {
         const k = self.len;
         var em_buf: [max_len]u8 = @splat(0);
         const em = em_buf[0..k];
-        encodePss(em, self.n.bits() - 1, msg, salt);
+        encodePss(em, self.bits - 1, msg, &salt);
         const s = out[0..k];
-        try self.privateOp(em, s);
-        // s^e must give the encoded message back.
-        const sv = Modulus.Fe.fromBytes(self.n, s, .big) catch return error.SignatureFault;
-        var e_buf: [4]u8 = undefined;
-        const back = self.n.powWithEncodedPublicExponent(sv, self.exponent(&e_buf), .big) catch return error.SignatureFault;
-        var check: [max_len]u8 = undefined;
-        back.toBytes(check[0..k], .big) catch return error.SignatureFault;
-        if (!std.mem.eql(u8, check[0..k], em)) {
-            @memset(s, 0);
-            return error.SignatureFault;
+        switch (self.crt) {
+            inline else => |*crt| {
+                crt.privateOp(self, em, s);
+                // s^e must give the encoded message back.
+                if (!crt.publicOpIs(self.e, s, em)) {
+                    @memset(s, 0);
+                    return error.SignatureFault;
+                }
+            },
         }
         return s;
     }
 
-    /// s = m^d mod n by the CRT: m^dp mod p and m^dq mod q, recombined
-    /// as m2 + q · (q⁻¹ (m1 − m2) mod p).
-    fn privateOp(self: *const PrivateKey, m: []const u8, s: []u8) Error!void {
-        const mu = Uint.fromBytes(m, .big) catch return error.SignatureFault;
-        const m1 = self.p.powWithEncodedExponent(self.p.reduce(mu), self.dp[0..self.p_len], .big) catch return error.SignatureFault;
-        const m2 = self.q.powWithEncodedExponent(self.q.reduce(mu), self.dq[0..self.q_len], .big) catch return error.SignatureFault;
-        const h = self.p.mul(self.q_inv, self.p.sub(m1, self.p.reduce(m2.v)));
-        var buf: [max_len]u8 = undefined;
-        defer std.crypto.secureZero(u8, &buf);
-        h.toBytes(buf[0..self.len], .big) catch return error.SignatureFault;
-        const h_n = Modulus.Fe.fromBytes(self.n, buf[0..self.len], .big) catch return error.SignatureFault;
-        m2.toBytes(buf[0..self.len], .big) catch return error.SignatureFault;
-        const m2_n = Modulus.Fe.fromBytes(self.n, buf[0..self.len], .big) catch return error.SignatureFault;
-        const sv = self.n.add(self.n.mul(h_n, self.q_n), m2_n);
-        sv.toBytes(s, .big) catch return error.SignatureFault;
+    /// s = m^d mod n for m below n (`len` bytes each), by the CRT. For
+    /// tests: `sign` checks the result.
+    pub fn privateOp(self: *const PrivateKey, m: []const u8, s: []u8) void {
+        switch (self.crt) {
+            inline else => |*crt| crt.privateOp(self, m, s),
+        }
     }
 };
 
-/// EMSA-PSS-ENCODE (RFC 8017 §9.1.1) with SHA-256 and sLen = hLen, into
-/// `out` (the modulus length; the encoding is right-aligned).
-fn encodePss(out: []u8, em_bits: usize, msg: []const u8, salt: [salt_len]u8) void {
+/// The CRT parts for primes of up to 1024, 1536 or 2048 bits.
+const Crt = union(enum) {
+    l16: Parts(16),
+    l24: Parts(24),
+    l32: Parts(32),
+};
+
+fn Parts(comptime limbs: usize) type {
+    return struct {
+        const Self = @This();
+        const Half = mont.Mont(limbs);
+        const Full = mont.Mont(2 * limbs);
+
+        p: Half,
+        q: Half,
+        /// For the check with the public exponent.
+        n: Full,
+        /// q⁻¹ mod p, outside the Montgomery domain: a Montgomery product
+        /// with it leaves the domain.
+        q_inv: Half.Int,
+
+        fn init(n: []const u8, p: []const u8, q: []const u8, q_inv: []const u8) Error!Self {
+            if (n.len > 16 * limbs or q_inv.len > 8 * limbs) return error.InvalidKey;
+            const p_l = mont.fromBytes(limbs, p);
+            const q_l = mont.fromBytes(limbs, q);
+            const n_l = mont.fromBytes(2 * limbs, n);
+            // n = p·q exactly: the CRT's result, below p·q, is then below
+            // n, and m below n is below p·R and q·R (for `redc`).
+            const pq = mont.mulAdd(limbs, &p_l, &q_l, &@as(Half.Int, @splat(0)));
+            if (!std.mem.eql(u64, &pq, &n_l)) return error.InvalidKey;
+            const qi = mont.fromBytes(limbs, q_inv);
+            if (mont.lessThan(&qi, &p_l) == 0) return error.InvalidKey;
+            return .{ .p = .init(p_l), .q = .init(q_l), .n = .init(n_l), .q_inv = qi };
+        }
+
+        /// m mod p (or q) in the Montgomery domain, for m below n:
+        /// redc gives m·R⁻¹, and two products with R² make it m·R.
+        fn reduce(h: *const Half, m: *const Full.Int) Half.Int {
+            var x = h.redc(m);
+            x = h.mul(&x, &h.r2);
+            return h.mul(&x, &h.r2);
+        }
+
+        /// s = m2 + q·(q⁻¹·(m1 − m2) mod p) with m1 = m^dp mod p and
+        /// m2 = m^dq mod q: below p·q = n, so no reduction is needed.
+        fn privateOp(self: *const Self, key: *const PrivateKey, m_bytes: []const u8, s_bytes: []u8) void {
+            @setRuntimeSafety(mont.safe);
+            const m = mont.fromBytes(2 * limbs, m_bytes);
+            var x = reduce(&self.p, &m);
+            var m1 = self.p.pow(&x, key.dp[0..key.p_len]);
+            x = reduce(&self.q, &m);
+            var m2 = self.q.pow(&x, key.dq[0..key.q_len]);
+            m2 = self.q.fromMont(&m2);
+            // m2 (below q, so below R) into p's domain, then the difference.
+            x = self.p.mul(&m2, &self.p.r2);
+            x = self.p.sub(&m1, &x);
+            var h = self.p.mul(&x, &self.q_inv);
+            var s = mont.mulAdd(limbs, &self.q.m, &h, &m2);
+            mont.toBytes(&s, s_bytes);
+            std.crypto.secureZero(u64, &x);
+            std.crypto.secureZero(u64, &m1);
+            std.crypto.secureZero(u64, &m2);
+            std.crypto.secureZero(u64, &h);
+            std.crypto.secureZero(u64, &s);
+        }
+
+        /// Whether s^e mod n = em (the signature check; s and em public).
+        fn publicOpIs(self: *const Self, e: u32, s_bytes: []const u8, em: []const u8) bool {
+            const s = mont.fromBytes(2 * limbs, s_bytes);
+            if (mont.lessThan(&s, &self.n.m) == 0) return false;
+            const sm = self.n.mul(&s, &self.n.r2);
+            const back = self.n.fromMont(&self.n.powPublic(&sm, e));
+            return std.mem.eql(u64, &back, &mont.fromBytes(2 * limbs, em));
+        }
+    };
+}
+
+/// EMSA-PSS-ENCODE (RFC 8017 §9.1.1) with SHA-256 and the salt's length
+/// (`sign` uses 32 bytes; the NIST vectors in the tests other lengths),
+/// into `out` (the modulus length; the encoding is right-aligned).
+pub fn encodePss(out: []u8, em_bits: usize, msg: []const u8, salt: []const u8) void {
     const h_len = Sha256.digest_length;
     const em_len = (em_bits + 7) / 8;
     @memset(out, 0);
@@ -147,13 +219,13 @@ fn encodePss(out: []u8, em_bits: usize, msg: []const u8, salt: [salt_len]u8) voi
     var hash = Sha256.init(.{});
     hash.update(&@as([8]u8, @splat(0)));
     hash.update(&m_hash);
-    hash.update(&salt);
+    hash.update(salt);
     var h: [h_len]u8 = undefined;
     hash.final(&h);
     // DB = PS || 0x01 || salt, masked with MGF1(H).
     const db = em[0 .. em_len - h_len - 1];
-    db[db.len - salt_len - 1] = 0x01;
-    @memcpy(db[db.len - salt_len ..], &salt);
+    db[db.len - salt.len - 1] = 0x01;
+    @memcpy(db[db.len - salt.len ..], salt);
     var counter: u32 = 0;
     var pos: usize = 0;
     while (pos < db.len) : (counter += 1) {
@@ -173,15 +245,15 @@ fn encodePss(out: []u8, em_bits: usize, msg: []const u8, salt: [salt_len]u8) voi
     em[em_len - 1] = 0xbc;
 }
 
-const Der = struct {
+pub const Der = struct {
     bytes: []const u8,
     pos: usize = 0,
 
-    fn atEnd(self: *const Der) bool {
+    pub fn atEnd(self: *const Der) bool {
         return self.pos >= self.bytes.len;
     }
 
-    fn read(self: *Der, tag: u8) Error![]const u8 {
+    pub fn read(self: *Der, tag: u8) Error![]const u8 {
         if (self.pos + 2 > self.bytes.len or self.bytes[self.pos] != tag) return error.InvalidKey;
         var len: usize = self.bytes[self.pos + 1];
         self.pos += 2;
@@ -198,7 +270,7 @@ const Der = struct {
     }
 
     /// A non-negative INTEGER without its leading zero bytes.
-    fn integer(self: *Der) Error![]const u8 {
+    pub fn integer(self: *Der) Error![]const u8 {
         var v = try self.read(0x02);
         if (v.len == 0 or v[0] & 0x80 != 0) return error.InvalidKey;
         while (v.len > 0 and v[0] == 0) v = v[1..];

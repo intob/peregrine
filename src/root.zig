@@ -37,6 +37,8 @@ pub const internal = struct {
     pub const tls_credentials = @import("./tls/credentials.zig");
     pub const tls_p256 = @import("./tls/p256.zig");
     pub const tls_x25519 = @import("./tls/x25519.zig");
+    pub const tls_rsa = @import("./tls/rsa.zig");
+    pub const tls_rsa_verify = @import("./tls/rsa_verify.zig");
 };
 
 /// Websocket helpers
@@ -65,7 +67,9 @@ test {
     _ = @import("./tls/x25519.zig");
     _ = @import("./tls/field25519.zig");
     _ = @import("./tls/x25519_verify.zig");
+    _ = @import("./tls/mont.zig");
     _ = @import("./tls/rsa.zig");
+    _ = @import("./tls/rsa_verify.zig");
     _ = @import("./tls/ticket.zig");
     _ = @import("./tls/handshake.zig");
     _ = @import("./tls/conn.zig");

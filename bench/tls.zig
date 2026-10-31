@@ -393,4 +393,33 @@ fn handshakes() !void {
         }
         reportOp("Ed25519 sign", n, sys.nanoTimestamp() - start);
     }
+    // RSA-PSS signing (each signature checked with the public exponent),
+    // against the std.crypto.ff implementation it replaced.
+    for ([_]struct { []const u8, []const u8, usize }{
+        .{ "RSA-2048", td.rsa2048_key, 400 },
+        .{ "RSA-4096", td.rsa4096_key, 60 },
+    }) |c| {
+        var der_buf: [4096]u8 = undefined;
+        const der = try rsa_verify.pemToPkcs1(&der_buf, c[1]);
+        const key = try rsa.PrivateKey.fromPkcs1(der);
+        const ref = try rsa_verify.Reference.fromPkcs1(der);
+        var out: [rsa.max_len]u8 = undefined;
+        var salt: [rsa.salt_len]u8 = @splat(9);
+        var name_buf: [64]u8 = undefined;
+        var start = sys.nanoTimestamp();
+        for (0..c[2] / 4) |i| {
+            salt[0] = @truncate(i);
+            std.mem.doNotOptimizeAway(try ref.sign(&msg, salt, &out));
+        }
+        reportOp(try std.fmt.bufPrint(&name_buf, "{s} sign (std.crypto.ff, before)", .{c[0]}), c[2] / 4, sys.nanoTimestamp() - start);
+        start = sys.nanoTimestamp();
+        for (0..c[2]) |i| {
+            salt[0] = @truncate(i);
+            std.mem.doNotOptimizeAway(try key.sign(&msg, salt, &out));
+        }
+        reportOp(try std.fmt.bufPrint(&name_buf, "{s} sign", .{c[0]}), c[2], sys.nanoTimestamp() - start);
+    }
 }
+
+const rsa = per.internal.tls_rsa;
+const rsa_verify = per.internal.tls_rsa_verify;

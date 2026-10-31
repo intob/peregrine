@@ -1,6 +1,8 @@
 //! dudect-style timing test (Reparaz, Balasch, Verbauwhede 2017) of the
-//! constant-time code in src/tls: P-256 (`p256.zig`) and X25519
-//! (`x25519.zig`). Two classes of secret inputs are interleaved at random
+//! constant-time code in src/tls: P-256 (`p256.zig`), X25519
+//! (`x25519.zig`) and RSA's private operation (`rsa.zig` over `mont.zig`,
+//! RSA-2048: the base is what varies, the key is fixed; a tenth of the
+//! samples, at about 0.5 ms each). Two classes of secret inputs are interleaved at random
 //! (class 0 a fixed secret, class 1 random or another fixed secret), and
 //! Welch's t compares their cycle counts, over all samples and below a
 //! ladder of percentiles (dudect's crops). |t| > 4.5 means the classes are
@@ -13,6 +15,8 @@ const builtin = @import("builtin");
 const per = @import("peregrine");
 const p256 = per.internal.tls_p256;
 const x25519 = per.internal.tls_x25519;
+const rsa = per.internal.tls_rsa;
+const rsa_verify = per.internal.tls_rsa_verify;
 const P256 = std.crypto.ecc.P256;
 const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
@@ -65,7 +69,7 @@ fn be(v: u256) [32]u8 {
     return out;
 }
 
-const Kind = enum { shared, keyshare, sign, public, x_shared, x_public };
+const Kind = enum { shared, keyshare, sign, public, x_shared, x_public, rsa };
 
 const Case = struct {
     name: []const u8,
@@ -91,6 +95,11 @@ const cases = [_]Case{
     .{ .name = "x25519 sharedSecret fixed vs random", .kind = .x_shared, .fixed = 0x3c1f7a92d0e5b8146a2f9c3e7d5b1a08f6e4c2a0193b5d7f8e6c4a2b0d9f7e5c },
     .{ .name = "x25519 publicKey sk=0 vs random", .kind = .x_public, .fixed = 0 },
     .{ .name = "x25519 publicKey sk=0x88.. vs random", .kind = .x_public, .fixed = 0x8888888888888888888888888888888888888888888888888888888888888888 },
+    // The base m (256 bytes): `fixed` as its last 32 bytes, the rest 0
+    // (so 0 and 1 are themselves), or 2^2040 + fixed; class 1 random below 2^2040.
+    .{ .name = "rsa2048 privateOp m=0 vs random", .kind = .rsa, .fixed = 0 },
+    .{ .name = "rsa2048 privateOp m=1 vs random", .kind = .rsa, .fixed = 1 },
+    .{ .name = "rsa2048 privateOp fixed vs random", .kind = .rsa, .fixed = 0x3c1f7a92d0e5b8146a2f9c3e7d5b1a08f6e4c2a0193b5d7f8e6c4a2b0d9f7e5c },
 };
 
 fn lessThan(_: void, a: u64, b: u64) bool {
@@ -101,9 +110,10 @@ const Peers = struct {
     p256: [65]u8,
     x25519: [32]u8,
     kp: Ecdsa.KeyPair,
+    rsa: rsa.PrivateKey,
 };
 
-inline fn run(kind: Kind, in: [32]u8, peers: *const Peers) void {
+inline fn run(kind: Kind, in: [32]u8, m: *const [256]u8, peers: *const Peers) void {
     const msg = "a CertificateVerify's content";
     switch (kind) {
         .shared => std.mem.doNotOptimizeAway(p256.sharedSecret(in, &peers.p256)),
@@ -112,6 +122,11 @@ inline fn run(kind: Kind, in: [32]u8, peers: *const Peers) void {
         .sign => std.mem.doNotOptimizeAway(p256.sign(peers.kp, msg, in)),
         .x_shared => std.mem.doNotOptimizeAway(x25519.sharedSecret(in, peers.x25519)),
         .x_public => std.mem.doNotOptimizeAway(x25519.publicKey(in)),
+        .rsa => {
+            var s: [256]u8 = undefined;
+            peers.rsa.privateOp(m, &s);
+            std.mem.doNotOptimizeAway(&s);
+        },
     }
 }
 
@@ -121,16 +136,21 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Clock.awake.now(init.io).nanoseconds))));
     const r = prng.random();
-    const peers: Peers = .{
+    var peers: Peers = .{
         .p256 = (P256.basePoint.mul(be(0x1234567890abcdef1234567890abcdef), .big) catch unreachable).toUncompressedSec1(),
         .x25519 = x25519.publicKey(@splat(0x42)),
         .kp = try Ecdsa.KeyPair.generateDeterministic(@splat(3)),
+        .rsa = undefined,
     };
+    var der_buf: [4096]u8 = undefined;
+    peers.rsa = try rsa.PrivateKey.fromPkcs1(try rsa_verify.pemToPkcs1(&der_buf, per.internal.tls_credentials.testdata.rsa2048_key));
 
     const class = try gpa.alloc(u1, count);
     defer gpa.free(class);
     const inputs = try gpa.alloc([32]u8, count);
     defer gpa.free(inputs);
+    const ms = try gpa.alloc([256]u8, count / 10);
+    defer gpa.free(ms);
     const times = try gpa.alloc(u64, count);
     defer gpa.free(times);
     const sorted = try gpa.alloc(u64, count);
@@ -145,28 +165,35 @@ pub fn main(init: std.process.Init) !void {
             }
             if (!want) continue;
         }
-        for (class, inputs) |*c, *in| {
+        const samples = if (cs.kind == .rsa) ms.len else count;
+        for (class[0..samples], inputs[0..samples], 0..) |*c, *in, i| {
             c.* = r.int(u1);
             if (c.* == 0) in.* = be(cs.fixed) else if (cs.other) |o| in.* = be(o) else r.bytes(in);
+            if (cs.kind == .rsa) {
+                ms[i] = @splat(0);
+                if (c.* == 0) ms[i][224..].* = in.* else r.bytes(ms[i][1..]);
+                if (c.* == 0 and cs.fixed > 1) ms[i][1] = 1;
+            }
         }
         // Warm up (the base-point tables, caches).
-        for (inputs[0..@min(200, count)]) |in| run(cs.kind, in, &peers);
-        for (inputs, times) |in, *t| {
+        for (inputs[0..@min(200, samples)], 0..) |in, i| run(cs.kind, in, &ms[i % @max(1, ms.len)], &peers);
+        for (inputs[0..samples], times[0..samples], 0..) |in, *t, i| {
+            const m = &ms[if (cs.kind == .rsa) i else 0];
             const t0 = ticks();
-            run(cs.kind, in, &peers);
+            run(cs.kind, in, m, &peers);
             t.* = ticks() - t0;
         }
-        @memcpy(sorted, times);
-        std.mem.sort(u64, sorted, {}, lessThan);
+        @memcpy(sorted[0..samples], times[0..samples]);
+        std.mem.sort(u64, sorted[0..samples], {}, lessThan);
         const pcts = [_]f64{ 1.0, 0.99, 0.95, 0.9, 0.75, 0.5, 0.25, 0.1 };
         var worst: f64 = 0;
         var line: [512]u8 = undefined;
         var w = std.Io.Writer.fixed(&line);
         for (pcts) |pc| {
-            const idx = @min(count - 1, @as(usize, @intFromFloat(pc * @as(f64, @floatFromInt(count - 1)))));
+            const idx = @min(samples - 1, @as(usize, @intFromFloat(pc * @as(f64, @floatFromInt(samples - 1)))));
             const cut = sorted[idx];
             var welch: Welch = .{};
-            for (class, times) |c, t| {
+            for (class[0..samples], times[0..samples]) |c, t| {
                 if (t <= cut) welch.push(c, @floatFromInt(t));
             }
             const t = welch.t();
@@ -174,7 +201,7 @@ pub fn main(init: std.process.Init) !void {
             try w.print(" p{d:.0}:{d:.2}", .{ pc * 100, t });
         }
         worst_all = @max(worst_all, @abs(worst));
-        std.debug.print("{s}: N={} median={} ticks, max|t|={d:.2} [{s}]\n", .{ cs.name, count, sorted[count / 2], @abs(worst), w.buffered() });
+        std.debug.print("{s}: N={} median={} ticks, max|t|={d:.2} [{s}]\n", .{ cs.name, samples, sorted[samples / 2], @abs(worst), w.buffered() });
     }
     std.debug.print("max |t| over the cases: {d:.2}{s}\n", .{ worst_all, if (worst_all > 4.5) " (> 4.5: LEAK?)" else "" });
     if (worst_all > 4.5) std.process.exit(1);

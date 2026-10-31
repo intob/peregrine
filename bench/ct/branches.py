@@ -1,6 +1,7 @@
 """Conditional branches in the constant-time code, from an objdump listing
 of bench/ct/dudect.zig's binary: for every function of p256, field_p256,
-x25519 and field25519 (what is inlined into them included), the
+x25519, field25519 and mont, and RSA's private operation (rsa.Parts(N)
+.privateOp; what is inlined into them included), the
 conditional branches that go backward (loops over public counts) and
 forward. A select the compiler turned into a branch on a secret is a
 forward branch, so forward branches must be in bench/ct/allowed.txt:
@@ -23,7 +24,7 @@ for line in open(allowed_path):
         if len(fields) == 3 or fields[0] not in allowed:
             allowed[fields[0]] = int(fields[1])
 
-watched = re.compile(r"^_?tls\.(p256|field_p256|x25519|field25519)\.")
+watched = re.compile(r"^_?tls\.(p256|field_p256|x25519|field25519|mont)\.|^_?tls\.rsa\.Parts\(\d+\)\.(privateOp|reduce)$")
 head = re.compile(r"^([0-9a-f]+) <(.*)>:$")
 forward, backward, where = {}, {}, {}
 fn = None
@@ -59,12 +60,12 @@ for line in open(path):
         backward[fn] += 1
 
 if not forward:
-    print(f"{path}: no p256/x25519 functions found")
+    print(f"{path}: no p256/x25519/mont functions found")
     sys.exit(1)
 bad = False
 for f in sorted(forward):
     # Generic instances carry their arguments in the name: match the base.
-    base = re.sub(r"__anon_\d+|\(.*", "", f)
+    base = re.sub(r"__anon_\d+|__func_\d+|\(.*", "", f)
     limit = allowed.get(f, allowed.get(base, 0))
     over = forward[f] > limit
     bad |= over
