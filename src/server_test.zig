@@ -57,6 +57,13 @@ const TestHandler = struct {
     uploads_mutex: sys.Mutex = .{},
     uploads: std.AutoHashMapUnmanaged(Exchange, Upload) = .empty,
     held: ?Exchange = null,
+    /// "storm"/"storm-close" senders, by connection (see Storm); the
+    /// counts of the last one stopped, and whether a send failed oddly.
+    storm_mutex: sys.Mutex = .{},
+    storms: std.AutoHashMapUnmanaged(*ws.Conn, *Storm) = .empty,
+    storm_sent: [Storm.n_threads]std.atomic.Value(u32) = @splat(.init(0)),
+    storms_done: std.atomic.Value(usize) = .init(0),
+    storm_failed: std.atomic.Value(bool) = .init(false),
 
     const Upload = struct {
         len: u64 = 0,
@@ -72,6 +79,8 @@ const TestHandler = struct {
     }
 
     pub fn deinit(self: *TestHandler) void {
+        std.debug.assert(self.storms.count() == 0);
+        self.storms.deinit(self.allocator);
         self.uploads.deinit(self.allocator);
         self.allocator.destroy(self);
     }
@@ -140,8 +149,29 @@ const TestHandler = struct {
         _ = self.ws_conns.fetchAdd(1, .monotonic);
     }
 
-    pub fn handleWSDisconn(self: *TestHandler, _: *ws.Conn) void {
+    pub fn handleWSDisconn(self: *TestHandler, conn: *ws.Conn) void {
+        // Storm senders stop before the connection goes.
+        self.storm_mutex.lock();
+        const st = if (self.storms.fetchRemove(conn)) |kv| kv.value else null;
+        self.storm_mutex.unlock();
+        if (st) |s| {
+            s.stop.store(true, .release);
+            for (s.threads) |t| t.join();
+            for (&self.storm_sent, s.sent) |*d, n| d.store(n, .monotonic);
+            if (s.failed.load(.monotonic)) self.storm_failed.store(true, .monotonic);
+            self.allocator.destroy(s);
+            _ = self.storms_done.fetchAdd(1, .release);
+        }
         _ = self.ws_disconns.fetchAdd(1, .monotonic);
+    }
+
+    fn startStorm(self: *TestHandler, conn: *ws.Conn, close_after: ?u32) void {
+        const s = self.allocator.create(Storm) catch unreachable;
+        s.* = .{ .conn = conn, .close_after = close_after, .limit = if (close_after != null) std.math.maxInt(u32) else 2000 };
+        for (&s.threads, 0..) |*t, i| t.* = std.Thread.spawn(.{}, Storm.run, .{ s, @as(u8, @intCast(i)) }) catch unreachable;
+        self.storm_mutex.lock();
+        self.storms.put(self.allocator, conn, s) catch unreachable;
+        self.storm_mutex.unlock();
     }
 
     pub fn handleWSFrame(self: *TestHandler, conn: *ws.Conn, frame: *ws.Frame) void {
@@ -169,6 +199,10 @@ const TestHandler = struct {
                     return;
                 };
             }
+        } else if (std.mem.eql(u8, data, "storm")) {
+            self.startStorm(conn, null);
+        } else if (std.mem.eql(u8, data, "storm-close")) {
+            self.startStorm(conn, 300);
         } else if (std.mem.eql(u8, data, "close-me")) {
             conn.close(1000, "bye") catch unreachable;
         } else if (std.mem.eql(u8, data, "async-big")) {
@@ -1435,6 +1469,294 @@ fn workersWsHeld(srv: *Server(TestHandler)) usize {
         },
     };
     return n;
+}
+
+// -- Send queues under a storm of senders (verification) ---------------------
+
+/// "storm": four threads send numbered binary messages (sizes around the
+/// send queue's size classes, from 5 B to 2 MiB) and, after every fifth, a
+/// ping naming it, until the connection is closed or 2000 are sent; "storm-close": thread 0
+/// closes it after 300 messages while the others go on. handleWSDisconn
+/// stops them (and joins them) before the connection goes.
+const Storm = struct {
+    const n_threads = 4;
+    const sizes = [_]usize{
+        5,      6,      120,    125,    126,    127,     246,     250,     251,       252,       256, 300, 1000,
+        4090,   4096,   16384,  65_530, 65_531, 65_535,  65_536,  65_537,  131_066,   131_072,
+        300_000, 1 << 20, (2 << 20) - 14,
+    };
+    const max_len = (2 << 20) - 14;
+
+    conn: *ws.Conn,
+    close_after: ?u32,
+    /// Each thread stops after this many: with the queue never empty the
+    /// worker doesn't read (backpressure), so a client's close is only
+    /// seen once they stop.
+    limit: u32 = 2000,
+    stop: std.atomic.Value(bool) = .init(false),
+    failed: std.atomic.Value(bool) = .init(false),
+    threads: [n_threads]std.Thread = undefined,
+    sent: [n_threads]u32 = @splat(0),
+
+    fn len(t: u8, seq: u32) usize {
+        var x: u64 = @as(u64, t) << 32 | seq;
+        x = (x +% 0x9E3779B97F4A7C15) *% 0xBF58476D1CE4E5B9;
+        x ^= x >> 29;
+        const r = x % 100;
+        const y = x >> 8;
+        return if (r < 70) sizes[y % 13] else if (r < 99) sizes[13 + y % 10] else sizes[23 + y % 3];
+    }
+
+    fn fill(m: []u8, t: u8, seq: u32) void {
+        m[0] = t;
+        std.mem.writeInt(u32, m[1..5], seq, .little);
+        for (m[5..], 0..) |*b, i| b.* = 'a' + @as(u8, @intCast((i + seq + t) % 16));
+    }
+
+    fn run(self: *Storm, t: u8) void {
+        const buf = std.heap.page_allocator.alloc(u8, max_len) catch unreachable;
+        defer std.heap.page_allocator.free(buf);
+        var seq: u32 = 0;
+        while (!self.stop.load(.acquire) and seq < self.limit) {
+            if (t == 0 and self.close_after != null and seq == self.close_after.?) {
+                self.conn.close(1000, "storm") catch {};
+                break;
+            }
+            const m = buf[0..len(t, seq)];
+            fill(m, t, seq);
+            self.conn.send(m, true) catch |err| switch (err) {
+                error.SendQueueFull => {
+                    std.Thread.yield() catch {};
+                    continue;
+                },
+                error.Closed => break,
+                else => {
+                    self.failed.store(true, .monotonic);
+                    break;
+                },
+            };
+            if (seq % 5 == 0) {
+                var p: [5]u8 = undefined;
+                p[0] = t;
+                std.mem.writeInt(u32, p[1..5], seq, .little);
+                self.conn.ping(&p) catch |err| switch (err) {
+                    error.SendQueueFull, error.Closed => {},
+                    else => self.failed.store(true, .monotonic),
+                };
+            }
+            seq += 1;
+        }
+        self.sent[t] = seq;
+    }
+};
+
+/// What the client saw of a storm.
+const StormSeen = struct {
+    next: [Storm.n_threads]u32 = @splat(0),
+    last_ping: [Storm.n_threads]?u32 = @splat(null),
+    messages: usize = 0,
+    client_closed: bool = false,
+    close: ?[]const u8 = null,
+    close_buf: [125]u8 = undefined,
+};
+
+/// Reads storm messages (each sender's in order, whole; a ping only after
+/// the message it names) until the close frame, `max` messages, or `ms`.
+fn stormRead(p: *WsPeer, seen: *StormSeen, max: usize, ms: u64, pace: bool, buf: []u8, want: []u8, pool: *BufferPool, inflated: *ws.inflate.Out) !void {
+    const start = sys.nanoTimestamp() / std.time.ns_per_ms;
+    var n: usize = 0;
+    while (n < max and sys.nanoTimestamp() / std.time.ns_per_ms - start < ms) : (n += 1) {
+        const m = try p.read(buf, pool, inflated);
+        switch (m.op) {
+            .close => {
+                @memcpy(seen.close_buf[0..m.data.len], m.data);
+                seen.close = seen.close_buf[0..m.data.len];
+                return;
+            },
+            .pong => continue,
+            .ping => {
+                try testing.expectEqual(@as(usize, 5), m.data.len);
+                const t = m.data[0];
+                const seq = std.mem.readInt(u32, m.data[1..5], .little);
+                try testing.expect(t < Storm.n_threads);
+                try testing.expect(seq < seen.next[t]);
+                if (seen.last_ping[t]) |l| try testing.expect(seq > l);
+                seen.last_ping[t] = seq;
+                continue;
+            },
+            .binary => {},
+            else => return error.UnexpectedOpcode,
+        }
+        try testing.expect(m.data.len >= 5);
+        const t = m.data[0];
+        try testing.expect(t < Storm.n_threads);
+        const seq = std.mem.readInt(u32, m.data[1..5], .little);
+        if (seq != seen.next[t]) {
+            std.debug.print("storm: thread {d} message {d} where {d} was due\n", .{ t, seq, seen.next[t] });
+            return error.StormOutOfOrder;
+        }
+        const w = want[0..Storm.len(t, seq)];
+        Storm.fill(w, t, seq);
+        if (!std.mem.eql(u8, w, m.data)) {
+            std.debug.print("storm: thread {d} message {d} differs ({d} bytes, {d} expected)\n", .{ t, seq, m.data.len, w.len });
+            return error.StormCorrupt;
+        }
+        seen.next[t] += 1;
+        seen.messages += 1;
+        // (Nothing after our close: the server, closing, would reset.)
+        if (seen.messages % 200 == 0 and !seen.client_closed) try p.send(.ping, "cp");
+        if (pace and seen.messages % 64 == 0) sleepMs(25);
+    }
+}
+
+fn waitStormDone(h: *TestHandler, before: usize) !void {
+    var tries: u32 = 0;
+    while (h.storms_done.load(.acquire) <= before) : (tries += 1) {
+        if (tries == 500) return error.StormNotStopped;
+        sleepMs(20);
+    }
+}
+
+fn expectStormCounts(h: *TestHandler, seen: *const StormSeen) !void {
+    for (&h.storm_sent, seen.next, 0..) |*s, n, t| {
+        if (s.load(.monotonic) != n) {
+            std.debug.print("storm: thread {d} sent {d}, client got {d}\n", .{ t, s.load(.monotonic), n });
+            return error.StormLost;
+        }
+    }
+}
+
+test "websocket: verify send queues under a storm of senders: slow reader, the client's close, the server's close, a dropped socket, shutdown (plain, TLS, permessage-deflate)" {
+    try forEachBackend(testWsStorm);
+}
+
+const StormMode = enum { plain, tls, ktls };
+
+fn stormOpen(port: u16, mode: StormMode, deflate: bool) !WsPeer {
+    if (mode != .ktls) return WsPeer.open(port, mode == .tls, deflate);
+    const t = try TlsClient.connect(port);
+    errdefer t.close();
+    var body: [6000]u8 = undefined;
+    try t.send("GET /file-range HTTP/1.1\r\nHost: x\r\n\r\n");
+    const res = try t.readResponse(&body);
+    try testing.expectEqual(@as(usize, 5000), res.body_len);
+    try t.send(if (deflate) WsPeer.offer else Client.upgrade_request);
+    const head = try t.client.reader.takeDelimiterInclusive('\n');
+    try testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 101 "));
+    var agreed = false;
+    while (true) {
+        const line = try t.client.reader.takeDelimiterInclusive('\n');
+        if (line.len == 2) break;
+        if (std.mem.indexOf(u8, line, "permessage-deflate") != null) agreed = true;
+    }
+    try testing.expectEqual(deflate, agreed);
+    return .{ .tls = t };
+}
+
+fn testWsStorm(backend: Backend) !void {
+    const buf = try testing.allocator.alloc(u8, 4 << 20);
+    defer testing.allocator.free(buf);
+    const want = try testing.allocator.alloc(u8, Storm.max_len);
+    defer testing.allocator.free(want);
+    var pool = try BufferPool.init(testing.allocator, 1024, 1);
+    defer pool.deinit();
+    var inflated: ws.inflate.Out = .{ .buf = &.{}, .max = 4 << 20, .pool = &pool };
+    defer if (inflated.buf.len > 0) pool.releaseLarge(inflated.buf);
+    // A file response first hands the TLS connection's sending side to the
+    // kernel (kTLS, where the kernel has it): WebSockets after it are
+    // written as plaintext.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(testing.io, "big", .{ .read = true });
+    defer file.close(testing.io);
+    try file.writeStreamingAll(testing.io, &big_body);
+    test_file_fd = file.handle;
+    defer test_file_fd = -1;
+    for ([_]StormMode{ .plain, .tls, .ktls }) |mode| {
+        const tls = mode != .plain;
+        const ktls_before = tls_conn.kernel_tx_count.load(.monotonic);
+        var cfg: Config = if (tls) tlsConfig() else .{};
+        cfg.worker_thread_count = 2;
+        cfg.websocket_deflate = .{};
+        const r = try Running.start(backend, cfg);
+        defer r.stop();
+        const h = r.srv.handler;
+        for ([_]bool{ false, true }) |deflate| {
+            var stage: []const u8 = "slow reader";
+            errdefer std.debug.print("storm failed: {s} {s} {s}: {s}\n", .{ @tagName(backend), @tagName(mode), if (deflate) "deflate" else "uncompressed", stage });
+            // A slow reader over several ticks, then the client's close:
+            // everything accepted before the close echo arrives first.
+            {
+                var p = try stormOpen(r.port, mode, deflate);
+                defer p.close();
+                const before = h.storms_done.load(.acquire);
+                try p.send(.text, "storm");
+                var seen: StormSeen = .{};
+                try stormRead(&p, &seen, 6000, 2500, true, buf, want, &pool, &inflated);
+                try testing.expect(seen.close == null);
+                stage = "client's close sent";
+                try p.send(.close, "\x03\xe8");
+                seen.client_closed = true;
+                stage = "reading after the client's close";
+                try stormRead(&p, &seen, std.math.maxInt(usize), 30_000, false, buf, want, &pool, &inflated);
+                if (seen.close == null) return error.CloseNeverEchoed;
+                try testing.expectEqualSlices(u8, "\x03\xe8", seen.close.?);
+                try waitStormDone(h, before);
+                try expectStormCounts(h, &seen);
+            }
+            // The server closes (from a sender thread) while the others
+            // send: their accepted messages, then the close frame.
+            {
+                stage = "storm-close";
+                var p = try stormOpen(r.port, mode, deflate);
+                defer p.close();
+                const before = h.storms_done.load(.acquire);
+                try p.send(.text, "storm-close");
+                var seen: StormSeen = .{};
+                try stormRead(&p, &seen, std.math.maxInt(usize), 30_000, false, buf, want, &pool, &inflated);
+                if (seen.close == null) return error.CloseNeverSent;
+                try testing.expectEqualSlices(u8, "\x03\xe8storm", seen.close.?);
+                try testing.expectEqual(@as(u32, 300), seen.next[0]);
+                stage = "storm-close: the client's reply";
+                try p.send(.close, "\x03\xe8");
+                try waitStormDone(h, before);
+                try expectStormCounts(h, &seen);
+            }
+            // The client drops the socket mid-storm.
+            {
+                stage = "dropped";
+                var p = try stormOpen(r.port, mode, deflate);
+                const before = h.storms_done.load(.acquire);
+                try p.send(.text, "storm");
+                var seen: StormSeen = .{};
+                try stormRead(&p, &seen, 300, 10_000, false, buf, want, &pool, &inflated);
+                p.close();
+                try waitStormDone(h, before);
+            }
+        }
+        try testing.expect(!h.storm_failed.load(.monotonic));
+        if (mode == .ktls) {
+            const n = tls_conn.kernel_tx_count.load(.monotonic) - ktls_before;
+            std.debug.print("storm {s}: {d} WebSockets over kernel TLS\n", .{ @tagName(backend), n });
+            if (kernelTlsAvailable()) try testing.expectEqual(@as(u64, 6), n);
+        }
+    }
+    // Shutdown while two storms run (one connection each way).
+    var cfg: Config = .{};
+    cfg.worker_thread_count = 2;
+    cfg.websocket_deflate = .{};
+    const r = try Running.start(backend, cfg);
+    var peers: [2]WsPeer = undefined;
+    for (&peers, 0..) |*p, i| {
+        p.* = try WsPeer.open(r.port, false, i == 1);
+        try p.send(.text, "storm");
+        var seen: StormSeen = .{};
+        try stormRead(p, &seen, 100, 10_000, false, buf, want, &pool, &inflated);
+    }
+    // The workers close both (handleWSDisconn stops the senders; the
+    // handler's deinit asserts none is left) and free everything.
+    r.stop();
+    for (&peers) |*p| p.close();
 }
 
 test "websocket: protocol violations fail with the right close code" {

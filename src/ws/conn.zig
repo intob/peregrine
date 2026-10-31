@@ -1169,3 +1169,255 @@ test "send queues: an allocation failing at any point fails one send whole; what
     }
     try testing.expect(fail_at > 5);
 }
+
+// -- Send queues, adversarial (verification) -------------------------------
+
+/// Every message accepted went out once, whole, in each sender's order;
+/// pongs answer the peer's pings in order (the n-th carries n); a close
+/// frame with `close_payload` ends it if one went out. Returns the pongs.
+fn expectSentWithControl(h: *Harness, threads: usize, sent: []const usize, close_payload: ?[]const u8) !usize {
+    var next: [8]usize = @splat(0);
+    const want = try testing.allocator.alloc(u8, 72 * 1024);
+    defer testing.allocator.free(want);
+    var got: inflate.Out = .{ .buf = &.{}, .max = 1 << 20, .pool = &h.pool };
+    defer if (got.buf.len > 0) h.pool.releaseLarge(got.buf);
+    var rest: []const u8 = h.out.items;
+    var closed = false;
+    var pongs: u32 = 0;
+    while (rest.len > 0) {
+        const f = try takeFrame(&rest);
+        try testing.expect(!closed);
+        switch (f.op) {
+            8 => {
+                try testing.expectEqualSlices(u8, close_payload.?, f.payload);
+                closed = true;
+                continue;
+            },
+            10 => {
+                try testing.expect(!f.rsv1);
+                try testing.expectEqual(@as(usize, 4), f.payload.len);
+                // A ping that finds the queue full goes unanswered
+                // (RFC 6455 §5.5.3 lets a later pong answer it): the
+                // pongs that go out answer pings in order.
+                const n = std.mem.readInt(u32, f.payload[0..4], .little);
+                try testing.expect(n >= pongs);
+                pongs = n + 1;
+                continue;
+            },
+            else => {},
+        }
+        try testing.expectEqual(@as(u4, 2), f.op);
+        const m = try messageOf(&h.pool, f, &got);
+        try testing.expect(m.len >= 5 and m[0] < threads);
+        const t = m[0];
+        const seq = std.mem.readInt(u32, m[1..5], .little);
+        try testing.expectEqual(next[t], seq);
+        const w = want[0..testMsgLen(t, seq)];
+        testMsgFill(w, t, seq);
+        try testing.expectEqualSlices(u8, w, m);
+        next[t] += 1;
+    }
+    try testing.expectEqualSlices(usize, sent[0..threads], next[0..threads]);
+    try testing.expectEqual(close_payload != null, closed);
+    try testing.expectEqual(@as(usize, 0), h.conn.queued);
+    return pongs;
+}
+
+/// Feeds the peer's bytes and runs the protocol, without writing.
+fn feedOnly(h: *Harness, bytes: []const u8) !void {
+    var rest = bytes;
+    while (rest.len > 0 and h.action == .ok) {
+        const space = try h.conn.decoder.readSpace();
+        const n = @min(space.len, rest.len);
+        @memcpy(space[0..n], rest[0..n]);
+        h.conn.decoder.commitRead(n);
+        rest = rest[n..];
+        h.action = h.conn.process(LogHandler, &h.handler);
+    }
+}
+
+/// The worker's side: writes in random pieces, trims the pool now and
+/// then (as its tick does), feeds the peer's pings, and the peer's close
+/// after `peer_close_after` bytes are out.
+fn workTrimPing(h: *Harness, s: *Senders, threads: usize, rand: std.Random, peer_close_after: ?usize, pings: *u32) !void {
+    var buf: [32]u8 = undefined;
+    var peer_closed = false;
+    while (true) {
+        const finished = s.done.load(.acquire) == threads;
+        _ = h.drainMailbox();
+        h.conn.clearPosted();
+        if (rand.uintLessThan(u8, 16) == 0) h.pool.trim();
+        if (!peer_closed and rand.uintLessThan(u8, 8) == 0) {
+            var p: [4]u8 = undefined;
+            std.mem.writeInt(u32, &p, pings.*, .little);
+            try feedOnly(h, masked(&buf, .ping, &p));
+            if (h.action == .ok) pings.* += 1;
+            h.handler.log.clearRetainingCapacity();
+        }
+        if (peer_close_after) |n| {
+            if (!peer_closed and h.out.items.len >= n) {
+                try feedOnly(h, masked(&buf, .close, "\x03\xe9gone"));
+                peer_closed = true;
+            }
+        }
+        const bytes = h.conn.wireBytes();
+        if (bytes.len == 0) {
+            if (finished) return;
+            std.Thread.yield() catch {};
+            continue;
+        }
+        const k = 1 + rand.uintLessThan(usize, @min(bytes.len, 20_000));
+        try h.out.appendSlice(testing.allocator, bytes[0..k]);
+        h.conn.advance(k);
+    }
+}
+
+test "verify send queues: senders racing trims, pings answered in between, every message once in order" {
+    for ([_]bool{ false, true }) |compress| {
+        for (0..3) |seed| {
+            const h = try Harness.init(.{ .max_send_queue_bytes = 32 * 1024, .deflate = .{ .min_size = 32 } });
+            defer h.deinit();
+            if (compress) h.conn.enableDeflate(.{ .enabled = true });
+            const threads = 6;
+            var s: Senders = .{ .conn = h.conn, .count = 800 };
+            var ts: [threads]std.Thread = undefined;
+            for (&ts, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Senders.run, .{ &s, i });
+            var prng = std.Random.DefaultPrng.init(100 + seed);
+            var pings: u32 = 0;
+            const res = workTrimPing(h, &s, threads, prng.random(), null, &pings);
+            for (ts) |t| t.join();
+            try res;
+            const pongs = try expectSentWithControl(h, threads, &s.sent, null);
+            try testing.expect(pongs <= pings and pongs + 64 > pings);
+            try testing.expect(pongs > 0);
+            try expectHoldsNothing(h);
+        }
+    }
+}
+
+test "verify send queues: the peer closes while senders race: accepted messages whole, the close echo last" {
+    for ([_]bool{ false, true }) |compress| {
+        for (0..3) |seed| {
+            const h = try Harness.init(.{ .max_send_queue_bytes = 32 * 1024, .deflate = .{ .min_size = 32 } });
+            defer h.deinit();
+            if (compress) h.conn.enableDeflate(.{ .enabled = true });
+            const threads = 5;
+            var s: Senders = .{ .conn = h.conn, .count = std.math.maxInt(usize) };
+            var ts: [threads]std.Thread = undefined;
+            for (&ts, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Senders.run, .{ &s, i });
+            var prng = std.Random.DefaultPrng.init(200 + seed);
+            var pings: u32 = 0;
+            const res = workTrimPing(h, &s, threads, prng.random(), 200 * 1024 + seed * 77_777, &pings);
+            for (ts) |t| t.join();
+            try res;
+            try testing.expectEqual(Conn.Action.close, h.action);
+            const pongs = try expectSentWithControl(h, threads, &s.sent, "\x03\xe9");
+            try testing.expect(pongs <= pings and pongs + 64 > pings);
+            try testing.expectError(error.Closed, h.conn.send("late", false));
+            try expectHoldsNothing(h);
+        }
+    }
+}
+
+// Messages straddling every size class boundary: alone, in batches, with
+// the wire half written, compressed or not; whole and in order, and the
+// pool's books balance.
+test "verify send queues: messages at the size class boundaries" {
+    const max = WsQueues.max_size;
+    const sizes = [_]usize{
+        0,        1,              125,      126,            127,      244,
+        246,      250,            252,      253,            254,      255,
+        256,      257,            508,      65_525,         65_527,   65_535,
+        65_536,   65_537,         131_062,  131_072,        16 << 20, (16 << 20) + 1,
+        max - 14, max - 10,       max - 9,  max - 1,        max,      max + 1,
+        max + 65_536, (40 << 20) + 3,
+    };
+    const big = try testing.allocator.alloc(u8, (40 << 20) + 3 + 64);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate((i >> 3) *% 31 +% (i & 7));
+    for ([_]bool{ false, true }) |compress| {
+        var counting = std.testing.FailingAllocator.init(testing.allocator, .{});
+        const h = try Harness.initWith(.{ .max_send_queue_bytes = 128 << 20, .deflate = .{ .min_size = 32 } }, counting.allocator());
+        defer h.deinit();
+        if (compress) {
+            h.conn.enableDeflate(.{ .enabled = true });
+            _ = try h.pool.wsDeflater();
+        }
+        _ = try h.pool.wsInflateTables();
+        const base = heldBy(&counting);
+        var got: inflate.Out = .{ .buf = &.{}, .max = 64 << 20, .pool = &h.pool };
+        var prng = std.Random.DefaultPrng.init(7);
+        const rand = prng.random();
+        // Each size, then small ones and a ping while it is half written,
+        // then it again.
+        for (sizes, 0..) |n, k| {
+            const off = k * 13 % 64;
+            const m = big[off..][0..n];
+            h.out.clearRetainingCapacity();
+            try h.conn.send(m, true);
+            const w = h.conn.wireBytes();
+            const half = w.len / 2;
+            try h.out.appendSlice(testing.allocator, w[0..half]);
+            h.conn.advance(half);
+            try h.conn.send(big[0..20], true);
+            try h.conn.send(m, true);
+            try h.conn.ping("p");
+            try h.conn.send(big[1..300], true);
+            while (true) {
+                const b = h.conn.wireBytes();
+                if (b.len == 0) break;
+                const step = 1 + rand.uintLessThan(usize, @min(b.len, 3 << 20));
+                try h.out.appendSlice(testing.allocator, b[0..step]);
+                h.conn.advance(step);
+                if (rand.boolean()) h.pool.trim();
+            }
+            var rest: []const u8 = h.out.items;
+            const expect = [_][]const u8{ m, big[0..20], m, "p", big[1..300] };
+            for (expect, 0..) |e, i| {
+                const f = try takeFrame(&rest);
+                if (i == 3) {
+                    try testing.expectEqual(@as(u4, 9), f.op);
+                    try testing.expectEqualSlices(u8, e, f.payload);
+                    continue;
+                }
+                try testing.expectEqual(@as(u4, 2), f.op);
+                const msg = try messageOf(&h.pool, f, &got);
+                if (!std.mem.eql(u8, e, msg)) {
+                    std.debug.print("size {d} compress {} message {d} differs ({d} vs {d} bytes)\n", .{ n, compress, i, msg.len, e.len });
+                    return error.TestUnexpectedResult;
+                }
+            }
+            try testing.expectEqual(@as(usize, 0), rest.len);
+            try testing.expectEqual(@as(usize, 0), h.conn.queued);
+            try testing.expectEqual(@as(usize, 0), h.conn.shared.buf.len + h.conn.wire.buf.len);
+            for (h.pool.ws_queues.sizes) |r| try testing.expectEqual(@as(usize, 0), r.in_use);
+            try testing.expectEqual(@as(usize, 0), h.pool.ws_queues.oversized);
+        }
+        if (got.buf.len > 0) h.pool.releaseLarge(got.buf);
+        h.pool.trim();
+        h.pool.trim();
+        try testing.expectEqual(@as(usize, 0), h.pool.ws_queues.held.load(.monotonic));
+        // Only the large-message cache (inflating the output) stays.
+        try testing.expectEqual(base + h.pool.large_bytes, heldBy(&counting));
+    }
+}
+
+// A backlog of multi-MiB messages, then small ones: what buffer does a
+// small message take after it?
+test "verify send queues: a backlog of large messages, then small batches" {
+    const big = try testing.allocator.alloc(u8, 5 << 20);
+    defer testing.allocator.free(big);
+    @memset(big, 'z');
+    const h = try Harness.init(.{ .max_send_queue_bytes = 64 << 20 });
+    defer h.deinit();
+    for (0..6) |_| try h.conn.send(big, true);
+    try h.flush();
+    var sizes: [4]usize = undefined;
+    for (&sizes) |*s| {
+        try h.conn.send("small", false);
+        s.* = h.conn.shared.buf.len;
+        try h.flush();
+    }
+    std.debug.print("buffers for a small message after a 30 MiB backlog: {any}\n", .{sizes});
+    try testing.expect(sizes[1] <= 4096);
+}
