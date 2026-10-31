@@ -1228,7 +1228,13 @@ pub const Conn = struct {
                             // before a restart) acknowledged in the same
                             // ACK must not take its place.
                             if (self.pmtu.probe_pn == pn) probe_acked = .{ .pn = pn, .size = @intCast(p.size) };
-                        } else if (pmtu) self.pmtu.onPacketAcked(p.size, p.time_sent);
+                        }
+                        // Any packet, a probe too: one of the full size or
+                        // larger that arrived means losses of full-sized
+                        // ones sent before it weren't the size's (else the
+                        // black hole check below, run before the probe
+                        // counts, would drop its acknowledgment).
+                        if (pmtu) self.pmtu.onPacketAcked(p.size, p.time_sent);
                         sp.sent.remove(p);
                     }
                     if (pn == low) break;

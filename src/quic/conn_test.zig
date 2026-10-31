@@ -3489,3 +3489,63 @@ test "QUIC PMTU: a probe the interface refuses gives the pacer back what it took
     try testing.expectEqual(pacer.tokens, s.pacer.tokens);
     try testing.expectEqual(@as(u64, 0), s.pacer.debt);
 }
+
+test "QUIC PMTU: a probe acknowledged in the ACK that completes black hole evidence is no black hole" {
+    // Full-sized packets (1350) lost over more than a probe timeout, then
+    // a larger probe (1472) and a small packet sent after them, both
+    // acknowledged in one ACK: the probe shows the path carries more
+    // than the size, so the losses weren't the size's. (The black hole
+    // check ran first, restarted the search and dropped the probe's
+    // acknowledgment: 1200, and 1472 not tried for 600 s.)
+    const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 32 << 20 }, pmtuOn);
+    defer h.deinit();
+    try h.run(20);
+    const s = h.server.?;
+    s.onPathChange(h.now, false, true, false);
+    try testing.expectEqual(@as(u16, 1350), s.max_datagram);
+    // The probe held back while the full-sized packets go.
+    s.pmtu.state = .complete;
+    s.pmtu.raise_at = std.math.maxInt(u64);
+    var buf: [1500]u8 = undefined;
+    const id = try h.client.openBidi();
+    try h.client.write(id, "big 50000", true);
+    while (true) {
+        const n = try h.client.send(&buf);
+        if (n == 0) break;
+        try h.toServer(buf[0..n]);
+    }
+    // Three full-sized datagrams 40 ms apart, all lost.
+    for (0..3) |i| {
+        if (i > 0) h.now += 40_000;
+        try testing.expectEqual(@as(usize, 1350), s.send(&buf, h.now));
+    }
+    // The probe (held on the way), then a small packet (an ACK: the pacer
+    // holds data back), both delivered after it.
+    h.now += 1000;
+    s.pmtu.state = .searching;
+    s.pacer.refill(h.now, &s.cc, &s.rtt);
+    s.pacer.tokens = 10_000;
+    var probe: [1500]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1472), s.send(&probe, h.now));
+    h.now += 1000;
+    s.pacer.refill(h.now, &s.cc, &s.rtt);
+    s.pacer.tokens = 0;
+    // Two ack-eliciting packets: acknowledged at once.
+    for (0..2) |_| {
+        try h.client.injectFrames(&.{0x01}); // PING
+        try h.toServer(buf[0..try h.client.send(&buf)]);
+    }
+    const n = s.send(&buf, h.now);
+    try testing.expect(n > 0 and n < 1350);
+    try h.toClient(buf[0..n], .not_ect);
+    try h.toClient(probe[0..1472], .not_ect);
+    // The client's ACK of both.
+    h.now += 8000;
+    while (true) {
+        const m = try h.client.send(&buf);
+        if (m == 0) break;
+        try h.toServer(buf[0..m]);
+    }
+    try testing.expectEqual(@as(u32, 0), s.pmtu.black_holes);
+    try testing.expectEqual(@as(u16, 1472), s.max_datagram);
+}

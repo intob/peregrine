@@ -219,7 +219,8 @@ pub const Search = struct {
         self.bisect(now);
     }
 
-    /// A packet other than a probe was acknowledged.
+    /// A packet was acknowledged (a probe too: one larger than `current`
+    /// that arrives shows earlier losses weren't the size's).
     pub fn onPacketAcked(self: *Self, size: u32, time_sent: u64) void {
         if (size >= self.current) {
             self.full_acked = @max(self.full_acked, time_sent);
