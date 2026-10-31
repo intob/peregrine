@@ -2601,6 +2601,95 @@ fn testWsPourPingClose(backend: Backend) !void {
     }
 }
 
+test "verify websocket: a ping flood inside a fragmented message behind a pour: pongs in order, the last ping answered, the message echoed (plain, TLS, permessage-deflate)" {
+    try forEachBackend(testWsPingFloodPour);
+}
+
+fn testWsPingFloodPour(backend: Backend) !void {
+    // io_uring reads only once its output drains (the open item).
+    if (backend == .io_uring) return;
+    for ([_]bool{ false, true }) |tls| {
+        for ([_]bool{ false, true }) |deflate| {
+            errdefer std.debug.print("{s} {s}{s}\n", .{ @tagName(backend), if (tls) "tls" else "plain", if (deflate) " deflate" else "" });
+            var cfg: Config = if (tls) tlsConfig() else .{};
+            cfg.worker_thread_count = 1;
+            if (deflate) cfg.websocket_deflate = .{};
+            const r = try Running.start(backend, cfg);
+            defer r.stop();
+            var p = try WsPeer.open(r.port, tls, deflate);
+            defer p.close();
+            try p.send(.text, "pour");
+            const buf = try testing.allocator.alloc(u8, 1 << 20);
+            defer testing.allocator.free(buf);
+            var pool = try BufferPool.init(testing.allocator, 1024, 1);
+            defer pool.deinit();
+            var inflated: ws.inflate.Out = .{ .buf = &.{}, .max = 4 << 20, .pool = &pool };
+            defer if (inflated.buf.len > 0) pool.releaseLarge(inflated.buf);
+            for (0..3) |round| {
+                const start = sys.nanoTimestamp();
+                while (sys.nanoTimestamp() - start < 100 * std.time.ns_per_ms) _ = try p.read(buf, &pool, &inflated);
+                // A text message in two fragments with 1500 pings between,
+                // all in one write.
+                const n_pings = 1500;
+                const out = try testing.allocator.alloc(u8, 64 + n_pings * 16);
+                defer testing.allocator.free(out);
+                var len: usize = 0;
+                len += Client.wsFrame(out[len..], false, .text, "abc").len;
+                for (0..n_pings) |i| {
+                    var pl: [6]u8 = undefined;
+                    pl[0] = @intCast(round);
+                    std.mem.writeInt(u32, pl[1..5], @intCast(i), .little);
+                    pl[5] = 'P';
+                    len += Client.wsFrame(out[len..], true, .ping, &pl).len;
+                }
+                len += Client.wsFrame(out[len..], true, .continuation, "def").len;
+                switch (p) {
+                    .plain => |*c| try c.send(out[0..len]),
+                    .tls => |t| try t.send(out[0..len]),
+                }
+                var last: ?u32 = null;
+                var echoed = false;
+                const sent = sys.nanoTimestamp();
+                while (last != n_pings - 1 or !echoed) {
+                    if (sys.nanoTimestamp() - sent > 5 * std.time.ns_per_s) {
+                        std.debug.print("round {d}: last pong {?d}, echoed {}\n", .{ round, last, echoed });
+                        return error.PingsNeverAnswered;
+                    }
+                    const m = try p.read(buf, &pool, &inflated);
+                    switch (m.op) {
+                        .binary => {},
+                        .text => {
+                            try testing.expectEqualStrings("abcdef", m.data);
+                            echoed = true;
+                        },
+                        .pong => {
+                            try testing.expectEqual(@as(usize, 6), m.data.len);
+                            try testing.expectEqual(@as(u8, @intCast(round)), m.data[0]);
+                            const i = std.mem.readInt(u32, m.data[1..5], .little);
+                            // Each later than the one before (§5.5.3: some
+                            // may be skipped, never answered out of order).
+                            if (last) |l| try testing.expect(i > l);
+                            last = i;
+                        },
+                        else => return error.UnexpectedOpcode,
+                    }
+                }
+            }
+            try p.send(.close, "\x03\xe8");
+            const sent = sys.nanoTimestamp();
+            while (true) {
+                if (sys.nanoTimestamp() - sent > 5 * std.time.ns_per_s) return error.CloseNeverEchoed;
+                const m = try p.read(buf, &pool, &inflated);
+                if (m.op == .close) {
+                    try testing.expectEqualStrings("\x03\xe8", m.data);
+                    break;
+                }
+                try testing.expectEqual(ws.Opcode.binary, m.op);
+            }
+        }
+    }
+}
+
 test "websocket: pipelined large echoes to a client reading as fast as it can are all sent" {
     try forEachBackend(testWsPipelinedEchoes);
 }
@@ -4337,6 +4426,154 @@ fn testH2WebSocket(backend: Backend) !void {
     defer after.deinit();
     try c.fetch(7, "GET", "/after", null, &after);
     try testing.expectEqualStrings("ok", after.body.items);
+}
+
+// -- Verification (round 4): permessage-deflate over HTTP/2 -----------------
+
+/// Server frames taken whole from the front of `body` (one stream's DATA),
+/// the rest left for more; each data message inflated if compressed.
+const H2WsReader = struct {
+    pos: usize = 0,
+    got: ws.inflate.Out,
+
+    fn next(self: *H2WsReader, body: []const u8, pool: *BufferPool) !?struct { op: u4, rsv1: bool, data: []const u8 } {
+        var rest = body[self.pos..];
+        const before = rest.len;
+        const f = @import("./ws/conn.zig").takeFrame(&rest) catch |err| switch (err) {
+            error.Truncated => return null,
+            else => return err,
+        };
+        self.pos += before - rest.len;
+        if (!f.rsv1) return .{ .op = f.op, .rsv1 = false, .data = f.payload };
+        const with_trailer = try std.mem.concat(testing.allocator, u8, &.{ f.payload, &ws.deflate.trailer });
+        defer testing.allocator.free(with_trailer);
+        self.got.len = 0;
+        _ = try ws.inflate.inflate(try pool.wsInflateTables(), null, with_trailer, &self.got);
+        return .{ .op = f.op, .rsv1 = true, .data = self.got.buf[0..self.got.len] };
+    }
+};
+
+test "verify h2c WebSocket with permessage-deflate: echoes, sends from other threads, a pour taking turns, a ping, the close" {
+    try forEachBackend(testH2WsDeflate);
+}
+
+fn testH2WsDeflate(backend: Backend) !void {
+    for (&big_body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    var cfg = h2Config();
+    cfg.websocket_deflate = .{};
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    const c = try H2Client.connect(r.port);
+    defer c.close();
+    var reply: H2Client.Reply = .{};
+    defer reply.deinit();
+    var map = std.AutoHashMap(u31, *H2Client.Reply).init(testing.allocator);
+    defer map.deinit();
+    try map.put(1, &reply);
+    {
+        var block: [1024]u8 = undefined;
+        var bn: usize = 0;
+        for ([_][2][]const u8{ .{ ":method", "CONNECT" }, .{ ":protocol", "websocket" }, .{ ":scheme", "http" }, .{ ":path", "/ws" }, .{ ":authority", "localhost" }, .{ "sec-websocket-version", "13" }, .{ "sec-websocket-extensions", "permessage-deflate" } }) |f|
+            bn += try c.enc.encode(block[bn..], f[0], f[1], .{});
+        var hdr: [1100]u8 = undefined;
+        const n = try h2frame.writeHeaders(&hdr, 1, h2frame.flag.end_headers, block[0..bn]);
+        try c.send(hdr[0..n]);
+    }
+    var rd: H2WsReader = .{ .got = .{ .buf = &.{}, .max = 4 << 20, .pool = &c.pool } };
+    defer if (rd.got.buf.len > 0) c.pool.releaseLarge(rd.got.buf);
+    while (reply.status == 0) _ = try c.readFrames(&map);
+    try testing.expectEqual(@as(u16, 200), reply.status);
+    try testing.expect(std.mem.indexOf(u8, reply.head.items, "permessage-deflate") != null);
+
+    // Echoes of compressible messages, around a chunk's size.
+    for ([_]usize{ 1000, 64 * 1024 - 7, 64 * 1024 + 9, 300 * 1024, 1 << 20 }) |len| {
+        try c.wsSend(1, .binary, big_body[3..][0..len], false);
+        const m = while (true) {
+            if (try rd.next(reply.body.items, &c.pool)) |m| break m;
+            _ = try c.readFrames(&map);
+        };
+        try testing.expectEqual(@as(u4, 2), m.op);
+        try testing.expect(m.rsv1);
+        try testing.expectEqualSlices(u8, big_body[3..][0..len], m.data);
+    }
+    // Six messages from two threads at once.
+    try c.wsSend(1, .text, "from-threads", false);
+    var next: [2]u8 = @splat(0);
+    var got: usize = 0;
+    while (got < 6) {
+        const m = (try rd.next(reply.body.items, &c.pool)) orelse {
+            _ = try c.readFrames(&map);
+            continue;
+        };
+        try testing.expectEqual(@as(u4, 2), m.op);
+        try testing.expect(m.rsv1);
+        const t = m.data[0];
+        try testing.expect(t < 2);
+        try testing.expectEqual(next[t], m.data[1]);
+        try testing.expectEqual(threadMessageLen(t, next[t]), m.data.len);
+        for (m.data[2..]) |b| try testing.expectEqual('a' + 3 * t + next[t], b);
+        next[t] += 1;
+        got += 1;
+    }
+    // The senders are done with the connection before the pour.
+    var tries: u32 = 0;
+    while (r.srv.handler.threads_done.load(.acquire) < 2) : (tries += 1) {
+        if (tries == 250) return error.ThreadsNotDone;
+        sleepMs(20);
+    }
+    // A pour from another thread, read for a while; then a ping and the
+    // close: the pong, then the close echo and END_STREAM.
+    try c.wsSend(1, .text, "pour", false);
+    var pours: usize = 0;
+    const start = sys.nanoTimestamp();
+    while (sys.nanoTimestamp() - start < 300 * std.time.ns_per_ms) {
+        const m = (try rd.next(reply.body.items, &c.pool)) orelse {
+            _ = try c.readFrames(&map);
+            continue;
+        };
+        try testing.expectEqual(@as(u4, 2), m.op);
+        try testing.expect(m.rsv1);
+        try testing.expectEqual(@as(usize, 64 * 1024), m.data.len);
+        try testing.expect(std.mem.allEqual(u8, m.data, 'p'));
+        pours += 1;
+    }
+    try testing.expect(pours > 10);
+    try c.wsSend(1, .ping, "pp", false);
+    try c.wsSend(1, .close, "\x03\xe8", false);
+    var pong = false;
+    const sent = sys.nanoTimestamp();
+    while (true) {
+        if (sys.nanoTimestamp() - sent > 5 * std.time.ns_per_s) return error.PingAndCloseNeverRead;
+        const m = (try rd.next(reply.body.items, &c.pool)) orelse {
+            if (reply.done) return error.EndedWithoutClose;
+            _ = try c.readFrames(&map);
+            continue;
+        };
+        switch (m.op) {
+            2 => {
+                try testing.expect(!pong);
+                try testing.expectEqual(@as(usize, 64 * 1024), m.data.len);
+            },
+            0xA => {
+                try testing.expectEqualStrings("pp", m.data);
+                pong = true;
+            },
+            8 => {
+                try testing.expectEqualStrings("\x03\xe8", m.data);
+                break;
+            },
+            else => return error.UnexpectedOpcode,
+        }
+    }
+    try testing.expect(pong);
+    while (!reply.done) _ = try c.readFrames(&map);
+    // Nothing after the close echo.
+    try testing.expectEqual(reply.body.items.len, rd.pos);
+    tries = 0;
+    while (r.srv.handler.ws_disconns.load(.monotonic) == 0) : (tries += 1) {
+        if (tries == 150) return error.NotClosed;
+        sleepMs(20);
+    }
 }
 
 test "h2c: GOAWAY on shutdown" {

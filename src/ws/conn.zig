@@ -2001,3 +2001,21 @@ test "fuzz: ws send queues" {
         &[_]u8{ 0x00, 0xff, 0xff, 0x02, 0x37, 0x00, 0x05, 0x05, 0x00, 0x10, 0x00, 0x00, 0x02, 0x33, 0x00, 0x09, 0x04, 0x00, 0x08 },
     } });
 }
+
+test "verify: permessage-deflate with min_size 0 compresses every message: an empty one goes out as it is" {
+    const h = try Harness.init(.{ .deflate = .{ .min_size = 0 } });
+    defer h.deinit();
+    h.conn.enableDeflate(.{ .enabled = true });
+    try h.conn.send("", true);
+    try h.conn.send("", false);
+    try h.flush();
+    var rest: []const u8 = h.out.items;
+    for ([_]u4{ 2, 1 }) |op| {
+        const f = try takeFrame(&rest);
+        try testing.expectEqual(op, f.op);
+        var got: inflate.Out = .{ .buf = &.{}, .max = 1 << 20, .pool = &h.pool };
+        defer if (got.buf.len > 0) h.pool.releaseLarge(got.buf);
+        try testing.expectEqualSlices(u8, "", try messageOf(&h.pool, f, &got));
+    }
+    try testing.expectEqual(@as(usize, 0), rest.len);
+}
