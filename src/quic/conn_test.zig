@@ -2616,9 +2616,72 @@ test "QUIC PMTU: probes wait for the pacer" {
     const sent = s.pmtu.probes_sent;
     try testing.expect(s.send(&buf, h.now) <= s.max_datagram);
     try testing.expectEqual(sent, s.pmtu.probes_sent);
-    // Later, it goes.
-    h.now += 50_000;
+    // With a datagram's worth it goes, and what it took beyond that is
+    // owed: the next tokens pay for it (the bucket's saturating count
+    // forgot it, up to 64 KB for a 65507-byte probe).
+    s.pacer.refill(h.now, &s.cc, &s.rtt);
+    s.pacer.tokens = s.max_datagram;
+    const before = s.pacer;
     try testing.expectEqual(@as(usize, 1472), s.send(&buf, h.now));
+    try testing.expectEqual(sent + 1, s.pmtu.probes_sent);
+    var dt: u64 = 1;
+    while (before.available(h.now + dt, &s.cc, &s.rtt) < 1472 + 1000) dt *= 2;
+    const later = h.now + dt;
+    try testing.expectEqual(before.available(later, &s.cc, &s.rtt) - 1472, s.pacer.available(later, &s.cc, &s.rtt));
+}
+
+test "QUIC PMTU: a ceiling larger than the window and the pacer's bucket: probes they take, up to the ceiling" {
+    // max_mtu 65535 (loopback): a 65507-byte ceiling over a 13.5 KB
+    // initial window. An app-limited connection never has more window, so
+    // a probe of the ceiling waited for good; it goes at what the window
+    // and the bucket take, and each size acknowledged raises the window's
+    // floor (two datagrams), so the search still reaches the ceiling.
+    for ([_]bool{ true, false }) |pacing| {
+        const h = try Harness.init(.{}, struct {
+            fn f(c: *conn_mod.Config) void {
+                c.max_datagram_size = 1350;
+                c.max_mtu = 65535;
+            }
+        }.f);
+        defer h.deinit();
+        h.cfg.pacing = pacing;
+        try h.run(20);
+        const s = h.server.?;
+        try testing.expectEqual(@as(u16, 65507), s.pmtu.ceiling);
+        const admit = if (pacing) @min(s.cc.window, s.pacer.capacity(&s.cc, &s.rtt)) else s.cc.window;
+        try testing.expect(admit < 65507);
+        const big = try h.a.alloc(u8, 65536);
+        defer h.a.free(big);
+        // Room and tokens (an idle connection fills its bucket).
+        h.now += 1_000_000;
+        const n = s.send(big, h.now);
+        try testing.expectEqual(@as(usize, @intCast(admit)), n);
+        try testing.expectEqual(@as(u32, 1), s.pmtu.probes_sent);
+        // Acknowledged: the size, and the search is over below the ceiling.
+        try h.toClient(big[0..n], .not_ect);
+        var buf: [1500]u8 = undefined;
+        while (true) {
+            const m = try h.client.send(&buf);
+            if (m == 0) break;
+            try h.toServer(buf[0..m]);
+        }
+        try testing.expectEqual(@as(u16, @intCast(admit)), s.max_datagram);
+        // The rest of the search, idle in between (app-limited).
+        var probes: u32 = 1;
+        while (s.pmtu.state == .searching) : (probes += 1) {
+            if (probes > 20) return error.NoEnd;
+            h.now += 1_000_000;
+            const m = s.send(big, h.now);
+            try testing.expect(m > s.max_datagram and m <= s.cc.window);
+            try h.toClient(big[0..m], .not_ect);
+            while (true) {
+                const k = try h.client.send(&buf);
+                if (k == 0) break;
+                try h.toServer(buf[0..k]);
+            }
+        }
+        try testing.expect(65507 - s.max_datagram < pmtud.min_step);
+    }
 }
 
 test "QUIC PMTU: an outage isn't a black hole: the size stays" {

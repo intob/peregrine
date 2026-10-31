@@ -252,6 +252,10 @@ pub const Pacer = struct {
     /// smoothed_rtt): frequent refills at low rates would lose it each time.
     frac: u64 = 0,
     burst_us: u64,
+    /// Bytes sent beyond the tokens (`onSentAhead`: a PMTU probe goes once
+    /// there is a datagram's worth), paid from the next refills before any
+    /// tokens are available again.
+    debt: u64 = 0,
 
     /// N in N · cwnd / smoothed_rtt, as a fraction.
     const rate_num = 5;
@@ -278,12 +282,12 @@ pub const Pacer = struct {
         return @max(rtt.smoothed, 1) *| rate_den;
     }
 
-    const Level = struct { tokens: u64, frac: u64 };
+    const Level = struct { tokens: u64, frac: u64, debt: u64 };
 
-    /// The tokens (and what is left of a byte) at `now`.
+    /// The tokens (and what is left of a byte, and of the debt) at `now`.
     fn level(self: *const Self, now: u64, cc: *const Congestion, rtt: *const Rtt) Level {
         const cap = self.capacity(cc, rtt);
-        if (now <= self.last) return .{ .tokens = @min(self.tokens, cap), .frac = self.frac };
+        if (now <= self.last) return .{ .tokens = @min(self.tokens, cap), .frac = self.frac, .debt = self.debt };
         const num = rateNum(cc);
         const den = rateDen(rtt);
         var add: u64 = undefined;
@@ -298,9 +302,11 @@ pub const Pacer = struct {
             add = @intCast(@min(t / den, std.math.maxInt(u64)));
             frac = @intCast(t % den);
         }
-        const tokens = self.tokens +| add;
-        if (tokens >= cap) return .{ .tokens = cap, .frac = 0 };
-        return .{ .tokens = tokens, .frac = frac };
+        // (A debt means no tokens: it is paid first.)
+        const pay = @min(add, self.debt);
+        const tokens = self.tokens +| (add - pay);
+        if (tokens >= cap) return .{ .tokens = cap, .frac = 0, .debt = self.debt - pay };
+        return .{ .tokens = tokens, .frac = frac, .debt = self.debt - pay };
     }
 
     /// The tokens at `now` (not before `last`).
@@ -313,10 +319,17 @@ pub const Pacer = struct {
         const l = self.level(now, cc, rtt);
         self.tokens = l.tokens;
         self.frac = l.frac;
+        self.debt = l.debt;
         self.last = @max(self.last, now);
     }
 
     pub fn onSent(self: *Self, bytes: u64) void {
+        self.tokens -|= bytes;
+    }
+
+    /// Sent `bytes`, perhaps more than the tokens: the rest is owed.
+    pub fn onSentAhead(self: *Self, bytes: u64) void {
+        self.debt += bytes -| self.tokens;
         self.tokens -|= bytes;
     }
 
@@ -328,7 +341,7 @@ pub const Pacer = struct {
         const want = @max(@min(self.capacity(cc, rtt) / 2, room), size);
         // (want - tokens - frac) / rate, rounded up. Rare: 128 bits.
         const num = rateNum(cc);
-        const need = (@as(u128, want - self.tokens) * rateDen(rtt)) -| self.frac;
+        const need = (@as(u128, want - self.tokens + self.debt) * rateDen(rtt)) -| self.frac;
         const wait = (need + num - 1) / num;
         return self.last +| @as(u64, @intCast(@min(wait, std.math.maxInt(u64))));
     }
@@ -432,6 +445,37 @@ test "a new maximum datagram size: the window's floor and increases follow, the 
             try testing.expectEqual(w + 9000, c.window);
         }
     }
+}
+
+test "pacer: bytes sent ahead of the tokens are owed, then paid before data goes" {
+    var cc = Congestion.init(1200, .cubic);
+    var rtt: Rtt = .{};
+    rtt.update(100_000, 0);
+    // 0.15 bytes/µs, as below.
+    var p = Pacer.init(1200, Pacer.default_burst_us);
+    p.refill(1_000_000, &cc, &rtt);
+    p.onSent(12000 - 1200);
+    // A datagram's worth left; a 3000-byte probe takes it and owes 1800.
+    p.onSentAhead(3000);
+    try testing.expectEqual(@as(u64, 0), p.tokens);
+    try testing.expectEqual(@as(u64, 1800), p.debt);
+    // 1800 bytes take 12 ms to pay; nothing is available before.
+    try testing.expectEqual(@as(u64, 0), p.available(1_012_000, &cc, &rtt));
+    try testing.expectEqual(@as(u64, 1200), p.available(1_020_000, &cc, &rtt));
+    // The next datagram is due once the debt and it are covered (or half
+    // the bucket: 6000 bytes more), 52 ms.
+    try testing.expectEqual(@as(?u64, 1_000_000 + 52_000), p.nextSend(1200, std.math.maxInt(u64), &cc, &rtt));
+    // Refills pay it in parts.
+    p.refill(1_006_000, &cc, &rtt);
+    try testing.expectEqual(@as(u64, 900), p.debt);
+    try testing.expectEqual(@as(u64, 0), p.tokens);
+    p.refill(1_020_000, &cc, &rtt);
+    try testing.expectEqual(@as(u64, 0), p.debt);
+    try testing.expectEqual(@as(u64, 1200), p.tokens);
+    // Without a shortfall, onSentAhead is onSent.
+    p.onSentAhead(1000);
+    try testing.expectEqual(@as(u64, 200), p.tokens);
+    try testing.expectEqual(@as(u64, 0), p.debt);
 }
 
 test "pacer: burst allowance, then the paced rate" {

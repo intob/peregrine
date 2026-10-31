@@ -71,6 +71,9 @@ pub const Search = struct {
     probe_pn: ?u64 = null,
     /// PROBE_COUNT: probes of `probe`'s size lost in a row.
     lost: u8 = 0,
+    /// `probe` was cut to what the sender could send (`limit`): once it
+    /// is acknowledged the top of the range is tried again, not halved.
+    clamped: bool = false,
     /// When `complete` searches again.
     raise_at: u64 = 0,
 
@@ -108,6 +111,7 @@ pub const Search = struct {
     fn search(self: *Self, high: u16, now: u64) void {
         self.high = high;
         self.lost = 0;
+        self.clamped = false;
         self.probe_pn = null;
         if (high <= self.current) return self.finish(now);
         self.state = .searching;
@@ -144,6 +148,22 @@ pub const Search = struct {
         return self.probe;
     }
 
+    /// The sender can't send more than `max` bytes at once now (its
+    /// congestion window, or its pacer's bucket): the probe due goes at
+    /// most at that size (the range above it is still searched once the
+    /// window allows, which a larger PLPMTU's floor of two datagrams
+    /// helps), or waits while that wouldn't be a step up. Returns the
+    /// probe's size, or null if none is worth sending now.
+    pub fn limit(self: *Self, max: u16) ?u16 {
+        if (self.state != .searching or self.probe <= max) return self.probe;
+        if (max <= self.current or max - self.current < min_step) return null;
+        // Another size: its losses so far don't count against it.
+        self.probe = max;
+        self.lost = 0;
+        self.clamped = true;
+        return max;
+    }
+
     pub fn onProbeSent(self: *Self, pn: u64) void {
         self.probe_pn = pn;
         self.probes_sent += 1;
@@ -154,15 +174,22 @@ pub const Search = struct {
     pub fn onProbeAcked(self: *Self, pn: u64, size: u16, now: u64) ?u16 {
         if (self.probe_pn != pn) return null;
         self.probe_pn = null;
-        if (size <= self.current) {
-            self.bisect(now);
-            return null;
+        const grew = size > self.current;
+        if (grew) {
+            self.current = size;
+            // A new size: the black hole record starts again at it.
+            self.full_lost = 0;
         }
-        self.current = size;
-        self.bisect(now);
-        // A new size: the black hole record starts again at it.
-        self.full_lost = 0;
-        return size;
+        if (self.clamped) {
+            // The size the sender allowed, not the middle of the range:
+            // the top of it next (the sender may allow it now).
+            self.clamped = false;
+            self.lost = 0;
+            if (self.high <= self.current or self.high - self.current < min_step) {
+                self.finish(now);
+            } else self.probe = self.high;
+        } else self.bisect(now);
+        return if (grew) size else null;
     }
 
     /// A probe was declared lost.
@@ -187,6 +214,7 @@ pub const Search = struct {
     }
 
     fn fail(self: *Self, size: u16, now: u64) void {
+        self.clamped = false;
         self.high = @min(self.high, size - 1);
         self.bisect(now);
     }
@@ -503,4 +531,38 @@ test "the start size is clamped to the ceiling; a local refusal lowers both at o
     // At BASE_PLPMTU there is nowhere lower to go.
     s = .init(1200, 1472);
     try testing.expectEqual(@as(?u16, null), s.onLocalTooBig(1200, 0));
+}
+
+test "the search under a sender that can't send the probe at once: what it can, then the top again" {
+    var s: Search = .init(1350, 65507);
+    s.start(0);
+    try testing.expectEqual(@as(?u16, 65507), s.due(0));
+    // A 13500-byte window: that, and when it is acknowledged the ceiling
+    // again (the window's floor is now two of the new size).
+    try testing.expectEqual(@as(?u16, 13500), s.limit(13500));
+    s.onProbeSent(1);
+    try testing.expectEqual(@as(?u16, 13500), s.onProbeAcked(1, 13500, 0));
+    try testing.expectEqual(@as(?u16, 65507), s.due(0));
+    try testing.expectEqual(@as(?u16, 27000), s.limit(27000));
+    s.onProbeSent(2);
+    _ = s.onProbeAcked(2, 27000, 0);
+    try testing.expectEqual(@as(?u16, 65507), s.limit(std.math.maxInt(u16)));
+    s.onProbeSent(3);
+    _ = s.onProbeAcked(3, 65507, 0);
+    try testing.expectEqual(@as(u16, 65507), s.current);
+    try testing.expectEqual(State.complete, s.state);
+    // Nothing worth a probe within a step of the current size: wait.
+    s = .init(1350, 65507);
+    s.start(0);
+    _ = s.due(0);
+    try testing.expectEqual(@as(?u16, null), s.limit(1360));
+    try testing.expectEqual(State.searching, s.state);
+    // A cut probe lost MAX_PROBES times fails its size: bisection below it.
+    try testing.expectEqual(@as(?u16, 9000), s.limit(9000));
+    for (0..max_probes) |i| {
+        s.onProbeSent(10 + i);
+        s.onProbeLost(10 + i, 0);
+    }
+    try testing.expectEqual(@as(u16, 8999), s.high);
+    try testing.expectEqual(@as(?u16, 1350 + (8999 - 1350 + 1) / 2), s.due(0));
 }

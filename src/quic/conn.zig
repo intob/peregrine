@@ -982,17 +982,24 @@ pub const Conn = struct {
 
     /// Writes a PMTU probe if one is due: PING and PADDING to the probed
     /// size (§14.4), in a 1-RTT packet of its own, sent when the window
-    /// and the pacer have room for it (it is in flight like any packet).
-    /// Not after two
-    /// probe timeouts in a row (packets aren't arriving; see `send`), and
-    /// not into a buffer too small for it.
+    /// and the pacer have room for all of it (it is in flight like any
+    /// packet). No larger than the window, or the pacer's bucket, could
+    /// ever take at once (a 64 KB ceiling over a 13.5 KB window waited
+    /// for good): a smaller probe goes, and once it is acknowledged the
+    /// window's floor is two of the new size. Not after two probe timeouts
+    /// in a row (packets aren't arriving; see `send`), and not into a
+    /// buffer too small for it.
     fn sendPmtuProbe(self: *Self, out: []u8, now: u64) usize {
         if (!self.pmtuEnabled() or self.pto_count >= 2) return 0;
-        const size = self.pmtu.due(now) orelse return 0;
+        var size = self.pmtu.due(now) orelse return 0;
+        var admit = self.cc.window;
+        if (self.cfg.pacing) admit = @min(admit, self.pacer.capacity(&self.cc, &self.rtt));
+        if (size > admit) size = self.pmtu.limit(@intCast(@min(admit, std.math.maxInt(u16)))) orelse return 0;
         if (out.len < size or self.cc.in_flight + size > self.cc.window) return 0;
         if (self.cfg.pacing) {
-            // Paced like data: when the pacer has a datagram's worth (the
-            // probe then takes what it has: one probe a round trip).
+            // Paced like data: when the pacer has a datagram's worth (a
+            // probe's worth may never gather while data drains it); what
+            // the probe takes beyond that is owed (`onSentAhead`).
             self.pacer.refill(now, &self.cc, &self.rtt);
             if (self.pacer.tokens < self.max_datagram) return 0;
         }
@@ -2147,7 +2154,7 @@ pub const Conn = struct {
         }
         if (b.last_eliciting or b.last_in_flight) {
             self.cc.onSent(size);
-            self.pacer.onSent(size);
+            if (b.pmtu_probe) self.pacer.onSentAhead(size) else self.pacer.onSent(size);
         }
         if (b.last_eliciting) {
             sp.last_ack_eliciting_time = now;
