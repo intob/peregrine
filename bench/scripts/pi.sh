@@ -14,6 +14,8 @@
 #                                    pi.sh load ./ws-load 10.252.1.125 8080 4 256 1 20 10
 #   pi.sh cpu                        CPU seconds the server has used (diff around a run)
 #   pi.sh stop                       stop the server
+# TLS handshakes against nginx and h2o: pi-tls-bench.sh; constant-time
+# timing: ct-check.sh pi.
 source "$(dirname "$0")/env.sh"
 SERVER=pi5-wg; CLIENT=pi1-wg
 case $1 in
@@ -30,5 +32,5 @@ cpu)
     ssh $SERVER 'p=$(pgrep -x bench-server) && awk -v t=$(getconf CLK_TCK) "{print (\$14 + \$15) / t}" /proc/$p/stat' ;;
 stop)
     ssh $SERVER "pkill -INT -x bench-server; true" ;;
-*) sed -n '2,21p' "$0"; exit 1 ;;
+*) sed -n '2,18p' "$0"; exit 1 ;;
 esac

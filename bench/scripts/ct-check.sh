@@ -10,7 +10,15 @@
 #                            200000) in Docker on one core for
 #                            DUDECT_TARGETS (aarch64 natively, x86_64 under
 #                            Rosetta), holding mac-bench exclusively; fails
-#                            on max |t| > 4.5
+#                            on max |t| > 4.5. Not on the Mac while
+#                            the user's rule against timing runs there
+#                            stands (2026-10-31): use `pi`
+#   ct-check.sh pi [N] [CASE...]
+#                            then runs the cortex_a76 ReleaseFast dudect
+#                            on pi5 CPU 3 under `nice`, holding pi5's lock
+#                            (see pi.sh), once no fuzz or test job runs
+#                            there; CASE: substrings of the case names
+#                            (default all); fails on max |t| > 4.5
 # x86_64 below v3 is where LLVM turned masked selections into branches
 # (2026-10-30): keep baseline and v2 in TARGETS.
 source "$(dirname "$0")/env.sh"
@@ -54,6 +62,23 @@ if [ "$MODE" = dudect ]; then
         docker run --rm --name "ct-dudect-$TAG" --platform $plat --cpuset-cpus=3 -v "$D":/t $img \
             /t/dudect-$arch-$cpu-ReleaseFast "$N" || status=1
     done
+fi
+if [ "$MODE" = pi ]; then
+    shift $(($# < 2 ? $# : 2))
+    bin=$D/dudect-aarch64-cortex_a76-ReleaseFast
+    [ -x "$bin" ] || { echo "no build for aarch64:cortex_a76 ReleaseFast (TARGETS, OPTS)"; exit 1; }
+    "$LOCK" acquire pi5 "ct-check pi dudect ($ROOT)" || exit 1
+    trap 'ssh pi5-wg "pkill -x dudect-ct; true"; "$LOCK" release pi5' EXIT
+    trap 'exit 1' INT TERM HUP
+    for i in $(seq 360); do
+        ssh pi5-wg 'pgrep -fa -- "--fuzz|/tests( |$)|zig (test|build)" | grep -qv pgrep' || break
+        [ $i = 360 ] && { echo "pi5 still runs a fuzz or test job after an hour"; exit 1; }
+        sleep 10
+    done
+    ssh pi5-wg "mkdir -p peregrine-work/ct" && scp -q "$bin" pi5-wg:peregrine-work/ct/dudect-ct || exit 1
+    echo "== dudect on pi5 CPU 3: aarch64 cortex_a76 ReleaseFast, N=$N, load $(ssh pi5-wg uptime | sed 's/.*average: //')"
+    ssh pi5-wg "cd peregrine-work/ct && nice -n 5 taskset -c 3 ./dudect-ct $N $*" || status=1
+    ssh pi5-wg "pgrep -fa -- '--fuzz|/tests( |\$)|zig (test|build)' | grep -v pgrep" && echo "VOID: a fuzz or test job ran on pi5 during dudect" && status=1
 fi
 [ $status = 0 ] && echo "ct-check: PASS" || echo "ct-check: FAIL"
 exit $status
