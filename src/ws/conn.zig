@@ -112,6 +112,13 @@ pub const Conn = struct {
     to_compress: bool = false,
     /// Worker only: the peer sent a close frame.
     close_received: bool = false,
+    /// Worker only: the answer to the latest ping, when the send queue had
+    /// no room for it (it is full of the handler's messages). It joins the
+    /// queue as the worker takes the queue, past the size limit: a ping
+    /// must be answered (RFC 6455 §5.5.2), and one pong waiting for the
+    /// latest of the pings is enough (§5.5.3).
+    waiting_pong: [protocol.max_control_payload]u8 = undefined,
+    pong_len: ?u8 = null,
     /// Worker only: the connection was failed (protocol error, limit).
     failed: bool = false,
 
@@ -206,29 +213,7 @@ pub const Conn = struct {
             if (opcode != .close and self.queued > 0 and self.queued + total > self.opts.max_send_queue_bytes) {
                 return error.SendQueueFull;
             }
-            const q = &self.shared;
-            if (q.buf.len - q.len < total) {
-                // A larger buffer (the first: an empty queue holds none),
-                // for what the last batch held if that is more, half as
-                // large again as the one it replaces (past the largest
-                // pooled size, growing a frame at a time would copy the
-                // queue on every send), and a small frame's room for
-                // another like it (two of 2^k bytes and their headers
-                // don't fit in 2^(k+1)). If that much can't be had, just
-                // what it must hold: a pong or a close echo isn't lost for
-                // a hint.
-                const want = q.len + total;
-                const hint = @min(self.batch_hint, hint_frames * total);
-                const room = @max(want, hint, q.buf.len + q.buf.len / 2) + if (total <= room_for_another) total else 0;
-                const buf = self.bufferPool().wsAcquire(room) catch try self.bufferPool().wsAcquire(want);
-                @memcpy(buf[0..q.len], q.bytes());
-                if (q.buf.len > 0) self.bufferPool().wsRelease(q.buf);
-                q.buf = buf;
-            }
-            @memcpy(q.buf[q.len..][0..h.len], h);
-            @memcpy(q.buf[q.len + h.len ..][0..payload.len], payload);
-            q.len += total;
-            self.queued += total;
+            try self.appendLocked(h, payload);
             if (compress) self.to_compress = true;
             if (opcode == .close) self.close_sent = true;
             const post = !self.posted;
@@ -236,6 +221,34 @@ pub const Conn = struct {
             break :blk post;
         };
         if (post) self.mailbox.post(self.post_entry);
+    }
+
+    /// Appends a frame to the shared queue. Hold `mutex`.
+    fn appendLocked(self: *Self, h: []const u8, payload: []const u8) error{OutOfMemory}!void {
+        const total = h.len + payload.len;
+        const q = &self.shared;
+        if (q.buf.len - q.len < total) {
+            // A larger buffer (the first: an empty queue holds none),
+            // for what the last batch held if that is more, half as
+            // large again as the one it replaces (past the largest
+            // pooled size, growing a frame at a time would copy the
+            // queue on every send), and a small frame's room for
+            // another like it (two of 2^k bytes and their headers
+            // don't fit in 2^(k+1)). If that much can't be had, just
+            // what it must hold: a pong or a close echo isn't lost for
+            // a hint.
+            const want = q.len + total;
+            const hint = @min(self.batch_hint, hint_frames * total);
+            const room = @max(want, hint, q.buf.len + q.buf.len / 2) + if (total <= room_for_another) total else 0;
+            const buf = self.bufferPool().wsAcquire(room) catch try self.bufferPool().wsAcquire(want);
+            @memcpy(buf[0..q.len], q.bytes());
+            if (q.buf.len > 0) self.bufferPool().wsRelease(q.buf);
+            q.buf = buf;
+        }
+        @memcpy(q.buf[q.len..][0..h.len], h);
+        @memcpy(q.buf[q.len + h.len ..][0..payload.len], payload);
+        q.len += total;
+        self.queued += total;
     }
 
     // -- Worker side -------------------------------------------------------
@@ -258,9 +271,7 @@ pub const Conn = struct {
             } orelse return .ok;
             const sent_close = self.closeSent();
             switch (frame.opcode) {
-                .ping => if (!sent_close) {
-                    self.queueFrame(.pong, frame.payload) catch {};
-                },
+                .ping => if (!sent_close) self.answerPing(frame.payload),
                 .close => {
                     self.close_received = true;
                     // Echo the status code (§5.5.1), then close the TCP
@@ -275,6 +286,29 @@ pub const Conn = struct {
             if (sent_close) continue;
             self.deliver(Handler, handler, &frame);
         }
+    }
+
+    fn answerPing(self: *Self, payload: []const u8) void {
+        // A pong waiting already answers an earlier ping: this one takes
+        // its place, so that pongs don't go out of order.
+        if (self.pong_len == null) {
+            if (self.queueFrame(.pong, payload)) |_| return else |err| if (err == error.Closed) return;
+        }
+        @memcpy(self.waiting_pong[0..payload.len], payload);
+        self.pong_len = @intCast(payload.len);
+    }
+
+    /// The waiting pong joins the shared queue, unless a close frame ended
+    /// it (nothing goes after one). Hold `mutex`.
+    fn queuePongLocked(self: *Self) void {
+        const len = self.pong_len orelse return;
+        if (!self.close_sent) {
+            var hdr: [10]u8 = undefined;
+            const h = protocol.encodeHeader(&hdr, true, .pong, len);
+            // Without a buffer it waits for the next time.
+            self.appendLocked(h, self.waiting_pong[0..len]) catch return;
+        }
+        self.pong_len = null;
     }
 
     inline fn deliver(self: *Self, comptime Handler: type, handler: *Handler, frame: *Frame) void {
@@ -297,6 +331,7 @@ pub const Conn = struct {
         if (self.wire_pos == self.wire.len) {
             self.releaseWire();
             self.mutex.lock();
+            self.queuePongLocked();
             if (self.shared.len > 0) self.batch_hint = self.shared.len;
             self.wire = self.shared;
             self.shared = .{};
@@ -404,7 +439,7 @@ pub const Conn = struct {
 
     /// Whether anything is queued, on the wire or in the shared queue.
     pub fn hasOutput(self: *Self) bool {
-        if (self.hasWire()) return true;
+        if (self.hasWire() or self.pong_len != null) return true;
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.shared.len > 0;
@@ -635,6 +670,57 @@ test "send queue limit and control frame size" {
     // A close frame is accepted even when the queue is full.
     try h.conn.close(1000, "");
     try testing.expectEqual(@as(usize, 1), h.drainMailbox());
+}
+
+test "a ping is answered while the send queue is full: the latest ping's pong joins the queue as the wire takes it, past the limit" {
+    const h = try Harness.init(.{ .max_send_queue_bytes = 100 });
+    defer h.deinit();
+    var buf: [64]u8 = undefined;
+    const big: [90]u8 = @splat('b');
+    try h.conn.send(&big, true);
+    // Room for one pong (92 + 7 bytes), not for the next.
+    try feedOnly(h, masked(&buf, .ping, "aaaaa"));
+    try testing.expectError(error.SendQueueFull, h.conn.send("x", true));
+    try feedOnly(h, masked(&buf, .ping, "bbbbb"));
+    try feedOnly(h, masked(&buf, .ping, "ccccc"));
+    try testing.expect(h.conn.hasOutput());
+    try h.flush();
+    var rest: []const u8 = h.out.items;
+    try testing.expectEqual(@as(u4, @backingInt(Opcode.binary)), (try takeFrame(&rest)).op);
+    try testing.expectEqualStrings("aaaaa", (try takeFrame(&rest)).payload);
+    const pong = try takeFrame(&rest);
+    try testing.expectEqual(@as(u4, @backingInt(Opcode.pong)), pong.op);
+    try testing.expectEqualStrings("ccccc", pong.payload);
+    try testing.expectEqualSlices(u8, "", rest);
+    try testing.expect(!h.conn.hasOutput());
+    try testing.expectEqual(@as(usize, 0), h.conn.queued);
+    // While the wire is being written the pong waits for it; then it goes
+    // out on its own.
+    try h.conn.send(&big, true);
+    const wire = h.conn.wireBytes();
+    try testing.expectEqual(@as(usize, 92), wire.len);
+    try h.conn.send("0123", true);
+    try feedOnly(h, masked(&buf, .ping, "ddddd"));
+    h.conn.advance(wire.len);
+    h.out.clearRetainingCapacity();
+    try h.flush();
+    rest = h.out.items;
+    try testing.expectEqualStrings("0123", (try takeFrame(&rest)).payload);
+    try testing.expectEqualStrings("ddddd", (try takeFrame(&rest)).payload);
+    try testing.expectEqualSlices(u8, "", rest);
+    // A waiting pong goes nowhere once a close frame is queued.
+    try h.conn.send(&big, true);
+    try feedOnly(h, masked(&buf, .ping, "aaaaa"));
+    try feedOnly(h, masked(&buf, .ping, "eeeee"));
+    try h.conn.close(1000, "");
+    h.out.clearRetainingCapacity();
+    try h.flush();
+    rest = h.out.items;
+    _ = try takeFrame(&rest);
+    try testing.expectEqualStrings("aaaaa", (try takeFrame(&rest)).payload);
+    try testing.expectEqual(@as(u4, @backingInt(Opcode.close)), (try takeFrame(&rest)).op);
+    try testing.expectEqualSlices(u8, "", rest);
+    try testing.expect(!h.conn.hasOutput());
 }
 
 test "permessage-deflate: sends are compressed on the way to the wire" {
