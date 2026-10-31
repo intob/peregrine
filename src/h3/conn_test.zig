@@ -45,6 +45,11 @@ const TestHandler = struct {
     file_fd: sys.fd_t = -1,
     file_len: u64 = 0,
     owned_fd: sys.fd_t = -1,
+    /// "storm" (see H3Storm): its senders, stopped by handleWSDisconn,
+    /// and what each had sent when they stopped.
+    storm: ?*H3Storm = null,
+    storm_sent: ?[H3Storm.n_threads]u32 = null,
+    storm_enabled: bool = false,
 
     pub fn handleWSConn(self: *TestHandler, conn: *ws.Conn) void {
         self.ws_conn = conn;
@@ -53,6 +58,13 @@ const TestHandler = struct {
 
     pub fn handleWSDisconn(self: *TestHandler, conn: *ws.Conn) void {
         if (self.ws_conn == conn) self.ws_conn = null;
+        if (self.storm) |s| if (s.conn == conn) {
+            s.stop.store(true, .release);
+            for (s.threads) |t| t.join();
+            self.storm_sent = s.sent;
+            testing.allocator.destroy(s);
+            self.storm = null;
+        };
         self.ws_log.appendSlice(testing.allocator, "gone;") catch unreachable;
     }
 
@@ -65,7 +77,12 @@ const TestHandler = struct {
             .text, .binary => {},
             else => return,
         }
-        if (std.mem.eql(u8, p, "close-me")) {
+        if (self.storm_enabled and std.mem.eql(u8, p, "storm")) {
+            const s = testing.allocator.create(H3Storm) catch unreachable;
+            s.* = .{ .conn = conn };
+            for (&s.threads, 0..) |*t, i| t.* = std.Thread.spawn(.{}, H3Storm.run, .{ s, @as(u8, @intCast(i)) }) catch unreachable;
+            self.storm = s;
+        } else if (std.mem.eql(u8, p, "close-me")) {
             conn.close(1000, "bye") catch unreachable;
         } else if (std.mem.eql(u8, p, "flood")) {
             for (0..200) |i| conn.sendBinary(&(@as([1000]u8, @splat(@truncate(i))))) catch unreachable;
@@ -899,6 +916,150 @@ test "WebSocket over HTTP/3: output beyond the stream buffer, sends from another
     }
     try testing.expectEqualSlices(u8, "\x81\x05after\x81\x0efrom elsewhere", r.body.items[200 * 1004 ..]);
     try testing.expectEqualStrings("open;text:flood;text:after;", h.handler.ws_log.items);
+}
+
+/// "storm" (verification): three threads send numbered binary messages
+/// (5 B to 70 KB) to the WebSocket until it goes or each has sent `limit`.
+const H3Storm = struct {
+    const n_threads = 3;
+    const limit = 200;
+    conn: *ws.Conn,
+    stop: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(u32) = .init(0),
+    failed: std.atomic.Value(bool) = .init(false),
+    threads: [n_threads]std.Thread = undefined,
+    sent: [n_threads]u32 = @splat(0),
+
+    fn len(t: u8, seq: u32) usize {
+        var x: u64 = @as(u64, t) << 32 | seq;
+        x = (x +% 0x9E3779B97F4A7C15) *% 0xBF58476D1CE4E5B9;
+        x ^= x >> 31;
+        return 5 + switch (x % 16) {
+            0 => 60_000 + x % 10_000,
+            1...3 => 1000 + x % 5000,
+            else => x % 250,
+        };
+    }
+
+    fn fill(m: []u8, t: u8, seq: u32) void {
+        m[0] = t;
+        std.mem.writeInt(u32, m[1..5], seq, .little);
+        for (m[5..], 0..) |*b, i| b.* = 'a' + @as(u8, @intCast((i + seq + t) % 16));
+    }
+
+    fn run(self: *H3Storm, t: u8) void {
+        var buf: [70_005]u8 = undefined;
+        var seq: u32 = 0;
+        while (seq < limit and !self.stop.load(.acquire)) {
+            const m = buf[0..len(t, seq)];
+            fill(m, t, seq);
+            self.conn.send(m, true) catch |err| switch (err) {
+                error.SendQueueFull => {
+                    std.Thread.yield() catch {};
+                    continue;
+                },
+                error.Closed => break,
+                else => {
+                    self.failed.store(true, .monotonic);
+                    break;
+                },
+            };
+            seq += 1;
+        }
+        self.sent[t] = seq;
+        _ = self.done.fetchAdd(1, .release);
+    }
+};
+
+/// The storm's messages (the stream's DATA): each sender's in order and
+/// whole, then the close frame if `close`. Returns the counts.
+fn expectH3Storm(bytes: []const u8, close: ?[]const u8) ![H3Storm.n_threads]u32 {
+    var next: [H3Storm.n_threads]u32 = @splat(0);
+    var want: [70_005]u8 = undefined;
+    var rest = bytes;
+    var closed = false;
+    while (rest.len > 0) {
+        try testing.expect(rest.len >= 2);
+        const b1 = rest[1] & 0x7f;
+        const hl: usize = switch (b1) {
+            126 => 4,
+            127 => 10,
+            else => 2,
+        };
+        try testing.expect(rest.len >= hl);
+        const n: usize = switch (b1) {
+            126 => std.mem.readInt(u16, rest[2..4], .big),
+            127 => @intCast(std.mem.readInt(u64, rest[2..10], .big)),
+            else => b1,
+        };
+        try testing.expect(rest.len >= hl + n);
+        const p = rest[hl..][0..n];
+        const op = rest[0] & 0x0f;
+        rest = rest[hl + n ..];
+        try testing.expect(!closed);
+        if (op == 8) {
+            try testing.expectEqualSlices(u8, close.?, p);
+            closed = true;
+            continue;
+        }
+        try testing.expectEqual(@as(u8, 2), op);
+        try testing.expect(p.len >= 5 and p[0] < H3Storm.n_threads);
+        const t = p[0];
+        const seq = std.mem.readInt(u32, p[1..5], .little);
+        try testing.expectEqual(next[t], seq);
+        const w = want[0..H3Storm.len(t, seq)];
+        H3Storm.fill(w, t, seq);
+        try testing.expectEqualSlices(u8, w, p);
+        next[t] += 1;
+    }
+    try testing.expectEqual(close != null, closed);
+    return next;
+}
+
+test "verify WebSocket over HTTP/3: threads sending through a small stream buffer; to the end, the client's close, teardown while they send" {
+    for (0..3) |variant| {
+        const h = try Harness.init();
+        defer h.deinit();
+        h.handler.storm_enabled = true;
+        h.h3_opts.enable_connect_protocol = true;
+        h.h3_opts.stream_buffer = 16 * 1024;
+        try h.startClient();
+        const id = try connectWs(h, "/ws");
+        try wsSend(h, id, .text, "storm", false);
+        try h.run(5);
+        try testing.expect(h.handler.storm != null);
+        var stopped = false;
+        var last: usize = 0;
+        var quiet: usize = 0;
+        var rounds: usize = 0;
+        while (rounds < 200_000) : (rounds += 1) {
+            try h.run(1);
+            if (rounds % 64 == 0) h.pool.trim();
+            const got = h.client.readAll(id).len;
+            if (variant == 2 and got > 200_000) break; // torn down by deinit, senders running
+            if (variant == 1 and !stopped and got > 200_000) {
+                try wsSend(h, id, .close, "\x03\xe8", false);
+                stopped = true;
+            }
+            const done = if (h.handler.storm) |s| s.done.load(.acquire) == H3Storm.n_threads else true;
+            if (done and got == last) {
+                quiet += 1;
+                if (quiet > 200) break;
+            } else quiet = 0;
+            last = got;
+            std.Thread.yield() catch {};
+        }
+        if (variant == 2) continue;
+        var r = try h.response(id);
+        defer r.deinit();
+        const counts = try expectH3Storm(r.body.items, if (variant == 1) "\x03\xe8" else null);
+        if (variant == 0) {
+            for (counts) |n| try testing.expectEqual(@as(u32, H3Storm.limit), n);
+        } else {
+            try testing.expect(h.handler.storm == null);
+            try testing.expectEqualSlices(u32, &h.handler.storm_sent.?, &counts);
+        }
+    }
 }
 
 test "HTTP/3: control and QPACK stream rules" {

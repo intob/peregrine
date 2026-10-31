@@ -2290,6 +2290,11 @@ const TestHandler = struct {
     file_fd: sys.fd_t = -1,
     file_len: u64 = 0,
     owned_fd: sys.fd_t = -1,
+    /// "storm" (see H2Storm): its senders, stopped by handleWSDisconn,
+    /// and what each had sent when they stopped.
+    storm: ?*H2Storm = null,
+    storm_sent: ?[H2Storm.n_threads]u32 = null,
+    storm_enabled: bool = false,
 
     pub fn handleWSConn(self: *TestHandler, conn: *ws.Conn) void {
         self.ws_conn = conn;
@@ -2298,6 +2303,13 @@ const TestHandler = struct {
 
     pub fn handleWSDisconn(self: *TestHandler, conn: *ws.Conn) void {
         if (self.ws_conn == conn) self.ws_conn = null;
+        if (self.storm) |s| if (s.conn == conn) {
+            s.stop.store(true, .release);
+            for (s.threads) |t| t.join();
+            self.storm_sent = s.sent;
+            testing.allocator.destroy(s);
+            self.storm = null;
+        };
         self.ws_log.appendSlice(testing.allocator, "gone;") catch unreachable;
     }
 
@@ -2310,7 +2322,12 @@ const TestHandler = struct {
             .text, .binary => {},
             else => return,
         }
-        if (std.mem.eql(u8, p, "close-me")) {
+        if (self.storm_enabled and std.mem.eql(u8, p, "storm")) {
+            const s = testing.allocator.create(H2Storm) catch unreachable;
+            s.* = .{ .conn = conn };
+            for (&s.threads, 0..) |*t, i| t.* = std.Thread.spawn(.{}, H2Storm.run, .{ s, @as(u8, @intCast(i)) }) catch unreachable;
+            self.storm = s;
+        } else if (std.mem.eql(u8, p, "close-me")) {
             conn.close(1000, "bye") catch unreachable;
         } else if (std.mem.eql(u8, p, "big")) {
             conn.sendBinary(&(@as([1000]u8, @splat('B')))) catch unreachable;
@@ -4916,6 +4933,153 @@ test "WebSocket over HTTP/2: windows hold output, held output holds the client's
     try testing.expectEqual(@as(u32, 1), h.conn.activeStreams());
     try testing.expectEqual(@as(usize, 1), h.slab.active_count);
     try testing.expect(std.mem.endsWith(u8, h.handler.ws_log.items, "open;text:big;gone;"));
+}
+
+/// "storm" (verification): three threads send numbered binary messages
+/// (5 B to 70 KB) to the WebSocket until it goes or each has sent `limit`.
+const H2Storm = struct {
+    const n_threads = 3;
+    const limit = 400;
+    conn: *ws.Conn,
+    stop: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(u32) = .init(0),
+    failed: std.atomic.Value(bool) = .init(false),
+    threads: [n_threads]std.Thread = undefined,
+    sent: [n_threads]u32 = @splat(0),
+
+    fn len(t: u8, seq: u32) usize {
+        var x: u64 = @as(u64, t) << 32 | seq;
+        x = (x +% 0x9E3779B97F4A7C15) *% 0xBF58476D1CE4E5B9;
+        x ^= x >> 31;
+        return 5 + switch (x % 16) {
+            0 => 60_000 + x % 10_000,
+            1...3 => 1000 + x % 5000,
+            else => x % 250,
+        };
+    }
+
+    fn fill(m: []u8, t: u8, seq: u32) void {
+        m[0] = t;
+        std.mem.writeInt(u32, m[1..5], seq, .little);
+        for (m[5..], 0..) |*b, i| b.* = 'a' + @as(u8, @intCast((i + seq + t) % 16));
+    }
+
+    fn run(self: *H2Storm, t: u8) void {
+        var buf: [70_005]u8 = undefined;
+        var seq: u32 = 0;
+        while (seq < limit and !self.stop.load(.acquire)) {
+            const m = buf[0..len(t, seq)];
+            fill(m, t, seq);
+            self.conn.send(m, true) catch |err| switch (err) {
+                error.SendQueueFull => {
+                    std.Thread.yield() catch {};
+                    continue;
+                },
+                error.Closed => break,
+                else => {
+                    self.failed.store(true, .monotonic);
+                    break;
+                },
+            };
+            seq += 1;
+        }
+        self.sent[t] = seq;
+        _ = self.done.fetchAdd(1, .release);
+    }
+};
+
+/// The storm's messages in `bytes` (one stream's DATA): each sender's in
+/// order and whole; a close frame last if `close`; with `cut`, the last
+/// frame may be cut short (the stream was reset). Returns the counts.
+fn expectStorm(bytes: []const u8, close: ?[]const u8, cut: bool) ![H2Storm.n_threads]u32 {
+    var next: [H2Storm.n_threads]u32 = @splat(0);
+    var want: [70_005]u8 = undefined;
+    var rest = bytes;
+    var closed = false;
+    while (rest.len > 0) {
+        if (rest.len < 2) return if (cut) next else error.Truncated;
+        const b1 = rest[1] & 0x7f;
+        const hl: usize = switch (b1) {
+            126 => 4,
+            127 => 10,
+            else => 2,
+        };
+        if (rest.len < hl) return if (cut) next else error.Truncated;
+        const n: usize = switch (b1) {
+            126 => std.mem.readInt(u16, rest[2..4], .big),
+            127 => @intCast(std.mem.readInt(u64, rest[2..10], .big)),
+            else => b1,
+        };
+        if (rest.len < hl + n) return if (cut) next else error.Truncated;
+        const p = rest[hl..][0..n];
+        const op = rest[0] & 0x0f;
+        rest = rest[hl + n ..];
+        try testing.expect(!closed);
+        if (op == 8) {
+            try testing.expectEqualSlices(u8, close.?, p);
+            closed = true;
+            continue;
+        }
+        try testing.expectEqual(@as(u8, 2), op);
+        try testing.expect(p.len >= 5 and p[0] < H2Storm.n_threads);
+        const t = p[0];
+        const seq = std.mem.readInt(u32, p[1..5], .little);
+        try testing.expectEqual(next[t], seq);
+        const w = want[0..H2Storm.len(t, seq)];
+        H2Storm.fill(w, t, seq);
+        try testing.expectEqualSlices(u8, w, p);
+        next[t] += 1;
+    }
+    try testing.expectEqual(close != null and !cut, closed);
+    return next;
+}
+
+test "verify WebSocket over HTTP/2: threads sending while windows open a little at a time; to the end, the client's close, RST_STREAM" {
+    for (0..3) |variant| {
+        for (0..2) |seed| {
+            const h = try Harness.init(.{ .enable_connect_protocol = true, .websocket = .{ .max_send_queue_bytes = 64 * 1024 } });
+            defer h.deinit();
+            h.handler.storm_enabled = true;
+            try h.preface();
+            try h.settings(&.{.{ .id = .initial_window_size, .value = 1000 }});
+            try connectWs(h, 1, "/ws");
+            try wsSend(h, 1, .text, "storm", false);
+            try testing.expect(h.handler.storm != null);
+            var prng = std.Random.DefaultPrng.init(variant * 10 + seed);
+            const rand = prng.random();
+            var stopped = false;
+            var quiet: usize = 0;
+            while (true) {
+                try h.drainMailbox();
+                try h.flushAll();
+                if (rand.uintLessThan(u8, 8) == 0) {
+                    h.bp().trim();
+                }
+                if (!stopped and variant != 0 and h.data_out.items.len > 400_000) {
+                    if (variant == 1) try wsSend(h, 1, .close, "\x03\xe8", false) else try h.rst(1, .cancel);
+                    stopped = true;
+                }
+                const gone = h.handler.storm == null;
+                if (gone and (variant == 2 or h.conn.activeStreams() == 0)) break;
+                if (!gone and h.handler.storm.?.done.load(.acquire) == H2Storm.n_threads and !(if (h.conn.findStream(1)) |st| st.ws_pending else false)) {
+                    quiet += 1;
+                    if (quiet > 3) break;
+                }
+                try h.window(0, 1 + rand.uintLessThan(u31, 30_000));
+                if (!(variant == 2 and stopped)) try h.window(1, 1 + rand.uintLessThan(u31, 30_000));
+                std.Thread.yield() catch {};
+            }
+            const s = h.handler.storm;
+            const sent = if (s) |st| st.sent else h.handler.storm_sent.?;
+            if (s) |st| try testing.expect(!st.failed.load(.monotonic));
+            const got = try expectStorm(h.data_out.items, if (variant == 1) "\x03\xe8" else null, variant == 2);
+            switch (variant) {
+                0 => for (got) |n| try testing.expectEqual(@as(u32, H2Storm.limit), n),
+                1 => try testing.expectEqualSlices(u32, &sent, &got),
+                else => for (got, sent) |g, n| try testing.expect(g <= n),
+            }
+        }
+    }
 }
 
 test "0-RTT: in early data, safe methods are handled and others get 425 Too Early" {
