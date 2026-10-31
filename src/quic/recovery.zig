@@ -333,6 +333,13 @@ pub const Pacer = struct {
         self.tokens -|= bytes;
     }
 
+    /// `onSentAhead`'s `bytes` never left: the debt, then the tokens, back.
+    pub fn onUnsent(self: *Self, bytes: u64) void {
+        const pay = @min(bytes, self.debt);
+        self.debt -= pay;
+        self.tokens += bytes - pay;
+    }
+
     /// When a held-back datagram of `size` bytes is due, as of the last
     /// `refill`: null if it may go now. `room` is what the congestion
     /// window has left: no point waiting for more tokens than that.

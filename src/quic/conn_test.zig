@@ -3433,3 +3433,59 @@ test "verify PMTU r2: a probe acknowledged long after it was declared lost, and 
     s.onTimeout(h.now);
     try testing.expect(s.isClosed());
 }
+
+test "QUIC PMTU: what a refused run spent comes back: the pacer's tokens, the key phase's count, a PATH_RESPONSE" {
+    const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 32 << 20 }, pmtuOn);
+    defer h.deinit();
+    try h.run(20);
+    const s = h.server.?;
+    try testing.expectEqual(@as(u16, 1472), s.max_datagram);
+    var buf: [1500]u8 = undefined;
+    // A response to send, and a PATH_CHALLENGE to answer.
+    const id = try h.client.openBidi();
+    try h.client.write(id, "big 100000", true);
+    try h.client.injectFrames(&.{ 0x1a, 1, 2, 3, 4, 5, 6, 7, 8 }); // PATH_CHALLENGE
+    while (true) {
+        const n = try h.client.send(&buf);
+        if (n == 0) break;
+        try h.toServer(buf[0..n]);
+    }
+    s.pacer.refill(h.now, &s.cc, &s.rtt);
+    const pacer = s.pacer;
+    const phase_packets = s.tx_phase_packets;
+    // A run of five, refused whole (the interface shrank).
+    const mark = s.sendMark();
+    for (0..5) |_| try testing.expect(s.send(&buf, h.now) > 0);
+    try testing.expect(s.pacer.tokens < pacer.tokens);
+    try testing.expect(s.onSendRefused(mark, 1472, h.now));
+    try testing.expectEqual(pacer.tokens, s.pacer.tokens);
+    try testing.expectEqual(pacer.debt, s.pacer.debt);
+    try testing.expectEqual(phase_packets, s.tx_phase_packets);
+    // Everything goes again at 1200 (besides the search's new probe), the
+    // PATH_RESPONSE included.
+    while (true) {
+        const n = s.send(&buf, h.now);
+        if (n == 0) break;
+        if (n > 1200) try testing.expect(s.pmtu.probe_pn != null);
+        try h.client.recv(buf[0..n]);
+    }
+    try testing.expectEqual(@as(u32, 1), h.client.path_responses);
+}
+
+test "QUIC PMTU: a probe the interface refuses gives the pacer back what it took" {
+    const h = try Harness.init(.{}, pmtuOn);
+    defer h.deinit();
+    try h.run(20);
+    const s = h.server.?;
+    s.onPathChange(h.now, false, true, false);
+    // Exactly a datagram's worth: the probe owes the rest.
+    s.pacer.refill(h.now, &s.cc, &s.rtt);
+    s.pacer.tokens = s.max_datagram;
+    const pacer = s.pacer;
+    var buf: [1500]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1472), s.send(&buf, h.now));
+    try testing.expect(s.pacer.debt > 0);
+    s.onProbeTooBig(h.now);
+    try testing.expectEqual(pacer.tokens, s.pacer.tokens);
+    try testing.expectEqual(@as(u64, 0), s.pacer.debt);
+}

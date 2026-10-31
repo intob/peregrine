@@ -184,6 +184,9 @@ const Rec = union(enum) {
     max_streams_uni,
     handshake_done,
     ping,
+    /// Sent once (RFC 9000 §13.3: not again when lost), but again if the
+    /// interface refused it (`unsend`).
+    path_response: [8]u8,
 };
 
 const Sent = sent_mod.SentPackets(Rec);
@@ -911,6 +914,7 @@ pub const Conn = struct {
         const pn = self.pmtu.probe_pn orelse return;
         const sp = &self.spaces[@backingInt(Space.application)];
         if (sp.sent.get(pn)) |p| {
+            if (p.in_flight) self.pacer.onUnsent(p.size);
             self.unsend(.application, p, now);
             sp.sent.compact();
         }
@@ -929,8 +933,13 @@ pub const Conn = struct {
                 sp.ack_wanted = true;
                 sp.ack_deadline = now;
             },
+            // Nor the PATH_RESPONSE (unless a newer challenge's is owed).
+            .path_response => |data| {
+                if (self.path_response == null) self.path_response = data;
+            },
             else => self.onRecordLost(space, rec),
         };
+        if (space == .application) self.tx_phase_packets -|= 1;
         if (p.ecn) {
             sp.ecn_sent -|= 1;
             self.ecn_marked -|= 1;
@@ -946,12 +955,22 @@ pub const Conn = struct {
     }
 
     /// Where the packets of the datagrams `send` returns next begin, per
-    /// packet number space (see `onSendRefused`).
-    pub const SendMark = [3]u64;
+    /// packet number space, and what sending them spends that a refusal
+    /// gives back: the probe timeout's datagrams owed (else a refused
+    /// probe timeout's packets waited for the next, backed-off one), and
+    /// the pacer's tokens (see `onSendRefused`).
+    pub const SendMark = struct {
+        pns: [3]u64,
+        probes: [3]u8,
+        pacer: recovery.Pacer,
+    };
 
     pub fn sendMark(self: *const Self) SendMark {
-        var m: SendMark = undefined;
-        for (&self.spaces, &m) |*sp, *x| x.* = sp.sent.nextPn();
+        var m: SendMark = .{ .pns = undefined, .probes = undefined, .pacer = self.pacer };
+        for (&self.spaces, &m.pns, &m.probes) |*sp, *pn, *probes| {
+            pn.* = sp.sent.nextPn();
+            probes.* = sp.probes;
+        }
         return m;
     }
 
@@ -965,12 +984,18 @@ pub const Conn = struct {
     pub fn onSendRefused(self: *Self, mark: SendMark, size: usize, now: u64) bool {
         if (self.max_datagram <= pmtud.base) return false;
         const lower = self.pmtu.onLocalTooBig(@intCast(@min(size, std.math.maxInt(u16))), now) orelse return false;
-        for (&self.spaces, mark, 0..) |*sp, from, i| {
+        // (The search began again: a probe among these packets is no
+        // longer the one in flight.)
+        std.debug.assert(self.pmtu.probe_pn == null);
+        // Nothing else happens between the mark and the refusal (one
+        // flush): the pacer is as it was, the probe timeout's budget too.
+        self.pacer = mark.pacer;
+        for (&self.spaces, mark.pns, mark.probes, 0..) |*sp, from, probes, i| {
             const space: Space = @fromBackingInt(@as(u2, @intCast(i)));
+            sp.probes = @max(sp.probes, probes);
             var pn = from;
             while (pn < sp.sent.nextPn()) : (pn += 1) {
                 const p = sp.sent.get(pn) orelse continue;
-                if (p.pmtu_probe and self.pmtu.probe_pn == pn) self.pmtu.probe_pn = null;
                 self.unsend(space, p, now);
             }
             sp.sent.compact();
@@ -1383,7 +1408,7 @@ pub const Conn = struct {
                 st.reset_acked = true;
                 self.maybeFree(s.slot);
             },
-            .stop_sending, .max_stream_data, .max_data, .max_streams_bidi, .max_streams_uni, .handshake_done, .ping => {},
+            .stop_sending, .max_stream_data, .max_data, .max_streams_bidi, .max_streams_uni, .handshake_done, .ping, .path_response => {},
         }
     }
 
@@ -1391,7 +1416,7 @@ pub const Conn = struct {
         const a = self.allocator;
         const sp = &self.spaces[@backingInt(space)];
         switch (rec) {
-            .ack, .ping => {},
+            .ack, .ping, .path_response => {},
             .crypto => |c| sp.crypto_tx.onLost(a, c.offset, c.len, false) catch {},
             .stream => |s| {
                 const st = self.streamAt(s.slot, s.gen) orelse return;
@@ -2229,8 +2254,8 @@ pub const Conn = struct {
         if (want_ack) try self.writeAck(sp, &fw, now);
         if (path_response and fw.left() >= 9) {
             frame.writePathResponse(&fw, self.path_response.?);
+            try sp.sent.addRecord(self.allocator, .{ .path_response = self.path_response.? });
             self.path_response = null;
-            try sp.sent.addRecord(self.allocator, .ping);
         }
         if (data or probing) {
             if (space == .application) try self.writeControl(&fw);
