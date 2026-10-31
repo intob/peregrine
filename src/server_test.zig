@@ -64,8 +64,8 @@ const TestHandler = struct {
     storm_sent: [Storm.n_threads]std.atomic.Value(u32) = @splat(.init(0)),
     storms_done: std.atomic.Value(usize) = .init(0),
     storm_failed: std.atomic.Value(bool) = .init(false),
-    /// A binary echo found the send queue full.
-    echo_full: std.atomic.Value(bool) = .init(false),
+    /// Binary echoes the send queue refused (SendQueueFull).
+    echoes_refused: std.atomic.Value(usize) = .init(0),
     /// "pour" senders, by connection (see Pour).
     pours: std.AutoHashMapUnmanaged(*ws.Conn, *Pour) = .empty,
 
@@ -196,7 +196,7 @@ const TestHandler = struct {
             .ping, .pong => return,
             .binary => {
                 conn.send(data, true) catch |err| switch (err) {
-                    error.SendQueueFull => self.echo_full.store(true, .monotonic),
+                    error.SendQueueFull => _ = self.echoes_refused.fetchAdd(1, .monotonic),
                     else => unreachable,
                 };
                 return;
@@ -2109,7 +2109,7 @@ fn testWsDeflateEchoFlood(backend: Backend) !void {
         _ = std.posix.system.shutdown(flood.fd(), std.posix.SHUT.RDWR);
         writer.join();
         reader.join();
-        const full = r.srv.handler.echo_full.load(.monotonic);
+        const full = r.srv.handler.echoes_refused.load(.monotonic) > 0;
         std.debug.print("{s} {s} deflate: {d} requests, worst {d} ms; {d} MiB echoed (compressed){s}\n", .{ @tagName(backend), @tagName(mode), n, worst / std.time.ns_per_ms, got >> 20, if (full) "; an echo found the queue full" else "" });
         try timed;
         if (got == 0) return error.NothingEchoed;
@@ -2494,6 +2494,190 @@ fn testWsPourPingClose(backend: Backend) !void {
                 if (sys.nanoTimestamp() - t0 > 3 * std.time.ns_per_s) return error.NotClosed;
                 sleepMs(10);
             }
+        }
+    }
+}
+
+test "websocket: pipelined large echoes to a client reading as fast as it can are all sent" {
+    try forEachBackend(testWsPipelinedEchoes);
+}
+
+/// Sends `n` binary messages of `len` bytes (byte i of message k is
+/// k + i), on its own thread while the test reads.
+const EchoWriter = struct {
+    c: *Client,
+    n: usize,
+    len: usize,
+    err: ?anyerror = null,
+
+    fn run(self: *EchoWriter) void {
+        const out = std.heap.page_allocator.alloc(u8, self.len + ws.protocol.max_header_len) catch unreachable;
+        defer std.heap.page_allocator.free(out);
+        const msg = std.heap.page_allocator.alloc(u8, self.len) catch unreachable;
+        defer std.heap.page_allocator.free(msg);
+        for (0..self.n) |k| {
+            for (msg, 0..) |*b, i| b.* = @truncate(k + i);
+            self.c.send(Client.wsFrame(out, true, .binary, msg)) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    }
+};
+
+fn testWsPipelinedEchoes(backend: Backend) !void {
+    // Reading went on while echoes were still queued: the next large
+    // message's echo found the queue past its limit and was refused, so a
+    // client that sends several before reading their echoes lost some
+    // (on main, reading waited for the queue to drain).
+    const cases = [_]struct { n: usize, len: usize }{
+        .{ .n = 8, .len = 3 << 20 },
+        .{ .n = 64, .len = 1 << 20 },
+        // Larger than the queue's limit: one is taken only into an empty
+        // queue.
+        .{ .n = 4, .len = 12 << 20 },
+    };
+    for (cases) |case| {
+        const r = try Running.start(backend, .{ .worker_thread_count = 1 });
+        defer r.stop();
+        const h = r.srv.handler;
+        var c = try Client.connect(r.port);
+        defer c.close();
+        try c.send(Client.upgrade_request);
+        try c.readUpgrade();
+        var wr: EchoWriter = .{ .c = &c, .n = case.n, .len = case.len };
+        const th = try std.Thread.spawn(.{}, EchoWriter.run, .{&wr});
+        defer th.join();
+        const buf = try testing.allocator.alloc(u8, case.len);
+        defer testing.allocator.free(buf);
+        var got: usize = 0;
+        while (got < case.n) : (got += 1) {
+            const f = c.wsRead(buf) catch |err| {
+                std.debug.print("{s}: {d} of {d} echoes of {d} KiB, then {s}; {d} refused by the send queue\n", .{ @tagName(backend), got, case.n, case.len >> 10, @errorName(err), h.echoes_refused.load(.monotonic) });
+                _ = std.posix.system.shutdown(c.fd, std.posix.SHUT.RDWR);
+                return err;
+            };
+            try testing.expectEqual(ws.Opcode.binary, f.opcode);
+            try testing.expectEqual(case.len, f.payload.len);
+            try testing.expectEqual(@as(u8, @truncate(got)), f.payload[0]);
+        }
+        try testing.expectEqual(@as(usize, 0), h.echoes_refused.load(.monotonic));
+    }
+}
+
+test "websocket: a client that never reads but keeps sending pings or echoed data is cut off" {
+    try forEachBackend(testWsNeverReads);
+}
+
+/// Sends `frame` over and over until the socket stays full for `ms` or
+/// the connection fails; counts the frames sent.
+const Pinger = struct {
+    fd: sys.fd_t,
+    frame: []const u8,
+    ms: u64,
+    sent: usize = 0,
+
+    fn run(self: *Pinger) void {
+        var since_progress: u64 = 0;
+        var pos: usize = 0;
+        while (since_progress < self.ms) {
+            const n = sys.write(self.fd, self.frame[pos..]) catch |err| switch (err) {
+                error.WouldBlock => {
+                    sleepMs(5);
+                    since_progress += 5;
+                    continue;
+                },
+                else => return,
+            };
+            since_progress = 0;
+            pos += n;
+            if (pos == self.frame.len) {
+                pos = 0;
+                self.sent += 1;
+            }
+        }
+    }
+};
+
+fn testWsNeverReads(backend: Backend) !void {
+    // Reading goes on while output is queued but the socket takes it; a
+    // client that never reads fills the socket with pongs (or echoes),
+    // then the server stops reading and the request timeout closes it.
+    for ([_]bool{ false, true }) |echo| {
+        const r = try Running.start(backend, .{ .worker_thread_count = 1, .request_timeout_s = 1 });
+        defer r.stop();
+        const h = r.srv.handler;
+        var c = try Client.connect(r.port);
+        defer c.close();
+        try c.send(Client.upgrade_request);
+        try c.readUpgrade();
+        const fl = std.posix.system.fcntl(c.fd, std.posix.F.GETFL, @as(usize, 0));
+        _ = std.posix.system.fcntl(c.fd, std.posix.F.SETFL, @as(usize, @intCast(fl)) | @as(usize, 1 << @bitOffsetOf(std.posix.O, "NONBLOCK")));
+        var buf: [16 * 1024 + 16]u8 = undefined;
+        const payload: [16 * 1024]u8 = @splat('e');
+        const ping: [125]u8 = @splat('p');
+        const frame = if (echo) Client.wsFrame(&buf, true, .binary, &payload) else Client.wsFrame(&buf, true, .ping, &ping);
+        var p: Pinger = .{ .fd = c.fd, .frame = frame, .ms = 8000 };
+        const start = sys.nanoTimestamp();
+        const th = try std.Thread.spawn(.{}, Pinger.run, .{&p});
+        while (h.ws_disconns.load(.monotonic) == 0 and sys.nanoTimestamp() - start < 6 * std.time.ns_per_s) sleepMs(20);
+        const closed = h.ws_disconns.load(.monotonic) == 1;
+        _ = std.posix.system.shutdown(c.fd, std.posix.SHUT.RDWR);
+        th.join();
+        std.debug.print("{s} {s}: {d} frames sent, closed: {}, after {d} ms\n", .{ @tagName(backend), if (echo) "echoes" else "pings", p.sent, closed, @divTrunc(sys.nanoTimestamp() - start, std.time.ns_per_ms) });
+        if (!closed) return error.NeverReaderNotClosed;
+    }
+}
+
+test "websocket: a worker left idle after turns, pongs and a stopped reader uses no CPU" {
+    try forEachBackend(testWsIdleCpu);
+}
+
+fn cpuUs() u64 {
+    const u = std.posix.getrusage(std.posix.rusage.SELF);
+    return @as(u64, @intCast(u.utime.sec + u.stime.sec)) * std.time.us_per_s + @as(u64, @intCast(u.utime.usec + u.stime.usec));
+}
+
+fn testWsIdleCpu(backend: Backend) !void {
+    // Posts left over make the next poll return at once: one that is
+    // never served, or is posted again without progress, would spin.
+    for ([_]bool{ false, true }) |tls| {
+        for ([_]bool{ false, true }) |deflate| {
+            var cfg: Config = if (tls) tlsConfig() else .{};
+            cfg.worker_thread_count = 1;
+            if (deflate) cfg.websocket_deflate = .{};
+            const r = try Running.start(backend, cfg);
+            defer r.stop();
+            const buf = try testing.allocator.alloc(u8, 4 << 20);
+            defer testing.allocator.free(buf);
+            var pool = try BufferPool.init(testing.allocator, 1024, 1);
+            defer pool.deinit();
+            var inflated: ws.inflate.Out = .{ .buf = &.{}, .max = 4 << 20, .pool = &pool };
+            defer if (inflated.buf.len > 0) pool.releaseLarge(inflated.buf);
+            // Echoes past the turn's size, and a ping.
+            var a = try WsPeer.open(r.port, tls, deflate);
+            defer a.close();
+            const big = try testing.allocator.alloc(u8, 3 << 20);
+            defer testing.allocator.free(big);
+            for (big, 0..) |*b, i| b.* = @truncate(i *% 7 >> 3);
+            for (0..3) |_| {
+                try a.send(.binary, big);
+                const m = try a.read(buf, &pool, &inflated);
+                try testing.expectEqual(big.len, m.data.len);
+            }
+            try a.send(.ping, "idle?");
+            try testing.expectEqual(ws.Opcode.pong, (try a.read(buf, &pool, &inflated)).op);
+            // A flood the client doesn't read (the socket stays full).
+            var b = try WsPeer.open(r.port, tls, deflate);
+            defer b.close();
+            try b.send(.text, "flood");
+            try b.send(.ping, "behind the flood");
+            sleepMs(300);
+            const before = cpuUs();
+            sleepMs(1000);
+            const used = cpuUs() - before;
+            std.debug.print("{s} {s}{s}: {d} us of CPU in 1 s idle\n", .{ @tagName(backend), if (tls) "tls" else "plain", if (deflate) " deflate" else "", used });
+            if (used > 100_000) return error.IdleWorkerSpins;
         }
     }
 }

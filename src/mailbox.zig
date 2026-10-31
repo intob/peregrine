@@ -126,3 +126,58 @@ test "mailbox: entries come out in the order posted, across the ring's end" {
     try testing.expectEqual(@as(u32, 5), out[0].slot);
     try testing.expectEqual(@as(usize, 0), m.drain(&out));
 }
+
+test "mailbox: threads posting while the owner drains in passes: every entry once, each thread's in order" {
+    // Posts race the drains across the ring's end; at most 12 entries
+    // per thread are outstanding (8 x 12 < 97, the ring's size), as the
+    // worker's posted flags bound them.
+    const testing = std.testing;
+    const n_threads = 8;
+    const per_thread = 20_000;
+    var waker = try sys.Waker.init();
+    defer waker.deinit();
+    var m = try Mailbox.init(testing.allocator, 97, waker);
+    defer m.deinit();
+    m.bind();
+    defer Mailbox.current = null;
+    const Poster = struct {
+        fn run(mb: *Mailbox, t: u32, room: *std.atomic.Value(u32)) void {
+            var i: u32 = 0;
+            while (i < per_thread) {
+                if (room.load(.acquire) == 0) {
+                    std.Thread.yield() catch {};
+                    continue;
+                }
+                _ = room.fetchSub(1, .acq_rel);
+                mb.post(.{ .slot = t, .gen = @intCast(i), .kind = .ws });
+                i += 1;
+            }
+        }
+    };
+    var room: [n_threads]std.atomic.Value(u32) = @splat(.init(12));
+    var threads: [n_threads]std.Thread = undefined;
+    for (&threads, 0..) |*th, t| th.* = try std.Thread.spawn(.{}, Poster.run, .{ &m, @as(u32, @intCast(t)), &room[t] });
+    var next: [n_threads]u32 = @splat(0);
+    var total: usize = 0;
+    var out: [64]Entry = undefined;
+    while (total < n_threads * per_thread) {
+        // One pass: what was posted when it began, in batches.
+        var left = m.pending();
+        if (left == 0) std.Thread.yield() catch {};
+        while (left > 0) {
+            const n = m.drain(out[0..@min(left, out.len)]);
+            try testing.expect(n > 0);
+            left -= n;
+            for (out[0..n]) |e| {
+                try testing.expectEqual(next[e.slot], @as(u32, e.gen));
+                next[e.slot] += 1;
+                _ = room[e.slot].fetchAdd(1, .acq_rel);
+            }
+            total += n;
+        }
+    }
+    for (threads) |th| th.join();
+    try testing.expect(!m.takeOverflow());
+    try testing.expectEqual(@as(usize, 0), m.pending());
+    for (next) |n| try testing.expectEqual(@as(u32, per_thread), n);
+}
