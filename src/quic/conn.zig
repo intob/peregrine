@@ -934,6 +934,11 @@ pub const Conn = struct {
         if (p.ecn) {
             sp.ecn_sent -|= 1;
             self.ecn_marked -|= 1;
+            // Testing packets that never left don't end the testing
+            // period: the next ones marked are the testing packets (else
+            // the path waits for counts of packets that weren't sent, and
+            // the check that they were all lost passes with none marked).
+            if (self.ecn == .unknown and self.ecn_marked < ecn_testing_packets) self.ecn = .testing;
         }
         self.bytes_sent -|= p.size;
         if (p.in_flight) self.cc.onDiscarded(p.size);

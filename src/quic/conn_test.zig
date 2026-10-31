@@ -115,6 +115,11 @@ const Harness = struct {
     /// in `runDelayed`), and how many were.
     iface_max: usize = std.math.maxInt(usize),
     refused: usize = 0,
+    /// The server's datagrams leave in GSO runs, as `Endpoint.flushRun`
+    /// builds them (equal segments, one codepoint; a probe alone), and the
+    /// interface refuses a run as a whole (`runDelayed`). Off: datagram by
+    /// datagram.
+    gso_runs: bool = false,
 
     fn init(client_opts: test_client.Options, tweak: anytype) !*Harness {
         const a = testing.allocator;
@@ -261,7 +266,12 @@ const Harness = struct {
                 if (s.isClosed()) return error.Closed;
                 const tokens = s.pacer.available(h.now, &s.cc, &s.rtt);
                 var bytes: u64 = 0;
-                while (true) {
+                if (h.gso_runs) {
+                    const in_flight = s.cc.in_flight;
+                    try h.flushRuns(s, &queue, delay);
+                    bytes = s.cc.in_flight -| in_flight;
+                }
+                while (!h.gso_runs) {
                     const in_flight = s.cc.in_flight;
                     const ecn = s.sendEcn();
                     const mark = s.sendMark();
@@ -301,6 +311,62 @@ const Harness = struct {
                 try EchoApp.run(h.server.?);
             };
         }
+    }
+
+    /// What `Endpoint.flush` does: runs of equal segments (a shorter one
+    /// ends a run; a codepoint change or 64 segments too), a probe in a
+    /// send of its own after the run before it, and a run larger than the
+    /// interface refused whole (EMSGSIZE), its packets handed back
+    /// (`onSendRefused`) and the flush started again at the new size.
+    fn flushRuns(h: *Harness, s: *Conn, queue: *std.ArrayList(Flight), delay: u64) !void {
+        var batch: [64]Flight = undefined;
+        flush: for (0..3) |_| {
+            const seg: usize = s.max_datagram;
+            var n_run: usize = 0;
+            var mark = s.sendMark();
+            var buf: [1500]u8 = undefined;
+            while (true) {
+                const ecn = s.sendEcn();
+                if (n_run > 0 and ecn != batch[0].ecn) {
+                    if (try h.sendRun(s, batch[0..n_run], seg, mark, queue)) continue :flush;
+                    n_run = 0;
+                }
+                if (n_run == 0) mark = s.sendMark();
+                const n = s.send(&buf, h.now);
+                if (n == 0) break;
+                if (n > seg) {
+                    if (try h.sendRun(s, batch[0..n_run], seg, mark, queue)) continue :flush;
+                    n_run = 0;
+                    if (n > h.iface_max) {
+                        s.onProbeTooBig(h.now);
+                        h.refused += 1;
+                    } else try queue.append(h.a, .{ .at = h.now + delay, .to_server = false, .len = n, .buf = buf, .ecn = ecn });
+                    continue;
+                }
+                batch[n_run] = .{ .at = h.now + delay, .to_server = false, .len = n, .buf = buf, .ecn = ecn };
+                n_run += 1;
+                if (n < seg or n_run == batch.len) {
+                    if (try h.sendRun(s, batch[0..n_run], seg, mark, queue)) continue :flush;
+                    n_run = 0;
+                }
+            }
+            _ = try h.sendRun(s, batch[0..n_run], seg, mark, queue);
+            return;
+        }
+    }
+
+    /// One GSO send. True when the interface refused it and the
+    /// connection's size dropped (the flush starts again).
+    fn sendRun(h: *Harness, s: *Conn, datagrams: []const Flight, seg: usize, mark: Conn.SendMark, queue: *std.ArrayList(Flight)) !bool {
+        if (datagrams.len == 0) return false;
+        const size = if (datagrams.len > 1) seg else datagrams[0].len;
+        if (size > h.iface_max) {
+            h.refused += datagrams.len;
+            // Not refused for good (already at 1200): lost.
+            return s.onSendRefused(mark, size, h.now);
+        }
+        try queue.appendSlice(h.a, datagrams);
+        return false;
     }
 };
 
@@ -2823,4 +2889,39 @@ test "QUIC PMTU: reordering doesn't fail probes: jitter of up to half the round 
             }
         }
     }
+}
+
+test "QUIC PMTU: a GSO run of ECN testing packets the interface refuses leaves ECN testing, not lost" {
+    // A new peer address (another host, so the old route's refusals are
+    // forgotten) behind a 1300-byte interface: the first flush sends a
+    // probe and a run of 1350-byte datagrams, the ECN testing packets
+    // among them, all refused. They never left, so testing isn't over:
+    // the packets sent again at 1200 are the testing packets.
+    const h = try Harness.init(.{ .max_stream_data = 8 << 20, .max_data = 32 << 20 }, pmtuOn);
+    defer h.deinit();
+    var bursts: std.ArrayList(Burst) = .empty;
+    defer bursts.deinit(h.a);
+    h.iface_max = 1300;
+    h.gso_runs = true;
+    try h.runDelayed(10_000, {}, established, &bursts);
+    const s = h.server.?;
+    {
+        const id = try h.client.openBidi();
+        try h.client.write(id, "big 300000", true);
+        try h.runDelayed(10_000, id, finishedAndSearched, &bursts);
+        try expectBody(h, id, 300_000);
+    }
+    try testing.expectEqual(conn_mod.EcnState.capable, s.ecn);
+    try testing.expect(s.max_datagram <= 1300);
+    s.onPathChange(h.now, false, true);
+    try testing.expectEqual(@as(u16, 1350), s.max_datagram);
+    const refused = h.refused;
+    const id = try h.client.openBidi();
+    try h.client.write(id, "big 300000", true);
+    try h.runDelayed(10_000, id, finishedAndSearched, &bursts);
+    try expectBody(h, id, 300_000);
+    // A whole run of testing packets was refused.
+    try testing.expect(h.refused - refused >= conn_mod.ecn_testing_packets);
+    try testing.expectEqual(conn_mod.EcnState.capable, s.ecn);
+    try testing.expect(s.max_datagram <= 1300);
 }
