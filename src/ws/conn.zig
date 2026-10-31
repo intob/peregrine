@@ -342,7 +342,12 @@ pub const Conn = struct {
             defer self.mutex.unlock();
             if (self.close_sent) return;
             self.queuePongLocked();
-            self.appendLocked(h, payload) catch return;
+            // Without a buffer the echo is lost: the connection fails (it
+            // closes once its output is written, as after the echo).
+            self.appendLocked(h, payload) catch {
+                self.failed = true;
+                return;
+            };
             self.close_sent = true;
             const post = !self.posted;
             self.posted = true;
@@ -352,16 +357,20 @@ pub const Conn = struct {
     }
 
     /// The waiting pong joins the shared queue, unless a close frame ended
-    /// it (nothing goes after one). Hold `mutex`.
+    /// it (nothing goes after one). Worker only; hold `mutex`.
     fn queuePongLocked(self: *Self) void {
         const len = self.pong_len orelse return;
-        if (!self.close_sent) {
-            var hdr: [10]u8 = undefined;
-            const h = protocol.encodeHeader(&hdr, true, .pong, len);
-            // Without a buffer it waits for the next time.
-            self.appendLocked(h, self.waiting_pong[0..len]) catch return;
-        }
         self.pong_len = null;
+        if (self.close_sent) return;
+        var hdr: [10]u8 = undefined;
+        const h = protocol.encodeHeader(&hdr, true, .pong, len);
+        // Without a buffer (it waited for one already) the ping goes
+        // unanswered, and the connection fails: a pong left waiting would
+        // count as output with nothing to write, and the connection would
+        // never close.
+        self.appendLocked(h, self.waiting_pong[0..len]) catch {
+            self.failed = true;
+        };
     }
 
     inline fn deliver(self: *Self, comptime Handler: type, handler: *Handler, frame: *Frame) void {
@@ -1355,6 +1364,36 @@ test "send queues: when the room asked for can't be had, a frame takes just what
     try testing.expectEqual(@as(u4, 8), close.op);
     try testing.expectEqualStrings("\x03\xe8", close.payload);
     try testing.expectEqual(@as(usize, 0), rest.len);
+}
+
+test "send queues: a waiting pong that gets no buffer, alone or before the close echo, fails the connection: nothing is left as output with nothing to write" {
+    // The pong waited for a buffer (the ping found none), and when the
+    // worker took the queue there was none either: it stayed waiting,
+    // counted as output, so the connection never closed (and with the
+    // peer's close, the echo was lost behind it too).
+    const ping = [_]u8{ 0x89, 0x81, 1, 2, 3, 4, 'p' ^ 1 };
+    const close = [_]u8{ 0x88, 0x82, 1, 2, 3, 4, 0x03 ^ 1, 0xe8 ^ 2 };
+    for ([_]bool{ false, true }) |with_close| {
+        var limited: LimitAllocator = .{ .limit = std.math.maxInt(usize) };
+        const h = try Harness.initWith(.{}, limited.allocator());
+        defer h.deinit();
+        const space = try h.conn.decoder.readSpace();
+        @memcpy(space[0..ping.len], &ping);
+        var n: usize = ping.len;
+        if (with_close) {
+            @memcpy(space[n..][0..close.len], &close);
+            n += close.len;
+        }
+        h.conn.decoder.commitRead(n);
+        // No buffer to be had from here on.
+        limited.limit = 0;
+        const action = h.conn.process(LogHandler, &h.handler);
+        try testing.expectEqual(if (with_close) Conn.Action.close else Conn.Action.ok, action);
+        try testing.expectEqual(@as(usize, 0), h.conn.wireBytes().len);
+        try testing.expect(!h.conn.hasOutput());
+        try testing.expect(h.conn.wantsClose());
+        try testing.expectEqual(Conn.Action.close, h.conn.process(LogHandler, &h.handler));
+    }
 }
 
 test "send queues: a connection destroyed with output queued and half written gives its buffers back" {
