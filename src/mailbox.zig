@@ -20,10 +20,12 @@ pub const Mailbox = struct {
     const Self = @This();
 
     mutex: sys.Mutex = .{},
-    /// Entries with new output. Deduplicated by the poster (`posted`
-    /// flags), so normally at most one entry per connection or exchange
-    /// and no allocation on post.
+    /// Entries with new output, a ring taken in the order posted (`head`
+    /// the oldest), so that one posting again is served after the others.
+    /// Deduplicated by the poster (`posted` flags), so normally at most one
+    /// entry per connection or exchange and no allocation on post.
     entries: []Entry,
+    head: usize = 0,
     len: usize = 0,
     /// Set if the list filled up (only possible with stale entries pending
     /// for reused slots); the worker then flushes everything instead.
@@ -60,7 +62,7 @@ pub const Mailbox = struct {
     pub fn post(self: *Self, entry: Entry) void {
         self.mutex.lock();
         if (self.len < self.entries.len) {
-            self.entries[self.len] = entry;
+            self.entries[(self.head + self.len) % self.entries.len] = entry;
             self.len += 1;
         } else {
             self.overflowed = true;
@@ -69,22 +71,25 @@ pub const Mailbox = struct {
         if (current != self) self.waker.wake();
     }
 
-    /// Moves posted entries into `out`, returning how many. Call until 0.
+    /// Moves the oldest posted entries into `out`, returning how many.
     pub fn drain(self: *Self, out: []Entry) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
         const n = @min(out.len, self.len);
-        @memcpy(out[0..n], self.entries[self.len - n ..][0..n]);
+        if (n == 0) return 0;
+        const first = @min(n, self.entries.len - self.head);
+        @memcpy(out[0..first], self.entries[self.head..][0..first]);
+        @memcpy(out[first..n], self.entries[0 .. n - first]);
+        self.head = (self.head + n) % self.entries.len;
         self.len -= n;
         return n;
     }
 
-    /// Whether nothing is posted (the owning worker, after its pass: posts
-    /// from its own thread don't wake it).
-    pub fn isEmpty(self: *Self) bool {
+    /// How many entries are posted.
+    pub fn pending(self: *Self) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.len == 0;
+        return self.len;
     }
 
     /// Whether posts were dropped since the last call.
@@ -96,3 +101,28 @@ pub const Mailbox = struct {
         return o;
     }
 };
+
+test "mailbox: entries come out in the order posted, across the ring's end" {
+    const testing = std.testing;
+    var waker = try sys.Waker.init();
+    defer waker.deinit();
+    var m = try Mailbox.init(testing.allocator, 4, waker);
+    defer m.deinit();
+    m.bind();
+    defer Mailbox.current = null;
+    var out: [3]Entry = undefined;
+    for (0..3) |i| m.post(.{ .slot = @intCast(i), .gen = 0, .kind = .ws });
+    try testing.expectEqual(@as(usize, 2), m.drain(out[0..2]));
+    try testing.expectEqual(@as(u32, 0), out[0].slot);
+    try testing.expectEqual(@as(u32, 1), out[1].slot);
+    // 2 is left; 3, 4 and 5 wrap past the end; a fifth entry overflows.
+    for (3..6) |i| m.post(.{ .slot = @intCast(i), .gen = 0, .kind = .ws });
+    try testing.expectEqual(@as(usize, 4), m.pending());
+    m.post(.{ .slot = 6, .gen = 0, .kind = .ws });
+    try testing.expect(m.takeOverflow());
+    try testing.expectEqual(@as(usize, 3), m.drain(&out));
+    for (out, 2..) |e, want| try testing.expectEqual(@as(u32, @intCast(want)), e.slot);
+    try testing.expectEqual(@as(usize, 1), m.drain(&out));
+    try testing.expectEqual(@as(u32, 5), out[0].slot);
+    try testing.expectEqual(@as(usize, 0), m.drain(&out));
+}

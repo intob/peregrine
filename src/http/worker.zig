@@ -351,6 +351,10 @@ pub fn Worker(comptime Handler: type) type {
                     if (ep.connections() > 0 and timeout < 0) timeout = 1000;
                     if (ep.timeoutMs(nowUs())) |ms| timeout = if (timeout < 0) ms else @min(timeout, ms);
                 }
+                // Posts left by the last drain (a turn cut short, a handler
+                // sending from this thread) are served without waiting; posts
+                // from other threads wake the worker themselves.
+                if (self.mailbox.pending() > 0) timeout = 0;
                 const n = self.poller.wait(&events, timeout);
                 self.tick();
                 for (events[0..n]) |ev| {
@@ -1758,8 +1762,17 @@ pub fn Worker(comptime Handler: type) type {
 
         fn drainMailbox(self: *Self) void {
             var entries: [64]mailbox_mod.Entry = undefined;
-            while (true) {
-                const n = self.mailbox.drain(&entries);
+            // What was posted before the drain began, oldest first. What is
+            // posted meanwhile (a turn cut short posts again, and senders on
+            // other threads post as soon as their connection is written)
+            // waits for the next pass: draining until empty, or until a
+            // short batch, a storm of sends on 65 connections kept the
+            // worker here, its other connections and timers waiting.
+            var left = self.mailbox.pending();
+            while (left > 0) {
+                const n = self.mailbox.drain(entries[0..@min(left, entries.len)]);
+                if (n == 0) break;
+                left -= n;
                 for (entries[0..n]) |e| switch (e.kind) {
                     .ws => {
                         const c = &self.conns[e.slot];
@@ -1767,16 +1780,7 @@ pub fn Worker(comptime Handler: type) type {
                     },
                     .exchange => self.exchangePosted(e.slot, e.gen),
                 };
-                // A full batch may have left more. What was posted since
-                // waits for the next pass: draining until empty, a storm of
-                // sends (each posting again as soon as its connection was
-                // written) kept the worker here, its other connections and
-                // timers waiting.
-                if (n < entries.len) break;
             }
-            // Posts from other threads woke the worker; its own (a turn cut
-            // short, a handler sending) don't.
-            if (!self.mailbox.isEmpty()) self.waker.wake();
             if (self.mailbox.takeOverflow()) {
                 for (self.exchanges.entries, 0..) |*e, slot| {
                     if (e.active and e.bound and e.conn_slot & quic_endpoint.exchange_slot_flag != 0)

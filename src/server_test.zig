@@ -2015,6 +2015,7 @@ fn testWsPourFair(backend: Backend) !void {
         const conns = case.conns;
         var cfg: Config = .{};
         cfg.worker_thread_count = 1;
+        cfg.h2c = true;
         if (case.deflate) cfg.websocket_deflate = .{};
         const r = try Running.start(backend, cfg);
         defer r.stop();
@@ -2054,6 +2055,32 @@ fn testWsPourFair(backend: Backend) !void {
             try testing.expectEqual(@as(u16, 200), resp.status);
             worst = @max(worst, @as(u64, @intCast(sys.nanoTimestamp() - t0)));
             sleepMs(20);
+        }
+        // An exchange posted among them: a WebSocket over HTTP/2 whose
+        // handler sends from another thread posts its stream.
+        {
+            const h2 = try H2Client.connect(r.port);
+            defer h2.close();
+            var reply: H2Client.Reply = .{};
+            defer reply.deinit();
+            var map = std.AutoHashMap(u31, *H2Client.Reply).init(testing.allocator);
+            defer map.deinit();
+            try map.put(1, &reply);
+            try h2.connectWs(1, "/ws");
+            var worst_h2: u64 = 0;
+            for (0..5) |_| {
+                reply.body.clearRetainingCapacity();
+                const t0 = sys.nanoTimestamp();
+                try h2.wsSend(1, .text, "async", false);
+                h2.collectBody(&map, &reply, 7) catch |err| {
+                    std.debug.print("{s} {d} connections: HTTP/2 WebSocket: {s} after {d} ms\n", .{ @tagName(backend), conns, @errorName(err), @divTrunc(sys.nanoTimestamp() - t0, std.time.ns_per_ms) });
+                    return err;
+                };
+                try testing.expectEqualSlices(u8, "\x81\x05later", reply.body.items);
+                worst_h2 = @max(worst_h2, @as(u64, @intCast(sys.nanoTimestamp() - t0)));
+            }
+            std.debug.print("{s} {d} connections: HTTP/2 WebSocket sends from another thread: worst {d} ms\n", .{ @tagName(backend), conns, worst_h2 / std.time.ns_per_ms });
+            if (worst_h2 > 1500 * std.time.ns_per_ms) return error.ExchangeHeldUp;
         }
         // Every connection was written to while the requests went on (the
         // mailbox once gave the same 64 connections every turn).
