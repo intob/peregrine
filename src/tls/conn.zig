@@ -46,14 +46,20 @@ pub const Pools = struct {
     // handshakes in flight are rate × round trip, 100 at 2000/s and 50
     // ms, and a reconnect storm closes and opens many at once). The
     // structs are small (1440 and 832 bytes on aarch64); what a handshake
-    // state can hold is its flight and reassembly buffers, bounded here:
-    // the first `large_buffer_states` free states keep buffers up to
-    // `large_buffer_kept`, the rest up to `small_buffer_kept` (a flight
-    // with one or two certificates). Worst case per worker for the
-    // default count of 64: 64 × (1440 + 832 + 2 × 4 KiB) + 16 × 2 × 12
-    // KiB, about 1 MiB; for 256, about 2.9 MiB. The reassembly buffer is
-    // only used by a message split across records, so it is usually
-    // empty.
+    // state can hold is its flight and reassembly buffers, bounded here.
+    // A flight buffer is made as large as the flight it holds (the
+    // certificate chain, a stapled OCSP response, the signature), so it
+    // settles at the largest flight the configured certificates make and
+    // every free state keeps it, up to `large_buffer_kept`: a chain of
+    // two certificates with an OCSP response is past 4 KiB, and a smaller
+    // limit would allocate per handshake whenever more than a few are
+    // under way. The reassembly buffer is only used by a message split
+    // across records, so it is usually empty: the first
+    // `large_buffer_states` free states keep one up to
+    // `large_buffer_kept`, the rest up to `small_buffer_kept`. Worst case
+    // per worker for the default count of 64: 64 × (1440 + 832 + 16 KiB
+    // + 4 KiB) + 16 × 12 KiB, about 1.6 MiB; for 256, about 6 MiB. With
+    // one P-256 certificate the flight is under 1 KiB.
     pub const large_buffer_states = 16;
     pub const large_buffer_kept = 16 * 1024;
     pub const small_buffer_kept = 4 * 1024;
@@ -117,7 +123,7 @@ pub const Pools = struct {
             self.allocator.destroy(hs);
             return;
         }
-        hs.release(if (free.len < large_buffer_states) large_buffer_kept else small_buffer_kept);
+        hs.release(if (free.len < large_buffer_states) large_buffer_kept else small_buffer_kept, large_buffer_kept);
         _ = free.push(hs);
     }
 };
@@ -1376,7 +1382,7 @@ test "a failed handshake leaves its pooled state as good as new" {
         };
         pools.destroyConn(conn);
         try testing.expectEqual(1, pools.handshakes.len);
-        try handshake.expectReleased(pools.handshakes.items[0], Pools.large_buffer_kept);
+        try handshake.expectReleased(pools.handshakes.items[0], Pools.large_buffer_kept, Pools.large_buffer_kept);
     }
     // Then the good session, on the state those failures used.
     server.config.groups = (Config{ .credentials = &server.creds }).groups;
@@ -1424,9 +1430,51 @@ test "a burst of concurrent handshakes allocates nothing the second time" {
         try testing.expectEqual(n, pools.handshakes.len);
         // Kept buffers are bounded, the flight (one certificate) kept.
         for (pools.handshakes.slice(), 0..) |hs, i| {
-            try handshake.expectReleased(hs, if (i < Pools.large_buffer_states) Pools.large_buffer_kept else Pools.small_buffer_kept);
+            try handshake.expectReleased(hs, if (i < Pools.large_buffer_states) Pools.large_buffer_kept else Pools.small_buffer_kept, Pools.large_buffer_kept);
             try testing.expect(hs.flight.len > 0);
         }
+    }
+}
+
+test "a burst of handshakes stapling an OCSP response to a two-certificate chain allocates nothing the second time" {
+    const ocsp = @import("./ocsp.zig");
+    const otd = ocsp.testdata;
+    var server: TestServer = undefined;
+    try server.init(otd.leaf_chain, otd.leaf_key);
+    defer server.deinit();
+    // A response large enough that the flight is past 4 KiB (as with an
+    // RSA chain and a real responder's response). The store doesn't
+    // check what it is given.
+    var staple: ocsp.Staple = .init(testing.allocator);
+    defer staple.deinit();
+    const response: [3000]u8 = @splat(0x5a);
+    try staple.set(&response, std.math.maxInt(i64));
+    server.creds.ocsp = &staple;
+    var hello_buf: [2048]u8 = undefined;
+    var rec: [2048]u8 = undefined;
+    const x = std.crypto.dh.X25519.recoverPublicKey(@splat(5));
+    const hello = plainRecord(&rec, handshake.buildClientHello(&hello_buf, .{
+        .shares = &.{.{ .group = .x25519, .key_exchange = &x }},
+        .extra = &.{ 0, 5, 0, 5, 1, 0, 0, 0, 0 }, // status_request
+    }));
+
+    // More than `large_buffer_states` at once: each gets its flight (the
+    // client goes no further), then all end.
+    const n = 40;
+    var counting: std.testing.FailingAllocator = .init(testing.allocator, .{});
+    var pools = try Pools.init(counting.allocator(), n);
+    defer pools.deinit();
+    var conns: [n]*Conn = undefined;
+    for (0..2) |round| {
+        const before = counting.allocations;
+        for (&conns) |*c| {
+            c.* = try pools.createConn(&server.config, &testEntropy(5));
+            _ = try replay(c.*, hello);
+            try testing.expect(!c.*.failed);
+            try testing.expect(c.*.hs.?.flight.len > Pools.small_buffer_kept);
+        }
+        for (conns) |c| pools.destroyConn(c);
+        if (round > 0) try testing.expectEqual(before, counting.allocations);
     }
 }
 

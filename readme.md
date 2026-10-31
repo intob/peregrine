@@ -39,6 +39,7 @@ Note: This project has just started, and is not yet a complete HTTP server imple
     - AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305
     - ECDSA P-256/P-384, Ed25519 and RSA (PSS) certificates, ALPN, KeyUpdate
     - Session resumption with stateless session tickets (PSK with ECDHE), over TCP and QUIC
+    - OCSP stapling from a response file per certificate, reread when it changes
     - The server's handshake work (key exchange, key schedule, signature) takes about 115 µs per core with a P-256 certificate and X25519MLKEM768, using precomputed tables for P-256 signing and X25519 key generation
     - HTTP/1.1, HTTP/2 and WebSockets over TLS, on every backend
 - Cross-platform IO Multiplexing
@@ -171,6 +172,12 @@ const srv = try per.Server(Handler).init(gpa, 443, .{
 RSA keys sign with RSA-PSS (`rsa_pss_rsae_sha256`, which every TLS 1.3 client supports); a 2048-bit RSA signature costs the server about 1 ms, roughly 25 times an ECDSA P-256 one, so prefer ECDSA certificates where you can.
 
 Session tickets are on by default (`session_tickets`): after each handshake the client gets a ticket, and a later connection that presents it resumes without the certificate signature, still with a fresh key exchange. Tickets are sealed with a key that is random per process unless you set `ticket_key` (32 bytes, shared by servers that should resume each other's sessions), and are valid for `ticket_lifetime_s` (one day). 0-RTT isn't supported.
+
+OCSP stapling: point `ocsp_response_path` (or a `TlsCertificate`'s, for SNI certificates) at a file holding the certificate's DER OCSP response, and clients that ask (`status_request`) get it with the certificate. The file is read at startup and again when it changes (checked every `ocsp_reload_interval_s`, 60 s by default, off the workers). A response is stapled only while it is successful, for this certificate (with a SHA-1 CertID, which is what OpenSSL clients look up; the issuer must be in the chain), signed by the issuer or by a responder it delegated to (RSA, ECDSA P-256/P-384 or Ed25519), good, between its thisUpdate and nextUpdate, and no older than the newest response seen; otherwise it is logged and the last good one stays. The exception is a current, properly signed response saying the certificate is revoked: stapling stops at once, logged as an error. Fetching responses is up to you, for example with a cron job:
+```bash
+openssl ocsp -no_nonce -issuer intermediate.pem -cert leaf.pem -url "$(openssl x509 -in leaf.pem -noout -ocsp_uri)" \
+    -respout /etc/peregrine/leaf.ocsp.tmp && mv /etc/peregrine/leaf.ocsp.tmp /etc/peregrine/leaf.ocsp
+```
 
 ### Serve HTTP/2
 Over TLS, add `"h2"` to the ALPN list; on a plaintext port, set `h2c` to accept the HTTP/2 connection preface (clients with prior knowledge, such as `curl --http2-prior-knowledge`). Both ports keep serving HTTP/1.1.

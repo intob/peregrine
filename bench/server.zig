@@ -4,7 +4,7 @@
 //! plaintext HTTP/1.1), and `/ws`, a WebSocket echo (HTTP/1.1 Upgrade, or
 //! extended CONNECT on HTTP/2 and HTTP/3); request bodies are read and
 //! discarded.
-//! Usage: bench-server [workers] [auto|epoll|io_uring] [port] [tls|h3|plain] [stream] [rsa] [noktls] [0rtt] [sni] [deflate] [nopace] [noecn] [mtu=N] [ip=ADDR]
+//! Usage: bench-server [workers] [auto|epoll|io_uring] [port] [tls|h3|plain] [stream] [rsa] [noktls] [0rtt] [sni] [ocsp=DIR] [deflate] [nopace] [noecn] [mtu=N] [ip=ADDR]
 //! With `tls`, serves TLS 1.3 with the self-signed P-256 certificate in
 //! this directory (`rsa`: the RSA-2048 one), with ALPN "h2" and
 //! "http/1.1"; `h3` adds HTTP/3 on the
@@ -15,7 +15,11 @@
 //! send up to 16 KiB of early data when resuming; responses to requests
 //! handled in it carry `x-early-data: 1`. With `sni`, two more
 //! certificates are chosen by SNI: for a.example, and for *.b.example and
-//! b.example. With `deflate`, WebSockets offered permessage-deflate are
+//! b.example. With `ocsp=DIR`, the certificates are the OCSP test ones
+//! (src/tls/testdata/ocsp: localhost, and ocsp.example by SNI, issued by
+//! a test CA) with their OCSP responses stapled from DIR/leaf.der and
+//! DIR/sni.der, which are checked for changes every second. With
+//! `deflate`, WebSockets offered permessage-deflate are
 //! compressed (`deflate-nct`: and clients are asked not to use context
 //! takeover). With `nopace`, HTTP/3 sends without pacing; with `noecn`,
 //! without ECN (no codepoints read or marked); `mtu=N` sets HTTP/3's PMTU
@@ -128,6 +132,7 @@ fn serve(comptime H: type, args: []const [:0]const u8) !void {
     var ecn = true;
     var max_mtu: u16 = 1500;
     var ip: []const u8 = "0.0.0.0";
+    var ocsp_dir: ?[]const u8 = null;
     for (args[@min(args.len, 5)..]) |arg| {
         if (std.mem.eql(u8, arg, "deflate")) ws_deflate = .{};
         if (std.mem.eql(u8, arg, "deflate-nct")) ws_deflate = .{ .client_no_context_takeover = true };
@@ -139,13 +144,29 @@ fn serve(comptime H: type, args: []const [:0]const u8) !void {
         if (std.mem.eql(u8, arg, "noecn")) ecn = false;
         if (std.mem.startsWith(u8, arg, "mtu=")) max_mtu = try std.fmt.parseInt(u16, arg[4..], 10);
         if (std.mem.startsWith(u8, arg, "ip=")) ip = arg[3..];
+        if (std.mem.startsWith(u8, arg, "ocsp=")) ocsp_dir = arg[5..];
     }
+    var leaf_path: [512]u8 = undefined;
+    var sni_path: [512]u8 = undefined;
+    const ocsp_td = per.internal.tls_ocsp.testdata;
     const srv = try per.Server(H).init(std.heap.smp_allocator, port, .{
         .ip = ip,
         .worker_thread_count = workers,
         .backend = backend,
         .h2c = true,
-        .tls = if (use_tls) .{
+        .tls = if (use_tls and ocsp_dir != null) .{
+            .cert_pem = ocsp_td.leaf_chain,
+            .key_pem = ocsp_td.leaf_key,
+            .ocsp_response_path = try std.fmt.bufPrint(&leaf_path, "{s}/leaf.der", .{ocsp_dir.?}),
+            .ocsp_reload_interval_s = 1,
+            .alpn = &.{ "h2", "http/1.1" },
+            .ktls = ktls,
+            .certificates = &.{.{
+                .cert_pem = ocsp_td.sni_chain,
+                .key_pem = ocsp_td.sni_key,
+                .ocsp_response_path = try std.fmt.bufPrint(&sni_path, "{s}/sni.der", .{ocsp_dir.?}),
+            }},
+        } else if (use_tls) .{
             .cert_pem = if (use_rsa) @embedFile("rsa.pem") else @embedFile("cert.pem"),
             .key_pem = if (use_rsa) @embedFile("rsa.key") else @embedFile("key.pem"),
             .alpn = &.{ "h2", "http/1.1" },

@@ -29,6 +29,11 @@ pub const Options = struct {
     /// The max_udp_payload_size transport parameter (none: the default,
     /// 65527).
     max_udp_payload_size: ?u64 = null,
+    /// Asks for an OCSP response (status_request); the leaf's
+    /// CertificateEntry extensions end up in `leaf_extensions`.
+    status_request: bool = false,
+    /// SNI.
+    server_name: ?[]const u8 = null,
 };
 
 const Space = struct {
@@ -88,6 +93,8 @@ pub const Client = struct {
     app_tx_secret: ks.Secret = undefined,
     alpn: ?[]u8 = null,
     server_params: ?[]u8 = null,
+    /// The extensions of the server's leaf CertificateEntry.
+    leaf_extensions: ?[]u8 = null,
     handshake_complete: bool = false,
     handshake_done: bool = false,
     /// NewSessionTickets received (not used to resume).
@@ -157,6 +164,7 @@ pub const Client = struct {
         if (self.server_cid) |c| a.free(c);
         if (self.alpn) |x| a.free(x);
         if (self.server_params) |x| a.free(x);
+        if (self.leaf_extensions) |x| a.free(x);
         self.inject.deinit(a);
         a.destroy(self);
     }
@@ -233,6 +241,21 @@ pub const Client = struct {
         w.int(u16, @intCast(1 + self.opts.alpn.len));
         w.byte(@intCast(self.opts.alpn.len));
         w.bytes(self.opts.alpn);
+        if (self.opts.status_request) {
+            w.int(u16, 5);
+            w.int(u16, 5);
+            w.byte(1);
+            w.int(u16, 0);
+            w.int(u16, 0);
+        }
+        if (self.opts.server_name) |name| {
+            w.int(u16, 0);
+            w.int(u16, @intCast(name.len + 5));
+            w.int(u16, @intCast(name.len + 3));
+            w.byte(0);
+            w.int(u16, @intCast(name.len));
+            w.bytes(name);
+        }
         // quic_transport_parameters
         var pbuf: [256]u8 = undefined;
         const params = self.opts.transport_params orelse self.defaultParams(&pbuf);
@@ -425,7 +448,15 @@ pub const Client = struct {
                 }
                 self.transcript.update(msg);
             },
-            11, 15 => self.transcript.update(msg), // Certificate, CertificateVerify
+            11 => { // Certificate
+                var r: packet.Reader = .{ .data = msg[4..] };
+                _ = try r.bytes(try r.byte()); // certificate_request_context
+                _ = try r.bytes(3); // certificate_list length
+                _ = try r.bytes(std.mem.readInt(u24, (try r.bytes(3))[0..3], .big)); // the leaf
+                self.leaf_extensions = try self.a.dupe(u8, try r.bytes(try r.int(u16)));
+                self.transcript.update(msg);
+            },
+            15 => self.transcript.update(msg), // CertificateVerify
             20 => { // Finished
                 var th: [32]u8 = undefined;
                 var t = self.transcript;

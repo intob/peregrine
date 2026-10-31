@@ -35,6 +35,7 @@ pub const internal = struct {
     pub const tls_record = @import("./tls/record.zig");
     pub const tls_handshake = @import("./tls/handshake.zig");
     pub const tls_credentials = @import("./tls/credentials.zig");
+    pub const tls_ocsp = @import("./tls/ocsp.zig");
     pub const tls_p256 = @import("./tls/p256.zig");
     pub const tls_x25519 = @import("./tls/x25519.zig");
     pub const tls_rsa = @import("./tls/rsa.zig");
@@ -50,6 +51,7 @@ test {
     _ = @import("./http/date.zig");
     _ = @import("./http/exchange.zig");
     _ = @import("./mailbox.zig");
+    _ = @import("./ocsp_watcher.zig");
     _ = @import("./poller.zig");
     _ = @import("./sys.zig");
     _ = @import("./ws/protocol.zig");
@@ -72,6 +74,7 @@ test {
     _ = @import("./tls/rsa_verify.zig");
     _ = @import("./tls/rsa_stress.zig");
     _ = @import("./tls/ticket.zig");
+    _ = @import("./tls/ocsp.zig");
     _ = @import("./tls/handshake.zig");
     _ = @import("./tls/conn.zig");
     _ = @import("./tls/fuzz.zig");

@@ -24,6 +24,7 @@ pub const H2Options = @import("./h2/conn.zig").Options;
 const Credentials = @import("./tls/credentials.zig").Credentials;
 const TicketKeys = @import("./tls/ticket.zig").Keys;
 const ReplayGuard = @import("./tls/ticket.zig").ReplayGuard;
+const ocsp_watcher = @import("./ocsp_watcher.zig");
 const quic_conn = @import("./quic/conn.zig");
 const quic_endpoint = @import("./quic/endpoint.zig");
 const udp = @import("./quic/udp.zig");
@@ -78,6 +79,8 @@ pub const Http3Options = struct {
 pub const TlsCertificate = struct {
     cert_pem: []const u8,
     key_pem: []const u8,
+    /// See `TlsOptions.ocsp_response_path`.
+    ocsp_response_path: ?[]const u8 = null,
 };
 
 pub const TlsOptions = struct {
@@ -94,6 +97,25 @@ pub const TlsOptions = struct {
     /// QUIC; a session ticket only resumes under the certificate it was
     /// issued with.
     certificates: []const TlsCertificate = &.{},
+    /// OCSP stapling (RFC 6066 §8, RFC 8446 §4.4.2.1): a file holding a DER
+    /// OCSP response for the default certificate, sent to clients that
+    /// ask for it (status_request) in full handshakes. Read at init and
+    /// again whenever it changes (checked every `ocsp_reload_interval_s`,
+    /// by a thread of its own). A response is stapled only while it is
+    /// successful, for this certificate (its issuer must be in the
+    /// chain), signed by the issuer or a responder it delegated to, good,
+    /// and between its thisUpdate (5 minutes' skew allowed) and nextUpdate;
+    /// anything else is logged and skipped, keeping the last good one,
+    /// except a current, signed revocation, which stops stapling (logged
+    /// as an error). An older response than the newest one verified isn't
+    /// stapled.
+    /// Fetching responses is left to
+    /// another job (say `openssl ocsp ... -respout`), which should replace
+    /// the file well before nextUpdate.
+    ocsp_response_path: ?[]const u8 = null,
+    /// How often OCSP response files are checked for changes. 0: read once
+    /// at init.
+    ocsp_reload_interval_s: u32 = 60,
     /// ALPN protocol names offered, in preference order.
     alpn: []const []const u8 = &.{"http/1.1"},
     /// Session tickets (RFC 8446 §4.6.1): a ticket after each handshake,
@@ -309,6 +331,7 @@ pub fn Server(comptime Handler: type) type {
         tls_sni_credentials: []Credentials = &.{},
         tls_tickets: TicketKeys = undefined,
         tls_replay: ?ReplayGuard = null,
+        tls_ocsp: ?*ocsp_watcher.Watcher = null,
         tls_config: tls_conn.Config = undefined,
         quic_tls_config: tls_conn.Config = undefined,
         quic_port: u16 = 0,
@@ -376,6 +399,18 @@ pub fn Server(comptime Handler: type) type {
                     c.* = try Credentials.fromPem(allocator, pem.cert_pem, pem.key_pem);
                     loaded += 1;
                 }
+                var ocsp_sources: [255]ocsp_watcher.Source = undefined;
+                var ocsp_count: usize = 0;
+                if (t.ocsp_response_path) |path| {
+                    ocsp_sources[0] = .{ .credentials = &srv.tls_credentials.?, .path = path };
+                    ocsp_count = 1;
+                }
+                for (t.certificates, srv.tls_sni_credentials) |pem, *c| {
+                    ocsp_sources[ocsp_count] = .{ .credentials = c, .path = pem.ocsp_response_path orelse continue };
+                    ocsp_count += 1;
+                }
+                if (ocsp_count > 0) srv.tls_ocsp = try .init(allocator, ocsp_sources[0..ocsp_count], t.ocsp_reload_interval_s);
+                errdefer if (srv.tls_ocsp) |w| w.deinit();
                 srv.tls_tickets = if (t.ticket_key) |k| .init(k) else .random();
                 srv.tls_tickets.lifetime_s = t.ticket_lifetime_s;
                 const tickets: ?*const TicketKeys = if (t.session_tickets) &srv.tls_tickets else null;
@@ -394,6 +429,7 @@ pub fn Server(comptime Handler: type) type {
                 srv.cfg.tls = null; // the PEM data may be freed after init
             }
             errdefer if (srv.tls_credentials) |*c| {
+                if (srv.tls_ocsp) |w| w.deinit();
                 c.deinit();
                 for (srv.tls_sni_credentials) |*sc| sc.deinit();
                 allocator.free(srv.tls_sni_credentials);
@@ -642,6 +678,7 @@ pub fn Server(comptime Handler: type) type {
             for (self.workers) |*w| w.deinit();
             if (shared_listener >= 0) sys.close(shared_listener);
             if (self.tls_credentials) |*c| {
+                if (self.tls_ocsp) |w| w.deinit();
                 c.deinit();
                 for (self.tls_sni_credentials) |*sc| sc.deinit();
                 self.allocator.free(self.tls_sni_credentials);

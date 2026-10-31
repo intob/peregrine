@@ -20,6 +20,7 @@
 //! Scope: full handshakes with certificate authentication, resumption
 //! with session tickets (`Config.tickets`, PSK with (EC)DHE only), and
 //! 0-RTT on resumption (`Config.max_early_data`); no client certificates.
+//! OCSP stapling (`Credentials.ocsp`) for clients that send status_request.
 //!
 //! 0-RTT: with early data accepted the client's early traffic secret goes
 //! to the sink (`.early`) right after ClientHello. Over TCP the
@@ -33,6 +34,7 @@ const credentials = @import("./credentials.zig");
 const p256_base = @import("./p256.zig");
 const x25519_base = @import("./x25519.zig");
 const ticket = @import("./ticket.zig");
+const ocsp = @import("./ocsp.zig");
 const Credentials = credentials.Credentials;
 const Error = errors.Error;
 const Suite = record.Suite;
@@ -174,6 +176,8 @@ pub const Handshake = struct {
     creds: *const Credentials = undefined,
     creds_index: u8 = 0,
     sni_matched: bool = false,
+    /// The client sent status_request for an OCSP response (RFC 6066 §8).
+    status_requested: bool = false,
     /// QUIC: our transport parameters, as the sink returned them; sent in
     /// EncryptedExtensions.
     transport_params: []const u8 = &.{},
@@ -200,15 +204,16 @@ pub const Handshake = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.release(0);
+        self.release(0, 0);
     }
 
     /// Ends a handshake (finished or failed) whose state will be reused
     /// (conn.zig's `Pools`): zeroes all of it, secrets, transcript and the
     /// buffers' whole capacity (they held the ClientHello, with any
-    /// ticket and binders, and the flight), and frees buffers larger than
-    /// `keep` bytes. `reinit` makes it usable again.
-    pub fn release(self: *Self, keep: usize) void {
+    /// ticket and binders, and the flight), and frees a reassembly buffer
+    /// larger than `keep` bytes and a flight buffer larger than
+    /// `keep_flight`. `reinit` makes it usable again.
+    pub fn release(self: *Self, keep: usize, keep_flight: usize) void {
         const allocator = self.allocator;
         var partial = self.partial;
         // Cleared first: in safe builds clearing marks the items undefined.
@@ -220,7 +225,7 @@ pub const Handshake = struct {
             std.crypto.secureZero(u8, partial.allocatedSlice());
         }
         var flight = self.flight;
-        if (flight.len > keep) {
+        if (flight.len > keep_flight) {
             freeZeroed(allocator, flight);
             flight = &.{};
         } else {
@@ -358,6 +363,8 @@ pub const Handshake = struct {
             self.session_id_len = @intCast(hello.session_id.len);
             @memcpy(self.session_id_buf[0..hello.session_id.len], hello.session_id);
             self.early_data_offered = hello.early_data;
+            // ClientHello2 repeats status_request (`repeatedDigest`).
+            self.status_requested = hello.status_request;
             self.chooseCredentials(hello.server_name);
         }
 
@@ -695,8 +702,19 @@ pub const Handshake = struct {
         if (!self.early_accepted or self.config.quic) try sink.readSecret(.handshake, suite, &c_hs);
 
         const creds = self.creds;
+        // RFC 8446 §4.4.2.1: the OCSP response goes in the leaf's
+        // CertificateEntry, to a client that asked for it. A resumed
+        // handshake has no Certificate, so nothing to staple. Released as
+        // soon as it is copied (`writeCertificate`): a new response waits
+        // for its readers.
+        var staple: ?ocsp.Staple.Ref = if (self.status_requested and !self.resumed)
+            if (creds.ocsp) |s| s.acquire() else null
+        else
+            null;
+        defer if (staple) |s| s.release();
         var chain_len: usize = 0;
         for (creds.chain) |c| chain_len += 3 + c.len + 2;
+        if (staple) |s| chain_len += s.bytes.len;
         const flight_len = 64 + 300 + self.transport_params.len + chain_len + credentials.max_signature_len + record.max_hash_len;
         if (self.flight.len < flight_len) {
             const new = self.allocator.alloc(u8, flight_len) catch return error.InternalError;
@@ -735,7 +753,7 @@ pub const Handshake = struct {
         self.transcript.update(w.buf[start..w.pos]);
 
         // A resumed session is authenticated by the PSK.
-        if (!self.resumed) try self.writeCertificate(&w, &hash_buf);
+        if (!self.resumed) try self.writeCertificate(&w, &hash_buf, &staple);
 
         // Finished
         start = w.pos;
@@ -761,18 +779,23 @@ pub const Handshake = struct {
         try sink.writeSecret(.application, suite, &s_ap);
     }
 
-    /// Certificate and CertificateVerify.
-    fn writeCertificate(self: *Self, w: *Writer, hash_buf: *[record.max_hash_len]u8) Error!void {
+    /// Certificate and CertificateVerify. `staple`: the OCSP response for
+    /// the leaf's CertificateEntry, if any, released once copied.
+    fn writeCertificate(self: *Self, w: *Writer, hash_buf: *[record.max_hash_len]u8, staple: *?ocsp.Staple.Ref) Error!void {
         const creds = self.creds;
         var start = w.pos;
         var hdr = w.beginMessage(.certificate);
         w.int(u8, 0); // certificate_request_context
         const list = w.begin(u24);
-        for (creds.chain) |c| {
+        for (creds.chain, 0..) |c, i| {
             w.int(u24, @intCast(c.len));
             w.bytes(c);
-            w.int(u16, 0); // extensions
+            const exts = if (i == 0) if (staple.*) |s| s.bytes else "" else "";
+            w.int(u16, @intCast(exts.len));
+            w.bytes(exts);
         }
+        if (staple.*) |s| s.release();
+        staple.* = null;
         w.end(u24, list);
         w.endMessage(hdr);
         self.transcript.update(w.buf[start..w.pos]);
@@ -1009,6 +1032,8 @@ const ClientHello = struct {
     server_name: ?[]const u8 = null,
     /// The quic_transport_parameters extension's contents.
     quic_transport_params: ?[]const u8 = null,
+    /// status_request asked for an OCSP response (RFC 6066 §8).
+    status_request: bool = false,
     /// The whole extensions block.
     extensions: []const u8 = "",
     tls13: bool = false,
@@ -1095,6 +1120,19 @@ const ClientHello = struct {
                 .quic_transport_parameters => {
                     hello.quic_transport_params = ext;
                     continue;
+                },
+                .status_request => {
+                    // CertificateStatusRequest: status_type, then for
+                    // ocsp (1) an OCSPStatusRequest: responder IDs (each
+                    // non-empty) and request extensions. Other types are
+                    // ignored.
+                    if (try e.int(u8) != 1) continue;
+                    var ids: Reader = .{ .data = try e.vector(u16) };
+                    while (ids.pos < ids.data.len) {
+                        if ((try ids.vector(u16)).len == 0) return error.DecodeError;
+                    }
+                    _ = try e.vector(u16);
+                    hello.status_request = true;
                 },
                 .psk_key_exchange_modes => {
                     const modes = try e.vector(u8);
@@ -1308,7 +1346,7 @@ test "ServerHello and handshake secrets match RFC 8448" {
 /// Expects a released state to hold nothing of its last handshake: every
 /// byte zero but the allocator and the buffers' bookkeeping, the buffers'
 /// whole capacity zero, and none larger than `keep`.
-pub fn expectReleased(hs: *const Handshake, keep: usize) !void {
+pub fn expectReleased(hs: *const Handshake, keep: usize, keep_flight: usize) !void {
     const bytes = std.mem.asBytes(hs);
     for (bytes, 0..) |b, i| {
         const kept = inline for (.{ "allocator", "partial", "flight" }) |name| {
@@ -1324,7 +1362,7 @@ pub fn expectReleased(hs: *const Handshake, keep: usize) !void {
     try std.testing.expect(std.mem.allEqual(u8, hs.partial.allocatedSlice(), 0));
     try std.testing.expect(std.mem.allEqual(u8, hs.flight, 0));
     try std.testing.expect(hs.partial.capacity <= keep);
-    try std.testing.expect(hs.flight.len <= keep);
+    try std.testing.expect(hs.flight.len <= keep_flight);
 }
 
 /// Counts frees of memory that wasn't zeroed first (std.testing.allocator
@@ -1386,7 +1424,7 @@ test "buffers are zeroed before they are freed: growing, replaced, released" {
         var pos: usize = 0;
         while (pos < hello.len) : (pos += 700) try hs.feed(.initial, hello[pos..@min(pos + 700, hello.len)], &sink);
         try std.testing.expect(hs.flight.len > 0);
-        if (config == &small) hs.release(16 * 1024);
+        if (config == &small) hs.release(16 * 1024, 16 * 1024);
     }
     hs.deinit();
     try std.testing.expectEqual(0, zc.unzeroed_frees);
@@ -1441,8 +1479,8 @@ test "release: nothing of the last handshake survives; big buffers are freed" {
             try hs.feed(.initial, hello[hello.len / 2 ..], &sink);
             try std.testing.expect(hs.partial.capacity >= hello.len);
             try std.testing.expect(hs.flight.len > 0);
-            hs.release(16 * 1024);
-            try expectReleased(&hs, 16 * 1024);
+            hs.release(16 * 1024, 16 * 1024);
+            try expectReleased(&hs, 16 * 1024, 16 * 1024);
             hs.reinit(&config, &entropy);
             try expectFresh(&hs, &config, &entropy);
         }
@@ -2352,11 +2390,18 @@ fn sniExt(comptime host: []const u8) []const u8 {
     return .{ 0, 0, 0, n + 5, 0, n + 3, 0, 0, n } ++ host;
 }
 
-/// The leaf certificate and whether EncryptedExtensions acknowledged
-/// server_name, from the server's encrypted flight.
-fn flightFacts(sink: *const TestSink) !struct { leaf: ?[]const u8, sni_ack: bool } {
+/// The leaf certificate, its CertificateEntry's extensions, whether any
+/// other entry has extensions, and whether EncryptedExtensions
+/// acknowledged server_name or carried status_request, from the server's
+/// encrypted flight.
+const FlightFacts = struct { leaf: ?[]const u8, leaf_exts: []const u8 = "", other_exts: bool = false, sni_ack: bool, status_in_ee: bool = false };
+
+fn flightFacts(sink: *const TestSink) !FlightFacts {
     var leaf: ?[]const u8 = null;
+    var leaf_exts: []const u8 = "";
+    var other_exts = false;
     var ack = false;
+    var status_in_ee = false;
     for (sink.events.items) |ev| {
         const d = switch (ev) {
             .data => |d| d,
@@ -2375,18 +2420,24 @@ fn flightFacts(sink: *const TestSink) !struct { leaf: ?[]const u8, sni_ack: bool
                         const et = try exts.int(u16);
                         _ = try exts.vector(u16);
                         if (et == @backingInt(ExtensionType.server_name)) ack = true;
+                        if (et == @backingInt(ExtensionType.status_request)) status_in_ee = true;
                     }
                 },
                 11 => {
                     _ = try b.vector(u8); // certificate_request_context
                     var list: Reader = .{ .data = try b.vector(u24) };
                     leaf = try list.vector(u24);
+                    leaf_exts = try list.vector(u16);
+                    while (list.pos < list.data.len) {
+                        _ = try list.vector(u24);
+                        if ((try list.vector(u16)).len != 0) other_exts = true;
+                    }
                 },
                 else => {},
             }
         }
     }
-    return .{ .leaf = leaf, .sni_ack = ack };
+    return .{ .leaf = leaf, .leaf_exts = leaf_exts, .other_exts = other_exts, .sni_ack = ack, .status_in_ee = status_in_ee };
 }
 
 test "SNI: the certificate whose names match, else the default; server_name acknowledged when it chose" {
@@ -2468,5 +2519,416 @@ test "SNI: a ticket resumes only for a name that selects the same certificate" {
         try std.testing.expectEqual(case.resumed, hs.resumed);
         // No acknowledgement on a resumed handshake.
         try std.testing.expectEqual(!case.resumed and case.extra.len > 6, (try flightFacts(&sink)).sni_ack);
+    }
+}
+
+// -- OCSP stapling --------------------------------------------------------------
+
+/// status_request for an OCSP response: no responder IDs, no extensions.
+const status_request_ext = [_]u8{ 0, 5, 0, 5, 1, 0, 0, 0, 0 };
+
+var ocsp_test_now: i64 = ocsp.testdata.this_update + 3600;
+
+fn ocspTestClock() i64 {
+    return ocsp_test_now;
+}
+
+/// The OCSP test leaf (default certificate) and ocsp.example (by SNI),
+/// each with its response.
+const OcspSetup = struct {
+    leaf: Credentials,
+    sni: [1]Credentials,
+    leaf_staple: ocsp.Staple,
+    sni_staple: ocsp.Staple,
+
+    fn init(self: *OcspSetup) !void {
+        const otd = ocsp.testdata;
+        self.leaf = try .fromPem(std.testing.allocator, otd.leaf_chain, otd.leaf_key);
+        errdefer self.leaf.deinit();
+        self.sni[0] = try .fromPem(std.testing.allocator, otd.sni_chain, otd.sni_key);
+        errdefer self.sni[0].deinit();
+        self.leaf_staple = .init(std.testing.allocator);
+        self.sni_staple = .init(std.testing.allocator);
+        self.leaf_staple.now = ocspTestClock;
+        self.sni_staple.now = ocspTestClock;
+        const now = ocspTestClock();
+        try self.leaf_staple.set(otd.leaf_good, (try ocsp.check(otd.leaf_good, self.leaf.chain, now)).expires);
+        try self.sni_staple.set(otd.sni_good, (try ocsp.check(otd.sni_good, self.sni[0].chain, now)).expires);
+        self.leaf.ocsp = &self.leaf_staple;
+        self.sni[0].ocsp = &self.sni_staple;
+    }
+
+    fn deinit(self: *OcspSetup) void {
+        self.leaf_staple.deinit();
+        self.sni_staple.deinit();
+        self.leaf.deinit();
+        self.sni[0].deinit();
+    }
+};
+
+fn expectStapled(facts: FlightFacts, response: ?[]const u8) !void {
+    var buf: [4096]u8 = undefined;
+    const want = if (response) |r| ocsp.writeEntryExtensions(&buf, r) else "";
+    try std.testing.expectEqualSlices(u8, want, facts.leaf_exts);
+    // Only the leaf's entry, never EncryptedExtensions (§4.4.2.1).
+    try std.testing.expect(!facts.other_exts and !facts.status_in_ee);
+}
+
+test "OCSP stapling: in the leaf's CertificateEntry when asked for, for the certificate SNI chose" {
+    var o: OcspSetup = undefined;
+    try o.init();
+    defer o.deinit();
+    ocsp_test_now = ocsp.testdata.this_update + 3600;
+    var keys = ticket.Keys.init(@splat(9));
+    keys.now = resumeTestClock;
+    var entropy: [entropy_len]u8 = undefined;
+    for (&entropy, 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+    var config = resumeConfig(&o.leaf, &keys, &.{.aes_128_gcm_sha256});
+    config.sni_credentials = &o.sni;
+    const otd = ocsp.testdata;
+    const cases = [_]struct { extra: []const u8, want: ?[]const u8 }{
+        .{ .extra = &status_request_ext, .want = otd.leaf_good },
+        .{ .extra = &status_request_ext ++ comptime sniExt("localhost"), .want = otd.leaf_good },
+        .{ .extra = comptime sniExt("ocsp.example") ++ &status_request_ext, .want = otd.sni_good },
+        // Not asked for.
+        .{ .extra = "", .want = null },
+        .{ .extra = comptime sniExt("ocsp.example"), .want = null },
+        // Responder IDs and request extensions are accepted (and not
+        // looked at).
+        .{ .extra = &.{ 0, 5, 0, 13, 1, 0, 4, 0, 2, 'i', 'd', 0, 4, 0, 1, 0, 0 }, .want = otd.leaf_good },
+        // Another status type (ocsp_multi is TLS 1.2's, RFC 6961): ignored.
+        .{ .extra = &.{ 0, 5, 0, 3, 2, 0, 0 }, .want = null },
+    };
+    for (cases) |case| {
+        var buf: [4096]u8 = undefined;
+        var c = RefClient(.aes_128_gcm_sha256).init();
+        var hs = Handshake.init(std.testing.allocator, &config, &entropy);
+        defer hs.deinit();
+        var sink: TestSink = .{ .allocator = std.testing.allocator };
+        defer sink.deinit();
+        const hello = c.hello(&buf, case.extra, null, true);
+        try hs.feed(.initial, hello, &sink);
+        try expectStapled(try flightFacts(&sink), case.want);
+        // The reference client follows the flight (its Finished covers
+        // the stapled Certificate).
+        _ = try c.finish(&hs, &sink, hello, 0, false);
+    }
+    // The response is read when the flight is written: a new one is
+    // stapled from the next handshake on, an expired one is not, nor is
+    // one cleared.
+    for ([_]struct { now: i64, set: ?[]const u8, want: ?[]const u8 }{
+        .{ .now = otd.this_update + 3600, .set = otd.both_good, .want = otd.both_good },
+        .{ .now = otd.next_update - 1, .set = null, .want = otd.both_good },
+        .{ .now = otd.next_update, .set = null, .want = null },
+        .{ .now = otd.this_update + 3600, .set = null, .want = otd.both_good },
+        .{ .now = otd.this_update + 3600, .set = "", .want = null },
+    }) |step| {
+        ocsp_test_now = step.now;
+        if (step.set) |r| {
+            if (r.len == 0) o.leaf_staple.clear() else try o.leaf_staple.set(r, otd.next_update);
+        }
+        var buf: [4096]u8 = undefined;
+        var c = RefClient(.aes_128_gcm_sha256).init();
+        var hs = Handshake.init(std.testing.allocator, &config, &entropy);
+        defer hs.deinit();
+        var sink: TestSink = .{ .allocator = std.testing.allocator };
+        defer sink.deinit();
+        try hs.feed(.initial, c.hello(&buf, &status_request_ext, null, true), &sink);
+        try expectStapled(try flightFacts(&sink), step.want);
+    }
+    // A certificate without a response.
+    var plain = try testCredentials();
+    defer plain.deinit();
+    const plain_config: Config = .{ .credentials = &plain, .groups = &.{.x25519} };
+    var buf: [4096]u8 = undefined;
+    var c = RefClient(.aes_128_gcm_sha256).init();
+    var hs = Handshake.init(std.testing.allocator, &plain_config, &entropy);
+    defer hs.deinit();
+    var sink: TestSink = .{ .allocator = std.testing.allocator };
+    defer sink.deinit();
+    try hs.feed(.initial, c.hello(&buf, &status_request_ext, null, true), &sink);
+    try expectStapled(try flightFacts(&sink), null);
+}
+
+test "OCSP stapling: nothing on resumption (no Certificate); after a HelloRetryRequest as in a full handshake" {
+    var o: OcspSetup = undefined;
+    try o.init();
+    defer o.deinit();
+    ocsp_test_now = ocsp.testdata.this_update + 3600;
+    var keys = ticket.Keys.init(@splat(9));
+    keys.now = resumeTestClock;
+    var entropy: [entropy_len]u8 = undefined;
+    for (&entropy, 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+    const suite = Suite.aes_128_gcm_sha256;
+    const config = resumeConfig(&o.leaf, &keys, &.{suite});
+    const extra = comptime pskModes(&.{1}) ++ status_request_ext;
+    const t = try issueTicket(suite, &config, &entropy, extra);
+    var buf: [4096]u8 = undefined;
+    {
+        var c = RefClient(suite).init();
+        var hs = Handshake.init(std.testing.allocator, &config, &entropy);
+        defer hs.deinit();
+        var sink: TestSink = .{ .allocator = std.testing.allocator };
+        defer sink.deinit();
+        const hello = c.hello(&buf, extra, &t, true);
+        try hs.feed(.initial, hello, &sink);
+        try std.testing.expect(hs.resumed);
+        const facts = try flightFacts(&sink);
+        try std.testing.expect(facts.leaf == null and !facts.status_in_ee);
+        _ = try c.finish(&hs, &sink, hello, 0, true);
+    }
+    // ClientHello2 repeats status_request: stapled; without it, it
+    // differs from ClientHello1 (§4.1.2).
+    for ([_]bool{ true, false }) |repeat| {
+        var c = RefClient(suite).init();
+        var hs = Handshake.init(std.testing.allocator, &config, &entropy);
+        defer hs.deinit();
+        var sink: TestSink = .{ .allocator = std.testing.allocator };
+        defer sink.deinit();
+        var buf1: [4096]u8 = undefined;
+        const ch1 = c.hello(&buf1, &status_request_ext, null, false);
+        try hs.feed(.initial, ch1, &sink);
+        try std.testing.expect(hs.isRetrying());
+        c.retried(ch1, sink.events.items[0].data.bytes);
+        const ch2 = c.hello(&buf, if (repeat) &status_request_ext else "", null, true);
+        if (!repeat) {
+            try std.testing.expectError(error.IllegalParameter, hs.feed(.initial, ch2, &sink));
+            continue;
+        }
+        try hs.feed(.initial, ch2, &sink);
+        try expectStapled(try flightFacts(&sink), ocsp.testdata.leaf_good);
+        _ = try c.finish(&hs, &sink, ch2, 1, false);
+    }
+}
+
+test "OCSP stapling: the largest response fits the CertificateEntry" {
+    var o: OcspSetup = undefined;
+    try o.init();
+    defer o.deinit();
+    ocsp_test_now = ocsp.testdata.this_update + 3600;
+    // The store takes any bytes (`ocsp.check` is the loader's job).
+    const big = try std.testing.allocator.alloc(u8, ocsp.max_response_len);
+    defer std.testing.allocator.free(big);
+    @memset(big, 0x42);
+    try o.leaf_staple.set(big, ocsp.testdata.next_update);
+    var keys = ticket.Keys.init(@splat(9));
+    keys.now = resumeTestClock;
+    const config = resumeConfig(&o.leaf, &keys, &.{.aes_128_gcm_sha256});
+    var entropy: [entropy_len]u8 = undefined;
+    for (&entropy, 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+    var buf: [4096]u8 = undefined;
+    var c = RefClient(.aes_128_gcm_sha256).init();
+    var hs = Handshake.init(std.testing.allocator, &config, &entropy);
+    defer hs.deinit();
+    var sink: TestSink = .{ .allocator = std.testing.allocator };
+    defer sink.deinit();
+    const hello = c.hello(&buf, &status_request_ext, null, true);
+    try hs.feed(.initial, hello, &sink);
+    const facts = try flightFacts(&sink);
+    try std.testing.expectEqual(@as(usize, 0xffff), facts.leaf_exts.len);
+    try std.testing.expectEqualSlices(u8, big, facts.leaf_exts[8..]);
+    _ = try c.finish(&hs, &sink, hello, 0, false);
+}
+
+test "OCSP stapling: the response is let go once copied, before the signature and the flight going out" {
+    var o: OcspSetup = undefined;
+    try o.init();
+    defer o.deinit();
+    ocsp_test_now = ocsp.testdata.this_update + 3600;
+    const config: Config = .{ .credentials = &o.leaf, .groups = &.{.x25519} };
+    var entropy: [entropy_len]u8 = undefined;
+    for (&entropy, 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+    // A sink that counts the staple's readers when the flight arrives.
+    const CheckingSink = struct {
+        pub const Error = TestSink.Error;
+        inner: TestSink,
+        staple: *ocsp.Staple,
+        readers_at_flight: ?u32 = null,
+
+        pub fn handshakeData(self: *@This(), level: Level, bytes: []const u8) TestSink.Error!void {
+            if (level == .handshake) self.readers_at_flight = self.staple.slots[0].readers.load(.seq_cst) + self.staple.slots[1].readers.load(.seq_cst);
+            return self.inner.handshakeData(level, bytes);
+        }
+        pub fn changeCipherSpec(self: *@This()) TestSink.Error!void {
+            return self.inner.changeCipherSpec();
+        }
+        pub fn writeSecret(self: *@This(), level: Level, suite: Suite, secret: []const u8) TestSink.Error!void {
+            return self.inner.writeSecret(level, suite, secret);
+        }
+        pub fn readSecret(self: *@This(), level: Level, suite: Suite, secret: []const u8) TestSink.Error!void {
+            return self.inner.readSecret(level, suite, secret);
+        }
+    };
+    var sink: CheckingSink = .{ .inner = .{ .allocator = std.testing.allocator }, .staple = &o.leaf_staple };
+    defer sink.inner.deinit();
+    var buf: [4096]u8 = undefined;
+    var c = RefClient(.aes_128_gcm_sha256).init();
+    var hs = Handshake.init(std.testing.allocator, &config, &entropy);
+    defer hs.deinit();
+    try hs.feed(.initial, c.hello(&buf, &status_request_ext, null, true), &sink);
+    try expectStapled(try flightFacts(&sink.inner), ocsp.testdata.leaf_good);
+    try std.testing.expectEqual(@as(?u32, 0), sink.readers_at_flight);
+}
+
+test "OCSP stapling: a malformed status_request fails the handshake" {
+    var o: OcspSetup = undefined;
+    try o.init();
+    defer o.deinit();
+    const config: Config = .{ .credentials = &o.leaf, .groups = &.{.x25519} };
+    for ([_][]const u8{
+        // Empty; a responder ID list cut short; an empty responder ID;
+        // request extensions missing; a byte left over.
+        &.{ 0, 5, 0, 0 },
+        &.{ 0, 5, 0, 3, 1, 0, 2 },
+        &.{ 0, 5, 0, 7, 1, 0, 2, 0, 0, 0, 0 },
+        &.{ 0, 5, 0, 3, 1, 0, 0 },
+        &.{ 0, 5, 0, 6, 1, 0, 0, 0, 0, 9 },
+        // Twice.
+        &status_request_ext ++ &status_request_ext,
+    }) |bad| {
+        var buf: [4096]u8 = undefined;
+        var c = RefClient(.aes_128_gcm_sha256).init();
+        const want: anyerror = if (bad.len == 2 * status_request_ext.len) error.IllegalParameter else error.DecodeError;
+        try expectHelloError(want, c.hello(&buf, bad, null, true), &config);
+    }
+}
+
+/// What the server must do with `body` as status_request's contents: fail
+/// (null), staple (true) or not (false). The parser's rules, written out
+/// again.
+fn statusRequestModel(body: []const u8) ?bool {
+    if (body.len == 0) return null;
+    if (body[0] != 1) return false;
+    var r: Reader = .{ .data = body[1..] };
+    var ids: Reader = .{ .data = r.vector(u16) catch return null };
+    while (ids.pos < ids.data.len) {
+        const id = ids.vector(u16) catch return null;
+        if (id.len == 0) return null;
+    }
+    _ = r.vector(u16) catch return null;
+    return if (r.pos == r.data.len) true else null;
+}
+
+fn fuzzStatusRequest(o: *OcspSetup, smith: *std.testing.Smith) anyerror!void {
+    var body_buf: [64]u8 = undefined;
+    const body = body_buf[0..smith.slice(&body_buf)];
+    const resumed_too = smith.boolWeighted(1, 1);
+    // psk_key_exchange_modes (for a ticket), then status_request.
+    const modes = comptime pskModes(&.{1});
+    var ext_buf: [modes.len + 4 + body_buf.len]u8 = undefined;
+    @memcpy(ext_buf[0..modes.len], modes);
+    ext_buf[modes.len..][0..4].* = .{ 0, 5, 0, @intCast(body.len) };
+    @memcpy(ext_buf[modes.len + 4 ..][0..body.len], body);
+    const extra = ext_buf[0 .. modes.len + 4 + body.len];
+    var keys = ticket.Keys.init(@splat(9));
+    keys.now = resumeTestClock;
+    var entropy: [entropy_len]u8 = undefined;
+    for (&entropy, 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+    const suite = Suite.aes_128_gcm_sha256;
+    const config = resumeConfig(&o.leaf, &keys, &.{suite});
+    var buf: [4096]u8 = undefined;
+    var c = RefClient(suite).init();
+    var hs = Handshake.init(std.testing.allocator, &config, &entropy);
+    defer hs.deinit();
+    var sink: TestSink = .{ .allocator = std.testing.allocator };
+    defer sink.deinit();
+    const hello = c.hello(&buf, extra, null, true);
+    const model = statusRequestModel(body);
+    hs.feed(.initial, hello, &sink) catch |err| {
+        try std.testing.expectEqual(@as(?bool, null), model);
+        try std.testing.expectEqual(error.DecodeError, err);
+        return;
+    };
+    try std.testing.expect(model != null);
+    try expectStapled(try flightFacts(&sink), if (model.?) ocsp.testdata.leaf_good else null);
+    const t = try c.finish(&hs, &sink, hello, 0, false);
+    if (!resumed_too) return;
+    // Resumed with the same status_request: no Certificate, no response.
+    var c2 = RefClient(suite).init();
+    var hs2 = Handshake.init(std.testing.allocator, &config, &entropy);
+    defer hs2.deinit();
+    var sink2: TestSink = .{ .allocator = std.testing.allocator };
+    defer sink2.deinit();
+    const hello2 = c2.hello(&buf, extra, &t, true);
+    try hs2.feed(.initial, hello2, &sink2);
+    try std.testing.expect(hs2.resumed);
+    try std.testing.expectEqual(@as(?[]const u8, null), (try flightFacts(&sink2)).leaf);
+    _ = try c2.finish(&hs2, &sink2, hello2, 0, true);
+}
+
+test "fuzz: ocsp status_request in ClientHello, full and resumed handshakes" {
+    var o: OcspSetup = undefined;
+    try o.init();
+    defer o.deinit();
+    ocsp_test_now = ocsp.testdata.this_update + 3600;
+    try std.testing.fuzz(&o, fuzzStatusRequest, .{ .corpus = &.{
+        &.{ 1, 0, 0, 0, 0 },
+        &.{ 1, 0, 4, 0, 2, 'i', 'd', 0, 0 },
+        &.{ 2, 0, 0 },
+        &.{1},
+        "",
+    } });
+}
+
+// -- Adversarial verification (OCSP) ----------------------------------------
+
+test "verify OCSP: ClientHello2 with a different status_request than ClientHello1 fails" {
+    var o: OcspSetup = undefined;
+    try o.init();
+    defer o.deinit();
+    ocsp_test_now = ocsp.testdata.this_update + 3600;
+    var keys = ticket.Keys.init(@splat(9));
+    keys.now = resumeTestClock;
+    var entropy: [entropy_len]u8 = undefined;
+    for (&entropy, 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+    const suite = Suite.aes_128_gcm_sha256;
+    const config = resumeConfig(&o.leaf, &keys, &.{suite});
+    const other_ids = [_]u8{ 0, 5, 0, 9, 1, 0, 4, 0, 2, 'i', 'd', 0, 0 };
+    for ([_][]const u8{ &other_ids, &.{ 0, 5, 0, 3, 2, 0, 0 } }) |ch2_ext| {
+        var c = RefClient(suite).init();
+        var hs = Handshake.init(std.testing.allocator, &config, &entropy);
+        defer hs.deinit();
+        var sink: TestSink = .{ .allocator = std.testing.allocator };
+        defer sink.deinit();
+        var buf1: [4096]u8 = undefined;
+        var buf: [4096]u8 = undefined;
+        const ch1 = c.hello(&buf1, &status_request_ext, null, false);
+        try hs.feed(.initial, ch1, &sink);
+        try std.testing.expect(hs.isRetrying());
+        c.retried(ch1, sink.events.items[0].data.bytes);
+        try std.testing.expectError(error.IllegalParameter, hs.feed(.initial, c.hello(&buf, ch2_ext, null, true), &sink));
+    }
+}
+
+test "verify OCSP: the largest response check passes is stapled whole" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var o: OcspSetup = undefined;
+    try o.init();
+    defer o.deinit();
+    ocsp_test_now = ocsp.testdata.this_update + 3600;
+    var entropy: [entropy_len]u8 = undefined;
+    for (&entropy, 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+    const config: Config = .{ .credentials = &o.leaf, .groups = &.{.x25519} };
+    // 0xffff - 8 fits exactly; above that check must refuse it, or the
+    // handshake must still produce a well-formed Certificate.
+    for ([_]usize{ 0xffff - 8, ocsp.max_response_len }) |size| {
+        const big = try ocsp.craft.padded(arena.allocator(), ocsp.testdata.leaf_good, size);
+        const checked = ocsp.check(big, o.leaf.chain, ocsp_test_now) catch |err| {
+            try std.testing.expectEqual(error.TooLarge, err);
+            continue;
+        };
+        try o.leaf_staple.set(big, checked.expires);
+        var buf: [4096]u8 = undefined;
+        var c = RefClient(.aes_128_gcm_sha256).init();
+        var hs = Handshake.init(std.testing.allocator, &config, &entropy);
+        defer hs.deinit();
+        var sink: TestSink = .{ .allocator = std.testing.allocator };
+        defer sink.deinit();
+        const hello = c.hello(&buf, &status_request_ext, null, true);
+        try hs.feed(.initial, hello, &sink);
+        const facts = try flightFacts(&sink);
+        try std.testing.expectEqual(ocsp.entryLen(size), facts.leaf_exts.len);
+        try std.testing.expectEqualSlices(u8, big, facts.leaf_exts[8..]);
     }
 }

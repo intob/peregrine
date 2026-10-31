@@ -5464,6 +5464,9 @@ const TlsAlpnClient = struct {
     rx_secret: ks.Secret = undefined,
     /// KeyUpdates received from the server.
     key_updates: usize = 0,
+    /// The extensions of the server's leaf CertificateEntry.
+    leaf_extensions: [2048]u8 = undefined,
+    leaf_extensions_len: usize = 0,
 
     const Keys = struct {
         key: [Aes.key_length]u8,
@@ -5510,6 +5513,20 @@ const TlsAlpnClient = struct {
 
     /// Connects and runs the handshake, offering `alpn` if given.
     fn connect(port: u16, alpn: ?[]const u8) !*TlsAlpnClient {
+        return connectWith(port, .{ .alpn = alpn });
+    }
+
+    const Options = struct {
+        alpn: ?[]const u8 = null,
+        /// SNI.
+        host: []const u8 = "localhost",
+        /// Asks for an OCSP response (status_request); the leaf's
+        /// CertificateEntry extensions end up in `leaf_extensions`.
+        status_request: bool = false,
+    };
+
+    fn connectWith(port: u16, opts: Options) !*TlsAlpnClient {
+        const alpn = opts.alpn;
         const self = try testing.allocator.create(TlsAlpnClient);
         errdefer testing.allocator.destroy(self);
         self.* = .{ .tcp = try Client.connect(port) };
@@ -5520,16 +5537,22 @@ const TlsAlpnClient = struct {
         var transcript: std.crypto.hash.sha2.Sha256 = .init(.{});
 
         // ClientHello: TLS 1.3, AES-128-GCM, X25519, ECDSA P-256 (the
-        // test certificate) and RSA-PSS signatures, SNI, ALPN.
+        // test certificate) and RSA-PSS signatures, SNI, ALPN,
+        // status_request.
         var hello: [512]u8 = undefined;
         var w: std.Io.Writer = .fixed(hello[5..]);
-        const exts_len: usize = 7 + 18 + 8 + 10 + 42 + if (alpn) |p| 7 + p.len else 0;
+        const exts_len: usize = 7 + 9 + opts.host.len + 8 + 10 + 42 + (if (alpn) |p| 7 + p.len else 0) + @as(usize, if (opts.status_request) 9 else 0);
         try w.writeAll(&.{ 1, 0, 0, 0, 3, 3 });
         try w.writeAll(&@as([32]u8, @splat(7)));
         try w.writeAll(&.{ 0, 0, 2, 0x13, 0x01, 1, 0 });
         try w.writeInt(u16, @intCast(exts_len), .big);
         try w.writeAll(&.{ 0, 43, 0, 3, 2, 3, 4 }); // supported_versions
-        try w.writeAll(&[_]u8{ 0, 0, 0, 14, 0, 12, 0, 0, 9 } ++ "localhost"); // server_name
+        try w.writeAll(&.{ 0, 0 }); // server_name
+        try w.writeInt(u16, @intCast(opts.host.len + 5), .big);
+        try w.writeInt(u16, @intCast(opts.host.len + 3), .big);
+        try w.writeByte(0);
+        try w.writeInt(u16, @intCast(opts.host.len), .big);
+        try w.writeAll(opts.host);
         try w.writeAll(&.{ 0, 10, 0, 4, 0, 2, 0, 0x1d }); // supported_groups
         try w.writeAll(&.{ 0, 13, 0, 6, 0, 4, 4, 3, 8, 4 }); // signature_algorithms
         try w.writeAll(&.{ 0, 51, 0, 38, 0, 36, 0, 0x1d, 0, 32 }); // key_share
@@ -5541,6 +5564,7 @@ const TlsAlpnClient = struct {
             try w.writeByte(@intCast(p.len));
             try w.writeAll(p);
         }
+        if (opts.status_request) try w.writeAll(&.{ 0, 5, 0, 5, 1, 0, 0, 0, 0 });
         const msg = w.buffered();
         std.mem.writeInt(u24, msg[1..4], @intCast(msg.len - 4), .big);
         std.debug.assert(msg.len - 4 == 43 + exts_len);
@@ -5586,6 +5610,7 @@ const TlsAlpnClient = struct {
                         if (m.len < 4 + len) break;
                         used += 4 + len;
                         if (m[0] == 8) self.readAlpn(m[4..][0..len]);
+                        if (m[0] == 11) try self.readLeafExtensions(m[4..][0..len]);
                         if (m[0] != 20) {
                             transcript.update(m[0 .. 4 + len]);
                             continue;
@@ -5630,6 +5655,20 @@ const TlsAlpnClient = struct {
             }
             i += 4 + len;
         }
+    }
+
+    fn readLeafExtensions(self: *TlsAlpnClient, cert: []const u8) !void {
+        // certificate_request_context (empty), the list's length, the
+        // leaf, its extensions.
+        if (cert.len < 4 or cert[0] != 0) return error.BadCertificate;
+        var i: usize = 4;
+        if (cert.len < i + 3) return error.BadCertificate;
+        i += 3 + std.mem.readInt(u24, cert[i..][0..3], .big);
+        if (cert.len < i + 2) return error.BadCertificate;
+        const n = std.mem.readInt(u16, cert[i..][0..2], .big);
+        if (cert.len < i + 2 + n or n > self.leaf_extensions.len) return error.BadCertificate;
+        @memcpy(self.leaf_extensions[0..n], cert[i + 2 ..][0..n]);
+        self.leaf_extensions_len = n;
     }
 
     fn close(self: *TlsAlpnClient) void {
@@ -5857,6 +5896,111 @@ fn testH2TlsRequestsFin(backend: Backend) !void {
         try testing.expectEqual(@as(u16, 200), x.status);
         try testing.expectEqualSlices(u8, &body, x.body.items);
     }
+}
+
+test "tls: OCSP stapling over HTTP/1.1, h2 and h3 (SNI certificates too), reloaded when the file changes" {
+    try forEachBackend(testTlsOcsp);
+}
+
+fn testTlsOcsp(backend: Backend) !void {
+    const ocsp = @import("./tls/ocsp.zig");
+    const otd = ocsp.testdata;
+    const saved_level = testing.log_level;
+    testing.log_level = .err; // the file that isn't for the certificate
+    defer testing.log_level = saved_level;
+    var dir: TestDir = undefined;
+    dir.init();
+    defer dir.deinit();
+    try dir.write("leaf.der", otd.leaf_good);
+    try dir.write("sni.der", otd.sni_good);
+    var b1: [192]u8 = undefined;
+    var b2: [192]u8 = undefined;
+    var cfg: Config = .{ .tls = .{
+        .cert_pem = otd.leaf_chain,
+        .key_pem = otd.leaf_key,
+        .ocsp_response_path = dir.file(&b1, "leaf.der"),
+        .ocsp_reload_interval_s = 1,
+        .alpn = &.{ "h2", "http/1.1" },
+        .certificates = &.{.{ .cert_pem = otd.sni_chain, .key_pem = otd.sni_key, .ocsp_response_path = dir.file(&b2, "sni.der") }},
+    } };
+    cfg.http3 = .{};
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+
+    const Expect = struct {
+        fn tcp(port: u16, opts: TlsAlpnClient.Options, response: ?[]const u8) !void {
+            const c = try TlsAlpnClient.connectWith(port, opts);
+            defer c.close();
+            var buf: [4096]u8 = undefined;
+            const want = if (response) |res| ocsp.writeEntryExtensions(&buf, res) else "";
+            try testing.expectEqualSlices(u8, want, c.leaf_extensions[0..c.leaf_extensions_len]);
+            if (opts.alpn != null and std.mem.eql(u8, opts.alpn.?, "h2")) {
+                try testing.expectEqualStrings("h2", c.alpn[0..c.alpn_len]);
+                // The connection preface and SETTINGS: the server's
+                // SETTINGS come back.
+                try c.send("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" ++ [_]u8{ 0, 0, 0, 4, 0, 0, 0, 0, 0 });
+                var head: [9]u8 = undefined;
+                try c.readExact(&head);
+                try testing.expectEqual(@as(u8, 4), head[3]);
+            } else {
+                try c.send("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+                const got = try c.readUntil(&buf, "\r\n\r\n");
+                try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+            }
+        }
+
+        fn h3(port: u16, server_name: ?[]const u8, status_request: bool, response: ?[]const u8) !void {
+            var c = try H3Client.connectOpts(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } }, .{ .server_name = server_name, .status_request = status_request });
+            defer c.close();
+            try c.start();
+            var buf: [4096]u8 = undefined;
+            const want = if (response) |res| ocsp.writeEntryExtensions(&buf, res) else "";
+            try testing.expectEqualSlices(u8, want, c.c.leaf_extensions.?);
+            const id = try c.request("GET", "/", "");
+            try c.waitFinished(&.{id});
+            var resp = try c.response(id);
+            defer resp.body.deinit(testing.allocator);
+            try testing.expectEqualStrings("200", &resp.status);
+        }
+
+        /// Until a new connection gets `response` (the file was reread).
+        fn eventually(port: u16, response: []const u8) !void {
+            var buf: [4096]u8 = undefined;
+            const want = ocsp.writeEntryExtensions(&buf, response);
+            const began = sys.nanoTimestamp();
+            while (true) {
+                const c = try TlsAlpnClient.connectWith(port, .{ .status_request = true });
+                defer c.close();
+                if (std.mem.eql(u8, want, c.leaf_extensions[0..c.leaf_extensions_len])) return;
+                if (sys.nanoTimestamp() - began > 10 * std.time.ns_per_s) return error.Timeout;
+                sleepMs(100);
+            }
+        }
+    };
+    const port = r.port;
+    const quic_port = r.srv.getQuicPort();
+    // HTTP/1.1 and h2, asked for or not, by SNI too.
+    try Expect.tcp(port, .{ .status_request = true }, otd.leaf_good);
+    try Expect.tcp(port, .{ .status_request = true, .alpn = "http/1.1" }, otd.leaf_good);
+    try Expect.tcp(port, .{ .status_request = true, .alpn = "h2" }, otd.leaf_good);
+    try Expect.tcp(port, .{ .alpn = "h2" }, null);
+    try Expect.tcp(port, .{}, null);
+    try Expect.tcp(port, .{ .status_request = true, .host = "ocsp.example", .alpn = "h2" }, otd.sni_good);
+    try Expect.tcp(port, .{ .host = "ocsp.example" }, null);
+    // HTTP/3.
+    try Expect.h3(quic_port, null, true, otd.leaf_good);
+    try Expect.h3(quic_port, "ocsp.example", true, otd.sni_good);
+    try Expect.h3(quic_port, null, false, null);
+    // A new response is picked up; one that isn't for the certificate
+    // is skipped and the last good one stays.
+    try dir.write("leaf.der", otd.both_good);
+    try Expect.eventually(port, otd.both_good);
+    try Expect.h3(quic_port, null, true, otd.both_good);
+    try dir.write("leaf.der", otd.sni_good);
+    sleepMs(2500);
+    try Expect.tcp(port, .{ .status_request = true }, otd.both_good);
+    try dir.write("leaf.der", otd.leaf_good_ca384);
+    try Expect.eventually(port, otd.leaf_good_ca384);
 }
 
 test "tls: keep-alive, pipelining, large responses and close_notify" {
@@ -7393,6 +7537,12 @@ const H3Client = struct {
 
     /// With the client's max_udp_payload_size transport parameter.
     fn connectWith(address: std.Io.net.IpAddress, max_udp_payload_size: ?u64) !H3Client {
+        return connectOpts(address, .{ .max_udp_payload_size = max_udp_payload_size });
+    }
+
+    /// With the client's max_udp_payload_size transport parameter, SNI
+    /// and status_request.
+    fn connectOpts(address: std.Io.net.IpAddress, o: struct { max_udp_payload_size: ?u64 = null, server_name: ?[]const u8 = null, status_request: bool = false }) !H3Client {
         const nonblock: u32 = if (sys.is_linux) std.os.linux.SOCK.NONBLOCK else 0;
         const family: u32 = if (address == .ip6) posix.AF.INET6 else posix.AF.INET;
         const rc = system.socket(family, posix.SOCK.DGRAM | nonblock, posix.IPPROTO.UDP);
@@ -7405,7 +7555,14 @@ const H3Client = struct {
         sys.setsockoptInt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, 8 << 20) catch {};
         var dcid: [8]u8 = undefined;
         sys.randomBytes(&dcid);
-        const c = try quic_test_client.Client.init(testing.allocator, .{ .dcid = dcid, .max_stream_data = 16 << 20, .max_data = 64 << 20, .max_udp_payload_size = max_udp_payload_size });
+        const c = try quic_test_client.Client.init(testing.allocator, .{
+            .dcid = dcid,
+            .max_stream_data = 16 << 20,
+            .max_data = 64 << 20,
+            .max_udp_payload_size = o.max_udp_payload_size,
+            .server_name = o.server_name,
+            .status_request = o.status_request,
+        });
         errdefer c.deinit();
         return .{ .fd = fd, .c = c, .batch = try testing.allocator.create(quic_udp.RecvBatch(8, 65536)) };
     }
@@ -8091,4 +8248,111 @@ fn testHeldHeadBehindBlocked(backend: Backend) !void {
         };
     }
     try testing.expectEqual(@as(u16, 202), later.status);
+}
+
+// -- Adversarial verification (OCSP) ----------------------------------------
+
+const TestDir = @import("./ocsp_watcher.zig").TestDir;
+
+test "verify: OCSP: handshakes while the file is replaced and reread nonstop staple only whole good responses" {
+    try forEachBackend(testOcspStress);
+}
+
+fn testOcspStress(backend: Backend) !void {
+    const ocsp = @import("./tls/ocsp.zig");
+    const otd = ocsp.testdata;
+    const saved_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = saved_level;
+    var dir: TestDir = undefined;
+    dir.init();
+    defer dir.deinit();
+    try dir.write("leaf.der", otd.leaf_good);
+    var b1: [192]u8 = undefined;
+    const path = dir.file(&b1, "leaf.der");
+    const r = try Running.start(backend, .{
+        .tls = .{
+            .cert_pem = otd.leaf_chain,
+            .key_pem = otd.leaf_key,
+            .ocsp_response_path = path,
+            // No thread: this test rereads the file, as fast as it can.
+            .ocsp_reload_interval_s = 0,
+            .alpn = &.{ "h2", "http/1.1" },
+        },
+    });
+    defer r.stop();
+    const goods = [_][]const u8{ otd.leaf_good, otd.leaf_good_ca384, otd.both_good };
+    const Shared = struct {
+        stop: std.atomic.Value(bool) = .init(false),
+        bad: std.atomic.Value(u32) = .init(0),
+        none: std.atomic.Value(u32) = .init(0),
+        ok: std.atomic.Value(u32) = .init(0),
+        errors: std.atomic.Value(u32) = .init(0),
+        port: u16,
+        dir: *const TestDir,
+        path: []const u8,
+
+        fn client(s: *@This()) void {
+            var wants: [3][1024]u8 = undefined;
+            var want_slices: [3][]const u8 = undefined;
+            for (goods, 0..) |g, i| want_slices[i] = ocsp.writeEntryExtensions(&wants[i], g);
+            while (!s.stop.load(.acquire)) {
+                const c = TlsAlpnClient.connectWith(s.port, .{ .status_request = true }) catch {
+                    _ = s.errors.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                defer c.close();
+                const got = c.leaf_extensions[0..c.leaf_extensions_len];
+                if (got.len == 0) {
+                    _ = s.none.fetchAdd(1, .monotonic);
+                    continue;
+                }
+                for (want_slices) |w| {
+                    if (std.mem.eql(u8, w, got)) {
+                        _ = s.ok.fetchAdd(1, .monotonic);
+                        break;
+                    }
+                } else _ = s.bad.fetchAdd(1, .monotonic);
+            }
+        }
+
+        /// Replaces the file nonstop: good responses, revoked, garbage,
+        /// truncated, by rename and in place.
+        fn writer(s: *@This()) void {
+            var k: usize = 0;
+            while (!s.stop.load(.acquire)) : (k += 1) {
+                const data: []const u8 = switch (k % 7) {
+                    0 => otd.leaf_good,
+                    // (A revocation would stop stapling: not here.)
+                    1 => otd.leaf_good_noeku,
+                    2 => otd.leaf_good_ca384,
+                    3 => otd.leaf_good[0..300],
+                    4 => otd.both_good,
+                    5 => "garbage",
+                    else => otd.sni_good,
+                };
+                if (k % 2 == 0) {
+                    s.dir.write("leaf.der", data) catch {};
+                } else {
+                    std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = s.path, .data = data }) catch {};
+                }
+            }
+        }
+    };
+    var sh: Shared = .{ .port = r.port, .dir = &dir, .path = path };
+    var clients: [4]std.Thread = undefined;
+    for (&clients) |*t| t.* = try std.Thread.spawn(.{}, Shared.client, .{&sh});
+    const wt = try std.Thread.spawn(.{}, Shared.writer, .{&sh});
+    const w = r.srv.tls_ocsp.?;
+    const began = sys.nanoTimestamp();
+    var rounds: usize = 0;
+    while (sys.nanoTimestamp() - began < 4 * std.time.ns_per_s) : (rounds += 1) w.checkAll();
+    sh.stop.store(true, .release);
+    wt.join();
+    for (clients) |t| t.join();
+    std.debug.print("ocsp stress ({t}): {d} rereads, {d} stapled, {d} without, {d} wrong, {d} connect errors\n", .{ backend, rounds, sh.ok.load(.monotonic), sh.none.load(.monotonic), sh.bad.load(.monotonic), sh.errors.load(.monotonic) });
+    try testing.expectEqual(@as(u32, 0), sh.bad.load(.monotonic));
+    // The last good response is kept until it expires: never none.
+    try testing.expectEqual(@as(u32, 0), sh.none.load(.monotonic));
+    try testing.expect(sh.ok.load(.monotonic) > 100);
 }

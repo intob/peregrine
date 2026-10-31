@@ -7,6 +7,7 @@ const EcdsaP384Sha384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 const Ed25519 = std.crypto.sign.Ed25519;
 const p256 = @import("./p256.zig");
 const rsa = @import("./rsa.zig");
+const ocsp = @import("./ocsp.zig");
 
 pub const max_signature_len = @max(EcdsaP384Sha384.Signature.der_encoded_length_max, rsa.max_len);
 pub const noise_len = EcdsaP384Sha384.noise_length;
@@ -83,6 +84,9 @@ pub const Credentials = struct {
     key: PrivateKey,
     /// The leaf, parsed (points into `chain`): its names, for SNI.
     leaf: Certificate.Parsed,
+    /// The leaf's OCSP response, stapled for clients that ask (owned by
+    /// whoever loads it: see `src/ocsp_watcher.zig`).
+    ocsp: ?*ocsp.Staple = null,
 
     /// Loads a PEM certificate chain (leaf first) and a PEM private key
     /// (PKCS#8 "PRIVATE KEY", or SEC1 "EC PRIVATE KEY"). Checks that the key

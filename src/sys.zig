@@ -273,6 +273,22 @@ pub fn close(fd: fd_t) void {
     _ = system.close(fd);
 }
 
+/// Opens a file for reading without blocking: a FIFO with no writer would
+/// block a plain open forever (check what was opened before reading).
+pub fn openReadNonBlocking(path: [*:0]const u8) error{ FileNotFound, AccessDenied, Unexpected }!fd_t {
+    const flags: posix.O = .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true, .NOCTTY = true };
+    while (true) {
+        const rc = if (is_linux) linux.open(path, flags, 0) else std.c.open(path, flags, @as(posix.mode_t, 0));
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .NOENT, .NOTDIR, .LOOP, .NAMETOOLONG => return error.FileNotFound,
+            .ACCES, .PERM => return error.AccessDenied,
+            else => |e| return unexpected(e),
+        }
+    }
+}
+
 /// Half-close: send FIN after any queued output.
 pub fn shutdownWrite(fd: fd_t) void {
     _ = system.shutdown(fd, posix.SHUT.WR);
