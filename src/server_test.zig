@@ -273,6 +273,13 @@ const TestHandler = struct {
                 }.run, .{ self, conn, @as(u8, @intCast(t)) }) catch unreachable;
                 th.detach();
             }
+        } else if (std.mem.eql(u8, data, "alt")) {
+            // Two threads alternating tiny and huge messages (see altLen)
+            // until done or the connection closes.
+            for (0..2) |t| {
+                const th = std.Thread.spawn(.{}, altRun, .{ self, conn, @as(u8, @intCast(t)) }) catch unreachable;
+                th.detach();
+            }
         } else if (std.mem.eql(u8, data, "async")) {
             // Sends from another thread must wake the owning worker.
             const t = std.Thread.spawn(.{}, struct {
@@ -1435,6 +1442,134 @@ fn wsQueueTraffic(p: *WsPeer, h: *TestHandler, deflate: bool, big: []const u8, b
     try p.send(.text, "again");
     const m = try p.read(buf, pool, &inflated);
     try testing.expectEqualStrings("again", m.data);
+}
+
+/// "alt": message `k` of thread `t`: 5 bytes, then a frame of exactly the
+/// largest pooled size (thread 0) or one byte more (thread 1), in turn.
+const alt_count = 5;
+fn altLen(t: u8, k: u8) usize {
+    if (k % 2 == 0) return 5;
+    const max = @import("./http/session.zig").WsQueues.max_size;
+    return max - 10 + @as(usize, t);
+}
+
+fn altFill(m: []u8, t: u8, k: u8) void {
+    m[0] = t;
+    m[1] = k;
+    @memset(m[2..], 'a' + 2 * t + k);
+    // Not all one byte: something for DEFLATE to do.
+    var i: usize = 2;
+    while (i < m.len) : (i += 4093) m[i] = @truncate(i);
+}
+
+fn altRun(h: *TestHandler, c: *ws.Conn, t: u8) void {
+    defer _ = h.threads_done.fetchAdd(1, .release);
+    const msg = std.heap.page_allocator.alloc(u8, altLen(1, 1)) catch unreachable;
+    defer std.heap.page_allocator.free(msg);
+    var k: u8 = 0;
+    while (k < alt_count) {
+        const m = msg[0..altLen(t, k)];
+        altFill(m, t, k);
+        c.send(m, true) catch |err| switch (err) {
+            error.SendQueueFull => {
+                sleepMs(1);
+                continue;
+            },
+            error.Closed => return,
+            else => {
+                h.thread_send_failed.store(true, .monotonic);
+                return;
+            },
+        };
+        k += 1;
+    }
+}
+
+test "verify websocket: two threads alternating 5 B and 32 MiB (+1) messages, read whole or cut by the client's close; the queues go back (plain, TLS, permessage-deflate)" {
+    try forEachBackend(testWsAlternating);
+}
+
+fn testWsAlternating(backend: Backend) !void {
+    const buf = try testing.allocator.alloc(u8, altLen(1, 1) + 64);
+    defer testing.allocator.free(buf);
+    const want = try testing.allocator.alloc(u8, altLen(1, 1));
+    defer testing.allocator.free(want);
+    var pool = try BufferPool.init(testing.allocator, 1024, 1);
+    defer pool.deinit();
+    var inflated: ws.inflate.Out = .{ .buf = &.{}, .max = 64 << 20, .pool = &pool };
+    defer if (inflated.buf.len > 0) pool.releaseLarge(inflated.buf);
+    const cases = [_]struct { tls: bool, deflate: bool }{
+        .{ .tls = false, .deflate = false },
+        .{ .tls = false, .deflate = true },
+        .{ .tls = true, .deflate = false },
+    };
+    for (cases) |cs| {
+        errdefer std.debug.print("{s} {s}{s}\n", .{ @tagName(backend), if (cs.tls) "tls" else "plain", if (cs.deflate) " deflate" else "" });
+        var live: LiveAllocator = .{};
+        var cfg: Config = if (cs.tls) tlsConfig() else .{};
+        cfg.worker_thread_count = 1;
+        if (cs.deflate) cfg.websocket_deflate = .{};
+        const r = try Running.startWith(backend, cfg, live.allocator());
+        defer r.stop();
+        const h = r.srv.handler;
+        // Once to the end; once cut short by the client's close after the
+        // first huge message it reads.
+        for ([_]bool{ false, true }, 0..) |cut, round| {
+            var p = try WsPeer.open(r.port, cs.tls, cs.deflate);
+            defer p.close();
+            const done_before = h.threads_done.load(.acquire);
+            try p.send(.text, "alt");
+            var next: [2]u8 = @splat(0);
+            var huge: usize = 0;
+            var closed = false;
+            while (true) {
+                if (!cut and next[0] == alt_count and next[1] == alt_count) break;
+                const m = try p.read(buf, &pool, &inflated);
+                if (m.op == .close) {
+                    try testing.expect(closed);
+                    try testing.expectEqualStrings("\x03\xe8", m.data);
+                    break;
+                }
+                try testing.expectEqual(ws.Opcode.binary, m.op);
+                const t = m.data[0];
+                try testing.expect(t < 2);
+                const k = next[t];
+                try testing.expectEqual(k, m.data[1]);
+                const w = want[0..altLen(t, k)];
+                altFill(w, t, k);
+                if (!std.mem.eql(u8, w, m.data)) return error.AltCorrupt;
+                next[t] += 1;
+                if (k % 2 == 1) huge += 1;
+                if (cut and !closed and huge == 1) {
+                    try p.send(.close, "\x03\xe8");
+                    closed = true;
+                }
+            }
+            var tries: u32 = 0;
+            while (h.threads_done.load(.acquire) < done_before + 2) : (tries += 1) {
+                if (tries == 1000) return error.ThreadsNotDone;
+                sleepMs(20);
+            }
+            try testing.expect(!h.thread_send_failed.load(.monotonic));
+            if (round == 0) {
+                try p.send(.close, "\x03\xe8");
+                const m = try p.read(buf, &pool, &inflated);
+                try testing.expectEqual(ws.Opcode.close, m.op);
+            }
+        }
+        var tries: u32 = 0;
+        while (h.ws_disconns.load(.monotonic) < 2) : (tries += 1) {
+            if (tries == 250) return error.NotClosed;
+            sleepMs(20);
+        }
+        // Every queue buffer goes back within a few ticks.
+        tries = 0;
+        while (workersWsHeld(r.srv) > 0) : (tries += 1) {
+            if (tries == 60) return error.SendQueuesKept;
+            sleepMs(100);
+        }
+        h.threads_done.store(0, .release);
+    }
 }
 
 /// "from-threads": message `k` of thread `t`.
