@@ -68,6 +68,8 @@ const TestHandler = struct {
     echoes_refused: std.atomic.Value(usize) = .init(0),
     /// "pour" senders, by connection (see Pour).
     pours: std.AutoHashMapUnmanaged(*ws.Conn, *Pour) = .empty,
+    /// "alt" senders, by connection, joined by handleWSDisconn.
+    alts: std.AutoHashMapUnmanaged(*ws.Conn, [2]std.Thread) = .empty,
 
     const Upload = struct {
         len: u64 = 0,
@@ -87,6 +89,8 @@ const TestHandler = struct {
         std.debug.assert(self.pours.count() == 0);
         self.storms.deinit(self.allocator);
         self.pours.deinit(self.allocator);
+        std.debug.assert(self.alts.count() == 0);
+        self.alts.deinit(self.allocator);
         self.uploads.deinit(self.allocator);
         self.allocator.destroy(self);
     }
@@ -160,7 +164,9 @@ const TestHandler = struct {
         self.storm_mutex.lock();
         const st = if (self.storms.fetchRemove(conn)) |kv| kv.value else null;
         const pour = if (self.pours.fetchRemove(conn)) |kv| kv.value else null;
+        const alt = if (self.alts.fetchRemove(conn)) |kv| kv.value else null;
         self.storm_mutex.unlock();
+        if (alt) |ts| for (ts) |t| t.join();
         if (pour) |po| {
             po.stop.store(true, .release);
             po.thread.join();
@@ -276,10 +282,12 @@ const TestHandler = struct {
         } else if (std.mem.eql(u8, data, "alt")) {
             // Two threads alternating tiny and huge messages (see altLen)
             // until done or the connection closes.
-            for (0..2) |t| {
-                const th = std.Thread.spawn(.{}, altRun, .{ self, conn, @as(u8, @intCast(t)) }) catch unreachable;
-                th.detach();
-            }
+            // Joined by handleWSDisconn: they stop at our close frame.
+            var ts: [2]std.Thread = undefined;
+            for (&ts, 0..) |*th, t| th.* = std.Thread.spawn(.{}, altRun, .{ self, conn, @as(u8, @intCast(t)) }) catch unreachable;
+            self.storm_mutex.lock();
+            self.alts.put(self.allocator, conn, ts) catch unreachable;
+            self.storm_mutex.unlock();
         } else if (std.mem.eql(u8, data, "async")) {
             // Sends from another thread must wake the owning worker.
             const t = std.Thread.spawn(.{}, struct {
