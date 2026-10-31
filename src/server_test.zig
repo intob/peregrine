@@ -220,6 +220,15 @@ const TestHandler = struct {
             self.storm_mutex.lock();
             self.pours.put(self.allocator, conn, po) catch unreachable;
             self.storm_mutex.unlock();
+        } else if (std.mem.eql(u8, data, "mailbox-overflow")) {
+            // As if a post had been dropped: the worker's next drain sweeps
+            // every connection.
+            conn.mailbox.mutex.lock();
+            conn.mailbox.overflowed = true;
+            conn.mailbox.mutex.unlock();
+        } else if (std.mem.eql(u8, data, "mailbox-pending")) {
+            var b: [20]u8 = undefined;
+            conn.send(std.fmt.bufPrint(&b, "{d}", .{conn.mailbox.pending()}) catch unreachable, false) catch unreachable;
         } else if (std.mem.eql(u8, data, "close-me")) {
             conn.close(1000, "bye") catch unreachable;
         } else if (std.mem.eql(u8, data, "async-big")) {
@@ -2374,6 +2383,63 @@ fn testWsSplitBehindStall(backend: Backend) !void {
             try testing.expect(floods * 16 * 1024 >= 4 * 1024 * 1024 - 16 * 1024);
         }
     }
+}
+
+test "websocket: after the mailbox overflows, each connection fed from another thread has one entry again" {
+    try forEachBackend(testWsOverflowSweep);
+}
+
+fn testWsOverflowSweep(backend: Backend) !void {
+    // The overflow sweep serves every connection while their entries are
+    // still queued; each then posted again, and both entries, each served
+    // and posted again, stayed: two turns a pass.
+    const conns = 8;
+    var cfg: Config = .{};
+    cfg.worker_thread_count = 1;
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    var readers: [conns]PourReader = undefined;
+    var started: usize = 0;
+    defer for (readers[0..started]) |*pr| {
+        pr.stop.store(true, .release);
+        _ = std.posix.system.shutdown(pr.c.fd, std.posix.SHUT.RDWR);
+        pr.thread.join();
+        pr.c.close();
+    };
+    for (&readers) |*pr| {
+        pr.* = .{ .c = try Client.connect(r.port) };
+        try pr.c.send(Client.upgrade_request);
+        try pr.c.readUpgrade();
+        try pr.c.wsSend(true, .text, "pour");
+        pr.thread = try std.Thread.spawn(.{}, PourReader.run, .{pr});
+        started += 1;
+    }
+    var probe = try Client.connect(r.port);
+    defer probe.close();
+    try probe.send(Client.upgrade_request);
+    try probe.readUpgrade();
+    var payload: [64]u8 = undefined;
+    // The entries queued as a pass begins: one a connection.
+    const most = struct {
+        fn get(c: *Client, buf: []u8) !usize {
+            var m: usize = 0;
+            for (0..20) |_| {
+                try c.wsSend(true, .text, "mailbox-pending");
+                const f = try c.wsRead(buf);
+                m = @max(m, try std.fmt.parseInt(usize, f.payload, 10));
+                sleepMs(10);
+            }
+            return m;
+        }
+    }.get;
+    sleepMs(200);
+    const before = try most(&probe, &payload);
+    try probe.wsSend(true, .text, "mailbox-overflow");
+    sleepMs(200);
+    const after = try most(&probe, &payload);
+    std.debug.print("{s}: at most {d} entries queued for {d} fed connections, {d} after an overflow\n", .{ @tagName(backend), before, conns, after });
+    try testing.expect(before <= conns + 1);
+    try testing.expect(after <= conns + 1);
 }
 
 test "websocket: protocol violations fail with the right close code" {

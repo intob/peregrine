@@ -109,6 +109,8 @@ pub fn Worker(comptime Handler: type) type {
             /// not ready); reading pauses until it drains (backpressure).
             /// Not when a turn ended with output left: input is read then.
             ws_blocked: bool = false,
+            /// WebSocket: the drainMailbox pass that last served its post.
+            ws_served: u32 = 0,
             /// Draining input after an error response (see Session.linger).
             lingering: bool = false,
             lingered: u32 = 0,
@@ -209,6 +211,9 @@ pub fn Worker(comptime Handler: type) type {
         /// upgrade (`wsTurn`).
         ws_out: usize = 0,
         ws_in: usize = 0,
+        /// Passes of drainMailbox: a connection served in this one is
+        /// skipped if it comes up again (`Conn.ws_served`).
+        drain_pass: u32 = 0,
         /// Connections speaking HTTP/2 (their streams are ticked once a second).
         h2_count: usize = 0,
         thread: ?std.Thread = null,
@@ -1804,6 +1809,7 @@ pub fn Worker(comptime Handler: type) type {
             // short batch, a storm of sends on 65 connections kept the
             // worker here, its other connections and timers waiting.
             var left = self.mailbox.pending();
+            self.drain_pass +%= 1;
             while (left > 0) {
                 const n = self.mailbox.drain(entries[0..@min(left, entries.len)]);
                 if (n == 0) break;
@@ -1811,7 +1817,15 @@ pub fn Worker(comptime Handler: type) type {
                 for (entries[0..n]) |e| switch (e.kind) {
                     .ws => {
                         const c = &self.conns[e.slot];
-                        if (c.open and (c.gen & 0x7fffffff) == e.gen) self.wsFlushPosted(c);
+                        // One connection has one entry at a time; a second in
+                        // one pass is left by the overflow sweep (which
+                        // serves every connection while their entries are
+                        // still queued), and serving both, each reposting,
+                        // kept the pair, two turns a pass.
+                        if (c.open and (c.gen & 0x7fffffff) == e.gen and c.ws_served != self.drain_pass) {
+                            c.ws_served = self.drain_pass;
+                            self.wsFlushPosted(c);
+                        }
                     },
                     .exchange => self.exchangePosted(e.slot, e.gen),
                 };
