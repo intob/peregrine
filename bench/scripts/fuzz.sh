@@ -9,8 +9,11 @@
 source "$(dirname "$0")/env.sh"
 T=$1; MIN=${2:-15}; JOBS=${3:-2}; HOST=${4:-local}
 name=$(echo "$T" | tr -c 'a-zA-Z0-9\n' '-')
-run="../zig/zig build test --fuzz=200 -Doptimize=ReleaseSafe -Dtest-filter='$T' > warmup.log 2>&1;
- rm -f .zig-cache/f/crash; timeout -s INT $((MIN * 60)) ../zig/zig build test --fuzz -j$JOBS -Doptimize=ReleaseSafe -Dtest-filter='$T' > fuzz.log 2>&1;
+# The filter goes in single quotes below, each ' in it as '\'' ("fuzz: h2
+# connections sharing a worker's pool").
+q=$(printf '%s' "$T" | sed "s/'/'\\\\''/g")
+run="../zig/zig build test --fuzz=200 -Doptimize=ReleaseSafe -Dtest-filter='$q' > warmup.log 2>&1;
+ rm -f .zig-cache/f/crash; timeout -s INT $((MIN * 60)) ../zig/zig build test --fuzz -j$JOBS -Doptimize=ReleaseSafe -Dtest-filter='$q' > fuzz.log 2>&1;
  echo exit=\$? >> fuzz.log; tr '\r' '\n' < fuzz.log | grep -E 'failed with|panic|error:' | head -5; tail -1 fuzz.log;
  if [ -f .zig-cache/f/crash ]; then echo CRASH; xxd -p .zig-cache/f/crash | tr -d '\n'; echo; else echo clean; fi"
 if [ "$HOST" = local ]; then

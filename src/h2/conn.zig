@@ -4524,6 +4524,49 @@ test "priorities: an exchange waiting behind other streams doesn't time out" {
     try h.expectEvents("rst 3 internal_error\n");
 }
 
+test "priorities: an answer waiting behind other streams goes out when the read ends, unless the client resets it first" {
+    // So how much of a stream the client resets went out depends on where
+    // reads end, as it would over a socket; the fuzz targets' comparisons
+    // allow for it.
+    for ([_]bool{ false, true }) |same_read| {
+        const h = try Harness.init(.{});
+        defer h.deinit();
+        const big = try testing.allocator.alloc(u8, 100_000);
+        defer testing.allocator.free(big);
+        @memset(big, 'b');
+        h.handler.big = big;
+        try h.preface();
+        try h.settings(&.{.{ .id = .initial_window_size, .value = 1 << 20 }});
+        var frames: std.ArrayList(u8) = .empty;
+        defer frames.deinit(testing.allocator);
+        try appendGet(h, &frames, 1, "/big", "u=0");
+        try appendGet(h, &frames, 3, "/later", "u=7");
+        try h.feed(frames.items);
+        // Stream 1 waits for the connection window; 3's answer waits behind it.
+        try h.handler.exchanges.items[0].respond(.{}, "late");
+        try h.drainMailbox();
+        try h.collect();
+        h.events.clearRetainingCapacity();
+        frames.clearRetainingCapacity();
+        var buf: [frame.header_len + 8]u8 = undefined;
+        try frames.appendSlice(testing.allocator, buf[0..try frame.writePing(&buf, false, "pingpong")]);
+        const ping_len = frames.items.len;
+        try frames.appendSlice(testing.allocator, buf[0..try frame.writeRstStream(&buf, 3, .cancel)]);
+        if (same_read) {
+            try h.feed(frames.items);
+            try h.expectEvents("ping ack=true pingpong\n");
+        } else {
+            try h.feed(frames.items[0..ping_len]);
+            try h.feed(frames.items[ping_len..]);
+            // The head went out (DATA waits for the connection window), then nothing.
+            try h.expectEvents("ping ack=true pingpong\nheaders 3 end=false [:status=200] [content-length=4] [date]\n");
+        }
+        try testing.expectEqual(@as(u32, 1), h.conn.activeStreams());
+        try h.window(0, 1 << 20);
+        try expectDataRuns(h, "1");
+    }
+}
+
 // Any split of the same client bytes gives the same frames per stream.
 fn connectWs(h: *Harness, stream: u31, path: []const u8) !void {
     try h.headers(.{ .stream = stream, .end_stream = false, .fields = &.{
@@ -5104,20 +5147,17 @@ fn mergeData(lines: []const u8) ![]u8 {
 }
 
 /// Same frames per stream (DATA as runs), same handler logs and the same
-/// DATA bytes.
-fn expectSameRun(a: *Harness, b: *Harness) !void {
+/// DATA bytes. Streams the client reset (`reset`) are the exception: a
+/// response that yields to a more urgent stream waits for the next pass
+/// over every stream, which comes at the end of a read, so how much of it
+/// went out before the RST_STREAM depends on where the reads ended, as it
+/// would over a socket. Their frames and bytes in one run need only be the
+/// start of the other's.
+fn expectSameRun(a: *Harness, b: *Harness, reset: []const u32) !void {
     if (a.conn.failed or b.conn.failed) return expectSameUntilFailure(a, b);
     try testing.expectEqual(a.last, b.last);
-    try testing.expectEqual(a.per_stream.count(), b.per_stream.count());
-    var ps = a.per_stream.iterator();
-    while (ps.next()) |entry| {
-        const other = b.per_stream.get(entry.key_ptr.*) orelse return error.MissingStream;
-        const x = try mergeData(entry.value_ptr.items);
-        defer testing.allocator.free(x);
-        const y = try mergeData(other.items);
-        defer testing.allocator.free(y);
-        try testing.expectEqualStrings(x, y);
-    }
+    try expectStreamsIn(a, b, reset);
+    try expectStreamsIn(b, a, reset);
     try testing.expectEqualStrings(a.handler.log.items, b.handler.log.items);
     try testing.expectEqualStrings(a.handler.bodies.items, b.handler.bodies.items);
     try testing.expectEqualStrings(a.handler.ws_log.items, b.handler.ws_log.items);
@@ -5125,12 +5165,60 @@ fn expectSameRun(a: *Harness, b: *Harness) !void {
     defer freeDataMap(&da);
     var db = try dataByStream(b);
     defer freeDataMap(&db);
-    try testing.expectEqual(da.count(), db.count());
-    var it = da.iterator();
-    while (it.next()) |e| {
-        const other = db.get(e.key_ptr.*) orelse return error.MissingStream;
-        try testing.expectEqualSlices(u8, e.value_ptr.items, other.items);
+    try expectDataIn(&da, &db, reset);
+    try expectDataIn(&db, &da, reset);
+}
+
+/// Each of `a`'s streams in `b`, with the same frames (DATA as runs); for
+/// one in `reset`, frames that agree as far as the shorter goes, or none
+/// in one run.
+fn expectStreamsIn(a: *Harness, b: *Harness, reset: []const u32) !void {
+    var ps = a.per_stream.iterator();
+    while (ps.next()) |entry| {
+        const was_reset = std.mem.indexOfScalar(u32, reset, entry.key_ptr.*) != null;
+        const other = b.per_stream.get(entry.key_ptr.*) orelse {
+            if (was_reset) continue;
+            return error.MissingStream;
+        };
+        const x = try mergeData(entry.value_ptr.items);
+        defer testing.allocator.free(x);
+        const y = try mergeData(other.items);
+        defer testing.allocator.free(y);
+        if (was_reset) try expectLinesAgree(x, y) else try testing.expectEqualStrings(x, y);
     }
+}
+
+/// Each of `a`'s DATA in `b`, the same bytes; for a stream in `reset`,
+/// one the start of the other.
+fn expectDataIn(a: *const std.AutoHashMap(u32, std.ArrayList(u8)), b: *const std.AutoHashMap(u32, std.ArrayList(u8)), reset: []const u32) !void {
+    var it = a.iterator();
+    while (it.next()) |e| {
+        const was_reset = std.mem.indexOfScalar(u32, reset, e.key_ptr.*) != null;
+        const other = (b.get(e.key_ptr.*) orelse {
+            if (was_reset) continue;
+            return error.MissingStream;
+        }).items;
+        const mine = e.value_ptr.items;
+        const n = if (was_reset) @min(mine.len, other.len) else mine.len;
+        try testing.expectEqualSlices(u8, mine[0..n], other[0..n]);
+        if (!was_reset) try testing.expectEqual(mine.len, other.len);
+    }
+}
+
+/// The streams a client's script resets, read frame by frame by their
+/// lengths after the preface, as the server reads them.
+fn clientResets(script: []const u8) !std.ArrayList(u32) {
+    var ids: std.ArrayList(u32) = .empty;
+    errdefer ids.deinit(testing.allocator);
+    var rest = script[frame.preface.len..];
+    while (rest.len >= frame.header_len) {
+        const len = std.mem.readInt(u24, rest[0..3], .big);
+        if (rest[3] == @backingInt(frame.FrameType.rst_stream))
+            try ids.append(testing.allocator, std.mem.readInt(u32, rest[5..9], .big) & 0x7fff_ffff);
+        if (rest.len < frame.header_len + len) break;
+        rest = rest[frame.header_len + len ..];
+    }
+    return ids;
 }
 
 /// Both runs ended in a connection error. Output still queued for a
@@ -5267,7 +5355,7 @@ test "stream states: large bodies, pending responses and moving tables are split
             // The worker's tick, now and then, while streams are open.
             if (random.uintLessThan(u8, 50) == 0) h.pool.trim();
         }
-        try expectSameRun(ref, h);
+        try expectSameRun(ref, h, &.{});
         // Nothing held: every state is back, none keeps a large buffer.
         try testing.expectEqual(@as(usize, 0), h.pool.h2_streams.in_use);
         for (h.pool.h2_streams.free.slice()) |st| {
@@ -5322,7 +5410,7 @@ test "stream states: connections on one worker interleaved, sharing its pool and
             for (conns) |x| open += x.conn.activeStreams();
             try testing.expectEqual(open, owner.pool.h2_streams.in_use);
         }
-        for (conns, 0..) |c, i| try expectSameRun(if (i % 2 == 0) big_ref else small_ref, c);
+        for (conns, 0..) |c, i| try expectSameRun(if (i % 2 == 0) big_ref else small_ref, c, &.{});
     }
 }
 
@@ -5639,7 +5727,11 @@ fn sharedConversation(pick: Pick) !void {
         try testing.expectEqual(open, owner.pool.h2_streams.in_use);
     }
     for (conns) |c| try answerExchanges(c);
-    for (refs, conns) |r, c| try expectSameRun(r, c);
+    for (refs, conns, scripts) |r, c, script| {
+        var reset = try clientResets(script);
+        defer reset.deinit(a);
+        try expectSameRun(r, c, reset.items);
+    }
 }
 
 test "fuzz: h2 connections sharing a worker's pool" {
@@ -5649,6 +5741,7 @@ test "fuzz: h2 connections sharing a worker's pool" {
             "\xff\xfe\xfd\x80\x40\x20\x10\x08\x04\x02\x01\x00\x37\x91\xaa\x55\x13\x77\xc4\x02\x99\x10\x00\x01",
             // Found by the fuzzer.
             @embedFile("testdata/fuzz/shared-1.bin"),
+            @embedFile("testdata/fuzz/shared-2.bin"),
         },
     });
 }
