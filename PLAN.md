@@ -267,6 +267,10 @@ end-to-end test pipelines 8 MB + 1 MB responses to a slow reader.
       is fixed per worker (rings, pools), the rest of the RSS gap is freed memory
       SmpAllocator keeps at the burst's high-water mark. Two review rounds and two
       adversarial verifiers
+- [ ] epoll spends 7-11 µs more server CPU per new TLS connection than
+      io_uring at 1 worker (`tls-bench.sh`; resumed 56.9 vs 46.0 µs, a fifth
+      of the handshake): profile per-connection setup and teardown (accept4,
+      epoll_ctl add/del, close)
 - [ ] NUMA-local allocation
 - [ ] UDP fast path for QUIC (M6): `recvmmsg`/`sendmmsg`, `UDP_SEGMENT` (GSO) and
       `UDP_GRO`, io_uring equivalents
@@ -848,6 +852,11 @@ Later in M4:
       still allocates a handshake state and its flight per connection; the
       pooling in `tls.Pools` (FreeList, release/reinit) could move to a
       module both share
+- [ ] Faster RSA-2048 signing: the one handshake peregrine loses (about 1.1 ms
+      of server CPU against 0.67-0.75 ms for nginx and h2o, `tls-bench.sh`).
+      std.crypto.ff's generic constant-time exponentiation; OpenSSL signs in
+      about 0.55 ms on this Mac. CRT halves with a fixed 16-limb (1024-bit)
+      Montgomery multiply and square instead of std.crypto.ff
 - [ ] TLS input buffers (BufferPool) keep plaintext ClientHello records and
       in-place-decrypted application data after release, never zeroed:
       zeroing 16 KiB per release is a hot-path cost to measure first
@@ -1763,7 +1772,20 @@ connection, for every server), so compare CPU/req there.
         **Still to do: separate machines**
   - [x] `wrk` keep-alive, plus pipelined ×16 (TechEmpower plaintext style)
   - [ ] Latency percentiles at a fixed rate (`wrk2`)
-  - [ ] TLS: handshakes/s per core. Throughput over TLS: first numbers in M4
+  - [x] TLS: handshakes/s per core (`bench/scripts/tls-bench.sh`, client
+        `bench/tls_load.zig`; results below). Throughput over TLS: M4
+  - [ ] h2-bench.sh reads the server's cgroup after h2load's main phase has
+        started and after its load has stopped, so cores read low by about
+        δ/DUR (tls-bench.sh measured δ at 74-129 ms: 1-2% at DUR 8). h2load
+        can't keep its load on after the phase ends: a load tail needs another
+        client, or the tables should say so
+  - [ ] The Linux suite holds mac-bench for 13-23 minutes per io_uring run at
+        under 1% CPU (859 s on main 05f96ff), and every benchmark waits behind
+        it. Two tests are most of it: "tls: key record limits with a slow
+        reader (the server's writes stop short)" (server_test.zig, 200 s,
+        mostly sleeping) and "io_uring: the rest of the suite with the ring at
+        0, 1 and 2 buffers" (180 s). Shorten their waits, or let a sleeping
+        test run hold the share without blocking benchmarks
   - [x] h2/h3: h2load (`bench/scripts/h2-bench.sh`; results in M5 and M6)
   - [x] Baseline nginx; h2o, facil.io (what Zap wraps), uWebSockets and
         may-minihttp (HTTP/1.1, below). Still to do: a minimal raw-epoll C
@@ -1803,6 +1825,52 @@ two runs each; ±10% run to run):
 |---|---|---|---|
 | keep-alive | 767k–944k | 956k–1.09M | 995k–1.07M |
 | pipelined ×16 | 1.24M–1.47M | 8.2M–9.4M | 8.5M–8.8M |
+
+TLS 1.3 handshakes (2026-10-31; Docker on the M2 Pro, Linux 6.12 aarch64; a new
+connection per request, one GET, then a reset; each server with 1 worker on CPU 0 and
+with 6 on CPUs 0-5, `tls-load` with 6 threads on 6-11; TLS_AES_128_GCM_SHA256 and the
+group shown, the only ones offered; one session ticket per handshake, checked; the
+same certificate and key; kTLS off; h2o with `neverbleed: OFF` so that every server
+signs in process (on: 7.2-7.3k ECDSA handshakes/s at 136 µs per core). Handshakes/s
+and server CPU per handshake (its cgroup's cores, read under load, over the rate).
+`tls-load` checks every Finished, certificate, ALPN and session id echo, rejects a
+reused server key share, and verifies the CertificateVerify signature with std:
+every one against 1 worker, 1 in 32 per thread against 6, which can miss a server
+that is rarely wrong (1 in 50000 passed; 1 in 1000 is caught). One round on the
+final script at load 11.7 (other agents' test jobs), within about 3% of an earlier
+round at load 4.2 and of the adversarial verifier's rerun at load 2-3.
+
+1 worker on CPU 0 (every server at 1.00 cores, the client at most 2.4 of its 6):
+
+| | peregrine epoll | peregrine io_uring | nginx 1.30.6 / OpenSSL 3.5.9 | h2o 2.3.0-DEV |
+|---|---|---|---|---|
+| ECDSA, X25519 | 12460 / 80.2 µs | 13802 / 72.3 µs | 5075 / 196.8 µs | 8110 / 123.2 µs |
+| ECDSA, P-256 | 10027 / 99.6 µs | 10887 / 91.8 µs | 5064 / 197.2 µs | 8663 / 115.3 µs |
+| ECDSA, X25519MLKEM768 | 9360 / 106.8 µs | 10100 / 98.7 µs | 4055 / 246.3 µs | n/a |
+| ECDSA, X25519, resumed | 17558 / 56.9 µs | 21708 / 46.0 µs | 5468 / 182.8 µs | 9583 / 104.2 µs |
+| RSA-2048, X25519 | 896 / 1115 µs | 906 / 1103 µs | 1394 / 717 µs | 1502 / 665 µs |
+| ECDSA, X25519, h2 | 12339 / 81.0 µs | 12666 / 78.9 µs | 5124 / 195.0 µs | 8210 / 121.7 µs |
+
+6 workers on CPUs 0-5 (`!` the client was saturated, `<` the server was not):
+
+| | peregrine epoll | peregrine io_uring | nginx | h2o |
+|---|---|---|---|---|
+| ECDSA, X25519 | 66799 / 87.4 µs | 70946 / 82.8 µs ! | 29420 / 201.3 µs | 19189 / 260.8 µs < |
+| ECDSA, P-256 | 52128 / 111.6 µs ! | 54630 / 107.1 µs ! | 29490 / 202.2 µs | 12064 / 417.1 µs < |
+| ECDSA, X25519MLKEM768 | 49068 / 119.0 µs ! | 51250 / 114.2 µs ! | 24212 / 245.3 µs | n/a |
+| ECDSA, X25519, resumed | 86063 / 67.0 µs ! | 89856 / 63.9 µs ! | 32368 / 184.3 µs | 21084 / 228.6 µs < |
+| RSA-2048, X25519 | 4928 / 1161 µs | 4910 / 1188 µs | 7810 / 754 µs | 8153 / 716 µs |
+| ECDSA, X25519, h2 | 65624 / 89.3 µs ! | 68411 / 86.0 µs ! | 29084 / 202.9 µs | 17587 / 285.7 µs < |
+
+peregrine's 6-worker rows are client-bound (`tls-load` at 5.4-5.7 of its 6 cores,
+server at 5.75-5.9): compare CPU per handshake there. h2o's 6-worker ECDSA rows
+measure its own scaling limit (4.8-5.0 cores even resumed, with or without
+neverbleed; likely OpenSSL 3.3 lock contention in a threaded server, untested), not
+its handshake cost. RSA-2048 is the one loss: std.crypto.ff's exponentiation (see
+M4, "Faster RSA-2048 signing"). epoll spends 7-11 µs more per connection than
+io_uring (see M2). CPU per handshake rises 10-20% from 1 to 6 workers for peregrine
+(nginx about 2%), probably loopback cost in the VM; separate machines would tell.
+nginx with OpenSSL 3.5 spends about 183 µs even on a resumption, with no signature.
 
 Micro-benchmarks (`zig build bench`, M2 Pro): parsing a 437-byte browser request with
 8 headers takes about 187 ns (about 2.1 GB/s); a full session cycle (parse, handler,
