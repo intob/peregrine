@@ -93,8 +93,19 @@ pub const Congestion = struct {
     /// The maximum datagram size changed (PMTU discovery; RFC 9002 §7.2):
     /// increases and the minimum window follow it. The window is in bytes
     /// and stays (above the new minimum), and bytes in flight need nothing:
-    /// each packet leaves the flight with the size it was sent at.
-    pub fn setMss(self: *Self, mss: u64) void {
+    /// each packet leaves the flight with the size it was sent at. CUBIC's
+    /// curve, whose cubic term scales with the size (C · mss · (t − K)³),
+    /// is moved along the time axis (K) to keep its value at `now`: the
+    /// target doesn't jump by the sizes' ratio (up to 50x, 1350 to 65507),
+    /// and it reaches W_max at the new size's pace.
+    pub fn setMss(self: *Self, mss: u64, now: u64) void {
+        if (self.algorithm == .cubic and mss != self.mss) {
+            if (self.epoch) |epoch| {
+                const t: f64 = @as(f64, @floatFromInt(now -| epoch)) / 1e6;
+                const term = self.wCubic(t) - self.w_max;
+                self.k = t - std.math.cbrt(term / (cubic_c * @as(f64, @floatFromInt(mss))));
+            }
+        }
         self.mss = mss;
         self.window = @max(self.window, self.minWindow());
         if (self.ssthresh != std.math.maxInt(u64)) self.ssthresh = @max(self.ssthresh, self.minWindow());
@@ -421,6 +432,32 @@ test "slow start, a loss, recovery, then growth again" {
     }
 }
 
+test "a new maximum datagram size mid-epoch: CUBIC's curve keeps its value, then grows at the new size's pace" {
+    var c = Congestion.init(1350, .cubic);
+    var rtt: Rtt = .{};
+    rtt.update(50_000, 0);
+    c.window = 1_000_000;
+    c.onSent(1_000_000);
+    c.onCongestionEvent(0, 1_000_000);
+    // K is about 8.2 s: 0.3 s into the epoch (below W_max, concave), and
+    // 10 s (past it, convex).
+    try testing.expect(c.k > 8 and c.k < 8.5);
+    for ([_]u64{ 300_000, 10_000_000 }) |dt| {
+        for ([_]u64{ 1472, 65507, 1200 }) |mss| {
+            var d = c;
+            const now = 1_000_000 + dt;
+            const t: f64 = @as(f64, @floatFromInt(dt)) / 1e6;
+            const before = d.wCubic(t);
+            d.setMss(mss, now);
+            try testing.expectApproxEqRel(before, d.wCubic(t), 1e-9);
+            // From there on, the time to W_max scales by the cube root of
+            // the sizes' ratio (a larger size closes it sooner).
+            const k_ratio = std.math.cbrt(@as(f64, @floatFromInt(1350)) / @as(f64, @floatFromInt(mss)));
+            try testing.expectApproxEqRel((c.k - t) * k_ratio, d.k - t, 1e-9);
+        }
+    }
+}
+
 test "a new maximum datagram size: the window's floor and increases follow, the pacer's floor too" {
     for ([_]Algorithm{ .cubic, .new_reno }) |alg| {
         var c = Congestion.init(1350, alg);
@@ -429,11 +466,11 @@ test "a new maximum datagram size: the window's floor and increases follow, the 
         var p = Pacer.init(1350, Pacer.default_burst_us);
         c.onPersistentCongestion();
         try testing.expectEqual(@as(u64, 2700), c.window);
-        c.setMss(1472);
+        c.setMss(1472, 0);
         try testing.expectEqual(@as(u64, 2944), c.window);
         try testing.expectEqual(@as(u64, 14720), p.capacity(&c, &rtt));
         // Smaller: the window stays, the floor drops.
-        c.setMss(1200);
+        c.setMss(1200, 0);
         try testing.expectEqual(@as(u64, 2944), c.window);
         try testing.expectEqual(@as(u64, 2400), c.minWindow());
         try testing.expectEqual(@as(u64, 12000), p.capacity(&c, &rtt));
@@ -445,7 +482,7 @@ test "a new maximum datagram size: the window's floor and increases follow, the 
         if (alg == .new_reno) {
             c.recovery_start = null;
             c.ssthresh = c.window;
-            c.setMss(9000);
+            c.setMss(9000, 0);
             const w = c.window;
             c.onSent(w);
             c.onAcked(w, 10, 20_000, &rtt, w);

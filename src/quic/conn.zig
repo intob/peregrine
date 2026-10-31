@@ -893,9 +893,9 @@ pub const Conn = struct {
 
     /// A new PLPMTU: the congestion controller counts in it, and the
     /// pacer's floor (ten datagrams) follows.
-    fn setMaxDatagram(self: *Self, size: u16) void {
+    fn setMaxDatagram(self: *Self, size: u16, now: u64) void {
         self.max_datagram = size;
-        self.cc.setMss(size);
+        self.cc.setMss(size, now);
     }
 
     /// A packet leaves the flight without being acknowledged and without
@@ -1000,7 +1000,7 @@ pub const Conn = struct {
             }
             sp.sent.compact();
         }
-        self.setMaxDatagram(lower);
+        self.setMaxDatagram(lower, now);
         self.setLossTimer(now);
         return true;
     }
@@ -1053,7 +1053,7 @@ pub const Conn = struct {
     /// packets over at least a probe timeout while smaller ones arrive.
     fn checkBlackHole(self: *Self, now: u64) void {
         if (!self.pmtuEnabled() or !self.pmtu.blackHole(self.rtt.pto(self.peerMaxAckDelay()))) return;
-        self.setMaxDatagram(self.pmtu.onBlackHole(now));
+        self.setMaxDatagram(self.pmtu.onBlackHole(now), now);
     }
 
     const TlsSink = struct {
@@ -1253,7 +1253,7 @@ pub const Conn = struct {
         }
         self.detectLoss(space, now);
         if (probe_acked) |pa| {
-            if (self.pmtu.onProbeAcked(pa.pn, pa.size, now)) |size| self.setMaxDatagram(size);
+            if (self.pmtu.onProbeAcked(pa.pn, pa.size, now)) |size| self.setMaxDatagram(size, now);
         }
         self.pto_count = 0;
         sp.sent.compact();
@@ -1379,7 +1379,7 @@ pub const Conn = struct {
             self.pmtu.restart(start, @min(self.pmtuCeiling(), peer_max), same_host, now);
             // (A path whose family has DF where the old one's hadn't.)
             if (self.handshake_complete and self.pmtuEnabled()) self.pmtu.start(now);
-            self.setMaxDatagram(self.pmtu.current);
+            self.setMaxDatagram(self.pmtu.current, now);
         }
         if (!self.cfg.ecn) return;
         self.ecn_retests = 0;
