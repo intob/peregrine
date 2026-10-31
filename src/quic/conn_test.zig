@@ -3387,3 +3387,49 @@ test "verify PMTU r2: a probe timeout's datagrams the interface refuses still go
         }
     }
 }
+
+test "verify PMTU r2: a probe acknowledged long after it was declared lost, and one in flight at close or refused at close" {
+    const h = try Harness.init(.{}, pmtuOn);
+    defer h.deinit();
+    var bursts: std.ArrayList(Burst) = .empty;
+    defer bursts.deinit(h.a);
+    try h.runDelayed(10_000, {}, established, &bursts);
+    const s = h.server.?;
+    // The first probe (1472) is held back by the path for 400 ms: lost
+    // by the time threshold first, its acknowledgment late.
+    var probe: [1500]u8 = undefined;
+    s.onPathChange(h.now, false, true, false);
+    const n = s.send(&probe, h.now);
+    try testing.expectEqual(@as(usize, 1472), n);
+    const pn = s.pmtu.probe_pn.?;
+    h.path_max = 1471;
+    try h.runDelayed(10_000, {}, searchDone, &bursts);
+    try testing.expect(s.max_datagram < 1472);
+    try testing.expect(s.spaces[2].sent.get(pn) == null);
+    h.path_max = std.math.maxInt(usize);
+    try h.toClient(probe[0..n], .not_ect);
+    const id = try h.client.openBidi();
+    try h.client.write(id, "big 100000", true);
+    try h.runDelayed(10_000, id, finishedStream, &bursts);
+    try expectBody(h, id, 100_000);
+    try testing.expectEqual(liveInFlight(s), s.cc.in_flight);
+    // A probe in flight, then the application closes; the close's
+    // datagram refused by the interface, then sent.
+    s.onPathChange(h.now, false, true, false);
+    const m = s.send(&probe, h.now);
+    try testing.expect(m > s.max_datagram);
+    try testing.expect(s.pmtu.probe_pn != null);
+    s.closeApp(0x100, "bye", h.now);
+    const mark = s.sendMark();
+    const c = s.send(&probe, h.now);
+    try testing.expect(c > 0 and c <= s.max_datagram);
+    _ = s.onSendRefused(mark, c, h.now);
+    s.onProbeTooBig(h.now);
+    const c2 = s.send(&probe, h.now);
+    try testing.expect(c2 <= 1200);
+    if (c2 > 0) try h.toClient(probe[0..c2], .not_ect);
+    std.debug.print("close: {d} bytes refused; then {d}; client closed {}\n", .{ c, c2, h.client.closed != null });
+    h.now += 10 * std.time.us_per_s;
+    s.onTimeout(h.now);
+    try testing.expect(s.isClosed());
+}
