@@ -2177,6 +2177,60 @@ fn testWsPourFair(backend: Backend) !void {
     }
 }
 
+test "websocket: a client of a sender on another thread that stops reading mid-turn is cut off" {
+    try forEachBackend(testWsPourStop);
+}
+
+fn testWsPourStop(backend: Backend) !void {
+    // Turns keep the connection posted while its client keeps up; once
+    // the client stops, writes stop making progress and the request
+    // timeout closes it (with others on the worker served meanwhile).
+    // Not with permessage-deflate: the pour compresses about 1000:1, and
+    // the stopped client's socket buffer takes gigabytes of it first.
+    for ([_]bool{false}) |deflate| {
+        var cfg: Config = .{ .worker_thread_count = 1, .request_timeout_s = 1 };
+        if (deflate) cfg.websocket_deflate = .{};
+        const r = try Running.start(backend, cfg);
+        defer r.stop();
+        const h = r.srv.handler;
+        var readers: [3]PourReader = undefined;
+        var started: usize = 0;
+        defer for (readers[0..started]) |*pr| {
+            pr.stop.store(true, .release);
+            _ = std.posix.system.shutdown(pr.c.fd, std.posix.SHUT.RDWR);
+            pr.thread.join();
+            pr.c.close();
+        };
+        for (&readers) |*pr| {
+            pr.* = .{ .c = try Client.connect(r.port) };
+            try pr.c.send(if (deflate) WsPeer.offer else Client.upgrade_request);
+            try pr.c.readUpgrade();
+            try pr.c.wsSend(true, .text, "pour");
+            pr.thread = try std.Thread.spawn(.{}, PourReader.run, .{pr});
+            started += 1;
+        }
+        sleepMs(500);
+        // The first stops reading (its thread is gone; the socket stays).
+        readers[0].stop.store(true, .release);
+        readers[0].thread.join();
+        readers[0].thread = try std.Thread.spawn(.{}, struct {
+            fn run() void {}
+        }.run, .{});
+        const mark = readers[1].bytes.load(.monotonic);
+        const start = sys.nanoTimestamp();
+        while (h.ws_disconns.load(.monotonic) == 0) {
+            if (sys.nanoTimestamp() - start > 5 * std.time.ns_per_s) {
+                std.debug.print("{s}{s}: a client that stopped reading still open after 5 s\n", .{ @tagName(backend), if (deflate) " deflate" else "" });
+                return error.StalledConnectionNotClosed;
+            }
+            sleepMs(20);
+        }
+        try testing.expectEqual(@as(usize, 1), h.ws_disconns.load(.monotonic));
+        // The others went on meanwhile.
+        try testing.expect(readers[1].bytes.load(.monotonic) > mark);
+    }
+}
+
 test "websocket: split and malformed input behind stalled output, read once the client reads again (plain, TLS)" {
     try forEachBackend(testWsSplitBehindStall);
 }
