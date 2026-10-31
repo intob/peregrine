@@ -1659,6 +1659,13 @@ pub fn Worker(comptime Handler: type) type {
             return c.ws.?.hasWire() or (c.tls != null and c.tls.?.hasWire());
         }
 
+        /// Input read but not yet processed: frames a turn left (its message
+        /// bytes ran out), or records the TLS layer holds (it hands the
+        /// decoder only what fits). The peer's end waits for it.
+        fn wsInputLeft(c: *const Conn) bool {
+            return c.ws.?.input_paused or (c.tls != null and c.tls.?.hasBufferedInput());
+        }
+
         fn wsTurn(self: *Self) void {
             self.ws_out = ws_turn_bytes;
             self.ws_in = ws_turn_bytes;
@@ -1687,7 +1694,8 @@ pub fn Worker(comptime Handler: type) type {
         fn wsReadable(self: *Self, c: *Conn) void {
             const w = c.ws.?;
             while (!c.ws_blocked) {
-                if (c.peer_closed and !w.input_paused) {
+                const tls_buffered = c.tls != null and c.tls.?.hasBufferedInput();
+                if (c.peer_closed and !wsInputLeft(c)) {
                     // The peer's FIN (or close_notify), its frames all
                     // processed: what is queued still goes out (the close
                     // echo among it), then wsFlush closes the socket.
@@ -1695,7 +1703,6 @@ pub fn Worker(comptime Handler: type) type {
                     if (!wsHasWire(c) and !w.hasOutput()) return self.closeConn(c);
                     return;
                 }
-                const tls_buffered = c.tls != null and c.tls.?.hasBufferedInput();
                 // Frames decoded but not yet processed (the turn's message
                 // bytes ran out) come before more input.
                 const paused = w.input_paused;
@@ -1790,7 +1797,7 @@ pub fn Worker(comptime Handler: type) type {
             }
             // Everything is written: the close handshake is over, or the
             // peer has closed its side.
-            if (w.wantsClose() or (c.peer_closed and !w.input_paused)) {
+            if (w.wantsClose() or (c.peer_closed and !wsInputLeft(c))) {
                 self.closeConn(c);
                 return false;
             }

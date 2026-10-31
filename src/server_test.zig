@@ -2237,6 +2237,57 @@ fn testWsMessagesThenFin(backend: Backend) !void {
     };
 }
 
+test "websocket over TLS: a burst, the client's close and FIN in one write, read 1 KiB at a time: every message echoed, then the close echo" {
+    try forEachBackend(testWsTlsBurstCloseFin);
+}
+
+fn testWsTlsBurstCloseFin(backend: Backend) !void {
+    // The TLS layer hands the decoder only what fits; with records still
+    // held there the read that returned 0 set peer_closed, and the socket
+    // was closed with them, messages and the close never processed.
+    var cfg = tlsConfig();
+    cfg.worker_thread_count = 1;
+    cfg.read_buffer_size = 1024;
+    const r = try Running.start(backend, cfg);
+    defer r.stop();
+    var p = try WsPeer.open(r.port, true, false);
+    defer p.close();
+    const count = 200;
+    const all = try testing.allocator.alloc(u8, count * (1000 + 8) + 16);
+    defer testing.allocator.free(all);
+    var n: usize = 0;
+    for (0..count) |i| {
+        var m: [1000]u8 = @splat(@truncate(i));
+        n += Client.wsFrame(all[n..], true, .binary, &m).len;
+    }
+    n += Client.wsFrame(all[n..], true, .close, "\x03\xe8").len;
+    const t = p.tls;
+    try t.send(all[0..n]);
+    _ = std.posix.system.shutdown(t.fd, std.posix.SHUT.WR);
+    const buf = try testing.allocator.alloc(u8, 1 << 16);
+    defer testing.allocator.free(buf);
+    var pool = try BufferPool.init(testing.allocator, 1024, 1);
+    defer pool.deinit();
+    var inflated: ws.inflate.Out = .{ .buf = &.{}, .max = 1 << 20, .pool = &pool };
+    defer if (inflated.buf.len > 0) pool.releaseLarge(inflated.buf);
+    var got: usize = 0;
+    while (true) {
+        const f = p.read(buf, &pool, &inflated) catch |err| {
+            std.debug.print("{s}: {s} after {d} of {d} echoes, no close echo\n", .{ @tagName(backend), @errorName(err), got, count });
+            return error.CloseNeverEchoed;
+        };
+        if (f.op == .close) {
+            try testing.expectEqualStrings("\x03\xe8", f.data);
+            break;
+        }
+        try testing.expectEqual(ws.Opcode.binary, f.op);
+        try testing.expectEqual(@as(u8, @truncate(got)), f.data[0]);
+        got += 1;
+    }
+    try testing.expectEqual(@as(usize, count), got);
+    try testing.expectError(error.EndOfStream, p.read(buf, &pool, &inflated));
+}
+
 /// "pour": one thread sends 64 KiB binary messages until the connection
 /// goes (handleWSDisconn stops it).
 const Pour = struct {
