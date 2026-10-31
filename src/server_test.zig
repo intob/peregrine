@@ -2231,6 +2231,71 @@ fn testWsPourStop(backend: Backend) !void {
     }
 }
 
+test "websocket: a ping and the client's close in one write while a sender on another thread takes turns (plain, TLS, permessage-deflate)" {
+    try forEachBackend(testWsPourPingClose);
+}
+
+fn testWsPourPingClose(backend: Backend) !void {
+    for ([_]bool{ false, true }) |tls| {
+        for ([_]bool{ false, true }) |deflate| {
+            errdefer std.debug.print("{s} {s}{s}\n", .{ @tagName(backend), if (tls) "tls" else "plain", if (deflate) " deflate" else "" });
+            var cfg: Config = if (tls) tlsConfig() else .{};
+            cfg.worker_thread_count = 1;
+            if (deflate) cfg.websocket_deflate = .{};
+            const r = try Running.start(backend, cfg);
+            defer r.stop();
+            var p = try WsPeer.open(r.port, tls, deflate);
+            defer p.close();
+            try p.send(.text, "pour");
+            // Read for a while: the worker takes turns with the sender.
+            const buf = try testing.allocator.alloc(u8, 1 << 20);
+            defer testing.allocator.free(buf);
+            var pool = try BufferPool.init(testing.allocator, 1024, 1);
+            defer pool.deinit();
+            var inflated: ws.inflate.Out = .{ .buf = &.{}, .max = 4 << 20, .pool = &pool };
+            defer if (inflated.buf.len > 0) pool.releaseLarge(inflated.buf);
+            const start = sys.nanoTimestamp();
+            while (sys.nanoTimestamp() - start < 300 * std.time.ns_per_ms) _ = try p.read(buf, &pool, &inflated);
+            // A ping and the close, in one write (one TLS record).
+            var out: [64]u8 = undefined;
+            const ping = Client.wsFrame(out[0..], true, .ping, "pp");
+            const close = Client.wsFrame(out[ping.len..], true, .close, "\x03\xe8");
+            switch (p) {
+                .plain => |*c| try c.send(out[0 .. ping.len + close.len]),
+                .tls => |t| try t.send(out[0 .. ping.len + close.len]),
+            }
+            var pong = false;
+            var after: usize = 0;
+            const sent = sys.nanoTimestamp();
+            while (true) : (after += 1) {
+                if (sys.nanoTimestamp() - sent > 5 * std.time.ns_per_s) {
+                    std.debug.print("no {s} 5 s after the ping and the close: {d} messages since\n", .{ if (pong) "close" else "pong", after });
+                    return error.PingAndCloseNeverRead;
+                }
+                const f = try p.read(buf, &pool, &inflated);
+                switch (f.op) {
+                    .binary => try testing.expect(!pong),
+                    .pong => {
+                        try testing.expectEqualStrings("pp", f.data);
+                        pong = true;
+                    },
+                    .close => {
+                        try testing.expectEqualStrings("\x03\xe8", f.data);
+                        break;
+                    },
+                    else => return error.UnexpectedOpcode,
+                }
+            }
+            try testing.expect(pong);
+            const t0 = sys.nanoTimestamp();
+            while (r.srv.handler.ws_disconns.load(.monotonic) == 0) {
+                if (sys.nanoTimestamp() - t0 > 3 * std.time.ns_per_s) return error.NotClosed;
+                sleepMs(10);
+            }
+        }
+    }
+}
+
 test "websocket: split and malformed input behind stalled output, read once the client reads again (plain, TLS)" {
     try forEachBackend(testWsSplitBehindStall);
 }
