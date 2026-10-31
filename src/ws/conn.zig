@@ -1867,6 +1867,72 @@ test "verify send queues: connections sharing a pool, threads sending to all of 
     }
 }
 
+/// Messages (fragmented, pings between fragments, compressed or not) run
+/// through process() whole with no budget, and again fed in fuzzer-chosen
+/// pieces with a fuzzer-chosen message-byte budget for each call, the
+/// frames a call leaves processed before more input (as the epoll
+/// worker's turns do): the same messages and control frames reach the
+/// handler, and the same output (pongs) goes out.
+fn fuzzTurns(_: void, smith: *std.testing.Smith) anyerror!void {
+    const a = testing.allocator;
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(a);
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(a);
+    const compressed = smith.value(u8) & 1 != 0;
+    const client: ?*deflate.TestClient = if (compressed) try a.create(deflate.TestClient) else null;
+    defer if (client) |c| {
+        c.out.deinit();
+        a.destroy(c);
+    };
+    if (client) |c| try c.init();
+    var count: usize = 0;
+    while (count < 12 and !smith.eos()) : (count += 1) try protocol.fuzzMessage(smith, &input, &expected, client);
+
+    const whole = try Harness.init(.{});
+    defer whole.deinit();
+    if (compressed) whole.conn.enableDeflate(.{ .enabled = true });
+    try whole.feed(input.items);
+    try testing.expectEqual(Conn.Action.ok, whole.action);
+
+    const turns = try Harness.init(.{});
+    defer turns.deinit();
+    if (compressed) turns.conn.enableDeflate(.{ .enabled = true });
+    var rest: []const u8 = input.items;
+    var pauses: usize = 0;
+    while (turns.action == .ok) {
+        const w = turns.conn;
+        if (!w.input_paused) {
+            if (rest.len == 0) break;
+            const space = try w.decoder.readSpace();
+            const n = @min(space.len, rest.len, 1 + @as(usize, smith.value(u16)) % 4096);
+            @memcpy(space[0..n], rest[0..n]);
+            w.decoder.commitRead(n);
+            rest = rest[n..];
+        } else pauses += 1;
+        // At least a byte: every call delivers a frame if one is whole.
+        w.input_budget = 1 + @as(usize, smith.value(u16)) % 8192;
+        turns.action = w.process(LogHandler, &turns.handler);
+        w.input_budget = std.math.maxInt(usize);
+        try turns.flush();
+    }
+    try testing.expectEqual(Conn.Action.ok, turns.action);
+    try testing.expect(!turns.conn.input_paused);
+    try testing.expectEqualStrings(whole.handler.log.items, turns.handler.log.items);
+    try testing.expectEqualSlices(u8, whole.out.items, turns.out.items);
+}
+
+test "fuzz: ws process across turns" {
+    try std.testing.fuzz({}, fuzzTurns, .{
+        .corpus = &.{
+            // Uncompressed: a few messages, small budgets.
+            &[_]u8{ 0x00, 0x01, 0x10, 0x20, 0x30, 0x00, 0x40, 0x01, 0x02, 0x05, 0x00, 0x10, 0x00, 0x03, 0x00, 0x08, 0x00, 0x01, 0x00 },
+            // Compressed, fragments with pings between.
+            &[_]u8{ 0x01, 0x05, 0x00, 0x01, 0x02, 0xff, 0x07, 0x02, 0x03, 0x00, 0x10, 0x00, 0x20, 0x01, 0x00, 0x04, 0x00, 0x02, 0x00 },
+        },
+    });
+}
+
 test "fuzz: ws send queues" {
     try std.testing.fuzz({}, fuzzSendQueues, .{ .corpus = &.{
         &[_]u8{ 0x01, 0x00, 0x10, 0x00, 0x2a, 0x00, 0x03, 0x00, 0x30, 0x05, 0x10, 0x00, 0x00, 0x00, 0x01, 0x2b, 0x01, 0x07, 0x00, 0x46, 0x00, 0x08 },

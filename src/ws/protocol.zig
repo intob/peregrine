@@ -1226,7 +1226,7 @@ fn fuzzDecoder(_: void, smith: *std.testing.Smith) anyerror!void {
 /// Appends one valid message: a ping or pong, or text or binary in up to
 /// three fragments with control frames between them, and logs it as
 /// `TestDecoder` does. With a `client`, data messages are compressed.
-fn fuzzMessage(smith: *std.testing.Smith, input: *std.ArrayList(u8), expected: *std.ArrayList(u8), client: ?*deflate.TestClient) !void {
+pub fn fuzzMessage(smith: *std.testing.Smith, input: *std.ArrayList(u8), expected: *std.ArrayList(u8), client: ?*deflate.TestClient) !void {
     const a = testing.allocator;
     var payload: [2048]u8 = undefined;
     var scratch: [4096 + max_header_len]u8 = undefined;
