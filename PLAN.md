@@ -559,22 +559,56 @@ Still open:
         the verifier's rerun in brackets): equal at 20 B and 1 MiB; 16 KiB
         epoll 8% (5%), io_uring 11% (18%); 64 KiB 14-18% (14-17%); 256 KiB
         epoll 13% (4%), io_uring noisy, 2% (7%) cheaper
-  - [ ] **A sender pouring to a WebSocket over HTTP/2 holds the worker** (main
-        too): after the output drains `h2Flush` pumps and recurses
-        (`if (conn.hasWire()) return self.h2Flush(c)`) until the socket says
-        EAGAIN, and h2's `pumpWebSocket` counts written bytes, not compressed
-        input (HTTP/1.1's turns use `takeCompressed`). With permessage-deflate a
-        64 KiB message of one byte compresses to ~60 bytes, so one pump
-        compresses ~4000 messages: a request on another connection waited 14-30
-        s on epoll (2.7 s io_uring). Without deflate, macOS Debug overflows the
-        worker's stack (Bus error). HTTP/3's pumpWebSocket buffers up to 1 MiB
-        counted in output bytes, likely the same. Tests "verify h2c WebSocket
-        ... pour ..." in server_test.zig, behind `reproduce = false`
-  - [ ] io_uring answers pings late under a send storm: it arms a receive only
-        once its output drains, so while a sender on another thread keeps the
-        queue full a ping (and the client's close) waits; over TLS no pong in
-        5 s. "A ping and the client's close in one write" skips io_uring until
-        fixed (epoll's turns already read during output)
+  - [x] **WebSockets over HTTP/2 and HTTP/3 take turns, output and input**
+        (main too: h2's pump counted only what it wrote and epoll's h2Flush
+        called itself while the socket took everything: with
+        permessage-deflate a request elsewhere waited 30 s+, without, macOS
+        Debug overflowed the stack; h3 filled 1 MiB, 3.8 s). Output: a
+        connection's WebSockets share `ws.turn_bytes` (256 KiB, compressed
+        messages charged before compression) per turn, one a pass for events,
+        completions and ticks and one per WebSocket post (each WebSocket's post
+        at most once a pass, `exchange.Slab.firstPost`); a WebSocket that finds
+        it spent reposts, not blocked, so streams behind it still send.
+        `h2Flush` is a loop. Input: `ws.turn_in_bytes` (128 KiB of messages
+        after inflation, debts carried) a turn; h2 yields before the next
+        WebSocket DATA frame (`.yield`; its window waits with it), h3 leaves
+        the DATA in the QUIC stream. io_uring: mailbox drained one pass at a
+        time, completions fetched while posts wait (DEFER_TASKRUN); after 64
+        writes in a streak a receive beside the writes (WebSockets: 32 KiB of
+        messages a write) — this also fixed "io_uring answers pings late under
+        a send storm" for HTTP/1.1; no receive into an empty buffer; TLS-held
+        input handed over before the next receive; input processed before
+        pumping after each write; grown h2 reader buffers from the large-buffer
+        cache.
+        Proof: three adversarial verifier rounds (pours with and without
+        deflate, four and 32 WebSockets on one connection, echo floods to a
+        client that keeps up with 0 refused and requests beside them answered
+        in ms, control frames and a GET behind held input, a dropped post,
+        half-close, the handler's close, inflation bombs, pool after idle;
+        pings and the close during pours on h2/h3/HTTP/1.1 io_uring; h2 over
+        TLS with held frames; a client's WebSocket close and close_notify in
+        one write behind a turn's input, whose close echo had been lost;
+        churn; kTLS on pi5) and three code reviews; fuzz targets `fuzz: ws
+        process across turns` and new `fuzz: h2 connection taking turns` (15
+        min each on a Pi); macOS and Linux suites, h2spec 146/146, ws_h2/ws_h3
+        interop, Autobahn 301/517/517 plain/deflate/TLS deflate on epoll and
+        io_uring; Pi benchmarks within noise of main (h2c GETs, h2 1 MiB, ws
+        20 B / 64 KiB / 1 MiB)
+  - [ ] Exchanges and files have no turns (HTTP/1.1 and h2): a streamed
+        response fed from another thread, or a file, to a fast reader holds the
+        worker in one h2Flush/flush until the body ends or the socket fills
+  - [ ] HTTP/3: WebSockets that never read their echoes hold the connection's
+        MAX_DATA (each up to 1 MiB of the 16 MiB; ~17 starve every other stream
+        until the stall timeout; main too). `testV3H3ConnWindow`, behind
+        `reproduce`
+  - [ ] HTTP/1.1 on io_uring refuses echoes of thousandfold-inflating messages
+        (epoll/kqueue don't; main too). `testWsBombEchoFlood`, behind
+        `reproduce_uring`
+  - [ ] An HTTP/3 pour of very compressible messages moves about one packet per
+        turn (−5% throughput in ReleaseFast on a Pi, by design)
+  - [ ] "websocket: many connections each fed from another thread" fails
+        WouldBlock in its 100-connection case on pi1 (main too, ReleaseFast and
+        Debug)
   - [ ] An endless sender against a slow client never reads the client's close:
         the close waits behind output that never drains, until the request
         timeout
