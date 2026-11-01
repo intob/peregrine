@@ -69,6 +69,9 @@ files in a subdirectory named after your item.
 Rules: pure Zig 0.17 (/Applications/zig-aarch64-macos-0.17.0/zig); I/O-free
 protocol layers; no per-request heap allocation in steady state; match the
 surrounding code and comment style; zig fmt.
+No benchmarks, timing measurements or fuzzing on the Mac (user rule): Pis
+only (bench/scripts/pi.sh, fuzz.sh ... pi1-wg). On the Mac hold `mac-bench`
+shared for tests, builds and interop; never take it exclusively.
 Done means:
 - the change, with tests that fail without it (unit, end to end on every
   backend where it applies, a fuzz target for anything that parses input);
@@ -121,6 +124,11 @@ All shared through `bench/scripts/lock.sh` (locks in /tmp/peregrine-locks,
 visible to every worktree). Never run two benchmarks at once, and never a
 benchmark next to fuzzing or test containers: the numbers would be noise.
 
+- **User rule (2026-10-31, overrides the Mac benchmark text below): no
+  benchmarks or fuzzing on the Mac, only on the Pis.** Put it in every
+  brief. A queued exclusive `mac-bench` request also stalls every shared
+  test job behind it (the queue is fair), so one stray benchmark serializes
+  the whole round.
 - **Mac (M2 Pro, 12 cores, Docker)**: tests, protocol suites, competitor
   images (`comp-uws*`, `comp-facil`, `comp-may`, `comp-h2o`, nginx in
   `peregrine-test`; uWS Dockerfiles in bench/competitors/uws). Benchmarks
