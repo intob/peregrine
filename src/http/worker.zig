@@ -35,15 +35,9 @@ fn isH2(alpn: ?[]const u8) bool {
 }
 /// Connections accepted per listener event, to stay fair to existing ones.
 const ACCEPT_BATCH = 64;
-/// WebSocket bytes moved per turn of a connection, each way (read; and
-/// written, encrypted or compressed), over all of one event's or one
-/// post's reads and writes: the rest waits for the next pass of the loop,
-/// after the others' events and the timers. Measured (output only) with a
-/// storm over TLS on one connection and requests on another (worst wait,
-/// Debug / ReleaseSafe): 128 KiB 30 / 12 ms, 256 KiB 57 / 12 ms, 1 MiB
-/// 192 / 21 ms, no turns over 5 s / 1 s; echoes of 20 B to 1 MiB cost the
-/// same with any of them.
-const ws_turn_bytes = 256 * 1024;
+/// WebSocket bytes moved per turn of a connection, each way (see
+/// `ws.turn_bytes`).
+const ws_turn_bytes = ws.turn_bytes;
 /// Message bytes delivered per turn (payloads, inflated): with
 /// permessage-deflate a turn's socket bytes may inflate tenfold or more,
 /// and an echo then queued far more than a turn writes. Less than a turn
@@ -125,6 +119,8 @@ pub fn Worker(comptime Handler: type) type {
             ws_blocked: bool = false,
             /// WebSocket: the drainMailbox pass that last served its post.
             ws_served: u64 = 0,
+            /// HTTP/2: the pass that last started a turn (`h2Turn`).
+            turn_pass: u64 = 0,
             /// Draining input after an error response (see Session.linger).
             lingering: bool = false,
             lingered: u32 = 0,
@@ -228,8 +224,10 @@ pub fn Worker(comptime Handler: type) type {
         /// What is left of the turn's message bytes (`ws_msg_bytes`):
         /// the payloads delivered, inflated.
         ws_msg: usize = 0,
-        /// Passes of drainMailbox: a connection served in this one is
-        /// skipped if it comes up again (`Conn.ws_served`).
+        /// Passes of the loop (its events, then drainMailbox): a connection
+        /// or exchange served in this one is skipped if its post comes up
+        /// again (`Conn.ws_served`, `exchange.Slab.firstPost`), and an
+        /// HTTP/2 connection's WebSockets get one turn in it (`h2Turn`).
         drain_pass: u64 = 0,
         /// Connections speaking HTTP/2 (their streams are ticked once a second).
         h2_count: usize = 0,
@@ -389,6 +387,8 @@ pub fn Worker(comptime Handler: type) type {
                 // from other threads wake the worker themselves.
                 if (self.mailbox.pending() > 0) timeout = 0;
                 const n = self.poller.wait(&events, timeout);
+                self.drain_pass = nextDrainPass(self.drain_pass);
+                if (self.quic) |*ep| ep.pass = self.drain_pass;
                 self.tick();
                 for (events[0..n]) |ev| {
                     switch (Poller.token(ev)) {
@@ -459,6 +459,7 @@ pub fn Worker(comptime Handler: type) type {
             if (self.h2_count == 0) return;
             for (self.conns) |*c| {
                 if (!c.open or c.h2 == null or c.lingering) continue;
+                self.h2Turn(c);
                 const ctx = self.h2Context(c);
                 c.h2.?.tick(Handler, &ctx);
                 self.h2Resume(c);
@@ -480,6 +481,7 @@ pub fn Worker(comptime Handler: type) type {
                 if (!c.open or c.gen != e.conn_gen or c.lingering) continue;
                 if (c.h2) |conn| {
                     // One stream's deadline: reset it, keep the connection.
+                    self.h2Turn(c);
                     const ctx = self.h2Context(c);
                     conn.onExchangeTimeout(Handler, &ctx, @intCast(slot));
                     self.h2Resume(c);
@@ -797,6 +799,10 @@ pub fn Worker(comptime Handler: type) type {
             if (!c.open or c.gen != e.conn_gen) return;
             if (c.h2) |conn| {
                 if (c.lingering) return;
+                // A WebSocket's post brings a turn of its own (see
+                // `h2Turn`); an exchange's doesn't (fifty streamed
+                // responses would give a pouring WebSocket fifty a pass).
+                if (e.tunnel) conn.newTurn();
                 const ctx = self.h2Context(c);
                 conn.onExchangePosted(Handler, &ctx, slot);
                 self.h2Resume(c);
@@ -852,6 +858,8 @@ pub fn Worker(comptime Handler: type) type {
                 conn.reader.end = s.end;
                 s.* = .{};
             }
+            conn.newTurn();
+            c.turn_pass = self.drain_pass;
             c.h2 = conn;
             c.proto_decided = true;
             self.h2_count += 1;
@@ -912,7 +920,22 @@ pub fn Worker(comptime Handler: type) type {
             if ((c.read_ready or tls_buffered) and !c.h2HasWire()) self.h2Readable(c);
         }
 
+        /// A turn for the connection's WebSockets (`H2Conn.ws_turn`): one
+        /// per pass of the loop for its event, the tick and timeouts; and
+        /// one for each post for its streams (a WebSocket's at most once a
+        /// pass, `exchange.Slab.firstPost`), which that WebSocket is pumped
+        /// in first. With one turn a pass for posts too, the WebSocket
+        /// served first each pass took all of it, every pass (four on one
+        /// connection: 4 KiB to one, 700 to another). One that finds the
+        /// turn spent posts itself for the next pass.
+        fn h2Turn(self: *Self, c: *Conn) void {
+            if (c.turn_pass == self.drain_pass) return;
+            c.turn_pass = self.drain_pass;
+            c.h2.?.newTurn();
+        }
+
         fn onH2Event(self: *Self, c: *Conn, ev: Poller.Event) void {
+            self.h2Turn(c);
             if (Poller.writable(ev) and c.h2HasWire()) {
                 if (!self.h2Flush(c)) return;
                 // Output drained: pending stream data and parsing resume.
@@ -979,7 +1002,9 @@ pub fn Worker(comptime Handler: type) type {
             // first requests, perhaps in 0-RTT data) mustn't wait behind
             // them for another read event.
             if (c.h2HasWire() and !self.h2Flush(c)) return;
-            while (!c.h2HasWire()) {
+            // Not while frames wait (output to drain, or the WebSockets'
+            // next turn, which their post brings).
+            while (!c.h2HasWire() and !c.h2.?.holdsFrames()) {
                 const tls_buffered = c.tls != null and c.tls.?.hasBufferedInput();
                 if (!c.read_ready and !tls_buffered) break;
                 if (c.read_ready and !self.readSocket(c)) return;
@@ -1002,7 +1027,7 @@ pub fn Worker(comptime Handler: type) type {
                 if (!self.h2Flush(c)) return false;
                 switch (action) {
                     .flush => if (c.h2HasWire()) break,
-                    .need_more => break,
+                    .need_more, .yield => break,
                     .close => {
                         if (c.h2HasWire()) break;
                         self.h2Linger(c);
@@ -1019,6 +1044,43 @@ pub fn Worker(comptime Handler: type) type {
         /// Writes queued frames (through TLS if set). Closes once drained
         /// if the connection wants it. Returns false if it is gone.
         fn h2Flush(self: *Self, c: *Conn) bool {
+            const conn = c.h2.?;
+            // Output drained: streams waiting for room continue, until a
+            // pump adds nothing. A loop, not a call of its own after each
+            // pump (the stack grew with every one while the socket took
+            // all it was given: a WebSocket pouring to a client that read
+            // as fast overflowed the worker's stack on macOS in Debug).
+            // What WebSockets add is bounded by the connection's turn
+            // (`H2Conn.ws_turn`); other output (a file, a streamed
+            // exchange) to a client that reads as fast is not, and holds
+            // the worker until it ends (an open item in PLAN.md).
+            while (true) {
+                if (!self.h2Write(c)) return false;
+                if (c.h2HasWire()) return true;
+                if (conn.wantsClose()) {
+                    self.h2Linger(c);
+                    return false;
+                }
+                const ctx = self.h2Context(c);
+                conn.pump(Handler, &ctx);
+                if (!conn.hasWire()) break;
+            }
+            if (c.peer_closed and !conn.holdsFrames() and !tlsInputLeft(c) and (conn.activeStreams() == 0 or !conn.answerableAlone())) {
+                self.closeConn(c);
+                return false;
+            }
+            // Written: buffers go back (exchange posts and deadlines end
+            // here, not in h2Process).
+            conn.releaseIfIdle(&self.pool);
+            if (c.tls) |t| t.releaseIfIdle();
+            self.h2Timer(c);
+            return true;
+        }
+
+        /// Writes queued frames (through TLS if set) until they are all
+        /// written or the socket is full (the timer set then). Returns
+        /// false if the connection is gone.
+        fn h2Write(self: *Self, c: *Conn) bool {
             const conn = c.h2.?;
             while (true) {
                 if (userTls(c)) |t| {
@@ -1067,23 +1129,6 @@ pub fn Worker(comptime Handler: type) type {
                     return true;
                 }
             }
-            if (conn.wantsClose()) {
-                self.h2Linger(c);
-                return false;
-            }
-            // Output drained: streams waiting for room continue.
-            const ctx = self.h2Context(c);
-            conn.pump(Handler, &ctx);
-            if (conn.hasWire()) return self.h2Flush(c);
-            if (c.peer_closed and !conn.holdsFrames() and !tlsInputLeft(c) and (conn.activeStreams() == 0 or !conn.answerableAlone())) {
-                self.closeConn(c);
-                return false;
-            }
-            // Written: buffers go back (exchange posts and deadlines end
-            // here, not in h2Process).
-            conn.releaseIfIdle(&self.pool);
-            if (c.tls) |t| t.releaseIfIdle();
-            self.h2Timer(c);
             return true;
         }
 
@@ -1782,23 +1827,18 @@ pub fn Worker(comptime Handler: type) type {
                     progress = (self.tlsFlush(c, t) orelse return false) or progress;
                     if (t.hasWire()) return self.wsBlocked(c, progress);
                     if (self.ws_out == 0) return self.wsTurnOver(c, progress);
-                    const bytes = w.wireBytes();
-                    self.ws_out -|= w.takeCompressed();
+                    const bytes = w.turnWire(&self.ws_out);
                     if (bytes.len == 0) break;
-                    const charged = w.wire_charged;
                     const n = t.encrypt(&.{bytes}) catch {
                         self.closeConn(c);
                         return false;
                     };
-                    w.advance(n);
-                    if (!charged) self.ws_out -|= n;
+                    w.turnAdvance(&self.ws_out, n);
                     continue;
                 }
                 if (self.ws_out == 0) return self.wsTurnOver(c, progress);
-                const wire = w.wireBytes();
-                self.ws_out -|= w.takeCompressed();
+                const wire = w.turnWire(&self.ws_out);
                 if (wire.len == 0) break;
-                const charged = w.wire_charged;
                 const max = switch (self.kernelGate(c)) {
                     .ready => |max| max,
                     .blocked => return self.wsBlocked(c, progress),
@@ -1812,8 +1852,7 @@ pub fn Worker(comptime Handler: type) type {
                         return false;
                     },
                 };
-                w.advance(n);
-                if (!charged) self.ws_out -|= n;
+                w.turnAdvance(&self.ws_out, n);
                 progress = progress or n > 0;
                 if (!self.kernelWrote(c, n)) return false;
                 // Socket buffer full: wait for writability.
@@ -1868,7 +1907,6 @@ pub fn Worker(comptime Handler: type) type {
             // short batch, a storm of sends on 65 connections kept the
             // worker here, its other connections and timers waiting.
             var left = self.mailbox.pending();
-            self.drain_pass = nextDrainPass(self.drain_pass);
             while (left > 0) {
                 const n = self.mailbox.drain(entries[0..@min(left, entries.len)]);
                 if (n == 0) break;
@@ -1886,7 +1924,7 @@ pub fn Worker(comptime Handler: type) type {
                             self.wsFlushPosted(c);
                         }
                     },
-                    .exchange => self.exchangePosted(e.slot, e.gen),
+                    .exchange => if (self.exchanges.firstPost(e.slot, e.gen, self.drain_pass)) self.exchangePosted(e.slot, e.gen),
                 };
             }
             if (self.mailbox.takeOverflow()) {

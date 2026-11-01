@@ -147,6 +147,9 @@ pub const Entry = struct {
     /// `tunnel_timed`.
     tunnel: bool = false,
     tunnel_timed: bool = false,
+    /// The worker's loop pass that last served a post for it: a second
+    /// entry in one pass is skipped (see the workers' drainMailbox).
+    served: u64 = 0,
 
     // -- Guarded by `mutex` --
     mutex: sys.Mutex = .{},
@@ -258,6 +261,7 @@ pub const Slab = struct {
         e.stream_id = 0;
         e.tunnel = false;
         e.tunnel_timed = false;
+        e.served = 0;
         // Deadlines are whole seconds: +1 so at least the timeout passes.
         e.deadline = now +% self.opts.response_timeout_s +% 1;
         e.mutex.unlock();
@@ -280,6 +284,21 @@ pub const Slab = struct {
 
     pub fn entry(self: *Self, slot: u32) *Entry {
         return &self.entries[slot];
+    }
+
+    /// Worker thread, draining its mailbox in pass `pass`: whether a post
+    /// for `slot` (generation `gen`) is the first for the exchange in this
+    /// pass, which then marks it. A second is left by the overflow sweep
+    /// (which serves every exchange while their entries are still queued);
+    /// serving both, a WebSocket reposting from each kept the pair for
+    /// good, two turns a pass. Stale posts (another generation) mark
+    /// nothing.
+    pub fn firstPost(self: *Self, slot: u32, gen: u31, pass: u64) bool {
+        const e = &self.entries[slot];
+        if (!e.active or (e.gen & 0x7fffffff) != gen) return true;
+        if (e.served == pass) return false;
+        e.served = pass;
+        return true;
     }
 
     /// Worker thread: a slot for a WebSocket over HTTP/2 or HTTP/3, bound

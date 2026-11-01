@@ -918,6 +918,81 @@ test "WebSocket over HTTP/3: output beyond the stream buffer, sends from another
     try testing.expectEqualStrings("open;text:flood;text:after;", h.handler.ws_log.items);
 }
 
+test "WebSocket over HTTP/3: a turn bounds what a pump moves into the stream, compressed messages counted before compression; the post brings the rest" {
+    const h = try Harness.init();
+    defer h.deinit();
+    h.h3_opts.enable_connect_protocol = true;
+    h.h3_opts.websocket.deflate = .{};
+    try h.startClient();
+    const Turns = struct {
+        /// Serves the WebSocket's posts, each a turn (as the endpoint
+        /// does), nothing sent in between; returns how many it took.
+        /// Within a turn the stream takes at most a turn's bytes (with its
+        /// last write's least, and DATA frame headers).
+        fn serve(hh: *Harness) !usize {
+            var entries: [4]@import("../mailbox.zig").Entry = undefined;
+            var turns: usize = 0;
+            while (hh.mailbox.drain(&entries) > 0) : (turns += 1) {
+                const slot = hh.slab.entry(entries[0].slot).stream_id;
+                const before = hh.server.?.streamBuffered(slot);
+                hh.h3c.?.newTurn();
+                const c = hh.ctx();
+                hh.h3c.?.onExchangePosted(TestHandler, &c, entries[0].slot);
+                try testing.expect(hh.server.?.streamBuffered(slot) - before <= ws.turn_bytes + ws.turn_min_write + 64);
+                try testing.expect(hh.mailbox.pending() <= 1);
+            }
+            // As before: the harness serves posts without turns.
+            hh.h3c.?.ws_turn = std.math.maxInt(usize);
+            return turns;
+        }
+    };
+    const msg: [64 * 1024]u8 = @splat('p');
+
+    // Uncompressed: 384 KiB and their headers in two turns, as written.
+    const id = try connectWs(h, "/ws");
+    try h.run(30);
+    const w = h.handler.ws_conn.?;
+    for (0..6) |_| try w.sendBinary(&msg);
+    try testing.expectEqual(@as(usize, 2), try Turns.serve(h));
+    try h.run(100);
+    {
+        var r = try h.response(id);
+        defer r.deinit();
+        try testing.expectEqual(@as(usize, 6 * (msg.len + 10)), r.body.items.len);
+        var rest: []const u8 = r.body.items;
+        for (0..6) |_| {
+            const f = try ws.takeFrame(&rest);
+            try testing.expect(!f.rsv1 and std.mem.eql(u8, f.payload, &msg));
+        }
+    }
+
+    // Compressed: a 64 KiB message of one byte shrinks to a few bytes, yet
+    // costs the turn its 64 KiB. Twelve take three turns.
+    const zid = try connectWs(h, "/ws");
+    try h.run(30);
+    const z = h.handler.ws_conn.?;
+    z.enableDeflate(.{ .enabled = true });
+    for (0..12) |_| try z.sendBinary(&msg);
+    try testing.expectEqual(@as(usize, 3), try Turns.serve(h));
+    try h.run(30);
+    var r = try h.response(zid);
+    defer r.deinit();
+    var rest: []const u8 = r.body.items;
+    const inflate = @import("../ws/inflate.zig");
+    var got: inflate.Out = .{ .buf = &.{}, .max = 1 << 20, .pool = &h.pool };
+    defer if (got.buf.len > 0) h.pool.releaseLarge(got.buf);
+    for (0..12) |_| {
+        const f = try ws.takeFrame(&rest);
+        try testing.expect(f.rsv1 and f.payload.len < 100);
+        const with_trailer = try std.mem.concat(testing.allocator, u8, &.{ f.payload, &@import("../ws/deflate.zig").trailer });
+        defer testing.allocator.free(with_trailer);
+        got.len = 0;
+        _ = try inflate.inflate(try h.pool.wsInflateTables(), null, with_trailer, &got);
+        try testing.expectEqualSlices(u8, &msg, got.buf[0..got.len]);
+    }
+    try testing.expectEqual(@as(usize, 0), rest.len);
+}
+
 /// "storm" (verification): three threads send numbered binary messages
 /// (5 B to 70 KB) to the WebSocket until it goes or each has sent `limit`.
 const H3Storm = struct {

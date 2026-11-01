@@ -31,6 +31,22 @@ const WsConn = ws.Conn;
 const tls = @import("../tls/conn.zig");
 const TlsConn = tls.Conn;
 const Options = @import("./worker.zig").Options;
+const nextDrainPass = @import("./worker.zig").nextDrainPass;
+/// Message bytes (payloads, inflated) a WebSocket may take from input
+/// read beside its writes (`armRecvBeside`), per write: half of a
+/// compressed chunk, what a write of compressed output takes from the
+/// queue at the least, so that echoes can't outgrow what the writes take
+/// (with permessage-deflate a socket byte may inflate fifteenfold). A
+/// larger message is taken whole, and later writes pay it off. Input left
+/// is taken as writes earn it, all of it once the output is written.
+const ws_beside_msg_bytes = 32 * 1024;
+/// Writes completed with more to write before a receive is armed beside
+/// the next (`armRecvBeside`): output written in a few dozen (a response
+/// of a few MiB, an echo) is followed by the usual receive, as before
+/// (with 16, 1 MiB echoes and pipelined 1 MiB HTTP/2 responses cost 3-6%
+/// more CPU on the Pis; with 64, within noise), while a pour still has
+/// its input read within milliseconds.
+const beside_after_writes = 64;
 const mailbox_mod = @import("../mailbox.zig");
 const Mailbox = mailbox_mod.Mailbox;
 const exchange = @import("./exchange.zig");
@@ -331,6 +347,11 @@ pub fn Worker(comptime Handler: type) type {
             recv_multi: bool = false,
             /// A cancel for the armed receive is in flight.
             recv_cancelling: bool = false,
+            /// The armed receive is one beside a write (`armRecvBeside`).
+            recv_beside: bool = false,
+            /// HTTP/2 and WebSockets: writes completed since the output was
+            /// last all written (`beside_after_writes`).
+            write_streak: u8 = 0,
             /// The armed receive's operation (`.recv` or `.recv_plain`).
             recv_op: Op = .recv,
             /// Received bytes the session had no room for yet, still in the
@@ -340,6 +361,18 @@ pub fn Worker(comptime Handler: type) type {
             parked: Parked = .{},
             write_inflight: bool = false,
             peer_closed: bool = false,
+            /// WebSocket: the pass that last served its post (drainMailbox).
+            ws_served: u64 = 0,
+            /// HTTP/2: the pass that last started a turn (`h2Turn`).
+            turn_pass: u64 = 0,
+            /// WebSocket: the last write completed short, so the socket is
+            /// full: reading beside writes waits for one that completes
+            /// whole (as epoll's reading waits while the socket is full).
+            send_short: bool = false,
+            /// WebSocket: message bytes input read beside writes may still
+            /// take (`ws_beside_msg_bytes` a write, at most that saved up;
+            /// below 0 while a larger message is paid off).
+            beside_msg: i64 = ws_beside_msg_bytes,
             /// Draining input after an error response (see Session.linger).
             lingering: bool = false,
             lingered: u32 = 0,
@@ -425,6 +458,12 @@ pub fn Worker(comptime Handler: type) type {
         active: List,
         open_count: usize = 0,
         h2_count: usize = 0,
+        /// Passes of the loop (its completions, then drainMailbox), as the
+        /// other loop counts them: a connection or exchange served in this
+        /// one is skipped if its post comes up again (`Conn.ws_served`,
+        /// `exchange.Slab.firstPost`), and an HTTP/2 connection's
+        /// WebSockets get one turn in it (`h2Turn`).
+        drain_pass: u64 = 0,
         /// Submissions whose last completion hasn't arrived: each takes an
         /// SQE (`getSqe`) and ends with a completion without F_MORE.
         ops: usize = 0,
@@ -624,7 +663,21 @@ pub fn Worker(comptime Handler: type) type {
             var cqes: [512]linux.io_uring_cqe = undefined;
             while (!self.shutdown.load(.acquire)) {
                 self.buffers.topUp();
-                _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
+                // Posts left by the last drain (a turn cut short, a handler
+                // sending from this thread) are served without waiting;
+                // posts from other threads wake the worker themselves. Not
+                // waiting still enters the kernel for completions: with
+                // DEFER_TASKRUN they are only processed then
+                // (`submit_and_wait(0)` skips the call when it has nothing
+                // to submit, and a WebSocket reposting itself kept every
+                // other connection's completions out for good). The ring
+                // has no SQPOLL thread, so there is no wakeup flag to
+                // check (`sq_ring_needs_enter`): entering submits.
+                const waited = if (self.mailbox.pending() > 0)
+                    self.ring.enter(self.ring.flush_sq(), 0, linux.IORING_ENTER_GETEVENTS)
+                else
+                    self.ring.submit_and_wait(1);
+                _ = waited catch |err| switch (err) {
                     error.SignalInterrupt => continue,
                     else => {
                         std.debug.print("io_uring submit failed: {s}\n", .{@errorName(err)});
@@ -632,6 +685,8 @@ pub fn Worker(comptime Handler: type) type {
                     },
                 };
                 const n = self.ring.copy_cqes(&cqes, 0) catch 0;
+                self.drain_pass = nextDrainPass(self.drain_pass);
+                if (self.quic) |*ep| ep.pass = self.drain_pass;
                 self.tick();
                 for (cqes[0..n]) |cqe| {
                     if (cqe.flags & linux.IORING_CQE_F_MORE == 0) self.ops -= 1;
@@ -744,6 +799,9 @@ pub fn Worker(comptime Handler: type) type {
             if (c.gen != gen) return; // completions of a reused slot never happen (inflight gating)
             // A multishot receive stays in flight until its last completion.
             if (op != .recv or cqe.flags & linux.IORING_CQE_F_MORE == 0) c.inflight -= 1;
+            // A completion may begin the pass's turn for an HTTP/2
+            // connection's WebSockets (a write's pumps the next output).
+            if (c.h2 != null) self.h2Turn(c);
             switch (op) {
                 .recv => self.onRecv(c, cqe),
                 .recv_plain => self.onRecvPlain(c, cqe),
@@ -937,11 +995,56 @@ pub fn Worker(comptime Handler: type) type {
         /// request, record or frame goes straight in after it.
         fn armRecvPlain(self: *Self, c: *Conn) void {
             const space = self.plainSpace(c) orelse return;
+            // No room (TLS holds plaintext it hasn't handed over, and its
+            // buffer is full): a receive would complete with 0, read as the
+            // peer's FIN. The input held goes in first (h2Drive and wsDrive
+            // see to it before arming; here for any other caller), again
+            // while that makes progress.
+            if (space.len == 0) {
+                const t = c.tls orelse return;
+                if (!t.hasBufferedInput()) return;
+                const mark = .{ t.in_start, t.plain.len };
+                if (!self.tlsDecrypt(c, t)) return;
+                if (t.in_start != mark[0] or t.plain.len != mark[1]) self.carryOn(c);
+                return;
+            }
             const sqe = self.getSqe();
             sqe.prep_recv(c.fd, space, 0);
             sqe.user_data = userData(c.gen, self.slotOf(c), .recv_plain);
             c.recv_op = .recv_plain;
             c.recv_armed = true;
+            c.inflight += 1;
+        }
+
+        /// While output is written (HTTP/2 and WebSockets): a receive into
+        /// the connection's own buffer, as far as it has room, so that the
+        /// client's frames (a WebSocket's close, its pings, requests on the
+        /// connection's other streams) are read on while a sender keeps the
+        /// output coming. Receiving only once there was nothing left to
+        /// write, a pour's every write completion pumped the next turn and
+        /// nothing was read again (as epoll reads on each event). Not while
+        /// the connection holds input it hasn't taken (frames waiting for
+        /// output to drain, TLS records): that is the backpressure. Only
+        /// once output has gone on for a while (`beside_after_writes`).
+        fn armRecvBeside(self: *Self, c: *Conn) void {
+            if (c.write_streak < beside_after_writes or c.recv_armed or c.closing or c.peer_closed or c.lingering) return;
+            if (c.tls) |t| {
+                if (t.hasBufferedInput()) return;
+            }
+            if (c.h2) |conn| {
+                if (conn.holdsFrames() or conn.wantsClose()) return;
+            } else if (c.ws) |w| {
+                if (w.wantsClose() or c.send_short or w.input_paused or c.beside_msg <= 0) return;
+            } else return;
+            const space = self.plainSpace(c) orelse return;
+            // An empty buffer would read as the peer's FIN.
+            if (space.len == 0) return;
+            const sqe = self.getSqe();
+            sqe.prep_recv(c.fd, space, 0);
+            sqe.user_data = userData(c.gen, self.slotOf(c), .recv_plain);
+            c.recv_op = .recv_plain;
+            c.recv_armed = true;
+            c.recv_beside = true;
             c.inflight += 1;
         }
 
@@ -1036,6 +1139,7 @@ pub fn Worker(comptime Handler: type) type {
             if (self.h2_count == 0) return;
             for (self.conns) |*c| {
                 if (!c.open or c.h2 == null or c.closing or c.lingering) continue;
+                self.h2Turn(c);
                 const ctx = self.h2Context(c);
                 c.h2.?.tick(Handler, &ctx);
                 self.h2Drive(c);
@@ -1054,6 +1158,7 @@ pub fn Worker(comptime Handler: type) type {
                 const c = &self.conns[e.conn_slot];
                 if (!c.open or c.gen != e.conn_gen or c.closing or c.lingering) continue;
                 if (c.h2) |conn| {
+                    self.h2Turn(c);
                     const ctx = self.h2Context(c);
                     conn.onExchangeTimeout(Handler, &ctx, @intCast(slot));
                     self.h2Drive(c);
@@ -1368,7 +1473,16 @@ pub fn Worker(comptime Handler: type) type {
         fn onRecvPlain(self: *Self, c: *Conn, cqe: linux.io_uring_cqe) void {
             c.recv_armed = false;
             c.recv_cancelling = false;
+            const beside = c.recv_beside;
+            c.recv_beside = false;
             if (c.closing) return;
+            // A receive beside a write, cancelled once the output was
+            // written: the usual one now.
+            if (beside and cqe.err() == .CANCELED) {
+                // Lingering (our GOAWAY written meanwhile): drained on.
+                if (c.lingering) return self.armRecv(c);
+                return self.carryOn(c);
+            }
             if (cqe.res < 0) return self.closeConn(c);
             self.plainInput(c, @intCast(cqe.res));
         }
@@ -1418,7 +1532,7 @@ pub fn Worker(comptime Handler: type) type {
                     c.peer_closed = true;
                 } else {
                     w.decoder.commitRead(n);
-                    _ = w.process(Handler, self.handler);
+                    _ = self.wsRun(c);
                 }
                 return self.wsDrive(c);
             }
@@ -1731,12 +1845,21 @@ pub fn Worker(comptime Handler: type) type {
             const c = &self.conns[e.conn_slot];
             if (!c.open or c.gen != e.conn_gen or c.closing or c.lingering) return;
             if (c.h2) |conn| {
+                // A WebSocket's post brings a turn of its own (see
+                // `h2Turn`); an exchange's doesn't.
+                if (e.tunnel) conn.newTurn();
                 const ctx = self.h2Context(c);
                 conn.onExchangePosted(Handler, &ctx, slot);
                 // As the other loop's flush does: output the post left
                 // waiting behind other streams (a head needs no window)
                 // goes now, not with the client's next frame (a write in
                 // flight pumps when it completes).
+                // Frames that waited for a turn are processed with this
+                // one (processing pumps).
+                if (conn.holdsFrames()) {
+                    _ = self.h2Process(c);
+                    return;
+                }
                 if (!c.write_inflight) conn.pump(Handler, &ctx);
                 return self.h2Drive(c);
             }
@@ -1776,6 +1899,8 @@ pub fn Worker(comptime Handler: type) type {
                 self.allocator.destroy(conn);
                 return false;
             };
+            conn.newTurn();
+            c.turn_pass = self.drain_pass;
             const s = &c.session;
             if (s.buf.len > 0) {
                 const leftover = s.buf[s.start..s.end];
@@ -1861,7 +1986,13 @@ pub fn Worker(comptime Handler: type) type {
             const conn = c.h2.?;
             var rest = data;
             while (rest.len > 0) {
-                const space = conn.readSpace(&self.pool) catch return self.closeConn(c);
+                const space = conn.readSpace(&self.pool) catch |err| switch (err) {
+                    // Frames wait (output to drain, or the WebSockets'
+                    // next turn): the rest of the kernel's buffer is kept
+                    // all the same (no receive is armed meanwhile).
+                    error.BufferFull => conn.readSpaceFor(&self.pool, rest.len) catch return self.closeConn(c),
+                    else => return self.closeConn(c),
+                };
                 const n = @min(space.len, rest.len);
                 @memcpy(space[0..n], rest[0..n]);
                 conn.commitRead(n);
@@ -1898,7 +2029,8 @@ pub fn Worker(comptime Handler: type) type {
         /// there is nothing to write. One write at a time; no recv while
         /// a write is in flight (backpressure).
         fn h2Drive(self: *Self, c: *Conn) void {
-            if (c.closing or c.write_inflight or c.lingering) return;
+            if (c.closing or c.lingering) return;
+            if (c.write_inflight) return self.armRecvBeside(c);
             const conn = c.h2 orelse return;
             if (userTls(c)) |t| {
                 switch (self.tlsSubmit(c, t)) {
@@ -1906,6 +2038,7 @@ pub fn Worker(comptime Handler: type) type {
                     .writing => {
                         c.after_write = .none;
                         if (c.list != .active) self.arm(c, .active);
+                        if (c.write_inflight) self.armRecvBeside(c);
                         return;
                     },
                     .closed => return,
@@ -1928,9 +2061,28 @@ pub fn Worker(comptime Handler: type) type {
                 c.write_inflight = true;
                 c.inflight += 1;
                 if (c.list != .active) self.arm(c, .active);
-                return;
+                return self.armRecvBeside(c);
             }
             if (conn.wantsClose()) return self.h2Linger(c);
+            // Frames waiting for the WebSockets' next turn come before
+            // anything else, the client's end included (their post brings
+            // the turn); nothing more is received meanwhile.
+            if (conn.holdsFrames()) {
+                if (c.peer_closed) {
+                    if (c.list != .active) self.arm(c, .active);
+                } else self.unlink(c);
+                return;
+            }
+            // What TLS kept back while frames waited goes in next, before
+            // any receive or the client's end: nothing new may come to
+            // bring it (and TLS's buffer may have no room for one).
+            if (c.tls) |t| {
+                if (t.hasBufferedInput()) {
+                    const mark = .{ t.in_start, t.plain.len };
+                    if (!self.tlsDecrypt(c, t)) return;
+                    if (t.in_start != mark[0] or t.plain.len != mark[1]) return self.h2Drive(c);
+                }
+            }
             if (c.peer_closed) {
                 // Half-closed: what was asked is still answered, within the
                 // request timeout (progress writing extends it), unless
@@ -1940,6 +2092,11 @@ pub fn Worker(comptime Handler: type) type {
                 if (c.list != .active) self.arm(c, .active);
                 return;
             }
+            // Output written: a receive armed beside it would hold the
+            // connection's buffer while it idles. It is cancelled; the
+            // usual receive (into a kernel buffer) follows (onRecvPlain).
+            c.write_streak = 0;
+            if (c.recv_beside) return self.cancelRecv(c);
             self.releaseIdle(c);
             if (conn.activeStreams() == 0 and !conn.inFrame()) {
                 self.arm(c, .idle);
@@ -1977,6 +2134,7 @@ pub fn Worker(comptime Handler: type) type {
 
         fn onH2Write(self: *Self, c: *Conn, cqe: linux.io_uring_cqe) void {
             c.write_inflight = false;
+            c.write_streak +|= 1;
             if (c.closing) return;
             if (cqe.res < 0) return self.closeConn(c);
             if (self.alertAfterWrite(c, @intCast(cqe.res))) return;
@@ -1990,13 +2148,16 @@ pub fn Worker(comptime Handler: type) type {
             }
             if (cqe.res > 0) self.arm(c, .active);
             if (conn.hasWire()) return self.h2Drive(c);
-            // Written: streams waiting for room continue, then input that
-            // arrived while output was pending is processed.
-            const ctx = self.h2Context(c);
-            conn.pump(Handler, &ctx);
-            if (conn.hasWire()) return self.h2Drive(c);
-            if (!self.h2Process(c)) return;
-            self.h2Drive(c);
+            // Written: input that arrived while output was pending is
+            // processed (with what TLS kept back for it), and processing
+            // pumps the streams waiting for room. Pumping first, a sender
+            // keeping the queue filled always left something to write, and
+            // frames that waited (for `out_limit`, or for a turn) were
+            // never parsed.
+            if (c.tls) |t| {
+                if (t.hasBufferedInput() and !self.tlsDecrypt(c, t)) return;
+            }
+            _ = self.h2Process(c);
         }
 
         /// Runs the session until it needs input, or output must be written
@@ -2174,9 +2335,14 @@ pub fn Worker(comptime Handler: type) type {
                 }
                 if (!t.hasBufferedInput()) break;
                 if (c.h2) |conn| {
-                    const space = conn.readSpace(&self.pool) catch {
-                        self.closeConn(c);
-                        return false;
+                    const space = conn.readSpace(&self.pool) catch |err| switch (err) {
+                        // Frames wait for output to drain (`out_limit`):
+                        // the rest stays with TLS until it has (onH2Write).
+                        error.BufferFull => break,
+                        else => {
+                            self.closeConn(c);
+                            return false;
+                        },
                     };
                     conn.commitRead(t.readPlain(space));
                     // Run only: I/O is driven once the input is consumed
@@ -2186,12 +2352,19 @@ pub fn Worker(comptime Handler: type) type {
                     continue;
                 }
                 if (c.ws) |w| {
-                    const space = w.decoder.readSpace() catch {
-                        self.closeConn(c);
-                        return false;
+                    // The writes' share is spent: the rest stays with TLS
+                    // until a write completes (onWsWrite) or the output is
+                    // written (wsDrive), not in a decoder that may be full.
+                    if (w.input_paused) break;
+                    const space = w.decoder.readSpace() catch |err| switch (err) {
+                        error.BufferFull => break,
+                        else => {
+                            self.closeConn(c);
+                            return false;
+                        },
                     };
                     w.decoder.commitRead(t.readPlain(space));
-                    if (w.process(Handler, self.handler) == .close) break;
+                    if (self.wsRun(c) == .close) break;
                 } else {
                     const space = c.session.readSpace(&self.pool, self.opts.session) catch {
                         self.closeConn(c);
@@ -2340,13 +2513,15 @@ pub fn Worker(comptime Handler: type) type {
         /// Writes queued output, or arms the next recv when there is none.
         /// A recv is armed only while no write is in flight (backpressure).
         fn wsDrive(self: *Self, c: *Conn) void {
-            if (c.closing or c.write_inflight) return;
+            if (c.closing) return;
+            if (c.write_inflight) return self.armRecvBeside(c);
             const w = c.ws.?;
             if (userTls(c)) |t| {
                 switch (self.tlsSubmit(c, t)) {
                     .idle => {},
                     .writing => {
                         if (c.list != .active) self.arm(c, .active);
+                        if (c.write_inflight) self.armRecvBeside(c);
                         return;
                     },
                     .closed => return,
@@ -2369,9 +2544,32 @@ pub fn Worker(comptime Handler: type) type {
                 c.write_inflight = true;
                 c.inflight += 1;
                 if (c.list != .active) self.arm(c, .active);
-                return;
+                return self.armRecvBeside(c);
+            }
+            // Input left while output was pending: all of it now (what TLS
+            // kept back included), and the writes' share starts afresh.
+            c.beside_msg = ws_beside_msg_bytes;
+            if (w.input_paused) {
+                _ = self.wsRun(c);
+                if (c.tls) |t| {
+                    if (t.hasBufferedInput() and !self.tlsDecrypt(c, t)) return;
+                }
+                return self.wsDrive(c);
+            }
+            // What TLS kept back goes in before any receive (see h2Drive).
+            if (c.tls) |t| {
+                if (t.hasBufferedInput() and !w.wantsClose()) {
+                    const mark = .{ t.in_start, t.plain.len };
+                    if (!self.tlsDecrypt(c, t)) return;
+                    if (t.in_start != mark[0] or t.plain.len != mark[1]) return self.wsDrive(c);
+                }
             }
             if (w.wantsClose() or c.peer_closed) return self.closeConn(c);
+            // Output written: a receive armed beside it would hold the
+            // connection's buffer while it idles. It is cancelled; the
+            // usual receive (into a kernel buffer) follows (onRecvPlain).
+            c.write_streak = 0;
+            if (c.recv_beside) return self.cancelRecv(c);
             self.releaseIdle(c);
             // Only a pending close handshake has a deadline.
             if (w.closeSent()) {
@@ -2384,32 +2582,70 @@ pub fn Worker(comptime Handler: type) type {
 
         fn onWsWrite(self: *Self, c: *Conn, cqe: linux.io_uring_cqe) void {
             c.write_inflight = false;
+            c.write_streak +|= 1;
             if (c.closing) return;
             if (cqe.res < 0) return self.closeConn(c);
             if (self.alertAfterWrite(c, @intCast(cqe.res))) return;
             // With TLS the WebSocket bytes were consumed when encrypted.
             if (userTls(c)) |t| {
                 t.advance(@intCast(cqe.res));
+                c.send_short = t.hasWire();
             } else {
                 c.ws.?.advance(@intCast(cqe.res));
+                c.send_short = c.ws.?.hasWire();
                 if (!self.kernelWrote(c, @intCast(cqe.res))) return;
             }
             // Progress extends the deadline; a stalled reader times out.
             if (cqe.res > 0) self.arm(c, .active);
+            // Input read beside the write and left for it, then what TLS
+            // kept back (`c.tls`: with the kernel's TLS sending, input is
+            // still decrypted here).
+            c.beside_msg = @min(c.beside_msg + ws_beside_msg_bytes, ws_beside_msg_bytes);
+            if (c.ws.?.input_paused) _ = self.wsRun(c);
+            if (c.tls) |t| {
+                if (!c.ws.?.input_paused and t.hasBufferedInput() and !self.tlsDecrypt(c, t)) return;
+            }
             self.wsDrive(c);
+        }
+
+        /// Runs the WebSocket over its buffered input: all of it once the
+        /// output is written, otherwise as far as the writes have earned
+        /// (`beside_msg`).
+        fn wsRun(self: *Self, c: *Conn) WsConn.Action {
+            const w = c.ws.?;
+            if (!c.write_inflight and !w.hasOutput()) return w.process(Handler, self.handler);
+            w.input_budget = if (c.beside_msg > 0) @intCast(c.beside_msg) else 0;
+            w.input_charged = 0;
+            const action = w.process(Handler, self.handler);
+            c.beside_msg -= @intCast(@min(w.input_charged, std.math.maxInt(i32)));
+            w.input_budget = std.math.maxInt(usize);
+            return action;
         }
 
         fn drainMailbox(self: *Self) void {
             var entries: [64]mailbox_mod.Entry = undefined;
-            while (true) {
-                const n = self.mailbox.drain(&entries);
+            // What was posted before the drain began, oldest first; what
+            // is posted meanwhile waits for the next pass (the loop then
+            // doesn't wait for a completion). A WebSocket over HTTP/2 or
+            // HTTP/3 whose turn ran out posts itself again, and draining
+            // until empty served it again at once, for as long as its
+            // sender kept up.
+            var left = self.mailbox.pending();
+            while (left > 0) {
+                const n = self.mailbox.drain(entries[0..@min(left, entries.len)]);
                 if (n == 0) break;
+                left -= n;
                 for (entries[0..n]) |e| switch (e.kind) {
                     .ws => {
                         const c = &self.conns[e.slot];
-                        if (c.open and (c.gen & 0x7fffffff) == e.gen) self.wsFlushPosted(c);
+                        // A second entry in one pass is left by the
+                        // overflow sweep (see the other loop's).
+                        if (c.open and (c.gen & 0x7fffffff) == e.gen and c.ws_served != self.drain_pass) {
+                            c.ws_served = self.drain_pass;
+                            self.wsFlushPosted(c);
+                        }
                     },
-                    .exchange => self.exchangePosted(e.slot, e.gen),
+                    .exchange => if (self.exchanges.firstPost(e.slot, e.gen, self.drain_pass)) self.exchangePosted(e.slot, e.gen),
                 };
             }
             if (self.mailbox.takeOverflow()) {
@@ -2438,6 +2674,18 @@ pub fn Worker(comptime Handler: type) type {
             const w = c.ws orelse return;
             w.clearPosted();
             self.wsDrive(c);
+        }
+
+        /// A turn for the connection's WebSockets (`H2Conn.ws_turn`): one
+        /// per pass of the loop for its completions (an HTTP/2 connection
+        /// has a receive and a write in flight at most), the tick and
+        /// timeouts; and one for each post for its streams, as the other
+        /// loop does (see its `h2Turn`). One that finds the turn spent
+        /// posts itself for the next pass.
+        fn h2Turn(self: *Self, c: *Conn) void {
+            if (c.turn_pass == self.drain_pass) return;
+            c.turn_pass = self.drain_pass;
+            c.h2.?.newTurn();
         }
     };
 }

@@ -85,6 +85,8 @@ pub fn Endpoint(comptime Handler: type) type {
             /// The deadline this slot has in the heap.
             scheduled: ?u64 = null,
             dirty: bool = false,
+            /// The worker's pass that last started a turn (`turn`).
+            turn_pass: u64 = 0,
         };
 
         const Timer = struct { at: u64, slot: u32, gen: u32 };
@@ -120,6 +122,9 @@ pub fn Endpoint(comptime Handler: type) type {
         resp: *Response = undefined,
         date_line: *const [date.header_len]u8 = undefined,
         now_s: *const u32 = undefined,
+        /// The worker's loop pass, set as each begins (never 0): a
+        /// connection's WebSockets get one turn in it (`turn`).
+        pass: u64 = 1,
         exchanges: *exchange.Slab = undefined,
         pool: *BufferPool = undefined,
 
@@ -418,9 +423,24 @@ pub fn Endpoint(comptime Handler: type) type {
             while (i < self.dirty.items.len) : (i += 1) {
                 const slot = self.dirty.items[i];
                 self.slots[slot].dirty = false;
+                self.turn(slot);
                 self.service(slot, now_us);
             }
             self.dirty.clearRetainingCapacity();
+        }
+
+        /// A turn for the connection's WebSockets (`h3.Conn.ws_turn`): one
+        /// per pass of the worker's loop for its packets and timers; and
+        /// one for each post for its streams (a WebSocket's at most once a
+        /// pass), which that WebSocket is pumped in first, as over HTTP/2
+        /// (the worker's `h2Turn`). One that finds the turn spent posts
+        /// itself for the next pass.
+        fn turn(self: *Self, slot: u32) void {
+            const st = &self.slots[slot];
+            const h = st.h orelse return;
+            if (st.turn_pass == self.pass) return;
+            st.turn_pass = self.pass;
+            h.newTurn();
         }
 
         fn service(self: *Self, slot: u32, now_us: u64) void {
@@ -647,6 +667,9 @@ pub fn Endpoint(comptime Handler: type) type {
         pub fn onExchangePosted(self: *Self, conn_slot: u32, conn_gen: u32, ex_slot: u32, now_us: u64) void {
             const slot = self.slotFor(conn_slot, conn_gen) orelse return;
             const c = self.ctx(slot, now_us);
+            // A WebSocket's post brings a turn of its own (see `turn`); an
+            // exchange's doesn't.
+            if (self.exchanges.entry(ex_slot).tunnel) self.slots[slot].h.?.newTurn();
             self.slots[slot].h.?.onExchangePosted(Handler, &c, ex_slot);
             self.service(slot, now_us);
         }

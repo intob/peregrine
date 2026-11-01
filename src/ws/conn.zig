@@ -22,6 +22,26 @@ pub const Frame = protocol.Frame;
 pub const Opcode = protocol.Opcode;
 pub const close_code = protocol.close_code;
 
+/// WebSocket bytes moved per turn of a connection, each way (read; and
+/// written, encrypted or compressed), over all of one event's or one
+/// post's reads and writes: the rest waits for the next pass of the loop,
+/// after the others' events and the timers. Over HTTP/1.1 the epoll
+/// worker's (`ws_turn_bytes`); over HTTP/2 and HTTP/3 the output of all
+/// of a connection's WebSockets on every backend (`h2.Conn.ws_turn`,
+/// `h3.Conn.ws_turn`). Measured (output only) with a storm over TLS on one
+/// connection and requests on another (worst wait, Debug / ReleaseSafe):
+/// 128 KiB 30 / 12 ms, 256 KiB 57 / 12 ms, 1 MiB 192 / 21 ms, no turns
+/// over 5 s / 1 s; echoes of 20 B to 1 MiB cost the same with any of them.
+pub const turn_bytes = 256 * 1024;
+/// Message bytes (payloads, inflated) a turn delivers from input over
+/// HTTP/2 and HTTP/3 (`h2.Conn.ws_in`, `h3.Conn.ws_in`), as HTTP/1.1's
+/// epoll turns do (`ws_msg_bytes`): less than a turn writes, so that a
+/// client's echoes can't outgrow what the turns take.
+pub const turn_in_bytes = turn_bytes / 2;
+/// The least a turn's last uncompressed write moves (`turnRoom`): one
+/// DATA frame of the default size, rather than a sliver of one.
+pub const turn_min_write = 16 * 1024;
+
 pub const Options = struct {
     /// Messages larger than this fail the connection with 1009.
     max_message_size: usize = 16 * 1024 * 1024,
@@ -115,9 +135,10 @@ pub const Conn = struct {
     /// `shared` is taken again only once they are).
     raw: Queue = .{},
     raw_pos: usize = 0,
-    /// Worker only: bytes of messages the last chunk compressed, for the
-    /// epoll worker's turns (`takeCompressed`, after each `wireBytes`).
-    /// Set, not added to: other backends never take it.
+    /// Worker only: bytes of messages the last chunk compressed, for turns
+    /// (`takeCompressed`, after each `wireBytes`): the epoll worker's over
+    /// HTTP/1.1, and HTTP/2's and HTTP/3's. Set, not added to: io_uring's
+    /// HTTP/1.1 path never takes it.
     compressed: usize = 0,
     /// Worker only: the wire was compressed, and its frames counted as
     /// they were (`compressed`): writing it costs a turn nothing more.
@@ -136,6 +157,10 @@ pub const Conn = struct {
     input_budget: usize = std.math.maxInt(usize),
     /// Worker only: process() stopped for `input_budget` with input left.
     input_paused: bool = false,
+    /// Worker only: what process() has charged (`input_budget`'s way),
+    /// overshoot included: io_uring carries a frame larger than its share
+    /// over as debt. Reset by the worker.
+    input_charged: usize = 0,
     /// Worker only: the answer to the latest ping, when the send queue had
     /// no room for it (it is full of the handler's messages). It joins the
     /// queue as the worker takes the queue, past the size limit: a ping
@@ -302,7 +327,9 @@ pub const Conn = struct {
             // A frame costs its payload and the longest header a client's
             // has: echoes of small frames, their headers and all, stay well
             // within what a turn writes.
-            self.input_budget -|= frame.payload.len + protocol.max_header_len;
+            const cost = frame.payload.len + protocol.max_header_len;
+            self.input_budget -|= cost;
+            self.input_charged +%= cost;
             const sent_close = self.closeSent();
             switch (frame.opcode) {
                 .ping => if (!sent_close) self.answerPing(frame.payload),
@@ -415,6 +442,28 @@ pub const Conn = struct {
     pub fn takeCompressed(self: *Self) usize {
         defer self.compressed = 0;
         return self.compressed;
+    }
+
+    /// `wireBytes`, its compression charged to `turn` (bytes of messages,
+    /// before compression).
+    pub fn turnWire(self: *Self, turn: *usize) []const u8 {
+        const bytes = self.wireBytes();
+        turn.* -|= self.takeCompressed();
+        return bytes;
+    }
+
+    /// How much of the wire a turn with `turn` left may write: all of a
+    /// compressed one (charged as it was taken), at most what is left (but
+    /// `turn_min_write`) of another.
+    pub fn turnRoom(self: *const Self, turn: usize) usize {
+        return if (self.wire_charged) std.math.maxInt(usize) else @max(turn, turn_min_write);
+    }
+
+    /// `advance`, charging `turn` for uncompressed bytes.
+    pub fn turnAdvance(self: *Self, turn: *usize, n: usize) void {
+        const charged = self.wire_charged;
+        self.advance(n);
+        if (!charged) turn.* -|= n;
     }
 
     /// The wire is written: its buffer goes back to the pool.

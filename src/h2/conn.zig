@@ -75,6 +75,10 @@ pub const Action = enum {
     flush,
     /// Write `out`, then close the connection.
     close,
+    /// The WebSockets' input for this turn is taken (`ws_in`): write
+    /// `out`; the rest is processed in a later turn, which a WebSocket's
+    /// post brings (read no more meanwhile: `holdsFrames`).
+    yield,
 };
 
 /// Everything `process` needs besides the connection.
@@ -400,6 +404,26 @@ pub const Conn = struct {
     held: bool = false,
     /// `pumpAll` passes so far (tests bound the work per frame with it).
     passes: u32 = 0,
+    /// What the WebSockets on this connection may still move in the
+    /// current turn (`newTurn`): bytes of messages taken, compressed ones
+    /// counted before compression, uncompressed ones as written. A
+    /// WebSocket that finds it spent with output left posts itself, to go
+    /// on in its next turn, whatever room `out` and the windows have left.
+    /// Before turns a pump compressed until `out_limit` filled: 64 KiB
+    /// messages of one byte shrink to about 60, so some 4000 messages a
+    /// pump, and with a client reading as fast as the worker wrote, a
+    /// request on another connection waited 14-30 s. Unbounded until the
+    /// worker starts a turn.
+    ws_turn: usize = std.math.maxInt(usize),
+    /// The message bytes (payloads, inflated) the WebSockets may still
+    /// take from input in the current turn (`ws.turn_in_bytes` a turn; a
+    /// DATA frame is taken whole, and what it takes past this is paid off
+    /// by the next turns). Once it is spent, frames wait from the next
+    /// WebSocket DATA frame on (`process` yields), so the client's window
+    /// isn't returned for them: without it the worker read and processed
+    /// as fast as an echo client sent, its echoes refused by the send queue
+    /// (1900 of 2000 64 KiB echoes) and other connections held up.
+    ws_in: i64 = std.math.maxInt(i32),
     /// Scratch for `pumpAll`: stream slots in sending order.
     order: []u32,
     /// Per urgency: the incremental stream served last, so the next pass
@@ -489,6 +513,12 @@ pub const Conn = struct {
 
     pub fn readSpace(self: *Self, pool: *BufferPool) ![]u8 {
         return self.reader.readSpace(pool, self.frame_opts);
+    }
+
+    /// Room for `n` bytes of input that must be kept although frames wait
+    /// unprocessed (`readSpace` found the buffer full): the buffer grows.
+    pub fn readSpaceFor(self: *Self, pool: *BufferPool, n: usize) ![]u8 {
+        return self.reader.spaceFor(pool, n);
     }
 
     pub inline fn commitRead(self: *Self, n: usize) void {
@@ -836,6 +866,10 @@ pub const Conn = struct {
                 self.reader.start += frame.preface.len;
                 self.state = .first_settings;
             }
+            if (self.wsInSpent()) {
+                if (!pumped) self.pumpAll(Handler, ctx);
+                return if (self.failed or self.wantsClose()) .close else .yield;
+            }
             switch (self.reader.next(self.frame_opts)) {
                 .need_more => break,
                 .failure => |f| {
@@ -1062,13 +1096,14 @@ pub const Conn = struct {
 
     /// DATA on an extended CONNECT stream: WebSocket bytes, run through
     /// the stream's ws.Conn at once, or dropped if the handler didn't take
-    /// the tunnel. The window comes back once the WebSocket's output has
-    /// been written (backpressure, as HTTP/1.1 stops reading the socket
-    /// while output is stalled).
+    /// the tunnel. The window comes back as the WebSocket's output is
+    /// pumped, unless the client holds that output back (backpressure, as
+    /// HTTP/1.1 stops reading the socket while it is full).
     fn tunnelData(self: *Self, comptime Handler: type, ctx: *const Context(Handler), s: *Stream, d: anytype) void {
         if (d.end_stream) s.state = .half_closed_remote;
         const w = s.ws orelse return self.creditStream(s, d.flow_len);
         var rest = d.data;
+        w.input_charged = 0;
         while (rest.len > 0 and !w.wantsClose()) {
             const space = w.decoder.readSpace() catch return self.resetStream(ctx, s, .internal_error);
             const n = @min(space.len, rest.len);
@@ -1077,6 +1112,7 @@ pub const Conn = struct {
             rest = rest[n..];
             _ = w.process(Handler, ctx.handler);
         }
+        self.ws_in -= @intCast(@min(w.input_charged, std.math.maxInt(i32)));
         w.decoder.releaseIfIdle();
         s.consumed += d.flow_len;
         self.pumpStream(Handler, ctx, s);
@@ -1697,6 +1733,29 @@ pub const Conn = struct {
         self.pumpAll(Handler, ctx);
     }
 
+    /// Called by the worker for each event or post of the connection: its
+    /// WebSockets may move `ws.turn_bytes` more (`ws_turn`).
+    pub fn newTurn(self: *Self) void {
+        self.ws_turn = ws.turn_bytes;
+        self.ws_in = @min(self.ws_in + ws.turn_in_bytes, ws.turn_in_bytes);
+    }
+
+    /// The next frame is DATA for a WebSocket and this turn's input is
+    /// taken: it waits, and the WebSocket's post brings a turn for it.
+    fn wsInSpent(self: *Self) bool {
+        if (self.ws_in > 0) return false;
+        const data = self.reader.buf[self.reader.start..self.reader.end];
+        if (data.len < frame.header_len or data[3] != @backingInt(frame.FrameType.data)) return false;
+        // Longer than we allow: the reader's error (FRAME_SIZE_ERROR)
+        // comes now, whatever the turn.
+        if (std.mem.readInt(u24, data[0..3], .big) > self.frame_opts.max_frame_size) return false;
+        const id: u31 = @truncate(std.mem.readInt(u32, data[5..9], .big));
+        const s = self.findStream(id) orelse return false;
+        const w = s.ws orelse return false;
+        w.repost();
+        return true;
+    }
+
     /// Sends for every stream with output, in priority order (RFC 9218
     /// §10), until `out` is full.
     fn pumpAll(self: *Self, comptime Handler: type, ctx: *const Context(Handler)) void {
@@ -1972,37 +2031,63 @@ pub const Conn = struct {
         self.finishStream(ctx, s);
     }
 
-    /// Sends what the WebSocket has queued as the windows allow. Once
-    /// everything is written and the WebSocket is over (the close
-    /// handshake, a failure, or the client's END_STREAM, which is a TCP
-    /// FIN to it), END_STREAM ends our side and the stream closes.
+    /// Sends what the WebSocket has queued as the windows and the turn
+    /// (`ws_turn`) allow. Once everything is written and the WebSocket is
+    /// over (the close handshake, a failure, or the client's END_STREAM,
+    /// which is a TCP FIN to it), END_STREAM ends our side and the stream
+    /// closes.
     fn pumpWebSocket(self: *Self, comptime Handler: type, ctx: *const Context(Handler), s: *Stream, budget: usize) void {
         const w = s.ws.?;
         var progressed = false;
         var sent: usize = 0;
+        var turn_over = false;
+        // Output held back by the client (its windows) or by room in `out`
+        // (it reads slower than we write).
+        var held = false;
         while (sent < budget) {
-            if (self.unsent() > self.opts.out_limit) {
-                self.setBlocked(s, s.send_window > 0);
+            // The turn first: a whole uncompressed turn, its DATA frame
+            // headers and all, is past `out_limit`, and that is no sign
+            // of a slow reader.
+            if (self.ws_turn == 0) {
+                turn_over = true;
                 break;
             }
-            const bytes = w.wireBytes();
+            if (self.unsent() > self.opts.out_limit) {
+                self.setBlocked(s, s.send_window > 0);
+                held = true;
+                break;
+            }
+            const bytes = w.turnWire(&self.ws_turn);
             if (bytes.len == 0) break;
-            const k = @min(bytes.len, budget - sent);
+            const k = @min(bytes.len, budget - sent, w.turnRoom(self.ws_turn));
             const n = self.writeData(s, bytes[0..k], false);
-            w.advance(n);
+            w.turnAdvance(&self.ws_turn, n);
             sent += n;
             progressed = progressed or n > 0;
             if (n < k) {
                 self.setBlocked(s, s.send_window > 0);
+                held = true;
                 break;
             }
         }
         s.ws_pending = w.hasOutput();
+        // A window spent just as the quantum or the turn ended holds the
+        // rest back too.
+        if (s.ws_pending and (s.send_window <= 0 or self.send_window <= 0)) held = true;
+        // Not blocked: streams behind it may send meanwhile (the turn
+        // bounds the worker's time, not the stream's share of the
+        // connection). The post brings it back on the worker's next pass.
+        if (turn_over and s.ws_pending) w.repost();
         self.noteStall(ctx, s, progressed or !s.ws_pending);
         ctx.exchanges.tunnelTimer(s.exchange, ctx.now, s.ws_pending, progressed, w.closeSent());
+        // The window for what was read comes back unless the client holds
+        // the output back (backpressure, as HTTP/1.1 stops reading while
+        // the socket is full). Output left for the next turn (or the next
+        // quantum) is no reason: with a sender keeping the queue filled
+        // it always is, and once the client had sent a window's worth it
+        // could send nothing more, its close included.
+        if (!held) self.creditStream(s, 0);
         if (s.ws_pending) return;
-        // Written: the window for what was read comes back.
-        self.creditStream(s, 0);
         if (!w.wantsClose() and s.state == .open) return;
         var hdr: [frame.header_len]u8 = undefined;
         frame.writeHeader(&hdr, 0, .data, frame.flag.end_stream, s.id);
@@ -2121,7 +2206,15 @@ pub const Conn = struct {
         if (self.hb_stream != 0 or self.conn_stalled) return false;
         for (self.streams) |entry| {
             const s = entry orelse continue;
-            if (s.active and (s.state == .open or s.stalled)) return false;
+            if (!s.active) continue;
+            if (s.stalled) return false;
+            // A WebSocket whose close handshake is over (or that failed)
+            // needs nothing more from the client: its output and END_STREAM
+            // go out, though they may wait for the next turn.
+            if (s.ws) |w| {
+                if (w.wantsClose()) continue;
+            }
+            if (s.state == .open) return false;
         }
         return true;
     }
@@ -4935,6 +5028,125 @@ test "WebSocket over HTTP/2: windows hold output, held output holds the client's
     try testing.expect(std.mem.endsWith(u8, h.handler.ws_log.items, "open;text:big;gone;"));
 }
 
+test "WebSocket over HTTP/2: once a turn's input is taken, the next WebSocket DATA waits unread (its window too) for the next turn, which the WebSocket's post brings" {
+    const h = try Harness.init(.{ .enable_connect_protocol = true });
+    defer h.deinit();
+    try h.preface();
+    try connectWs(h, 1, "/ws");
+    h.events.clearRetainingCapacity();
+    h.data_out.clearRetainingCapacity();
+    // A turn whose input is taken (a large message took it, and more).
+    h.conn.newTurn();
+    h.conn.ws_in = -10;
+    const posts = h.mailbox.pending();
+    // The DATA frame, received and processed by hand (the harness serves
+    // posts as they come): `process` yields before it, and the WebSocket
+    // posts itself once.
+    var wsbuf: [64]u8 = undefined;
+    const wsf = ws_protocol.encodeFrame(&wsbuf, true, .text, "waits", .{ 1, 2, 3, 4 });
+    var fbuf: [128]u8 = undefined;
+    const fn_ = try frame.writeData(&fbuf, 1, false, wsf);
+    const space = try h.conn.readSpace(h.bp());
+    @memcpy(space[0..fn_], fbuf[0..fn_]);
+    h.conn.commitRead(fn_);
+    const c = h.ctx();
+    try testing.expectEqual(Action.yield, h.conn.process(TestHandler, &c));
+    try h.collect();
+    try h.expectEvents("");
+    try testing.expect(h.conn.holdsFrames());
+    try testing.expectEqual(posts + 1, h.mailbox.pending());
+    // Its post: the next turn pays the debt off first, then takes the
+    // frame.
+    var entries: [4]@import("../mailbox.zig").Entry = undefined;
+    _ = h.mailbox.drain(&entries);
+    h.conn.newTurn();
+    try testing.expect(h.conn.ws_in > 0 and h.conn.ws_in < ws.turn_in_bytes);
+    try h.run();
+    try h.expectEvents("data 1 len=7 end=false\n");
+    try testing.expectEqualSlices(u8, "\x81\x05waits", h.data_out.items);
+    try testing.expect(!h.conn.holdsFrames());
+}
+
+test "WebSocket over HTTP/2: a DATA header longer than allowed on a WebSocket meets FRAME_SIZE_ERROR even with the turn's input taken" {
+    const h = try Harness.init(.{ .enable_connect_protocol = true });
+    defer h.deinit();
+    try h.preface();
+    try connectWs(h, 1, "/ws");
+    h.events.clearRetainingCapacity();
+    h.conn.newTurn();
+    h.conn.ws_in = -10;
+    var hdr: [frame.header_len]u8 = undefined;
+    frame.writeHeader(&hdr, frame.min_max_frame_size + 1, .data, 0, 1);
+    try h.feed(&hdr);
+    try h.expectEvents("goaway last=1 frame_size_error\n");
+}
+
+test "WebSocket over HTTP/2: a turn bounds what the WebSockets move per event or post, compressed messages counted before compression; their posts bring the rest" {
+    const h = try Harness.init(.{ .enable_connect_protocol = true, .websocket = .{ .deflate = .{} } });
+    defer h.deinit();
+    try h.preface();
+    try openWindows(h);
+    const Turns = struct {
+        /// Serves the WebSocket's posts, each a turn (as the workers do)
+        /// with the output written in between; returns how many it took.
+        /// Within a turn the stream moves at most a turn's bytes (with its
+        /// last write's least, `ws.turn_min_write`).
+        fn serve(hh: *Harness) !usize {
+            var entries: [4]@import("../mailbox.zig").Entry = undefined;
+            var turns: usize = 0;
+            while (hh.mailbox.drain(&entries) > 0) : (turns += 1) {
+                hh.conn.newTurn();
+                const before = hh.data_out.items.len;
+                const c = hh.ctx();
+                hh.conn.onExchangePosted(TestHandler, &c, entries[0].slot);
+                try hh.flushAll();
+                try testing.expect(hh.data_out.items.len - before <= ws.turn_bytes + ws.turn_min_write);
+                // Posted again with output left, at most once.
+                try testing.expect(hh.mailbox.pending() <= 1);
+            }
+            return turns;
+        }
+    };
+    const msg: [64 * 1024]u8 = @splat('p');
+
+    // Uncompressed: 384 KiB and their headers in two turns, as written.
+    try connectWs(h, 1, "/ws");
+    h.events.clearRetainingCapacity();
+    h.data_out.clearRetainingCapacity();
+    const w = h.handler.ws_conn.?;
+    for (0..6) |_| try w.sendBinary(&msg);
+    try testing.expectEqual(@as(usize, 2), try Turns.serve(h));
+    try testing.expectEqual(@as(usize, 6 * (msg.len + 10)), h.data_out.items.len);
+    var rest: []const u8 = h.data_out.items;
+    for (0..6) |_| {
+        const f = try ws.takeFrame(&rest);
+        try testing.expect(!f.rsv1 and std.mem.eql(u8, f.payload, &msg));
+    }
+
+    // Compressed: a 64 KiB message of one byte shrinks to a few bytes, yet
+    // costs the turn its 64 KiB. Twelve take three turns.
+    try connectWs(h, 3, "/ws");
+    h.data_out.clearRetainingCapacity();
+    const z = h.handler.ws_conn.?;
+    z.enableDeflate(.{ .enabled = true });
+    for (0..12) |_| try z.sendBinary(&msg);
+    try testing.expectEqual(@as(usize, 3), try Turns.serve(h));
+    rest = h.data_out.items;
+    const inflate = @import("../ws/inflate.zig");
+    var got: inflate.Out = .{ .buf = &.{}, .max = 1 << 20, .pool = &h.pool };
+    defer if (got.buf.len > 0) h.pool.releaseLarge(got.buf);
+    for (0..12) |_| {
+        const f = try ws.takeFrame(&rest);
+        try testing.expect(f.rsv1 and f.payload.len < 100);
+        const with_trailer = try std.mem.concat(testing.allocator, u8, &.{ f.payload, &@import("../ws/deflate.zig").trailer });
+        defer testing.allocator.free(with_trailer);
+        got.len = 0;
+        _ = try inflate.inflate(try h.pool.wsInflateTables(), null, with_trailer, &got);
+        try testing.expectEqualSlices(u8, &msg, got.buf[0..got.len]);
+    }
+    try testing.expectEqual(@as(usize, 0), rest.len);
+}
+
 /// "storm" (verification): three threads send numbered binary messages
 /// (5 B to 70 KB) to the WebSocket until it goes or each has sent `limit`.
 const H2Storm = struct {
@@ -5273,6 +5485,65 @@ test "fuzz: h2 connection" {
             &[_]u8{ 0, 0, 5, 1, 5, 0, 0, 0, 1, 0x82, 0x87, 0x84, 0x41, 0x00 },
             &[_]u8{ 0, 0, 8, 6, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8 },
             // Found by the fuzzer.
+            @embedFile("testdata/fuzz/split-1.bin"),
+        },
+    });
+}
+
+/// verify3: the script of `fuzzConn` fed whole with no turns, and split
+/// with turns whose input (`ws_in`) the fuzzer picks, from spent (`process`
+/// yields before the next WebSocket DATA frame) to a few frames; a yield
+/// gets the next turn before anything more is read, as the workers do.
+/// What each stream sends and what the handler sees must not depend on it.
+fn fuzzConnTurns(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buf: [4096]u8 = undefined;
+    const tail = input_buf[0..smith.slice(&input_buf)];
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(testing.allocator);
+    try script.appendSlice(testing.allocator, frame.preface);
+    var buf: [64]u8 = undefined;
+    const n = try frame.writeSettings(&buf, &.{});
+    try script.appendSlice(testing.allocator, buf[0..n]);
+    try script.appendSlice(testing.allocator, tail);
+    const opts: Options = .{ .limits = .{ .max_header_bytes = 2048, .max_body_size = 1024 }, .out_limit = 4096, .max_concurrent_streams = 8, .enable_connect_protocol = true, .websocket = .{ .max_message_size = 4096, .max_send_queue_bytes = 8192 } };
+    const whole = try Harness.init(opts);
+    defer whole.deinit();
+    whole.handler.big = "big body for the fuzzer, not very big";
+    try whole.feed(script.items);
+    const turns = try Harness.init(opts);
+    defer turns.deinit();
+    turns.handler.big = whole.handler.big;
+    var rest: []const u8 = script.items;
+    var yields: usize = 0;
+    while (rest.len > 0 and turns.last != .close) {
+        const k = @min(rest.len, @as(usize, smith.value(u8)) + 1);
+        var chunk = rest[0..k];
+        rest = rest[k..];
+        while (chunk.len > 0 and turns.last != .close) {
+            // The turn's input: spent (yield at once) up to a few frames.
+            turns.conn.ws_in = @as(i64, smith.value(u8)) - 64;
+            const space = try turns.conn.readSpace(turns.bp());
+            const m = @min(space.len, chunk.len);
+            @memcpy(space[0..m], chunk[0..m]);
+            turns.conn.commitRead(m);
+            chunk = chunk[m..];
+            try turns.run();
+            while (turns.last == .yield) : (yields += 1) {
+                if (yields > 1 << 16) return error.YieldsForever;
+                turns.conn.ws_in = @as(i64, smith.value(u8)) + 1;
+                try turns.run();
+            }
+        }
+    }
+    try expectSameStreams(whole, turns);
+}
+
+test "fuzz: h2 connection taking turns" {
+    const script = try buildScript();
+    defer testing.allocator.free(script);
+    try std.testing.fuzz({}, fuzzConnTurns, .{
+        .corpus = &.{
+            script[frame.preface.len + frame.header_len ..],
             @embedFile("testdata/fuzz/split-1.bin"),
         },
     });

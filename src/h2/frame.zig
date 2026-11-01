@@ -158,8 +158,9 @@ pub const Reader = struct {
     buf: []u8 = &.{},
     start: usize = 0,
     end: usize = 0,
-    /// The buffer is from the allocator, not the pool (grown for a large
-    /// frame).
+    /// The buffer is from the pool's large-buffer cache, not its read
+    /// buffers (grown for a large frame, or for input kept while frames
+    /// wait: `spaceFor`).
     grown: bool = false,
 
     pub inline fn buffered(self: *const Self) usize {
@@ -180,7 +181,7 @@ pub const Reader = struct {
             } else {
                 const need = @as(usize, opts.max_frame_size) + header_len;
                 if (self.buf.len >= need) return error.BufferFull;
-                const new_buf = try pool.allocator.alloc(u8, need);
+                const new_buf = try pool.acquireLarge(need);
                 @memcpy(new_buf[0..self.end], self.buf[0..self.end]);
                 self.releaseBuf(pool);
                 self.buf = new_buf;
@@ -194,6 +195,21 @@ pub const Reader = struct {
         self.end += n;
     }
 
+    /// Room for `n` bytes past what is buffered, the buffer compacted and
+    /// grown beyond the largest frame if need be (input received that has
+    /// to be kept while frames wait: io_uring copies it out of a kernel
+    /// buffer it gives back).
+    pub fn spaceFor(self: *Self, pool: *BufferPool, n: usize) ![]u8 {
+        if (self.start > 0) self.compact();
+        if (self.buf.len - self.end >= n) return self.buf[self.end..];
+        const new_buf = try pool.acquireLarge(self.end + n);
+        @memcpy(new_buf[0..self.end], self.buf[0..self.end]);
+        if (self.buf.len > 0) self.releaseBuf(pool);
+        self.buf = new_buf;
+        self.grown = true;
+        return self.buf[self.end..];
+    }
+
     fn compact(self: *Self) void {
         const len = self.end - self.start;
         std.mem.copyForwards(u8, self.buf[0..len], self.buf[self.start..self.end]);
@@ -202,7 +218,7 @@ pub const Reader = struct {
     }
 
     fn releaseBuf(self: *Self, pool: *BufferPool) void {
-        if (self.grown) pool.allocator.free(self.buf) else pool.release(self.buf);
+        if (self.grown) pool.releaseLarge(self.buf) else pool.release(self.buf);
         self.buf = &.{};
         self.grown = false;
     }

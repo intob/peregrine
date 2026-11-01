@@ -53,6 +53,10 @@ fn qpackInt(data: []const u8, comptime prefix: u4) error{Overflow}!?@import("../
     return r;
 }
 
+/// What a WebSocket's input is read in, over HTTP/3, between checks of the
+/// turn's input (`Conn.ws_in`): one HTTP/2 DATA frame's worth.
+const ws_in_piece = 16 * 1024;
+
 pub const Options = struct {
     limits: parser.Limits = .{},
     qpack: qpack.Limits = .{},
@@ -136,10 +140,15 @@ const Stream = struct {
     /// otherwise.
     tunnel: bool = false,
     ws: ?*ws.Conn = null,
-    /// The WebSocket has output the stream's buffer held back; while it
-    /// does, input is left unread (`ws_held`), so QUIC flow control holds
-    /// the client back.
+    /// The WebSocket has output not yet in the stream (its buffer or the
+    /// turn held it back).
     ws_pending: bool = false,
+    /// The stream's buffer is what holds it back (the client reads or
+    /// acknowledges slower than we write): input is then left unread
+    /// (`ws_held`), so QUIC flow control holds the client back. Output left
+    /// for the next turn is no reason: with a sender keeping the queue
+    /// filled it always is, and the client's pings and close went unread.
+    ws_full: bool = false,
     ws_held: bool = false,
     /// The client finished its side (FIN), all of it read.
     ws_peer_done: bool = false,
@@ -190,6 +199,17 @@ pub const Conn = struct {
     /// PRIORITY_UPDATEs for request streams not opened yet (RFC 9218 §7).
     idle_prio: []IdlePriority,
     idle_prio_len: u32 = 0,
+    /// What the WebSockets on this connection may still move into their
+    /// streams in the current turn (`newTurn`), counted as over HTTP/2
+    /// (`h2.Conn.ws_turn`). Without it a pump filled the stream's buffer:
+    /// with permessage-deflate, 1 MiB of messages of one byte compressed
+    /// from about 1 GiB. Unbounded until the endpoint starts a turn.
+    ws_turn: usize = std.math.maxInt(usize),
+    /// The message bytes the WebSockets may still take from input in the
+    /// current turn, as over HTTP/2 (`h2.Conn.ws_in`): once spent, a
+    /// WebSocket's DATA waits in the QUIC stream (no credit for it) and its
+    /// post brings the next turn.
+    ws_in: i64 = std.math.maxInt(i32),
 
     pub fn init(allocator: Allocator, opts: Options, q: *quic.Conn) !*Self {
         const self = try allocator.create(Self);
@@ -585,11 +605,20 @@ pub const Conn = struct {
                         s.frame_left -= n;
                         continue;
                     };
-                    if (s.ws_pending) {
+                    if (s.ws_pending and s.ws_full) {
                         s.ws_held = true;
                         return;
                     }
-                    var rest = data[0..n];
+                    if (self.ws_in <= 0) {
+                        // This turn's input is taken: the next turn's.
+                        s.ws_held = true;
+                        return w.repost();
+                    }
+                    // A piece at a time, each charged to the turn (a DATA
+                    // frame may be as long as the client likes).
+                    const piece = @min(n, ws_in_piece);
+                    var rest = data[0..piece];
+                    w.input_charged = 0;
                     while (rest.len > 0 and !w.wantsClose()) {
                         const space = w.decoder.readSpace() catch return self.streamError(ctx, slot, .internal_error);
                         const k = @min(space.len, rest.len);
@@ -598,9 +627,10 @@ pub const Conn = struct {
                         rest = rest[k..];
                         _ = w.process(Handler, ctx.handler);
                     }
+                    self.ws_in -= @intCast(@min(w.input_charged, std.math.maxInt(i32)));
                     w.decoder.releaseIfIdle();
-                    q.streamConsume(slot, n);
-                    s.frame_left -= n;
+                    q.streamConsume(slot, piece);
+                    s.frame_left -= piece;
                     self.pumpStream(Handler, ctx, slot);
                     if (!s.active) return;
                     continue;
@@ -1025,6 +1055,14 @@ pub const Conn = struct {
         self.pumpStream(Handler, ctx, slot);
     }
 
+    /// Called by the endpoint for each batch of the connection's packets or
+    /// timers, and each post: its WebSockets may move `ws.turn_bytes` more
+    /// (`ws_turn`).
+    pub fn newTurn(self: *Self) void {
+        self.ws_turn = ws.turn_bytes;
+        self.ws_in = @min(self.ws_in + ws.turn_in_bytes, ws.turn_in_bytes);
+    }
+
     /// Called by the worker for a mailbox post naming this exchange.
     pub fn onExchangePosted(self: *Self, comptime Handler: type, ctx: *const Context(Handler), slot: u32) void {
         const ex_slot = slot;
@@ -1127,32 +1165,45 @@ pub const Conn = struct {
     }
 
     /// Moves what the WebSocket has queued into the stream, in DATA
-    /// frames, as far as the stream's buffer allows; reads on once it is
-    /// all in. Once the WebSocket is over (the close handshake, a failure,
-    /// or the client's FIN) and its output is in, FIN ends our side.
+    /// frames, as far as the stream's buffer and the turn (`ws_turn`)
+    /// allow; reads on once it is all in. Once the WebSocket is over (the
+    /// close handshake, a failure, or the client's FIN) and its output is
+    /// in, FIN ends our side.
     fn pumpWebSocket(self: *Self, comptime Handler: type, ctx: *const Context(Handler), slot: u32) void {
         const q = self.quic;
         const s = &self.streams[slot];
         const w = s.ws.?;
         var progressed = false;
+        var full = false;
         while (true) {
             const buffered = q.streamBuffered(slot);
-            if (buffered >= self.opts.stream_buffer) break;
-            const bytes = w.wireBytes();
+            if (buffered >= self.opts.stream_buffer) {
+                full = true;
+                break;
+            }
+            if (self.ws_turn == 0) break;
+            const bytes = w.turnWire(&self.ws_turn);
             if (bytes.len == 0) break;
-            const n = @min(bytes.len, self.opts.stream_buffer - buffered, 64 * 1024);
+            const n = @min(bytes.len, self.opts.stream_buffer - buffered, 64 * 1024, w.turnRoom(self.ws_turn));
             self.writeFrame(slot, .data, bytes[0..n]) catch return self.fail(.internal_error, "", ctx.now_us);
-            w.advance(n);
+            w.turnAdvance(&self.ws_turn, n);
             progressed = true;
         }
         s.ws_pending = w.hasOutput();
+        s.ws_full = full and s.ws_pending;
         ctx.exchanges.tunnelTimer(s.exchange, ctx.now, s.ws_pending, progressed, w.closeSent());
-        if (s.ws_pending) return q.streamWantWritable(slot, self.opts.stream_buffer / 2);
-        if (s.ws_held) {
-            // Input left unread while output was stalled.
+        if (s.ws_pending) {
+            // Full: acknowledgements make room again. Otherwise the turn
+            // is over, and the post brings it back on the worker's next
+            // pass.
+            if (full) q.streamWantWritable(slot, self.opts.stream_buffer / 2) else w.repost();
+        }
+        if (s.ws_held and !s.ws_full) {
+            // Input left unread while the buffer was full.
             s.ws_held = false;
             return self.readRequest(Handler, ctx, slot);
         }
+        if (s.ws_pending) return;
         if (!w.wantsClose() and !s.ws_peer_done) return;
         dropWebSocket(ctx, s);
         ctx.exchanges.release(s.exchange);
